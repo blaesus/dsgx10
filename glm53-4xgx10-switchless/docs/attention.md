@@ -64,6 +64,16 @@ A slot is `slot_stride` entries from the previous; rows carry their slot in a de
 
 Every FP8 tensor is zai's codes (e4m3) and `weight_scale_inv` (f32 per 128 × 128), re-cut losslessly:
 
+*Quantiser (2026-10-14):* `pack.py`'s `fp8_from_master` now uses zai's rule, `scale = f32(amax) × f32(1/448)`
+(a multiply by the rounded reciprocal), not `amax / 448`, which differed by one ulp in ~half the scales and
+matched 0 of 20 release tensors ([layout.md § 4](layout.md#4-fp8-conversion-zais-rule-reproduced)).
+`tools/fp8_vs_converter.py --ckpt NV --cache CACHE` checks real tensors (L42 indexer wk, L5 kv_a with its
+partial 128-row block, L0 q_a): pack.py's codes and scales are byte-identical to the converter's
+(`engine/weights/quant.py`) and to zai's release, 3 of 3. The test data were regenerated with it (`gen_ref.py`,
+S = 300 and 4600: scales changed in 44–67 % of blocks) and the attention tests rerun on the new data: 44 + 93
+pass, memcheck clean. (The FP8 *index-key cache*, amax/448 a key, is the engine's own runtime format and is
+unchanged.)
+
 - **Tile layout** `[N/8][K/64][32 lanes][16 B]`: lane `4g + t` holds row `8i + g`, k = `64j + 16t + b` at
   byte `b` (512 contiguous bytes a warp-step). A warp widens its 16 bytes to bf16 exactly (bits into bf16's
   fields, one bf16 multiply by 2^120) and feeds them as the B operand of four m16n8k16 MMAs.
@@ -377,4 +387,5 @@ above come from nsys timelines and A/B builds only.
   all-reduces; CUDA graphs over a whole layer; the position-split cache (DCP) if memory requires it; an FP8
   latent-cache track was not built.
 - **Converter:** `tools/pack.py` is the reference for every tile; the real converter (zai's checkpoint →
-  these tiles) is the G2 tool's job and must reproduce `pack.py` byte for byte.
+  these tiles) is the G2 tool's job and must reproduce `pack.py` byte for byte (the FP8 quantiser now agrees,
+  `tools/fp8_vs_converter.py`).
