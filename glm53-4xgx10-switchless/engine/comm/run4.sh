@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run one ring binary on all four boxes (the DeepSeek engine's engine/comm/run4.sh pattern): ranks 1-3 detached on
-# the workers, rank 0 here in the foreground. The binary and the fleet file (FLEET=FILE; default this configuration's fleet/homelab.conf, the same boxes as the DeepSeek
-# engine's fleet/homelab.conf, the same boxes) go to ~/dsgb10-data/glm53-comm/run/ on every box, the fleet file
+# the workers, rank 0 here in the foreground. The binary and the fleet file (FLEET=FILE; default this configuration's
+# fleet/homelab.conf, the same boxes as the DeepSeek engine's) go to ~/dsgb10-data/glm53-comm/run/ on every box, the fleet file
 # as fleet.conf beside the binary; logs in run/logs/<name>.<rank>.log there; worker log tails are printed after.
 # GPU and ring code only through the DeepSeek engine's ring.sh (it lends the ring while the service is idle and
 # preempts the job for a request: then this script's TERM trap stops the workers' ranks too):
