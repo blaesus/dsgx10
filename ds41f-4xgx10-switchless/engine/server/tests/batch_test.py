@@ -6,7 +6,7 @@ its first token after its own prefill, not after their decode; more requests tha
 (--slice > 0) or wait for a slot (--slice 0); a cancel and a stop id inside a batch end only their own
 request; a kept session whose slot went to another continues from the store. With drafts (serve's
 default, docs/batching.md B3) batches of up to kMaxRows / 2 sessions decode with drafts across them: the
-last two scenarios run pairs and triples (a draft cap of 3 and 1 each with kMaxRows 8), a pause, a
+last two scenarios run pairs and triples (a draft cap of 5 and 4 each with kMaxRows 16), a pause, a
 cancel and a stop id inside a drafted batch; every request must still equal its run alone.
 
   python3 engine/server/tests/batch_test.py --socket S --slots 4
@@ -173,7 +173,7 @@ def main():
               '%s: cached %d of %d (its session holds %d), %d tokens, %s' % (
                   e.recs[r]['name'], d['cached'], d['prompt'], base, d['completion'], d['reason']))
 
-    print('7. drafts across sessions (B3): pairs (a draft cap of 3 each with kMaxRows 8), then triples (1 each)')
+    print('7. drafts across sessions (B3): pairs (a draft cap of 5 each with kMaxRows 16), then triples (4 each)')
     # a server with drafts runs batches of up to kMaxRows / 2 sessions through the spec batch loop; the
     # sampled B, D and F and C with its top 5 log-probabilities cover the verdicts' bits; when one of a
     # group ends first the rest go on (the last one alone, with drafts)
