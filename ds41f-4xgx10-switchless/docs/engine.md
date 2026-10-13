@@ -639,9 +639,10 @@ the design, steps B1 and B2).
   them ([`spec_batch_loop`](../engine/server/cmd.cpp), `kCmdSpecBatch`): a batch spec step holds each
   request's bonus token and its drafts, at most (kMaxRows − S) / S each for S requests and never more
   than the five the drafter makes (5 for two, 4 for three, 3 for four, 2 for five, 1 for six to
-  eight), laid out on the device in request order. The verdicts are per
-  request and the draft passes run one per request in its own slot, so every request's tokens and
-  log-probabilities are its run's alone. Its end, stop ids, cancel (its slot's bit) and a pause act per
+  eight), laid out on the device in request order. The verdicts are per request, the accepts run per
+  request in its own slot, and the drafts in one pass over the requests on (each request's rows in its
+  slot, every row computed as in a pass of its own; B3 phase 2a, built on 2026-10-13 and not yet run
+  on the ring), so every request's tokens and log-probabilities are its run's alone. Its end, stop ids, cancel (its slot's bit) and a pause act per
   request as in the speculative loop; a request that ends keeps its rows in the step already queued
   (their KV counts, their tokens do not); the last one decoding pauses to go on alone with its five
   drafts. Larger runs take the plain batch loop. The batch log line adds `drafts: T tokens and R rows

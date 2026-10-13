@@ -101,7 +101,7 @@ prompts (v2.2); neither that nor the catalogs is like for like
 
 **Several streams at once** (2026-10-13, on the variant weights; [batching.md](docs/batching.md#b3-the-build-2026-10-13)):
 with four slots, up to eight requests decode together, each with its own drafts. Four streams of different text
-(1k-token prompts, 512 tokens each, `bench/multistream.py`) decode 131 tok/s in all, three 122, two 107, one
+(1k-token prompts, 512 tokens each, `bench/multistream.py`) decode 136 tok/s in all, three 127, two 109, one
 alone 97; batches without drafts (the step before) gave 121 / 107 / 88, and one stream at a time gives 97
 whatever their number. One stream is unchanged: A/B/B/A against the engine before, six runs each, 8.322 against
 8.322 ms a token with drafts. Every request's tokens and log-probabilities are its run's alone.
