@@ -30,7 +30,9 @@ struct RowCand {   // one rank's view of one row
 };
 static_assert(sizeof(RowCand) % 16 == 0, "RowCand");
 constexpr int kHdr = 16;  // rank 0's control word, padded
-constexpr uint32_t kBytes = kHdr + kMaxRows * sizeof(RowCand);
+// a rank's contribution: the control word and a RowCand per block (RB = sample's max_rows: kLowRows or kMaxRows)
+template <int RB>
+constexpr uint32_t kBytes = kHdr + RB * sizeof(RowCand);
 constexpr int kChunks = sizeof(RowCand) / 16;
 
 __device__ __forceinline__ void wait_prev() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
@@ -95,6 +97,9 @@ __device__ __forceinline__ int bin_of(float m, float l) {
   return d < 256.f ? (int)d : 256;
 }
 
+// RB blocks (one per row of the step's at most RB): the instance of kLowRows is the kernel of before B4, launch
+// and bytes alike, the one of kMaxRows serves steps of 9..16 rows.
+template <int RB>
 __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const float* logits, int vocab0,
                                                      const StepIn* in, const uint32_t* ctl, SampleOut* outs,
                                                      int32_t* fb, uint32_t* counter, SpecState* ss) {
@@ -230,7 +235,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     mine->gv = -INFINITY, mine->gi = INT_MAX, mine->gl = 0.f;
     mine->t = -INFINITY, mine->n = 0;
   }
-  comm::post_grid(ch, s, kBytes);
+  comm::post_grid(ch, s, kBytes<RB>);
   comm::wait_all(ch, s);
   if (b < R)
     for (int k = t; k < kRanks * kChunks; k += kThreads) {
@@ -363,10 +368,16 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
 }  // namespace
 
 void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in, const uint32_t* ctl,
-            SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss) {
-  if (kBytes > ch.cap) die("sample: %u bytes exceed the channel's %u", kBytes, ch.cap);
-  attn::launch(k_sample, dim3(kMaxRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb, counter,
-               ss);
+            SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss, int max_rows) {
+  if (kBytes<kMaxRows> > ch.cap) die("sample: %u bytes exceed the channel's %u", kBytes<kMaxRows>, ch.cap);
+  if (max_rows == kLowRows)
+    attn::launch(k_sample<kLowRows>, dim3(kLowRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb,
+                 counter, ss);
+  else if (max_rows == kMaxRows)
+    attn::launch(k_sample<kMaxRows>, dim3(kMaxRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb,
+                 counter, ss);
+  else
+    die("sample: max_rows %d (kLowRows %d or kMaxRows %d)", max_rows, kLowRows, kMaxRows);
 }
 
 }  // namespace model::ops

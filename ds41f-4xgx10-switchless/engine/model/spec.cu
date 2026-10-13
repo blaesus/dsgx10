@@ -536,31 +536,36 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &deps, nullptr, &nd));
   const std::vector<cudaGraphNode_t> head(deps, deps + nd);
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
-  // the switch: body R - 1 runs R rows
+  // the switch: body R - 1 runs R rows. One session's step has at most kMaxSessRows rows (next_in: a given
+  // step's, from serve's small turns of up to --small-rows; a verify step's 1 + kDrafts), so that many bodies,
+  // whatever kMaxRows (B4: the batch steps of several sessions have graphs of their own).
+  constexpr int kBodies = kMaxSessRows;
+  static_assert(kBodies <= ops::kLowRows && kBodies >= 1 + ops::kDrafts, "the spec switch's bodies");
   cudaGraphNodeParams cp{};
   cp.type = cudaGraphNodeTypeConditional;
   cp.conditional.handle = h;
   cp.conditional.type = cudaGraphCondTypeSwitch;
-  cp.conditional.size = kMaxRows;
+  cp.conditional.size = kBodies;
   cudaGraphNode_t sw;
   CUDA_CHECK(cudaGraphAddNode(&sw, g, head.data(), nullptr, head.size(), &cp));
   mh_on = true;
-  for (int R = 1; R <= kMaxRows; ++R) {
+  for (int R = 1; R <= kBodies; ++R) {
     CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, cp.conditional.phGraph_out[R - 1], nullptr, nullptr, 0, mode));
     forward_rows(R, ctx, 0, nullptr, 0);
     CUDA_CHECK(cudaStreamEndCapture(st, &cap));
   }
   mh_on = false;
   size_t nodes = 0;
-  for (int R = 1; R <= kMaxRows; ++R) {
+  for (int R = 1; R <= kBodies; ++R) {
     size_t k = 0;
     CUDA_CHECK(cudaGraphGetNodes(cp.conditional.phGraph_out[R - 1], nullptr, &k));
     nodes += k;
   }
   sp.nodes = nodes;
-  // the verdicts, the draft module, the next step's rows, the publication
+  // the verdicts (the sampler's grid of kLowRows blocks: the bodies hold at most that many rows), the draft
+  // module, the next step's rows, the publication
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &sw, nullptr, 1, mode));
-  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss);
+  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss, ops::kLowRows);
   // the step's session's windows (every entry of its slot table holds its slot)
   const int* slot = nslots > 1 ? in_d->slot : nullptr;
   sp.draft->accept(sp.mh, &sp.ss->count, &sp.ss->pos0, st, slot);
@@ -620,7 +625,8 @@ void Model::Impl::spec_fill(ops::StepIn& in, int mode, const SpecCfg& c) {
 uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const Sampling& sp, const SpecCfg& c) {
   if (!spec) die("model: launch_spec without bind_spec");
   const int pos_last = pos0 + R - 1;
-  if (R < 1 || R > kMaxRows || pos0 < 0 || pos_last >= opt.max_ctx) die("model: bad spec step R=%d pos0=%d", R, pos0);
+  if (R < 1 || R > kMaxSessRows || pos0 < 0 || pos_last >= opt.max_ctx)  // the switch has kMaxSessRows bodies
+    die("model: bad spec step R=%d pos0=%d (at most %d rows: one session's)", R, pos0, kMaxSessRows);
   for (int r = 0; r < R; ++r)
     if (tokens[r] < 0) die("model: launch_spec takes the step's tokens");
   const uint64_t n = n_steps;
