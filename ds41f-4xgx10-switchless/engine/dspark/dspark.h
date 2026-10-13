@@ -25,6 +25,7 @@ namespace dspark {
 inline constexpr int kBlocks = 3;   // mtp.0 .. mtp.2
 inline constexpr int kDraft = 5;    // block rows = drafts per pass (dspark_block_size)
 inline constexpr int kMaxAcc = 8;   // positions per accept() call
+inline constexpr int kMaxHidden = 16;  // rows of a main_hidden buffer, at most: a batch spec step's (docs/batching.md, B3)
 inline constexpr int kRanks = 4;
 inline constexpr int kDim = 5120, kHc = 4, kQLora = 1280;
 inline constexpr int kVocab = 129280, kVocabRank = kVocab / kRanks, kMarkov = 256;
@@ -99,7 +100,7 @@ void sim_fp8_l2(uint8_t* w, int N, int K, cudaStream_t st);
 
 // The runner's part, at the start of layers 37, 38 and 39 (their input stream x [rows][4][5120], after Engram
 // where there is one): the mean of the 4 copies (torch's bf16 mean) into columns [5120 * slot, +5120) of
-// main_hidden [kMaxAcc][15360], slot = layer - 37.
+// main_hidden [rows][15360] (rows <= kMaxHidden: a step's; accept() reads at most kMaxAcc of them), slot = layer - 37.
 void main_hidden(const uint16_t* x, int rows, int slot, uint16_t* mh, bool pdl, cudaStream_t s);
 
 // A rank's argmax candidate over its vocab slice (id: the global token id).

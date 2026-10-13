@@ -527,7 +527,7 @@ Weights weights_from(std::initializer_list<const dsw::WeightFile*> files) {
 }
 
 void main_hidden(const uint16_t* x, int rows, int slot, uint16_t* mh, bool pdl, cudaStream_t s) {
-  if (rows < 1 || rows > kMaxAcc || slot < 0 || slot > 2) die("dspark::main_hidden: rows %d slot %d", rows, slot);
+  if (rows < 1 || rows > kMaxHidden || slot < 0 || slot > 2) die("dspark::main_hidden: rows %d slot %d", rows, slot);
   launch(main_hidden_kernel, dim3(kDim / 256, rows), dim3(256), 0, s, pdl, x, slot, mh);
 }
 

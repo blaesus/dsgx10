@@ -515,6 +515,7 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
   sp.draft = std::make_unique<dspark::Draft>(dw, rank, sp.comm.get(), sp.rope, nslots);
   sp.draft->use_slot(cur_slot);
   if (opt.tree_probe) sp.draft->enable_probe();
+  static_assert(kMaxRows <= dspark::kMaxHidden, "a batch spec step's rows fit the draft module's main_hidden tap");
   sp.mh = dalloc<uint16_t>((size_t)kMaxRows * dspark::kMainK);
   sp.ss = dalloc<ops::SpecState>(ops::kMaxSess);  // [0] the one-session step's; B3's entries' [k]
   sp.bents = std::min(ops::kMaxSess, nslots);
