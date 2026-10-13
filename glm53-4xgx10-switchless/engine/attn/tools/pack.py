@@ -12,8 +12,10 @@ HEADS = 64 // TP
 
 
 def fp8_from_master(w):
-    """zai's FP8 from a BF16 master (torch tensor [N][K]): per 128x128 block scale = amax / 448 (f32),
-    codes = e4m3(w / scale) round-to-nearest-even. Returns (codes uint8 [N][K], scales f32 [ceil(N/128)][K/128])."""
+    """zai's FP8 from a BF16 master (torch tensor [N][K]): per 128x128 block scale = f32(amax) * f32(1/448) (a
+    multiply by the rounded reciprocal, as zai's release and engine/weights/quant.py; amax / 448 differs by one ulp
+    in about half the blocks), codes = e4m3(f32(w) / scale) round-to-nearest-even. Returns (codes uint8 [N][K],
+    scales f32 [ceil(N/128)][K/128]). An all-zero block (random test masters only) gets scale 1e-12."""
     import torch
     w = w.float()
     N, K = w.shape
@@ -22,7 +24,7 @@ def fp8_from_master(w):
     pad[:N] = w
     blk = pad.view(nb, 128, kb, 128)
     amax = blk.abs().amax(dim=(1, 3))
-    scale = (amax / 448.0).clamp_min(1e-12)
+    scale = (amax * torch.tensor(1.0 / 448.0, dtype=torch.float32)).clamp_min(1e-12)
     q = (blk / scale[:, None, :, None]).to(torch.float8_e4m3fn)
     codes = q.view(torch.uint8).reshape(nb * 128, K)[:N].contiguous()
     return codes.numpy(), scale.numpy().astype(np.float32)
