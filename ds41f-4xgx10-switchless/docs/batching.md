@@ -699,3 +699,36 @@ refused.
   graph's capture: `dspark::main_hidden` refused more than `kMaxAcc` = 8 rows, while the batch graph's bodies
   go to 16; it now takes `kMaxHidden` = 16 (accept still reads at most 8, from its entry's row0). The
   drafted-batch hashes, the one-session ABBA and the serve tests follow.
+- 2026-10-13 15:35, the second fault, found by the next run: `cudaGraphInstantiate` refused the batch graph
+  (invalid argument) because a conditional handle was created for every `kMaxSess` entry while only `bents`
+  if nodes used one. One handle per node (ee748c1), and the graph of 4 entries instantiates: 14,584 nodes in
+  its bodies, 483–490 MiB of device memory, 0.29 s. Then the checks below passed.
+
+### Measured (2026-10-13, engine ee748c1 on the integration branch)
+
+**Every reference hash in drafted batches** (`--mode batch --spec --draft-fp8 --slots 4`, 256 steps a
+session, 128 sampled; the same text in every 1k session, so these sessions share experts):
+
+| sessions (context) | hashes | steps, rows a step | tokens a step | ms a step | tok/s in all, per session |
+|---|---|---|---|---|---|
+| 1k, 1k | febc7dc54ee40a39 twice | 74, 8.30 | 6.92 | 37.0 | 187.1, 93.6 |
+| 1k, 16k CED, 1k | febc7dc54ee40a39, 81f772ab79a950e4, febc7dc54ee40a39 | 88, 10.47 | 8.73 | 51.1 | 170.8, 56.9 |
+| 1k ×4 | febc7dc54ee40a39 four times | 89, 13.66 | 11.51 | 44.3 | 259.7, 64.9 |
+| sampled (T 0.8, top-p 0.95, top-k 40, seed 7): 1k, 4k, 1k | a8f7a08f8cd1c5e8 twice (the 4k one has no reference) | 54, 10.43 | 7.11 | 49.1 | 144.7, 48.2 |
+
+- A step's GPU time by its rows, 4 sessions of one text: 8 rows 32.8 ms (16 steps), 12 rows 40.4 (7), 16
+  rows 47.5 (60). Two sessions: 4 rows 25.9, 6 rows 30.1, 8 rows 33.2, 12 rows 44.6 (33 of 74 steps).
+  Three sessions with the 16k one: 9–15 rows 49.5–62.4 ms.
+- One session alone decodes this text at 8.29 ms a token with drafts (120.7 tok/s; the ABBA below), so two
+  sessions of it decode 55 % more in all and four 115 % more.
+
+**One session, A/B/B/A** (bench/abba.sh: master 4e2bae9 against the integration engine, the 1k golden run,
+two runs each per variant, both orders; every run the reference hash):
+
+| variant | master, ms a token | integration | B over A |
+|---|---|---|---|
+| k = 1 | 16.730 (16.677, 16.784) | 16.768 (16.743, 16.794) | +0.23 % |
+| drafts (fp8) | 8.285 (8.270, 8.301) | 8.352 (8.313, 8.391) | +0.80 % |
+
+Both within the owner's 2 %. The drafted figure is not clearly inside the run-to-run spread with two runs
+each (the ranges do not overlap); a longer A/B of the drafted variant follows the serve tests.
