@@ -246,6 +246,83 @@ def check_fp8(fd, e, se, r, full, M):
     return None
 
 
+EXPERT_SAMPLE = (0, 1, 17, 128, 255)
+
+
+def nvfp4_untile(b, N, K):
+    """A rank's NVFP4 expert matrix from its [N/8][K/512][2304 B] blocks, by docs/layout.md's byte formula
+    (written out per index here, not by pack_nvfp4's reshape): codes [N][K/2], scales [N][K/16]."""
+    B = K // 512
+    n, j = np.indices((N, K // 2))
+    bb, r = j // 256, j % 256
+    jj, q, t, c = r // 64, (r // 32) % 2, (r // 8) % 4, r % 8
+    w = b[(n // 8 * B + bb) * glw.Q4_BLK + 512 * jj + 16 * (4 * (n % 8) + t) + 8 * q + c]
+    n, k = np.indices((N, K // 16))
+    bb, r = k // 32, k % 32
+    jj, q, t = r // 8, (r // 4) % 2, r % 4
+    s = b[(n // 8 * B + bb) * glw.Q4_BLK + 2048 + 8 * (4 * (n % 8) + t) + 2 * jj + q]
+    return w, s
+
+
+def check_expert(fd, e, ed, r, ck, cache):
+    """An expert entry: the desc's offsets, scale_2 and format tag; a sampled expert's codes and scales against
+    NVIDIA's (layers 3-77) or nvfp4_rtn of the BF16 (the MTP layer), cut to the rank's rows (gate, up) or input
+    columns (down)."""
+    import struct
+    import torch
+    L = e["layer"]
+    p = f"model.layers.{L}.mlp.experts."
+    if e["name"].endswith(".desc"):
+        d = read_entry(fd, e)
+        for x in range(256):
+            for m in range(3):
+                off, s2, fmt = struct.unpack_from("<QfI", d, (3 * x + m) * 64)
+                n = f"{p}{x}.{('gate', 'up', 'down')[m]}_proj.weight"
+                want = (np.float32(ck.get(n + "_scale_2")[0].reshape(-1)[0].item()) if L != glw.MTP else
+                        rtn_s2(ck, p, x, m, cache))
+                if off != (3 * x + m) * 1769472 or fmt != 0 or np.float32(s2) != want:
+                    return f"descriptor {x}.{m}: offset {off}, scale_2 {s2}, fmt {fmt}"
+        return None
+    x = int(e["name"].split(".")[-1])
+    b = np.frombuffer(read_entry(fd, e), np.uint8)
+    for m, proj in enumerate(("gate", "up", "down")):
+        N, K = (512, 6144) if m < 2 else (6144, 512)
+        w, s = nvfp4_untile(b[m * 1769472:(m + 1) * 1769472], N, K)
+        n = f"{p}{x}.{proj}_proj.weight"
+        if L != glw.MTP:
+            cw = ck.get(n)[0].numpy()
+            cs = ck.get(n + "_scale")[0].view(torch.uint8).numpy()
+        else:
+            q = rtn(ck, p, x, cache)[m]
+            cw, cs = q["weight"], q["weight_scale"]
+        if m < 2:
+            cw, cs = cw[512 * r:512 * r + 512], cs[512 * r:512 * r + 512]
+        else:
+            cw, cs = cw[:, 256 * r:256 * r + 256], cs[:, 32 * r:32 * r + 32]
+        if not np.array_equal(w, cw) or not np.array_equal(s, cs):
+            return f"{proj}: {int((w != cw).sum())} code bytes, {int((s != cs).sum())} scales differ"
+    return None
+
+
+def rtn(ck, p, x, cache):
+    if x not in cache:
+        sys.path.insert(0, os.path.join(ROOT, "..", "..", "quant"))
+        import formats
+        W = [ck.get(f"{p}{x}.{proj}_proj.weight")[0].float() for proj in ("gate", "up", "down")]
+        gu = max(W[0].abs().max(), W[1].abs().max())
+        cache.clear()
+        cache[x] = [formats.nvfp4_rtn(W[0], gu), formats.nvfp4_rtn(W[1], gu), formats.nvfp4_rtn(W[2])]
+    return cache[x]
+
+
+def rtn_s2(ck, p, x, m, cache):
+    """scale_2 = amax * f32(1/2688), amax shared by gate and up; from the BF16 maxima alone."""
+    import torch
+    W = [ck.get(f"{p}{x}.{proj}_proj.weight")[0] for proj in ("gate", "up", "down")]
+    a = torch.maximum(W[0].abs().max(), W[1].abs().max()) if m < 2 else W[2].abs().max()
+    return np.float32(a.float().item()) * np.float32(1 / 2688.0)
+
+
 def indep(files, ck_dir, cache):
     import rope_table
     import sources
@@ -267,12 +344,21 @@ def indep(files, ck_dir, cache):
     bad = checked = 0
     t0 = time.time()
     rope = None
+    rtn_cache = {}
     for L in sorted(groups):
         full = L >= 0 and f"model.layers.{L}.self_attn.indexer.wk.weight" in ck
         for n in groups[L]:
             for path, hd, ed, fd in per:
                 e, r, why = ed[n], hd["rank"], None
                 if e["kind"] == glw.RESERVED:
+                    continue
+                if re.match(r"layers\.\d+\.experts\.", n):
+                    if n.endswith(".desc") or int(n.split(".")[-1]) in EXPERT_SAMPLE:
+                        why = check_expert(fd, e, ed, r, ck, rtn_cache)
+                        checked += 1
+                        if why:
+                            bad += 1
+                            print(f"MISMATCH {path} {n}: {why}", flush=True)
                     continue
                 if n.endswith(".scale"):
                     continue  # checked with its weight
@@ -295,6 +381,7 @@ def indep(files, ck_dir, cache):
                     bad += 1
                     print(f"MISMATCH {path} {n}: {why}", flush=True)
         M.cache.clear()
+        rtn_cache.clear()
         if L % 10 == 0 or L == 78:
             print(f"  through layer {L}: {checked} tensor checks, {bad} bad, {time.time() - t0:.0f} s", flush=True)
     # cross-rank: replicated entries identical, split ones distinct pieces (by CRC; their content was checked above)

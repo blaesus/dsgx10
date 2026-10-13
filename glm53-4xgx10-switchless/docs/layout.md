@@ -201,9 +201,29 @@ tail (truncate at the first expert entry, append again), leaving the non-expert 
 | **Independent** | `verify.py --indep` | without pack.py, quant.py or the plan: the natural matrix each FP8 tensor should hold, written out again from attention.md as source row/column pieces (transposes, interleaving); scales by the rule in numpy; every element's scale read through the TOC's rs × ks must be its source block's; every code un-tiled with glw.h's formula must be `e4m3_rne(master / scale)`; BF16/F32 tensors byte-equal to their source rows; the RoPE table equal to rope_table.py's; replicated tensors equal across ranks | 4,772 checks, 0 bad; a flipped code bit and a flipped scale bit are both caught |
 | Kernel binding | `glw_kcheck --rank R` | every layer against attn.h (`kXRows`, `kHeads`, …, the GemvSeg rs/ks, `full_indexer`), experts.h (`mat_bytes`, `MatDesc`, `SharedW` when T128), the head/embed/RoPE shapes; binds each FP8 tensor into a `glm::GemvSeg` | 101,053 checks a rank, 0 bad |
 | Rank refusal | `glw_rank_test --file F R` | the loader refuses the three other ranks | all ok |
-| Device | `glw_kcheck --gpu` | the chosen layers' GEMVs (`glm::gemv`, SwiGLU pairs, grouped W_UK/W_UV, the BF16 head) against a double reference from the file's own bytes | **built, not run** (a ring job) |
+| Device | `glw_kcheck --gpu` | the chosen layers' GEMVs (`glm::gemv`, SwiGLU pairs, grouped W_UK/W_UV, the BF16 head) against a double reference from the file's own bytes; kF32 within 1e-4 of Σ\|x·w\|, SwiGLU within 2 bf16 ulps plus the f32 sums' rounding carried through (below) | rank 0, layers 0, 3, 10, 78 and the head: 105,136 ok, 1 bad under the old SwiGLU bound (below); layer 0 again with the new bound: 102,142 ok, 0 bad |
 
 `verify.py --crc --fresh --indep` over all four files: ~7 min, 5.6 GB peak, nice 19, no GPU.
+
+**The SwiGLU bound (2026-10-14).** `glw_kcheck --gpu`'s first run found one of 12,288 SwiGLU outputs of
+`layers.0.mlp.gate_up` outside the plain 2-ulp bound: row 1, intermediate 659 (flat 3,731 of the [4][3072]
+output). The kernel gave 1.48266554e-06, kcheck's reference 1.50501728e-06, the exact value in f64
+1.50243735e-06; the bound was 1.49e-08 (2 ulps), the difference 2.24e-08 (3.0 ulps). The cause is the bound,
+not the kernel or the reference: the gate's sum cancels, g = -3.33342485e-06 against Σ\|x·w\| = 52.36 (6.4e-8 of
+it, under f32's epsilon), so the kernel's f32 sum (-3.27324096e-06, off by 6.0e-08 = 1.1e-9 of Σ\|x·w\|, an
+ordinary rounding error) is 1.8 % from the exact gate, and SiLU near 0 (≈ g/2) passes that straight to the output.
+The up value (-0.901439162) is unremarkable. Reproduced on the CPU first: the same inputs (mt19937(1234) with the
+earlier draws replayed), kcheck's double reference, and an emulation of `k_gemv`'s sums (each 64-k chunk exact,
+rounded to f32, times its scale, added in k order) flag that one output, no other, and give the kernel's
+value to the bit; the ring job then printed the same value from the GPU. A wrong byte would not cancel only
+this one output, and the reference agrees with the exact value to 0.35 ulp. **The rule now:** the kernel's g is
+within E = 2⁻²² Σ\|x·w·s\| (MMA-internal) + 2⁻²⁴ Σⱼ (\|Sⱼ\| + \|sⱼcⱼ\|) (the scale multiply and the running sum,
+Sⱼ the exact sum after chunk j) of the exact one, and likewise u; the reference is recomputed at g ± E_g,
+u ± E_u, and the output may be 2 ulps beyond the widest corner (`swiglu_tol` in kcheck.cu). Here E_g = 1.46e-05,
+the bound 6.62e-06; the output is inside. On these inputs the rule widens 569 of 12,288 bounds (cancelling gates
+and values on a bf16 rounding boundary) and still catches 3,997 of the 4,035 outputs that a wrong scale block on
+one chunk moves out of the old bound (a worst-case 3·(K/64)·2⁻²³ Σ\|x·w\| was tried first and dropped: it caught
+2,359). kcheck prints every output outside the plain 2 ulps with its values and the verdict.
 
 ## 8. Files written
 
@@ -249,7 +269,7 @@ glw_load FILE --rank R [--verify-crc];  glw_expert_fill_test FILE R D L E ...
 - **The full expert fill** (NVFP4 first: ~96 GiB a rank, ~10 s a layer a rank of CPU, so the time is disk) is for
   the orchestrator to schedule; rank 1 needs ~20 GB freed (quantisation § 4). The MTP layer's experts (NVFP4 by
   our RTN of its BF16) and the S3 fill from the quantiser are later items.
-- `glw_kcheck --gpu` and `glw_load` on the device, in a ring window.
+- `glw_load` on the device, in a ring window (`glw_kcheck --gpu` ran 2026-10-14, § 7).
 - **`engine/attn/tools/pack.py`'s `fp8_from_master` still computes `amax / 448`** and must be changed to zai's
   rule (`amax × f32(1/448)`, § 4) by the attention side; the converter does not use it (only pack.py's re-cuts).
 - The router is replicated (0.22 GiB, as quantisation § 2); a split by output (64 rows a rank, logits

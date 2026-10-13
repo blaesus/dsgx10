@@ -14,10 +14,14 @@
 //                                            projection and the BF16 head with random bf16 inputs, against a host
 //                                            reference that un-tiles the file's own bytes with glw.h's formula and
 //                                            dequantises in double: kF32 outputs within 1e-4 of sum |x w|, the
-//                                            SwiGLU pairs within 2 bf16 ulps. Needs the GPU (a ring job).
+//                                            SwiGLU pairs within 2 bf16 ulps plus the spread the kernel's f32 sums'
+//                                            rounding can carry through the bf16 SwiGLU (swiglu_tol below). Needs
+//                                            the GPU (a ring job).
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <random>
 #include <set>
@@ -249,6 +253,30 @@ HostFp8 host_fp8(const WeightFile& wf, const std::string& base, const glm::GemvS
   return h;
 }
 
+// The SwiGLU bound. The kernel sums each gate/up row in f32: per 64-k chunk an MMA of exact bf16 x bf16 products
+// (internal error <= 2^-22 of the chunk's sum |x w|), times the chunk's scale (<= 2^-24 of |s c|), added to the
+// running sum (<= 2^-24 of it). To first order its g is within E = 2^-22 sum|x w s| + 2^-24 sum_j (|S_j| + |s_j c_j|)
+// of the exact one (S_j the exact running sum after chunk j). The reference's bf16(silu(bf16 g)) * bf16 u is then
+// recomputed at the four corners g +- E_g, u +- E_u, and the output may sit 2 bf16 ulps of ref beyond the widest
+// corner. For most outputs E moves nothing (the corners round to ref); it matters where the gate's sum cancels
+// (2026-10-14: layers.0.mlp.gate_up row 1 intermediate 659, |g| = 3.3e-6 of sum |x w| = 52.4, the kernel's f32 g
+// 1.8 % from the exact one, 3 ulps on the output; docs/layout.md) or a value sits on a bf16 rounding boundary.
+struct RowSum {
+  double v = 0, mag = 0, err = 0;  // the exact sum, sum |x w s|, E
+};
+float swiglu_ref(double g, double u) {
+  const float gb = bf(to_bf(float(g))), ub = bf(to_bf(float(u)));
+  return bf(to_bf(bf(to_bf(gb / (1.f + std::exp(-gb)))) * ub));
+}
+float ulp_bf(float v) { return std::ldexp(1.f, std::ilogb(std::fabs(v) + 1e-30f) - 7); }
+float swiglu_tol(const RowSum& g, const RowSum& u, float ref) {
+  float spread = 0;
+  for (int a = -1; a <= 1; a += 2)
+    for (int b = -1; b <= 1; b += 2)
+      spread = std::max(spread, std::fabs(swiglu_ref(g.v + a * g.err, u.v + b * u.err) - ref));
+  return 2 * ulp_bf(ref) + spread;
+}
+
 template <class T>
 T* dev(const std::vector<T>& v) {
   T* p;
@@ -289,20 +317,38 @@ void run_fp8(const WeightFile& wf, const std::string& base, glm::GemvSeg g, int 
         }
         return acc;
       };
-      double mag, mag2;
+      double mag;
       if (!swiglu) {
         const double ref = dot(n, mag);
         float got;
         std::memcpy(&got, &y[(size_t(r) * nout + n) * 4], 4);
         if (std::fabs(got - ref) > 1e-4 * mag + 1e-30) bad++;
       } else {
-        const double gg = dot(n, mag), uu = dot(n + 1, mag2);
-        const float gb = bf(to_bf(float(gg))), ub = bf(to_bf(float(uu)));
-        const float ref = bf(to_bf(bf(to_bf(gb / (1.f + std::exp(-gb)))) * ub));
+        auto rsum = [&](int row) {  // in the kernel's 64-k chunks, for E
+          RowSum s;
+          for (int k0 = 0; k0 < K; k0 += 64) {
+            double c = 0, cm = 0;
+            for (int k = k0; k < k0 + 64; k++) {
+              const double p = double(bf(x[size_t(r) * ldx + k])) * h.at(row, k);
+              c += p, cm += std::fabs(p);
+            }
+            s.v += c, s.mag += cm;
+            s.err += std::fabs(s.v) + std::fabs(c);
+          }
+          s.err = std::ldexp(s.mag, -22) + std::ldexp(s.err, -24);
+          return s;
+        };
+        const RowSum gs = rsum(n), us = rsum(n + 1);
+        const float ref = swiglu_ref(gs.v, us.v);
         uint16_t got;
         std::memcpy(&got, &y[(size_t(r) * nout + n / 2) * 2], 2);
-        const float tol = 2 * std::ldexp(1.f, std::ilogb(std::fabs(ref) + 1e-30f) - 7);
-        if (std::fabs(bf(got) - ref) > tol) bad++;
+        const float d = std::fabs(bf(got) - ref), tol = swiglu_tol(gs, us, ref);
+        if (d > tol) bad++;
+        if (d > 2 * ulp_bf(ref))  // outside the plain 2-ulp bound: say why
+          std::printf("    row %d intermediate %d: got %.9g ref %.9g (exact %.9g), %.1f ulps; gate %.9g of sum|xw| "
+                      "%.4g (E %.3g), up %.9g (E %.3g); bound %.3g: %s\n",
+                      r, n / 2, bf(got), ref, gs.v / (1 + std::exp(-gs.v)) * us.v, d / ulp_bf(ref), gs.v, gs.mag,
+                      gs.err, us.v, us.err, tol, d > tol ? "BAD" : "inside");
       }
     }
   expect(bad == 0, base + ": " + std::to_string(bad) + " of " + std::to_string(rows * nout) + " GEMV outputs off");
