@@ -772,3 +772,16 @@ once per entry in its own conditional node ([design item 5](#design)). So the tw
 are worth, at the measured rows: one draft pass over all anchors, 3, 6 and 9 ms of a 41, 57 and 67 ms
 step (7, 11 and 13 %); and a gate across the sessions, which today verifies 2.3 drafts a session in a
 pair whose cap is 5, judging each entry's drafts as its one-session gate would.
+
+**B4's runner half** (`--batch-tf`, [engine.md](engine.md#scheduling-time-slicing-and-batching)): a
+session's 256 golden positions through batch steps of 1, 4 and 8 rows give the teacher-forced hash of
+`--mode tf` (1k: cbf28c20d4a29e35; 2k: c612bb419cd6aeb4; 4k: d095975dd8969f11), and so do four sessions
+(1k, 2k, 4k, 1k) at 4 rows each (16 rows a step, 57.8 ms median), two (1k, 2k) at 8 rows each (16 rows,
+63.0 ms) and three (1k, 2k, 4k) at 4 rows each (12 rows, 54.5 ms): every session its own hash. One
+session's steps: 16.76 ms at 1 row, 27.5 at 4, 37.4 at 8. `--mode bench --ks 8,12,16 --bench-groups 4,8`
+(context 1k, 40 steps a k): 8 rows as two sessions of 4, 35.6 ms (26.1 experts a layer; the sessions'
+routing rotated, 39.5); 12 rows as three of 4, 53.1 (39.4 experts; rotated 62.6); 16 rows as four of 4,
+62.6 (50.9; rotated 78.0) and as two of 8, 62.2 (rotated 70.3); one session's 8 consecutive rows 38.1.
+
+**Everything else as before.** The final integration engine (ee748c1) gives every reference hash alone
+(tf, k = 1, the drafted variants, sampled, 16k CED, 28k CED: 8 of 8), as it did before the two fixes.
