@@ -13,12 +13,17 @@ constexpr int kHcDim = kHc * kDim;          // 20480
 constexpr int kMix = 24;                    // (2 + hc) * hc mixes per sublayer
 constexpr int kVocab = 129280;
 constexpr int kVocabPart = kVocab / kRanks;  // 32320 head rows per rank
-constexpr int kMaxRows = 8;                 // rows per step (decode 1, verify <= 6, prefill chunks <= 8)
+// Rows per step, at most (docs/batching.md, B4): one session's decode (1), verify (<= 6) or prefill-by-steps
+// rows (<= kMaxSessRows), or several sessions' runs of consecutive rows (Model::launch_batch) up to 16. The
+// step buffers, the StepIn / SampleOut rings, the sampler's grid and the graphs are sized by it; a graph is
+// captured on first use, so unused row counts cost nothing.
+constexpr int kMaxRows = 16;
 constexpr int kMaxSlots = 8;                // session slots (Options::slots): live sessions' states, at most
-// Rows of one session in a step, at most, whatever kMaxRows becomes (B4): the attention kernels' contract
-// for a step's slot table. attn::decode_prep's fused compressor emit and carry race across CTAs at 16
-// rows of one session (the step runs kv_write and compressor_emit, safe at 16, but the contract holds for
-// any caller), and attn can check only steps without a table: the model checks every step it builds.
+// Rows of one session in a step, at most, whatever kMaxRows is: the attention kernels' contract for a
+// step's slot table. attn::decode_prep's fused compressor emit and carry race across CTAs at 16 rows of
+// one session (the step runs kv_write and compressor_emit, safe at 16, but the contract holds for any
+// caller), and attn can check only steps without a table: the model checks every step it builds
+// (next_in, launch_batch). The one-session spec graph's switch has this many bodies.
 constexpr int kMaxSessRows = 8;
 
 // attention, per rank

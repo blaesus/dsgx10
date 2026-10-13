@@ -26,6 +26,11 @@ enum : int32_t { kSpecOff = 0, kSpecGiven = 1, kSpecVerify = 2 };
 //   being the tokens per ms of the steps so far.
 enum : int32_t { kGateThresh = 0, kGateRatio = 1, kGateMarginal = 2 };
 constexpr int kMaxSess = kMaxRows;  // sessions in a step, at most (docs/batching.md, B2)
+// The runner's kernels whose launch geometry holds the rows (sample's grid and posted bytes, fused.cu's block
+// sizes) launch as they did before B4 up to kLowRows rows, and sized for kMaxRows past them (as dsk's
+// row_budget): a step of at most 8 rows runs the kernels and launches it ran.
+constexpr int kLowRows = 8;
+constexpr int row_budget(int R) { return R <= kLowRows ? kLowRows : kMaxRows; }
 struct StepSamp {  // one session's sampling (model::Sampling)
   uint64_t seed;
   float temperature;  // 0: greedy
@@ -73,7 +78,8 @@ struct SampleRow {
   uint32_t flags;  // kSampApprox: the kept candidates reached past the exactly known ones
 };
 enum : uint32_t { kSampApprox = 1 };
-// One step's result in pinned memory (a ring of kOutSlots, by StepIn::step), the same on every rank.
+// One step's result in pinned memory (a ring of kOutSlots, by StepIn::step), the same on every rank. Its
+// rows are the step's, up to kMaxRows (a batch step's) or kMaxSessRows (one session's).
 struct SampleOut {
   uint32_t seq;  // StepIn::step + 1, written last
   uint32_t ctl;  // rank 0's control word as the step read it
@@ -115,8 +121,12 @@ struct SpecState {
 // the non-speculative sampler's (noise from the seed and position), so the tokens are its tokens. The
 // step's final rows and the token after them go to ss and row[] (SampleOut::rows); the step is
 // published later, after its draft pass (spec.cu).
+// max_rows (kLowRows or kMaxRows, row_budget): the grid, a block per row, and the bytes each rank posts; the
+// step's rows must not exceed it (a captured launch serves every step of its graph: the one-session spec graph's
+// kLowRows, a batch graph's kMaxRows).
 void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in, const uint32_t* ctl,
-            SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss = nullptr);
+            SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss = nullptr,
+            int max_rows = kMaxRows);
 
 // x [R][4][5120] = embed[tokens[r]] in every copy; pre_mix [R][4] = (1, 0, 0, 0).
 void embed(const bf16* table, const int* tokens, int R, bf16* x, float* pre_mix, cudaStream_t s);

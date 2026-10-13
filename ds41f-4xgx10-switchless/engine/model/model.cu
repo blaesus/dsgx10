@@ -628,7 +628,9 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
 // ---- the step -----------------------------------------------------------------------------------
 
 ops::StepIn& Model::Impl::next_in(uint64_t n, int R, int pos0, const int32_t* tokens, const Sampling& sp) {
-  if (R > kMaxSessRows) die("model: a step of %d rows of one session (at most %d: config.h)", R, kMaxSessRows);
+  if (R > kMaxSessRows)
+    die("model: a step of %d rows of one session (at most %d: config.h kMaxSessRows; more rows need a batch of "
+        "several sessions)", R, kMaxSessRows);
   ops::StepIn& in = in_h[n % ops::kInSlots];
   for (int r = 0; r < kMaxRows; ++r) {
     in.tokens[r] = r < R ? tokens[r] : 0;
@@ -682,6 +684,8 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
   const int R = b.R;
   if (R < 1 || R > kMaxRows || b.nsess < 1 || b.nsess > ops::kMaxSess || b.sess[0] != 0 || b.sess[R - 1] != b.nsess - 1)
     die("model: a batch step of %d rows, %d sessions", R, b.nsess);
+  if (opt.first_layer > 0 && !(b.flags & kFlagInject) && (b.flags & (kFlagDump | kFlagLogits)))
+    die("model: starting at layer %d needs golden injection", opt.first_layer);
   bool device_tokens = false;
   int pos_last = 0;
   for (int r = 0; r < R; ++r) {
@@ -691,12 +695,14 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
     if (same) ok &= b.slot[r] == b.slot[r - 1] && b.pos[r] == b.pos[r - 1] + 1;
     int run = 1;  // the session's rows so far: at most kMaxSessRows (config.h: attn's race past it)
     while (run <= r && b.sess[r - run] == b.sess[r]) ++run;
-    ok &= run <= kMaxSessRows;
+    if (run > kMaxSessRows)
+      die("model: a batch step with %d rows of one session (at most %d: config.h kMaxSessRows)", run, kMaxSessRows);
     for (int q = 0; q < r; ++q) ok &= b.sess[q] == b.sess[r] || b.slot[q] != b.slot[r];  // a slot each
     if (!ok) die("model: batch row %d: position %d, slot %d, session %d", r, b.pos[r], b.slot[r], b.sess[r]);
     device_tokens |= b.tokens[r] < 0;
     pos_last = std::max(pos_last, b.pos[r]);
   }
+  if (device_tokens && (b.flags & ~kFlagProfile)) die("model: golden checks need the batch step's tokens");
   const uint64_t n = n_steps;
   if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);  // its StepIn slot has been read
   ops::StepIn& in = in_h[n % ops::kInSlots];
@@ -724,7 +730,7 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
       engram_rows(R, b.tokens, b.pos, b.slot, seq);
     }
   }
-  return run_step(n, R, scan_ctx(pos_last), 0, nullptr, 0);
+  return run_step(n, R, scan_ctx(pos_last), b.flags, b.sink, b.pos[0]);
 }
 
 uint64_t Model::Impl::run_step(uint64_t n, int R, int ctx, uint32_t flags, Sink* sink, int pos0) {
@@ -796,7 +802,8 @@ cudaGraphExec_t Model::Impl::graph(int R, int ctx) {
 void Model::Impl::forward(int R, int ctx, uint32_t flags, Sink* sink, int pos0) {
   ops::step_in(in_h, in_ctr, fb, in_d, st);
   forward_rows(R, ctx, flags, sink, pos0);
-  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st);
+  // the sampler's grid by the row budget: a step of at most 8 rows launches what it did before B4
+  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, nullptr, ops::row_budget(R));
 }
 
 void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int pos0) {

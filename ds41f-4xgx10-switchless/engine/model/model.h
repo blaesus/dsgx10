@@ -1,7 +1,8 @@
 // The TP=4 forward of DeepSeek-V4.1-Flash on one rank (docs/engine.md). Every rank holds a Model and
 // runs the same steps in the same order; the residual stream, the routing and the index choices are
-// bit-identical on all four (collectives sum in rank order). A step takes R <= 8 consecutive positions:
-// a decode step (R = 1), a verify step (R <= 6) or a prefill chunk (exact mode: every layer, every row).
+// bit-identical on all four (collectives sum in rank order). A step takes R <= kMaxRows rows: one session's
+// R <= kMaxSessRows consecutive positions (a decode step, R = 1; a verify step, R <= 6; a prefill chunk by
+// steps, exact mode: every layer, every row), or several sessions' runs of consecutive positions (Batch).
 #pragma once
 #include <cstdint>
 #include <memory>
@@ -26,15 +27,21 @@ struct Sampling {
 };
 using ops::SampleOut;
 
+struct Sink;
+
 // A step of rows from several sessions (docs/batching.md, B2; Model::launch_batch). Row r is position
 // pos[r] of the session in slot slot[r], fed tokens[r] (>= 0, or -1 - j: row j of the previous step's
-// sample, as launch()'s). A session's rows are consecutive and ascend one position at a time; sess[r]
-// numbers the step's sessions in row order from 0, each in a slot of its own, and session k is sampled
-// by sp[k].
+// sample, as launch()'s). A session's rows are consecutive and ascend one position at a time, at most
+// kMaxSessRows of them (B4: up to kMaxRows rows in all); sess[r] numbers the step's sessions in row order
+// from 0, each in a slot of its own, and session k is sampled by sp[k]. flags and sink are launch()'s
+// (kFlagDump with a sink: an eager step handing rank 0's sink each layer's results, e.g. the bench's
+// routed experts; the tokens must then be given).
 struct Batch {
   int R = 0, nsess = 0;
   int32_t tokens[kMaxRows] = {}, pos[kMaxRows] = {}, slot[kMaxRows] = {}, sess[kMaxRows] = {};
   Sampling sp[ops::kMaxSess];
+  uint32_t flags = 0;
+  Sink* sink = nullptr;
 };
 
 // What a spec step (spec.cu) lets its draft pass choose for the step after it: by default draft j is

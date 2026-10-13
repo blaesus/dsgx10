@@ -658,3 +658,17 @@ refused.
 
 - 2026-10-13 14:10: the design above; the runner builds B3 and B4's runner half on two branches, with no
   ring time until both are built (the kit serves an agent; its interruptions come last).
+- 2026-10-13, B4's runner half (branch runner-b4rows, built, untested on the ring): `kMaxRows` 16 with
+  `kMaxSessRows` 8. Everything sized by `kMaxRows` follows it (the step buffers, the `StepIn` / `SampleOut`
+  rings, the sampler's candidates, the Engram segments, `Cmd::tokens`, the graphs' `warm`); the runner's own
+  kernels whose launch holds the rows come in two instances by a row budget of 8 or 16 (`ops::row_budget`:
+  the sampler's grid and posted bytes, `allreduce_hc`'s and `mix_allreduce`'s block sizes), so a step of at
+  most 8 rows launches the kernels it launched before, and the one-session spec graph keeps its 8 bodies
+  (serve's small turns run spec steps of up to `--small-rows` = 8 rows: no change to its startup or memory).
+  A step with more than 8 rows of one session is refused with a message (`next_in`, `launch_batch`,
+  `launch_spec`; main.cpp's `--chunk`, `--k`, `--small-rows`, `--batch-rows`, `--route-every`, spectf's
+  chunks). New: `kCmdBatchTf` / `batch_tf_loop` (teacher-forced rows of several sessions, G of each per
+  step; `Batch::flags` / `sink` for an eager dumped step), `--mode bench` at 9–16 rows as runs of 2–4
+  sessions in slots (`--bench-groups`, `--slots`), `--mode batch --batch-tf [--batch-rows G]` whose
+  per-session hash must equal the session's run alone and tf mode's. Untested: every GPU run (the
+  equalities above, the ABBA at one session, the 12- and 16-row step times).

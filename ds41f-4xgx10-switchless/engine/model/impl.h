@@ -156,7 +156,8 @@ struct Model::Impl {
   cudaEvent_t ev_pf[5];    // the last prefill chunk: begin, layers 0-19 done, replay done, head done, end
   cudaEvent_t ev_mark[4];  // Model::mark
 
-  // captured steps: one graph per (rows, context bucket); a row count runs eagerly once first
+  // captured steps: one graph per (rows, context bucket), captured on first use (up to kMaxRows rows: a row
+  // count never used costs nothing); a row count runs eagerly once first
   std::map<std::pair<int, int>, cudaGraphExec_t> graphs;
   bool warm[kMaxRows + 1] = {};
   // side streams: the mHC mixes (sa); the window/compressed KV writes and the indexer's head weights (sb)

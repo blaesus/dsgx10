@@ -61,6 +61,9 @@ enum : int32_t {
   kCmdState = 5,    // nothing but the state operations (every command applies ops[0 .. n_ops) first)
   kCmdRows = 6,     // a step of `rows` rows with explicit tokens, sampled with sp, then snaps[] from the ring
   kCmdBatch = 7,    // batch_loop: n sessions decoding together, their BatchEntry's follow as a payload
+  // batch_tf_loop: n sessions' teacher-forced rows, `rows` of each per step (B4's checks and bench); the
+  // BatchEntry's and then their tokens follow as payloads. (20: clear of the batch commands added beside it.)
+  kCmdBatchTf = 20,
 };
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
@@ -192,6 +195,21 @@ struct BatchEnd {
 using OnBatch = std::function<void(int k, const model::SampleOut& o, int row)>;  // entry k's next token: o.row[row]
 std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
                                  const OnBatch& on);
+
+// kCmdBatchTf (docs/batching.md, B4): the entries' rows teacher-forced, in steps of up to c.rows rows of each
+// (1..model::kMaxSessRows; a step of at most kMaxRows rows in all). Entry k feeds tokens[k] (e[k].max_new of
+// them) at positions e[k].pos0 .., its next c.rows per step in slot e[k].slot, sampled with e[k].sp; a step
+// holds the entries with tokens left, in entry order (Model::launch_batch). Every rank runs it alike: the
+// tokens go with the command (bcast_tf_tokens). c.flags and sink are the steps' (model::Batch: kFlagDump with
+// rank 0's sink, an eager step with its dumps, e.g. the bench's routed experts); no step is queued ahead.
+// on(k, o, row): entry k's sample for the row's position (o.row[row]). Returns each step's GPU time, ms.
+std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e,
+                                 const std::vector<std::vector<int32_t>>& tokens, Watchdog& wd, const OnBatch& on,
+                                 model::Sink* sink = nullptr);
+// kCmdBatchTf's payloads after bcast: the entries (c.n of them), then every entry's e[k].max_new tokens in entry
+// order; rank 0 sends them, the others receive them.
+void bcast_tf(comm::Ring& ring, const Cmd& c, std::vector<BatchEntry>& e, std::vector<std::vector<int32_t>>& tokens,
+              int rank);
 
 // Host timeline of the last decode loop (diagnostics): per step, when its sample arrived, when the
 // next step's Engram lookups were submitted, and when the step after was launched.

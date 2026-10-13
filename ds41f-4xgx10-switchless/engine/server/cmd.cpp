@@ -427,6 +427,69 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
   return end;
 }
 
+void bcast_tf(comm::Ring& ring, const Cmd& c, std::vector<BatchEntry>& e, std::vector<std::vector<int32_t>>& tokens,
+              int rank) {
+  if (rank != 0) e.assign(c.n, BatchEntry{}), tokens.assign(c.n, {});
+  if (c.n < 1 || (int)e.size() != c.n || (int)tokens.size() != c.n) die("batch_tf: %d entries", c.n);
+  bcast_payload(ring, e.data(), e.size() * sizeof(BatchEntry), rank);
+  size_t total = 0;
+  for (int k = 0; k < c.n; ++k) total += (size_t)std::max(0, e[k].max_new);
+  std::vector<int32_t> all;
+  if (rank == 0)
+    for (const std::vector<int32_t>& t : tokens) all.insert(all.end(), t.begin(), t.end());
+  else
+    all.resize(total);
+  if (all.size() != total) die("batch_tf: %zu tokens for %zu", all.size(), total);
+  if (total) bcast_payload(ring, all.data(), total * 4, rank);
+  if (rank != 0)
+    for (int k = 0, off = 0; k < c.n; off += e[k].max_new, ++k)
+      tokens[k].assign(all.begin() + off, all.begin() + off + std::max(0, e[k].max_new));
+}
+
+std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e,
+                                 const std::vector<std::vector<int32_t>>& tokens, Watchdog& wd, const OnBatch& on,
+                                 model::Sink* sink) {
+  const int n = (int)e.size(), G = c.rows;
+  if (n < 1 || n > model::ops::kMaxSess || G < 1 || G > model::kMaxSessRows || (int)tokens.size() != n)
+    die("batch_tf: %d entries, %d rows of each per step (1..%d)", n, G, model::kMaxSessRows);
+  for (int k = 0; k < n; ++k)
+    if (e[k].max_new < 0 || (int)tokens[k].size() != e[k].max_new || e[k].pos0 < 0 ||
+        e[k].pos0 + e[k].max_new > e[k].limit)
+      die("batch_tf: entry %d: %d tokens at %d, limit %d", k, e[k].max_new, e[k].pos0, e[k].limit);
+  std::vector<int> fed(n, 0);
+  std::vector<float> ms;
+  for (;;) {
+    model::Batch b;
+    int ent[model::kMaxRows] = {};  // row r's entry
+    for (int k = 0; k < n; ++k) {
+      const int rows = std::min(G, e[k].max_new - fed[k]);
+      if (rows <= 0) continue;
+      if (b.R + rows > model::kMaxRows) die("batch_tf: a step of more than %d rows", model::kMaxRows);
+      const int s = b.nsess++;
+      b.sp[s] = e[k].sp;
+      for (int i = 0; i < rows; ++i) {
+        const int r = b.R++;
+        b.tokens[r] = tokens[k][fed[k] + i];
+        b.pos[r] = e[k].pos0 + fed[k] + i;
+        b.slot[r] = e[k].slot;
+        b.sess[r] = s;
+        ent[r] = k;
+      }
+      fed[k] += rows;
+    }
+    if (!b.R) break;
+    b.flags = c.flags;
+    b.sink = sink;
+    wd.started = now_s();
+    const model::SampleOut& o = m.wait(m.launch_batch(b));
+    ms.push_back(m.last_gpu_ms());
+    wd.started = 0;
+    if (on)
+      for (int r = 0; r < b.R; ++r) on(ent[r], o, r);
+  }
+  return ms;
+}
+
 void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
   bool prof = false;
   int32_t sampled[model::kMaxRows];
@@ -450,6 +513,11 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       std::vector<BatchEntry> e(c.n);
       bcast_payload(ring, e.data(), e.size() * sizeof(BatchEntry), rank);
       batch_loop(m, c, e, wd, nullptr);
+    } else if (c.op == kCmdBatchTf) {
+      std::vector<BatchEntry> e;
+      std::vector<std::vector<int32_t>> t;
+      bcast_tf(ring, c, e, t, rank);
+      batch_tf_loop(m, c, e, t, wd, nullptr);
     } else if (c.op == kCmdTokens) {
       std::vector<int32_t> t(c.n);
       bcast_payload(ring, t.data(), t.size() * 4, rank);
