@@ -50,14 +50,21 @@ cost as many decode bytes as the experts (13.1B attention parameters are read ev
 ## Decisions
 
 1. **Routed experts: a mixed 3/4-bit code of our own at ~3.75 bits a weight, made from the BF16 master.**
-   The leading candidate is a trellis code (EXL3/QTIP family: K3 and K4 widths per expert, K4 on down
-   projections and the most sensitive experts), on the scouting's evidence that a data-free 3.42 bpw trellis
-   scores inside NVFP4's KL range at three quarters of the bytes, while GGUF at 3.6–3.9 bpw is twice as far.
-   The fallback is a 3-bit code restricted to the E2M1 grid mixed with NVFP4, which keeps the FP4 tensor-core
-   prefill path (1.6× NVFP4's weight error on one sampled expert). **Experiment 1 decides between them**: a
-   trellis decode GEMV must reach ≥ 95 % of the bandwidth floor on 48 SMs and its prefill must have a
-   tensor-core path. NVIDIA's NVFP4 experts are plain round-to-nearest of the master (reproduced bit for bit),
-   so "NVFP4 as published" is a function we can compute ourselves and serves as the quality anchor.
+   *As scouted (2026-10-13 afternoon):* the leading candidate was a trellis code (EXL3/QTIP family), on the
+   evidence that a data-free 3.42 bpw trellis scores inside NVFP4's KL range at three quarters of the bytes,
+   while GGUF at 3.6–3.9 bpw is twice as far. *As measured (experiment 1, 2026-10-13 21:38,
+   [findings](docs/findings.md#experiment-1-decode-gemvs-and-tensor-cores-for-the-expert-format-2026-10-13)):*
+   a faithful trellis decode GEMV is bound by instruction issue on the GB10's 48 SMs, not by memory: 55 % of
+   the 235 GB/s floor at K3 and 75 % at K4, at 1 and 6 rows alike, so K3 costs more time a token than NVFP4
+   despite a third fewer bytes. NVFP4 reaches 95–96 % and the **3-bit code on the E2M1 grid 91–93 %** (a first
+   kernel; ~3 points of tuning left). The FP4 tensor cores run `mxf4nvf4` with E4M3 scales at 429 TFLOPS
+   against 107 for bf16, a path only the E2M1-grid codes have, and only if FP4 activations are admitted
+   (decision 4). **So the build proceeds on the E2M1-subset 3-bit code mixed with NVFP4 (K4 on down
+   projections and the most sensitive experts), averaging ~3.75 bpw.** Trellis stays open on two gates: a
+   tuned kernel measured at ≥ 95 % (it needs ~2× the weight rate of the first one) and experiment 3's KL
+   showing the subset code clearly worse. NVIDIA's NVFP4 experts are plain round-to-nearest of the master
+   (reproduced bit for bit), so "NVFP4 as published" is a function we compute ourselves and the quality
+   anchor.
 2. **Non-expert weights: zai's own FP8 values** (attention, shared experts, indexer, dense MLPs; 128×128 block
    scales from the FP8 release, which is round-to-nearest of the master), the head and routers as shipped,
    the embedding split by vocabulary. ~5 GiB a rank. o_proj at 4 bits (−3.7 ms a token) is a later lever,
@@ -93,9 +100,11 @@ cost as many decode bytes as the experts (13.1B attention parameters are read ev
 
 ## Risks and open questions
 
-- A trellis GEMV may not stay at the bandwidth floor on 48 SMs (decode is a 16-bit-state bit-shift and a
-  1-MAD decode per weight), and its prefill needs a dequantise-to-tile path on the bf16 tensor cores (~107
-  TFLOPS) unless the code is grid-restricted. Experiment 1.
+- A trellis GEMV does not stay at the bandwidth floor on 48 SMs in a first kernel (55–75 %, experiment 1):
+  ~11 instructions a weight against 5–6 for the grid codes. Whether a tuned kernel can reach 95 % is open;
+  the build does not wait for it.
+- The E2M1-subset code's quality is measured on weights only so far (1.6× NVFP4's error on one expert);
+  experiment 3's KL decides whether 3.75 bpw of it is inside the bar, or whether the mix needs more NVFP4.
 - The budget leaves rank 0 ~4 GiB available instead of today's 21; earlyoom's line there is 2 GiB.
 - Rank 1 has 74 GB of disk free and needs ~20 GB freed for its rank file; the BF16 master's experts are
   1.45 TB to fetch once at ~24 MB/s (~17 h), streamed a layer at a time through rank 2's disk, never whole.
