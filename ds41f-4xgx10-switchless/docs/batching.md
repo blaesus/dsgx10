@@ -622,11 +622,16 @@ four sessions, under two bars:
    go to `ss[k]`. `SampleOut` keeps `row[r]` as row r's sample (today's layout) and adds, per entry,
    the rows it emits (`sess_rows`), its first row (`sess_row0`), and the next step's rows, pos0 and
    tokens.
-5. **The draft passes.** One per entry on: the accept of its final rows from its row0 (`Draft::accept`
-   takes a device row offset), then its draft from its bonus, each pass under a conditional node of
-   the graph (`sess_on[k]`) with a per-entry slot table (device, host-filled when the loop starts).
-   That is today's pass, run per session, so the drafts are the same bits as alone. One pass over
-   every anchor is phase 2.
+5. **The draft passes.** The accept of each entry on, of its final rows from its row0 (`Draft::accept`
+   takes a device row offset) into its own slot's windows, under a conditional node of the graph
+   (`sess_on[k]`) with a per-entry slot table (device, host-filled when the loop starts); then one draft
+   pass over the entries on (phase 2a, `Draft::draft_batch`): a switch over their number S, body S − 1
+   running passes of at most three entries (15 rows within the kernels' 16) over a device-side list of
+   the entries on, each entry's five rows from its bonus token in its slot, the weights read once a
+   pass. Every row computes as in a pass of its own (the kernels' per-row contract,
+   [kernels § 9–16 rows](../engine/kernels/README.md#916-rows-b4); the entries' Markov chains and
+   confidence per entry), so the drafts are the same bits as alone; `--bgraph-check` compares them on
+   the device. The experts' reads shrink only where rows share an expert.
 6. **The gate.** Per entry, today's gates (thresh, ratio, marginal) under its cap. The caps come from
    the budget: cap = min(5, (kMaxRows − S) / S) with S entries on. The marginal gate across sessions
    (the batch's tokens per ms against a row's marginal cost) is phase 2.
@@ -785,6 +790,35 @@ refused.
     --steps 256` and `--batch 1024,1024,1024,1024`); batch_test.py `--slots 4`; bench/multistream.py; and
     the batch line's steps, rows and tokens a step equal to the table below (the same drafts give the same
     steps).
+- 2026-10-13, B3 phase 2a built, not run (branch runner-b3p2 from b3-int e1072d0; commits fa317f0 the plan,
+  e5f63d2 the draft module, 6c9096d the model layer and the flag; the whole engine builds with no warnings,
+  spec_batch_test 0 failed over 20000 iterations; no ring time). What is there:
+  - `engine/dspark`: `Draft::draft_batch(BatchPass, stream)` runs draft()'s launches over 5 n rows (n ≤ 3
+    entries): `draft_prep_batch_kernel` (grid (5, n): row 5 q + j takes entry ent[q]'s token at j = 0 and
+    the noise token after, its anchor from `batch_start()[ent[q]]`), `bmix` (hc_project and hc_mix over
+    the rows; the chunk gather 1,000 B a row a rank), the GEMVs on 5 n rows (from 9 rows the `_r16`
+    builds), `decode_prep` and `sparse_attn` with the pass's slot table, the MoE over the rows' union
+    (from 9 rows up16 4 and down16 2, which test_kernels rows16 checks row by row against two 8-row calls
+    at up 0 and down 4: draft()'s configuration), the FP4 head per entry (8 rows a call), the five Markov
+    kernels with a grid over the entries (each entry its own CTA candidates and counter, its ids; the
+    pass's candidates [5][4]) and one `argmax_rows` collective a step (an even count of candidates; the
+    unused ones stay zero), `conf` per entry into `batch_ids(k)` [8] and `batch_confidence(k)` [16]
+    (survival at + 8). The pass has an arena of its own (`enable_batch()`, about 10 MB); the one-session
+    kernels are the `<false>` instances of the same templates (every offset folded to zero), and draft()
+    does not change. `Comm::argmax_rows` (the default: `argmax` per row); `accept()` takes `start_out`.
+  - `engine/model`: `spec_batch_passes` (spec_batch.h: the compact list and the slot tables, checked by
+    spec_batch_test); `k_spec_in_batch` sets the switch over the entries on; the batch graph: the accepts
+    under their if nodes (each with its anchor into `batch_start()[k]`), the switch (body S − 1 runs
+    ceil(S / 3) passes), `k_spec_gate_batch_all` (a thread per entry on; the three gates and the caps as
+    before), the publication. RingComm: `argmax_rows`, the all-reduce buffer at 15 rows. `--bgraph-check`:
+    after the pass, every entry's accept and draft() as before under an if node of its own, and
+    `k_spec_draft_check` counts the words of its ids, confidence and survival that differ
+    (`Model::spec_batch_mismatches()`, the batch mode's last line). The loop, its protocol, the batch line
+    and `SpecBatchStats` are not touched.
+  - Not verified without a GPU: that the batch graph instantiates with the second switch and the check's
+    if nodes (every handle has one node); the `_r16` GEMV builds at the drafter's shapes and the MoE at 10
+    and 15 rows of the drafter's experts (the per-row contract is tested at the main model's shapes); the
+    bit check itself; the hashes and the step times. The checks run in the plan's order above.
 
 ### Measured (2026-10-13, engine ee748c1 on the integration branch)
 

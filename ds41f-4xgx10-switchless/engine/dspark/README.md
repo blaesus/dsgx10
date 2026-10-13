@@ -119,7 +119,23 @@ dspark::main_hidden(stream, rows, layer - 37, mh, true, s); // mh: bf16 [8][1536
 d.accept(mh_rows_of_the_accepted, &count /* k+1 */, &pos0 /* p+1 */, s);
 d.draft(&t, s);
 // d.tokens() [5], d.survival() [5], d.confidence() [5]: device memory, the same bits on every rank
+// a batch step (the runner's B3, phase 2a): the accepts per entry k, each with its anchor into
+// d.batch_start() + k, then one pass over the entries on, at most kBatchEnts (3) a call, each entry's 5
+// rows in its own slot (a device slot table), the weights read once; entry k's results as draft()'s
+d.enable_batch();  // once: the pass's buffers, about 10 MB
+d.accept(mh_rows_of_entry_k, &count_k, &pos0_k, s, slot_table_k, &row0_k, d.batch_start() + k);
+dspark::Draft::BatchPass bp{ent /* device [n]: the entries, in row order */, n, tok /* entry k's token at tok[k * tok_stride] */, tok_stride, slot /* device [5 n]: each row's slot */};
+d.draft_batch(bp, s);
+// d.batch_tokens(k) [5], d.batch_survival(k) [5], d.batch_confidence(k) [5]: entry k's, the bits of d.draft() alone
 ```
+
+A batch pass runs draft()'s launches from `draft_prep` on over 5 n rows: the GEMVs from 9 rows in their
+`_r16` builds, the MoE over the rows' union of experts, the FP4 head per entry (8 rows a call), the five
+Markov kernels with a grid over the entries and one `argmax_rows` collective a step, and `conf` per
+entry. Every row's bits are those of its entry's own pass (the kernels' per-row contract,
+[kernels § 9–16 rows](../kernels/README.md#916-rows-b4)); the runner's `--bgraph-check` compares them on
+the device. The one-session path does not change: the batch kernels are instances of the same templates
+with their offsets folded to zero, and the pass has buffers of its own.
 
 - **Prompt.** `accept` its last 128 positions (8 per call: `main_hidden` of a prefill chunk's rows), then
   `draft` the first generated token.
@@ -128,6 +144,8 @@ d.draft(&t, s);
   - `all_gather`: up to 4 segments in one collective, rank order.
   - `all_reduce`: an fp32 sum in rank order, rounded to bf16.
   - `argmax`: the highest `{v, id}`, ties to the lowest id.
+  - `argmax_rows`: a batch pass's candidates, `rows` of them, in one collective (an even count); the
+    default runs `argmax` per row.
   - Every rank must get the same bits back. `standin_comm()` times one rank alone.
 - **Memory per rank.** 2.0 GB of `mtp.*` (+ the main model's embed and head) and 3 MB of buffers. The
   windows hold 3 × 135 KB.
