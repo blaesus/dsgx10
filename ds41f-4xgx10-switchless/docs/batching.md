@@ -691,3 +691,11 @@ refused.
   Two choices to note: a paused entry's last token is not fed by an extra step (its next run feeds it,
   as B2's pause does), and the ahead launch waits for the step before when any entry's worst-case rows
   would pass its `feed` (the speculative loop's rule, applied to the batch as a whole).
+- 2026-10-13 15:25, the integration branch `b3-int` (B4's runner half merged first, then B3; one closing brace
+  between `batch_tf_loop` and `spec_batch_loop` added by hand). On the ring, preemptible, the owner's agent
+  paused: the merged engine gives every reference hash (tf 842278b28d87dad0, k1 / nol2pf / fp8 / bf16
+  febc7dc54ee40a39, temp a8f7a08f8cd1c5e8, ced16 81f772ab79a950e4, ced28 8f08a153d415c5c8; golden/refhash.sh
+  8 of 8, 52–65 s a run), so one session computes as before. The first drafted batch died at the batch
+  graph's capture: `dspark::main_hidden` refused more than `kMaxAcc` = 8 rows, while the batch graph's bodies
+  go to 16; it now takes `kMaxHidden` = 16 (accept still reads at most 8, from its entry's row0). The
+  drafted-batch hashes, the one-session ABBA and the serve tests follow.
