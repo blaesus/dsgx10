@@ -22,15 +22,21 @@ kernels read, cut on the CPU from NVIDIA's checkpoint (the BF16 master) and zai'
 
 ## 1. Status
 
-- **Non-expert files for all four ranks written and verified**: 5.178 GiB each (5,560,139,776 B), 21,377 TOC
-  entries of which 19,532 are reserved routed-expert entries. Every byte checked against the master by an
+- **Files for all four ranks written and verified**: 6.444 GiB each (6,919,143,424 B): every non-expert tensor
+  (5.178 GiB) plus the MTP layer's 256 routed experts at NVFP4 (1.266 GiB); 21,377 TOC entries of which 19,275
+  are reserved routed-expert entries (layers 3–77). Every byte checked against the master by an
   independent description, against a fresh conversion, and by CRC; the host binding against `attn.h` and
   `experts.h` passes on every rank.
 - **FP8 reproduces zai's release bit for bit**: 20 of 20 tensors, 924,975,104 codes and 56,480 scales equal,
   once the scale is computed as zai does (`amax × f32(1/448)`, not `amax / 448`; § 4).
 - **Routed experts**: the TOC reserves one entry an expert with a per-matrix format tag; the NVFP4 fill from
   NVIDIA's tensors is implemented and was run for one layer of one rank into a separate file (layer 3, rank 0):
-  28.3M values read back through `layout.h`'s own readers, 0 differ. The full fill (~96 GiB a rank) is not run.
+  28.3M values read back through `layout.h`'s own readers, 0 differ. The full fill of layers 3–77 (~95 GiB a
+  rank) is not run.
+- **The MTP layer's experts are filled** (2026-10-14) by our NVFP4 round-to-nearest-even of their BF16 with
+  NVIDIA's recipe (`quant/formats.py` `nvfp4_rtn`), which reproduces NVIDIA's own NVFP4 bytes on 18 of 18
+  layer-3 tensors from the BF16 master (§ 6). Relative RMS error against the BF16 0.0945–0.0953; outside the
+  exactness bar (DESIGN decision 6: the MTP layer only drafts).
 
 ## 2. The file format
 
@@ -178,7 +184,29 @@ NVFP4 (5,308,416 B an expert, 1.27 GiB a layer); an S3 expert is 4,128,768 B.
 rank's slice (gate/up rows [512r, +512); down input columns [512r, +512) = value bytes [256r, +256), scale
 columns [32r, +32)), re-tiled by a numpy port of `layout.h`'s `pack_nvfp4` (the nibbles unchanged);
 `MatDesc{off = (3e + m) · 1,769,472, s2 = weight_scale_2, fmt = kNVFP4}` (`make_desc` with zero tables).
-Layers must be filled in TOC order. The MTP layer's experts are BF16 in NVIDIA's file and are refused for now.
+Layers must be filled in TOC order (`glw_check` requires offsets in TOC order), so filling layers 3–77 now means
+truncating the files at layer 78's descriptor table and filling 3–78 again (layer 78 takes 83 s for four ranks). Several `--file`s are
+filled in one pass over the sources; each expert entry is written at its precomputed offset (the file's end +
+the 49,152 B descriptor table + e × 5,308,416), then the descriptor table, the TOC and the header.
+
+**The MTP layer (78)**: its experts are BF16 in NVIDIA's file (`model.layers.78.mlp.experts.E.{gate,up,down}_proj.weight`,
+[2048][6144] and [6144][2048]). `experts_fill.py` quantises each full tensor once with `quant/formats.py`
+`nvfp4_rtn` (NVIDIA's recipe: s2 = amax × f32(1/2688), gate and up sharing amax = max(amax_gate, amax_up); e4m3
+scale per 16 along K; E2M1 round to nearest even, low nibble first) and then cuts the rank's slice as above.
+The entries carry `kLossy` and `rel_err` (the expert's largest relative RMS error against the BF16 over its three
+matrices); the manifest's `expert_rel_err` has every matrix's, `expert_sources` the BF16 sources' SHA-256s, and
+`expert_fills` the format note (outside the exactness bar, DESIGN decision 6) and the SHA-256s of
+`experts_fill.py` and `formats.py`. **The recipe checked first** (`experts_fill.py --rtn-check`): `nvfp4_rtn` on
+the BF16 master of layer 3's experts 0, 1, 2, 3, 100, 255 (`/data/scratch/glm53-master`, its fetch SHA-256s
+checked) gives NVIDIA's `weight`, `weight_scale` and `weight_scale_2` bytes exactly: 18 of 18 tensors.
+
+**The MTP fill, run** (2026-10-14): all four rank files in one pass, 2 min 36 s wall, 1.7 GB peak, nice 19, CPU
+only; relative RMS error 0.0945–0.0953 over the 768 matrices. Checks: `glw_check`; `verify.py --crc`, `--indep`
+(now also every layer's descriptor table: offsets, format, scale_2 from the BF16 maxima; and experts 0, 1, 17,
+128, 255 of a rank un-tiled by the byte formula, written out per index, against `nvfp4_rtn` of the BF16 cut to
+the rank), `--fresh`; `glw_kcheck --rank R` (102,077 checks a rank, 1,024 more than before: the layer's sizes by
+tag, contiguity, descriptors); `glw_expert_fill_test` on experts 0, 17, 255 of every rank (28,311,552 values a
+rank read through `gx::read_q4`, 0 differ). Canonical dumps in `test-l3/canon78/`.
 
 **One layer, one rank, run** (2026-10-13): `convert.py --ranks 0 --only layers.3.` then `experts_fill.py
 --layers 3`: `/data/dsgb10/glm53/weights/test-l3/rank0.l3.glw`, 1,413,062,656 B (layer 3's attention,
@@ -198,12 +226,12 @@ tail (truncate at the first expert entry, append again), leaving the non-expert 
 |---|---|---|---|
 | Structure and CRCs | `glw_check` (C++), `verify.py --crc` | header geometry, TOC CRC, offsets in order, shape × dtype = bytes, reserved entries empty, every CRC32C, zero padding; the manifest's per-tensor and whole-file SHA-256s | OK, 3 s a file |
 | Fresh conversion | `verify.py --fresh` | every tensor rebuilt by the converter's own code and compared byte for byte (determinism) | 7,380 of 7,380 equal |
-| **Independent** | `verify.py --indep` | without pack.py, quant.py or the plan: the natural matrix each FP8 tensor should hold, written out again from attention.md as source row/column pieces (transposes, interleaving); scales by the rule in numpy; every element's scale read through the TOC's rs × ks must be its source block's; every code un-tiled with glw.h's formula must be `e4m3_rne(master / scale)`; BF16/F32 tensors byte-equal to their source rows; the RoPE table equal to rope_table.py's; replicated tensors equal across ranks | 4,772 checks, 0 bad; a flipped code bit and a flipped scale bit are both caught |
-| Kernel binding | `glw_kcheck --rank R` | every layer against attn.h (`kXRows`, `kHeads`, …, the GemvSeg rs/ks, `full_indexer`), experts.h (`mat_bytes`, `MatDesc`, `SharedW` when T128), the head/embed/RoPE shapes; binds each FP8 tensor into a `glm::GemvSeg` | 101,053 checks a rank, 0 bad |
+| **Independent** | `verify.py --indep` | without pack.py, quant.py or the plan: the natural matrix each FP8 tensor should hold, written out again from attention.md as source row/column pieces (transposes, interleaving); scales by the rule in numpy; every element's scale read through the TOC's rs × ks must be its source block's; every code un-tiled with glw.h's formula must be `e4m3_rne(master / scale)`; BF16/F32 tensors byte-equal to their source rows; the RoPE table equal to rope_table.py's; replicated tensors equal across ranks | 4,796 checks (24 of them the MTP experts, § 6), 0 bad; a flipped code bit and a flipped scale bit are both caught |
+| Kernel binding | `glw_kcheck --rank R` | every layer against attn.h (`kXRows`, `kHeads`, …, the GemvSeg rs/ks, `full_indexer`), experts.h (`mat_bytes`, `MatDesc`, `SharedW` when T128), the head/embed/RoPE shapes; binds each FP8 tensor into a `glm::GemvSeg` | 102,077 checks a rank, 0 bad |
 | Rank refusal | `glw_rank_test --file F R` | the loader refuses the three other ranks | all ok |
 | Device | `glw_kcheck --gpu` | the chosen layers' GEMVs (`glm::gemv`, SwiGLU pairs, grouped W_UK/W_UV, the BF16 head) against a double reference from the file's own bytes; kF32 within 1e-4 of Σ\|x·w\|, SwiGLU within 2 bf16 ulps plus the f32 sums' rounding carried through (below) | rank 0, layers 0, 3, 10, 78 and the head: 105,136 ok, 1 bad under the old SwiGLU bound (below); layer 0 again with the new bound: 102,142 ok, 0 bad |
 
-`verify.py --crc --fresh --indep` over all four files: ~7 min, 5.6 GB peak, nice 19, no GPU.
+`verify.py --crc --fresh --indep` over all four files: ~14 min (the MTP descriptors' scale_2 re-reads the BF16), 5.6 GB peak, nice 19, no GPU.
 
 **The SwiGLU bound (2026-10-14).** `glw_kcheck --gpu`'s first run found one of 12,288 SwiGLU outputs of
 `layers.0.mlp.gate_up` outside the plain 2-ulp bound: row 1, intermediate 659 (flat 3,731 of the [4][3072]
@@ -227,15 +255,15 @@ one chunk moves out of the old bound (a worst-case 3·(K/64)·2⁻²³ Σ\|x·w\
 
 ## 8. Files written
 
-`/data/dsgb10/glm53/weights/` on rank 0 (2026-10-13 23:19; tool `63b15f221d924873f8a6358e1e2e8cd46bf41cb290005df4715788c41a75e4a5`, `--commit e33e73f`,
-shared expert in T128):
+`/data/dsgb10/glm53/weights/` on rank 0 (converted 2026-10-13 23:19, tool `63b15f221d924873f8a6358e1e2e8cd46bf41cb290005df4715788c41a75e4a5`, `--commit e33e73f`,
+shared expert in T128; the MTP layer's experts filled 2026-10-14, § 6):
 
 | File | Bytes | SHA-256 | TOC CRC |
 |---|---:|---|---|
-| `rank0.glw` | 5,560,139,776 | `c7d3341fb94849104bebbeca3ba79d1b4325827c8ada646ab154bf77e3b1094e` | `836dc158` |
-| `rank1.glw` | 5,560,139,776 | `6e740f1533b4b0d0a3ab32f4e151c2edd1bf367ae5da21280f19ac4a24d53734` | `9cf9364f` |
-| `rank2.glw` | 5,560,139,776 | `f5d179aa996f8ca19ab1ca2a679a2c17bed95c7668e57b3d02580c1870e9132c` | `751ad407` |
-| `rank3.glw` | 5,560,139,776 | `3feef748c4fb71a7c8f4a34bf637738edca720ce0d27fa1e525ff4f9de0cc1c7` | `781d1799` |
+| `rank0.glw` | 6,919,143,424 | `3d1a4f122a14e105f434ca9d78f495262e6d2ce838ccf6a2b4f4ce47ad738923` | `1f668ded` |
+| `rank1.glw` | 6,919,143,424 | `4813956771c220263b9cbc0b5198ca796e30e7bba33778c9a3eaa81b4e4f2d17` | `76cf6d29` |
+| `rank2.glw` | 6,919,143,424 | `0f63b55a2fafbe71ba016f6a62e798e8fc3b68577ee8342918540bf6df54c853` | `e0869b45` |
+| `rank3.glw` | 6,919,143,424 | `5cdf0bade9d44713fd0a9106b53b011580bdb2fa72a0926fe9ec9be13117fd39` | `13dec971` |
 | `test-l3/rank0.l3.glw` (layer 3 with its NVFP4 experts; cut before the T128 decision, tool `5dafdb3e…`, so its shared expert is T64) | 1,413,062,656 | `2d60e39ff59294f51e05f6154f58fc0d0ac11b5c5a9d333a37d6d2af18ee068e` | `a7e87fee` |
 
 All four ranks in one pass: **2 min 47 s** wall (2 min 7 s in an earlier run), 5.0 GB peak resident, nice 19, 4 torch threads, CPU only
@@ -255,7 +283,7 @@ python -I fp8check.py --ckpt NV --cache CACHE [--rule pack]       # FP8 reproduc
 python -I convert.py --ckpt NV --cache CACHE --plan [--list]      # the plan, bytes a rank, coverage
 python -I convert.py --ckpt NV --cache CACHE --out-dir DIR [--ranks 0 1 2 3] [--only SUBSTR] [--shared-layout t64|t128]
 python -I verify.py DIR/rank{0,1,2,3}.glw --crc --fresh --indep --ckpt NV --cache CACHE
-python -I experts_fill.py --ckpt NV --file DIR/rankR.glw --layers 3 ... [--dump-canon D]
+python -I experts_fill.py --ckpt NV --file DIR/rank{0,1,2,3}.glw --layers 78 [--rtn-check MASTER] [--dump-canon D]
 glw_check FILE ...;  glw_kcheck FILE --rank R [--gpu | --partial --layers L];  glw_rank_test --file FILE R
 glw_load FILE --rank R [--verify-crc];  glw_expert_fill_test FILE R D L E ...
 ```
@@ -266,9 +294,10 @@ glw_load FILE --rank R [--verify-crc];  glw_expert_fill_test FILE R D L E ...
   (`moe_decode`/`moe_prefill` read `SharedW`: gate, up, down in T128 with `[N/128][K/128]` scales), so that is the
   path the engine runs and the attention side's shared-expert GEMV (pack.py's interleaved T64 form) is unused.
   T128 is the default; `--shared-layout t64` still writes the other form (kcheck and verify check either).
-- **The full expert fill** (NVFP4 first: ~96 GiB a rank, ~10 s a layer a rank of CPU, so the time is disk) is for
-  the orchestrator to schedule; rank 1 needs ~20 GB freed (quantisation § 4). The MTP layer's experts (NVFP4 by
-  our RTN of its BF16) and the S3 fill from the quantiser are later items.
+- **The full expert fill of layers 3–77** (NVFP4 first: ~95 GiB a rank, ~10 s a layer a rank of CPU, so the time
+  is disk) is for the orchestrator to schedule; rank 1 needs ~20 GB freed (quantisation § 4); rank 0's disk had
+  38 GB free after the MTP fill. The S3 fill from the quantiser is a later item. (The MTP layer's experts are
+  done, § 6.)
 - `glw_load` on the device, in a ring window (`glw_kcheck --gpu` ran 2026-10-14, § 7).
 - `engine/attn/tools/pack.py`'s `fp8_from_master` used `amax / 448` until 2026-10-14; it now uses zai's rule
   (`amax × f32(1/448)`, § 4), checked byte for byte against the converter by `engine/attn/tools/fp8_vs_converter.py`.
