@@ -1,7 +1,7 @@
 # The attention side (milestone G3, attention half)
 
 What `engine/attn/` computes for one rank at TP=4, the layouts it reads and writes, the per-rank split, how it
-was tested and what it measured. Written 2026-10-13. The math is [model.md § 2](model.md#2-the-forward-pass);
+was tested and what it measured. Written 2026-10-13; performance work 2026-10-14 (§ 5, last part). The math is [model.md § 2](model.md#2-the-forward-pass);
 the API and every constant are in [engine/attn/attn.h](../engine/attn/attn.h).
 
 ## Contents
@@ -93,12 +93,12 @@ weight loads, then waits for its predecessor):
 | # | Kernel (file) | What it does |
 |---|---|---|
 | 1 | `rmsnorm` (prep.cu) | input_layernorm, one CTA a row, f32 statistics in a fixed order |
-| 2 | `gemv` x-projection (gemv.cu) | 688 rows (656 shared layers) of FP8, split-K 4, bf16 out; then the all-gather (G4) |
+| 2 | `gemv` x-projection (gemv.cu) | 688 rows (656 shared layers) of FP8, split-K 4, bf16 out; then the all-gather (G4); can carry # 3 in its launch (`GemvIw`) |
 | 3 | `index_weights` (prep.cu) | BF16 `weights_proj`, the rank's 8 heads, f32 out × 32^-0.5; all-gathered with the x-projection |
 | 4 | `attn_prep` (prep.cu) | q_a_layernorm → qr; kv_a_layernorm + RoPE of k_rope → the cache entry; indexer key LayerNorm + RoPE → BF16 (or FP8 + scale) key |
 | 5 | `gemv` q_b + indexer wq_b (one launch, two segments) | 4096 + 1024 rows, K 2048 |
 | 6 | `gemv` W_UK^T grouped | per head: q_nope (192) → q_lat (512); x rows grouped by head |
-| 7 | `index_select` (indexer.cu) | `k_score` then 5 selection passes → top-2048 positions (or a quarter's candidates + `index_merge`) |
+| 7 | `index_select` (indexer.cu) | `k_score` then 5 selection passes → top-2048 positions (or a quarter's candidates + `index_merge`); prefill: `k_q_stage`, `k_score_pf`, `k_sel_thresh`, `k_sel_compact` |
 | 8 | `sparse_attn` (sparse_attn.cu) | split-K over the 2048 keys, `k_attn` + `k_attn_combine` |
 | 9 | `gemv` W_UV grouped | per head: latent (512) → v (256) |
 | 10 | `gemv` o_proj | 6144 × 4096, f32 partials for the all-reduce (G4) |
@@ -110,7 +110,13 @@ multiplies each 64-k MMA partial (`acc += s · c`, the same order whatever the r
 warps a tile) sums the warps' partials in shared memory in warp order. Outputs: bf16, f32 (partials for
 all-reduces) or SwiGLU (gate/up rows interleaved, the epilogue computes `silu(g) · u` in f32 and rounds once).
 Grouped mode gives each `group_rows` block of output rows its own x row (absorption: head h's rows read head
-h's q_nope or latent). Results are independent of the number of rows (tested 1/6/16 bit-equal).
+h's q_nope or latent). Results are independent of the number of rows (tested 1/6/16 bit-equal). Loads in flight
+and warps a CTA are chosen by shape (16 loads for the grouped W_UV, 8 warps a CTA otherwise); they do not change
+any bit.
+
+**GEMM** (gemm.cu). Prefill's projections: the GEMV's segments and outputs over any number of rows on tensor
+cores (cp.async pipeline, 128-row tiles), each output equal to the GEMV's bit for bit (the same 64-k chunk MMAs
+from zero, `acc + s · c` in k order, split-K parts in order).
 
 **Indexer** (indexer.cu). `k_score`: a CTA takes up to RG rows of one session (decode: grouped by slot; prefill:
 groups of 8) and 1024 keys. The rows' queries are RoPE'd while staged into padded shared memory; each warp
@@ -132,9 +138,10 @@ softmax in f32 with P rounded to bf16, O += P·V over the 512 latent dims (a war
 256^-0.5 (qk_head_dim), keys = the 2048 selected or 0..p. Splits: the 32 key blocks divide over `splits` CTAs a
 row; `k_attn_combine` merges (m, l, O) in split order. Shared memory 96.5 KB, one CTA an SM.
 
-**Prefill** runs the same kernels: the projections as 16-row GEMVs (a placeholder: a tensor-core GEMM path for
-prefill projections is G4 work), `k_score` with RG = 8 (tensor cores, 20.6 TFLOPS), the selection passes with
-one grid row a query row, and `k_attn` with one row a CTA set. Chunking a prompt does not change any bit
+**Prefill** runs the projections as GEMMs (`gemm()`), the indexer as `k_q_stage` (each row's RoPE'd query
+staged once) and `k_score_pf` (256 keys in registers a CTA, the rows' queries streamed; scores = `k_score`'s bit
+for bit, 52–66 TFLOPS), the selection as a sampled threshold (`k_sel_thresh`) and one compaction launch
+(`k_sel_compact`, the exact top-2048 from the candidates), and `k_attn` with one row a CTA set. Chunking a prompt does not change any bit
 (tested: two chunks = one, for cache, keys, top-k and attention output).
 
 ## 4. Numerics and tests
@@ -252,19 +259,120 @@ layer at 256k, 1 row: **16 µs**. Use 16 splits for 1–2 rows, 8 for 6. The gat
 256k was not run (the bench step's 5-minute budget; the indexer scales linearly: ~210 ms a chunk). The
 attention slows at 128k because the 2048 selected entries are scattered over a 151 MB cache (L2 misses).
 
+### 2026-10-14: prefill GEMM, prefill indexer, decode tails
+
+Rank 0's GB10 through `ring.sh` between production turns, 2026-10-13 23:20 – 2026-10-14 00:09 (+0100); final
+sources sha256 `5464b861c28b01ca` (benches) and `02e401c0ea49f9b1` (the committed sources, comments only since; tests rerun). Outputs are unchanged bit for bit:
+every new path is tested equal to the old one (`attn_tests`: 44 checks at S = 300, 93 at S = 4600, all pass;
+compute-sanitizer memcheck clean on A, B, C, F, P at S = 300 and E at S = 4600). "Before" is the base build
+(`43bfd9a`) run in the same job where an A/B is given, else the tables above.
+
+**Prefill projections: a tensor-core GEMM** (`gemm()`, gemm.cu). Any number of rows, the GEMV's segments, output
+kinds, grouping and split-K; each output equals `gemv()`'s at the same split-K bit for bit: per 64-k chunk the
+four m16n8k16 MMAs start from zero in the GEMV's fragment map and `acc = acc + s · c` in k order, split-K parts
+added in part order. cp.async multi-stage pipeline (A 128 × 64 chunk, swizzled), B tiles in the engine's
+warp-step layout, staged coalesced epilogue. Six tile configurations (bench knob `gemm_config`); the default is
+by shape: 128 × 64 tiles, warps 64 × 16, 3 stages for split-K, 128 × 128, warps 64 × 32, 4 stages otherwise.
+Test P: every projection (ranks 0 and 3, dense and shared MLP) in all six configurations = the 16-row GEMVs.
+
+| Projection (TFLOPS at 2048 / 8192 rows; % of 107) | 16-row GEMVs (before) | GEMM, best configuration over the runs |
+|---|---:|---:|
+| x-projection 688 × 6144, split-K 4 | 4.4 / 3.9 | 51.8 / 56.3 (48 / 53 %) |
+| q_b + wq_b 5120 × 2048 | 4.2 / 4.4 | 61.4 / 64.2 (57 / 60 %) |
+| o_proj 6144 × 4096 | 5.3 / 5.0 | 64.4 / 62.7 (60 / 59 %) |
+| dense gate+up 6144 × 6144 | 5.2 / 4.7 | 61.3 / 58.9 (57 / 55 %) |
+| dense down 6144 × 3072 | 5.1 / 4.6 | 62.9 / 63.8 (59 / 60 %) |
+| shared gate+up 1024 × 6144, split-K 4 | 5.3 / 4.6 | 49.9 / 54.9 (47 / 51 %) |
+| W_UK grouped / W_UV grouped / shared down (best of either size) | 8.9 / 6.1 / 6.8 | 28.4 / 34.2 / 39.8 |
+
+10–15× the GEMVs on the large shapes; the 60 % target is met by q_b, o_proj and dense down at one size each
+and missed by 1–8 points elsewhere. The small-K shapes (W_UK K = 192, W_UV and shared down K = 512) are bound
+by output and activation bytes, not MMAs. Tried and not kept: 64 × 128 tiles (config 1: 29–37 TFLOPS on wide
+N); 128 × 128 with 16 warps (config 5: the split-K variant spills); 3 stages on unsplit shapes (equal or worse).
+
+**Prefill indexer: keys in registers, queries streamed** (`k_q_stage` + `k_score_pf`). A CTA holds 256 keys as
+MMA A fragments (8 warps × 2 tiles, `k_score`'s lane map) and streams up to 256 rows' RoPE'd queries (staged once
+a row by `k_q_stage`) through two cp.async buffers; each row runs `k_score`'s MMA chain and head sum, so the
+scores equal decode's bit for bit (test E: decode calls of 1/6/16 rows = the prefill rows, scores and top-2048).
+Selection at prefill: a 1-in-16 sample of first-level bins (bits 31..19) counted while scoring; `k_sel_thresh`
+picks the bin where the sample reaches 256 (~4096 candidates); `k_sel_compact` (one launch) compacts candidates
+at or above it per 4096-key chunk and its last CTA selects the exact top-2048 from them (three histogram levels
+in registers), or from the scores when the sample missed (fewer than 2048 candidates) or the candidates
+overflow the cap (8192; tested with caps 0 and 2100 = the default bit for bit). Launches a call: 4 (was 6).
+
+| Chunk of 2048 rows ending at | Before (ms, TFLOPS of score MMAs) | After, calls of 2048 rows | calls of 512 |
+|---|---:|---:|---:|
+| 32k | 25.9 (20.6) | **10.1 (52.7)** | 11.2 |
+| 128k | 105.8 (20.6) | **33.8 (64.6)** | 35.3 |
+| 256k | ~210 (not run) | **66.1 (66.3)** | 66.2 |
+
+TFLOPS count the whole call (selection included) against the score MMAs: 62 % of the 107 TFLOPS bf16 peak at
+256k, 49 % at 32k (target 50 %). nsys of a near-final build (calls of 512 rows at 32k and 128k): `k_score_pf`
+6.8 ms a launch on average, `k_sel_compact` 1.7, `k_sel_thresh` 0.33, `k_q_stage` 0.07.
+
+**Decode GEMVs.** The launch shape is now chosen by shape (`gemv_config` -1, bit-neutral: test B runs every
+configuration against the default): 16 loads in flight a lane for the grouped W_UV, 8 warps a CTA elsewhere.
+The x-projection can carry the index weights in its launch (`GemvIw`: extra CTAs run `k_index_weights`'s
+arithmetic, 128 threads doing 256 threads' sums in the same order; test B: = the two launches bit for bit).
+
+| Projection (% of 235 GB/s, 1 / 6 rows, PDL chain) | Before | After |
+|---|---:|---:|
+| x-projection 688 × 6144 | 85.3 / 85.2 | 86.4 / 86.1 |
+| x-projection + index weights (two launches → one) | 22.5 / 24.3 µs | **21.0 / 21.2 µs** |
+| W_UK grouped | 98.7 / 98.5 | 102.0 / 103.1 |
+| W_UV grouped | 81.6 / 82.8 | **103.3 / 101.5** |
+| shared gate+up 1024 × 6144 | 91.6 / 93.0 | 93.2 / 92.6 |
+| shared down 6144 × 512 | 95.6 / 98.9 | 98.8 / 97.9 |
+
+The x-projection stays at ~86 %: every configuration (P 8/16/24, 2/4/8 warps) lands at 82–86 %, the limit
+being its 86 tiles of 8 rows for 48 SMs; fusing the index weights hides their launch instead. Shared gate+up
+stays at ~93 % (best configuration 93.7 %).
+
+**Decode index-key scan.** `k_score`'s key loads have variants (`index_score_config`; tested equal for every
+variant, BF16 and FP8, 1/6/16 rows): 0, each lane its own 16-byte pieces (half of each 32-byte sector an
+instruction, L1 bypassed); 1, the same through L1; 2, lanes t and t ^ 1 each load whole sectors (their own piece
+and the partner's) and swap halves by shuffle when the tile is used; 3, 2 with two tiles in flight; 4, 0 with two
+tiles in flight. Default: 2 for BF16 keys, 0 for FP8 (2 costs FP8 40–90 %: 320 vs 174 µs at 256k).
+
+| Context, keys, rows (replicated µs, GB/s of keys) | Before (base, same job) | After |
+|---|---:|---:|
+| 32k BF16 1 / 6 | 89.2 / 109.9 | **69.3 / 91.2** |
+| 128k BF16 1 / 6 | 300.2 (112) / 345.0 | **242.2 (139) / 276.0** |
+| 256k BF16 1 / 6 | 585.7 (115) / 664.1 | **464.7 (144) / 530.4** |
+| 32k FP8 1 / 6 | 40.0 / 62.3 | 40.3 / 62.5 |
+| 128k FP8 1 / 6 | 92.3 / 157.9 | 94.5 / 158.0 |
+| 256k FP8 1 / 6 | 171.1 (196) / 293.5 | 173.0 (194) / 292.0 |
+
+(Second run of the new build after the base, same job: within 3 % except one 256k BF16 6-row sample at 675 µs.)
+BF16 reaches 144 GB/s, short of the 200 GB/s target.
+
+**Decode selection: not merged.** The five parallel passes stay at decode. Tried: the first-level histogram (bits
+31..19, 8192 bins) counted in `k_score` with warp-aggregated atomics, then one `k_sel_compact` launch (the exact
+bin from the full histogram, candidates compacted, the last CTA selecting): one launch instead of five, but
+slower in every case, e.g. 32k FP8 1 row 45.4 vs 40.0 µs, 256k FP8 6 rows 335 vs 291 µs (A/B in one job).
+nsys: the merged pass took 21–23 µs at 32k (the five passes ~17 µs together under PDL) and 74 µs at 256k ×
+6 rows (60). Skipping the last CTA's selection (a timing-only build) took 13–17 µs off, so the cost is that
+serial tail; also tried in it: warp-aggregated shared-memory atomics (+2 µs: `__match_any_sync` costs more
+than the contention it saves), and ranking the threshold bin's candidates pairwise (O(M²), +6 µs at 32k, more
+at 6 rows: the bin holds up to ~2000 candidates). The histogram in `k_score` cost 1–13 µs on its own. Prefill,
+with thousands of rows a call, keeps the merged compaction (the tail is per row and runs in parallel).
+
+ncu is not available (GPU performance counters are not permitted for this user), so kernel-level attributions
+above come from nsys timelines and A/B builds only.
+
 ## 6. What remains
 
-- **Prefill projections:** the projections run as 16-row GEMV launches; a tensor-core GEMM over the chunk
-  (FP8 widened to bf16, the DeepSeek engine's `gemm_woa` shape) is needed before prefill rates mean anything
-  end to end.
-- **Prefill indexer at 20 % of bf16 peak** (107 TFLOPS): stage keys in shared memory and keep query fragments
-  in registers (one ldmatrix a key tile shared by all rows) instead of a shared-memory query load per MMA.
-- **Small-GEMV tails:** x-projection (85 %), W_UV (81 %), shared gate/up (93 %) under 95 %; candidates: a
-  persistent kernel running several projections back to back, or fusing W_UV into the attention combine.
-- **BF16 index-key scan** at ~110 GB/s (FP8 at 203): register pressure of the 16-word tile; FP8 keys are the
-  measured option (overlap 0.993) if model quality allows (G4 decision with the end-to-end check).
-- **Selection launches:** 5 passes a call (~10 µs of the 1-row total); fusing into a single persistent pass is
-  bit-neutral.
+- **Prefill projections** (2026-10-14: GEMM at 48–60 % of 107 TFLOPS on the large shapes): the last points to
+  60 % on the x-projection and shared gate/up (split-K 4 shapes) and dense gate/up; the small-K projections
+  (W_UK, W_UV, shared down) need a fused attention-side kernel rather than a faster GEMM.
+- **Prefill indexer** at 49–62 % of peak: the remaining time is the score MMAs; a further step is keeping two
+  key tiles a warp to raise MMA issue rate.
+- **Small-GEMV tails:** x-projection at ~86 % in every launch shape (86 tiles for 48 SMs); its index weights now
+  ride in its launch. Shared gate/up at ~93 %.
+- **BF16 index-key scan** at 144 GB/s (was 115; FP8 at ~195): short of 200; the next candidate is a
+  shared-memory staged key ring (cp.async, coalesced) feeding the fragments.
+- **Decode selection:** still 5 passes; the merged single launch was slower (§ 5, 2026-10-14). A merged pass
+  needs a parallel final step (not one CTA) to win.
 - **G4:** the all-gathers (x-projection outputs, wq_b output, merge candidates) and the o_proj / down
   all-reduces; CUDA graphs over a whole layer; the position-split cache (DCP) if memory requires it; an FP8
   latent-cache track was not built.

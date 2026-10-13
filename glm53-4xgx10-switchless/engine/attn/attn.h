@@ -81,8 +81,30 @@ struct GemvSeg {
 inline constexpr int kMaxSegs = 4;
 // fp8: true for FP8 tiles, false for BF16 rows. K: multiple of 64. splitk in {1, 2, 4}: warps of a CTA share a
 // tile's k range (for small N). All segments share K, x and the output kind.
+// The index weights (index_weights() below) fused into the x-projection's launch: its own CTAs after the
+// GEMV's, the same arithmetic bit for bit. FP8 bf16-out GEMV of K = 6144 only (the x-projection of a full layer).
+struct GemvIw {
+  const uint16_t* wproj = nullptr;  // BF16 [nh][6144]
+  int nh = 0;
+  float* w = nullptr;               // [rows][ldw] f32
+  int ldw = 0;
+};
 void gemv(bool fp8, const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out,
-          int splitk, cudaStream_t s, bool pdl = false);
+          int splitk, cudaStream_t s, bool pdl = false, const GemvIw* iw = nullptr);
+// bench knob: the FP8 GEMV's loads in flight a lane and warps a CTA (-1, the default: by shape, 1 for the grouped
+// W_UV and 4 otherwise; 0: 8 and 4; 1: 16, 4; 2: 24, 4; 3: 8, 2; 4: 8, 8; 5: 16, 2; configurations a split-K does
+// not fit use 0). Outputs do not depend on it.
+void gemv_config(int cfg);
+
+// FP8 GEMM for prefill chunks (any number of rows; the BF16 path stays GEMV-only): the same segments, output
+// kinds and split-K as gemv(), and every output equals gemv()'s at the same splitk bit for bit (the same MMAs from
+// zero over each 64-k chunk, acc += s * c in k order, split-K parts added in part order). Tiles of 128 x 128 rows
+// x columns (split-K: 128 x 64); a group (group_rows) must hold whole column tiles.
+void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
+          cudaStream_t s, bool pdl = false);
+// bench knob: the GEMM tile configuration (-1, the default: 4 for a split-K, else 0; 0-5: gemm.cu). Outputs do not
+// depend on it.
+void gemm_config(int cfg);
 
 // ---- norms, RoPE, cache entries ------------------------------------------------------------------------------
 // RMSNorm as the reference: bf16(w * bf16(x * rsqrt(mean(x^2) + eps))), fp32 statistics. [rows][D] bf16.
@@ -151,6 +173,12 @@ struct IdxScratch {
   uint32_t* work = nullptr;    // index_scratch_words(rows) words, zero before the first call; left zero
 };
 size_t index_scratch_words(int rows);
+// test knob: how many candidates a row's selection keeps (8192, the default and the maximum) before it selects from
+// the row's scores directly instead; results do not depend on it.
+void index_candidate_cap(int cap);
+// bench knob: how the decode scoring kernel loads its key tiles (-1, the default: 2 for BF16 keys, 0 for FP8; 0-4:
+// indexer.cu). Results do not depend on it.
+void index_score_config(int cfg);
 // Decode (rows <= 16) or prefill (any rows): positions [lo, hi) of each row's scan (hi = 0: up to p + 1).
 // topk [rows][2048]: ascending positions; with lo/hi a part of the positions (a rank's quarter), the part's
 // own top-2048 (fewer: -1 padded), and cand_key [rows][2048] u32 the order keys for index_merge.

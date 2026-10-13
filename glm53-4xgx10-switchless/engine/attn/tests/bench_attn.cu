@@ -1,7 +1,7 @@
 // Timings of engine/attn on one GB10 (this rank's shapes at TP=4). Weights and caches are cycled through pools
 // several times larger than L2 (24 MB), so every timed launch reads from DRAM, as a step's would. Each figure is
 // the median over replays of a CUDA graph of one pass over the pool, divided by the launches in it.
-// usage: bench_attn [--out FILE] [--only bw,gemv,index,attn,prefill] [--ctx 32768,131072,262144]
+// usage: bench_attn [--out FILE] [--only bw,gemv,index,attn,prefill,pgemm] [--ctx 32768,131072,262144]
 #include <algorithm>
 #include <cstdarg>
 #include <random>
@@ -166,6 +166,81 @@ void bench_gemv() {
              per / us / 1e3, per / us / 1e3 / 2.35, g_bw > 0 ? per / us / 1e3 / g_bw * 100 : 0.0);
     }
   }
+  // launch-configuration sweep (bit-neutral): the FP8 GEMVs at 1 and 6 rows in a PDL chain
+  for (const auto& c : cases) {
+    if (!c.fp8) continue;
+    size_t wbytes = 0, sbytes = 0;
+    for (int n : c.n) {
+      wbytes += (size_t)n * c.K;
+      sbytes += (size_t)n / c.rs * (c.K / c.ks) * 4;
+    }
+    const size_t per = wbytes + sbytes;
+    const int L = (int)std::max<size_t>(4, ((size_t)768 << 20) / per);
+    Dev<uint8_t> pool(per * L);
+    fill(pool.p, wbytes * L, 11, 0);
+    fill(pool.p + wbytes * L, sbytes * L, 13, 2);
+    for (int cfg = -1; cfg < 6; ++cfg)
+      for (int rows : {1, 6}) {
+        gemv_config(cfg);
+        const double us = time_graph(L, [&](int l, cudaStream_t s) {
+          GemvSeg sg[2];
+          size_t wo = 0, so = 0;
+          for (size_t i = 0; i < c.n.size(); ++i) {
+            sg[i].w = pool.p + wbytes * l + wo;
+            sg[i].s = reinterpret_cast<const float*>(pool.p + wbytes * L + sbytes * l + so);
+            sg[i].n = c.n[i];
+            sg[i].rs = c.rs;
+            sg[i].ks = c.ks;
+            sg[i].y = y.p + wo / c.K * 4;
+            sg[i].ldy = c.out == GemvOut::kSwiGLU ? 20000 : 40000;
+            sg[i].group_rows = c.group_rows;
+            sg[i].x_group = c.x_group;
+            wo += (size_t)c.n[i] * c.K;
+            so += (size_t)c.n[i] / c.rs * (c.K / c.ks) * 4;
+          }
+          gemv(true, x.p, c.ldx, rows, c.K, sg, (int)c.n.size(), c.out, c.splitk, s, true);
+        });
+        result("gemvcfg\t%s\tcfg %d\trows %d\t%.1f us\t%.1f %% of 235", c.name, cfg, rows, us, per / us / 1e3 / 2.35);
+      }
+    gemv_config(-1);
+  }
+  // the x-projection and the index weights: two launches against one (fused)
+  {
+    const size_t wb = (size_t)kXRows * kDim, sb = (size_t)kXRows / 16 * (kDim / 128) * 4, ib = (size_t)kIdxHeadsRank * kDim * 2;
+    const size_t per = wb + sb + ib;
+    const int L = (int)std::max<size_t>(4, ((size_t)768 << 20) / per);
+    Dev<uint8_t> pool(per * L);
+    fill(pool.p, wb * L, 11, 0);
+    fill(pool.p + wb * L, sb * L, 13, 2);
+    fill(pool.p + (wb + sb) * L, ib * L, 3, 1);
+    Dev<float> w(16 * kIdxHeadsRank);
+    for (int fused = 0; fused < 2; ++fused)
+      for (int rows : {1, 6}) {
+        const double us = time_graph(L, [&](int l, cudaStream_t s) {
+          GemvSeg sg;
+          sg.w = pool.p + wb * l;
+          sg.s = reinterpret_cast<const float*>(pool.p + wb * L + sb * l);
+          sg.n = kXRows;
+          sg.rs = 16;
+          sg.y = y.p;
+          sg.ldy = 40000;
+          const uint16_t* wp = reinterpret_cast<const uint16_t*>(pool.p + (wb + sb) * L + ib * l);
+          if (fused) {
+            GemvIw iw;
+            iw.wproj = wp;
+            iw.nh = kIdxHeadsRank;
+            iw.w = w.p;
+            iw.ldw = kIdxHeadsRank;
+            gemv(true, x.p, kDim, rows, kDim, &sg, 1, GemvOut::kBF16, 4, s, true, &iw);
+          } else {
+            gemv(true, x.p, kDim, rows, kDim, &sg, 1, GemvOut::kBF16, 4, s, true);
+            index_weights(x.p, rows, wp, kIdxHeadsRank, w.p, kIdxHeadsRank, s, true);
+          }
+        });
+        result("gemv\tx-projection + index weights_proj (%s)\tPDL chain\trows %d\t%.2f MB\t%.1f us\t%.1f %% of 235", fused ? "one launch" : "two launches",
+               rows, per / 1e6, us, per / us / 1e3 / 2.35);
+      }
+  }
   // index weights (8 heads a rank, BF16 [8][6144], f32 out)
   {
     const size_t per = (size_t)kIdxHeadsRank * kDim * 2;
@@ -178,6 +253,85 @@ void bench_gemv() {
         index_weights(x.p, rows, pool.p + per / 2 * l, kIdxHeadsRank, w.p, kIdxHeadsRank, s);
       });
       result("gemv\tindex weights_proj 8x6144 bf16 (f32)\trows %d\t%.2f MB\t%.1f us\t%.1f GB/s", rows, per / 1e6, us, per / us / 1e3);
+    }
+  }
+}
+
+// ---- prefill projections: the GEMM against the 16-row GEMV launches, chunks of 2048-8192 rows -----------------
+void bench_pgemm() {
+  struct PCase {
+    const char* name;
+    int K;
+    std::vector<int> n;
+    int rs, ks, group_rows, x_group, ldx;
+    GemvOut out;
+    int splitk;
+  };
+  const std::vector<PCase> cases = {
+      {"x-projection 688x6144 (split-K 4)", kDim, {kXRows}, 16, 128, 0, 0, kDim, GemvOut::kBF16, 4},
+      {"q_b + wq_b (4096+1024)x2048", kQLora, {kOProjK, 1024}, 128, 128, 0, 0, kQLora, GemvOut::kBF16, 1},
+      {"W_UK^T 16x(512x192) grouped", kNope, {kHeads * kKvLora}, 128, 64, kKvLora, kQkDim, kOProjK, GemvOut::kBF16, 1},
+      {"W_UV 16x(256x512) grouped", kKvLora, {kOProjK}, 64, 128, kVDim, kKvLora, kHeads * kKvLora, GemvOut::kBF16, 1},
+      {"o_proj 6144x4096 (f32)", kOProjK, {kDim}, 128, 128, 0, 0, kOProjK, GemvOut::kF32, 1},
+      {"dense gate+up 6144x6144 (SwiGLU)", kDim, {2 * kDenseInterRank}, 128, 128, 0, 0, kDim, GemvOut::kSwiGLU, 1},
+      {"dense down 6144x3072 (f32)", kDenseInterRank, {kDim}, 128, 128, 0, 0, kDenseInterRank, GemvOut::kF32, 1},
+      {"shared gate+up 1024x6144 (SwiGLU, split-K 4)", kDim, {2 * kSharedInterRank}, 128, 128, 0, 0, kDim, GemvOut::kSwiGLU, 4},
+      {"shared down 6144x512 (f32)", kSharedInterRank, {kDim}, 128, 128, 0, 0, kSharedInterRank, GemvOut::kF32, 1},
+  };
+  const int RMAX = 8192;
+  Dev<uint16_t> x((size_t)RMAX * kHeads * kKvLora);
+  fill(x.p, x.n * 2, 7, 1);
+  Dev<uint8_t> y((size_t)RMAX * kDim * 4);
+  for (const auto& c : cases) {
+    size_t wbytes = 0, sbytes = 0;
+    int N = 0;
+    for (int n : c.n) {
+      wbytes += (size_t)n * c.K;
+      sbytes += (size_t)n / c.rs * (c.K / c.ks) * 4;
+      N += n;
+    }
+    Dev<uint8_t> w(wbytes + sbytes);
+    fill(w.p, wbytes, 11, 0);
+    fill(w.p + wbytes, sbytes, 13, 2);
+    std::vector<GemvSeg> sg(c.n.size());
+    size_t wo = 0, so = 0, yo = 0;
+    for (size_t i = 0; i < c.n.size(); ++i) {
+      sg[i].w = w.p + wo;
+      sg[i].s = reinterpret_cast<const float*>(w.p + wbytes + so);
+      sg[i].n = c.n[i];
+      sg[i].rs = c.rs;
+      sg[i].ks = c.ks;
+      sg[i].group_rows = c.group_rows;
+      sg[i].x_group = c.x_group;
+      sg[i].ldy = c.out == GemvOut::kSwiGLU ? N / 2 : N;
+      sg[i].y = y.p + yo * (c.out == GemvOut::kF32 ? 4 : 2);
+      wo += (size_t)c.n[i] * c.K;
+      so += (size_t)c.n[i] / c.rs * (c.K / c.ks) * 4;
+      yo += c.n[i];
+    }
+    for (int rows : {2048, 8192}) {
+      const double fl = 2.0 * rows * N * c.K;
+      double best = 1e30;
+      int bcfg = 0;
+      for (int cfg = 0; cfg < 6; ++cfg) {
+        gemm_config(cfg);
+        const double us = time_graph(1, [&](int, cudaStream_t s) {
+          gemm(x.p, c.ldx, rows, c.K, sg.data(), (int)sg.size(), c.out, c.splitk, s);
+        }, 5);
+        result("pgemm\t%s\trows %d\tGEMM cfg %d\t%.1f us\t%.1f TFLOPS\t%.1f %% of 107", c.name, rows, cfg, us, fl / us / 1e6,
+               fl / us / 1e6 / 1.07);
+        if (us < best) best = us, bcfg = cfg;
+      }
+      gemm_config(-1);
+      const double gus = time_graph(1, [&](int, cudaStream_t s) {
+        for (int r0 = 0; r0 < rows; r0 += kMaxRows) {
+          std::vector<GemvSeg> s2 = sg;
+          for (auto& g : s2) g.y = static_cast<char*>(g.y) + (size_t)r0 * g.ldy * (c.out == GemvOut::kF32 ? 4 : 2);
+          gemv(true, x.p + (size_t)r0 * c.ldx, c.ldx, kMaxRows, c.K, s2.data(), (int)s2.size(), c.out, c.splitk, s, true);
+        }
+      }, 3);
+      result("pgemm\t%s\trows %d\t16-row GEMVs\t%.1f us\t%.1f TFLOPS\tGEMM best cfg %d %.1f us (%.1fx)", c.name, rows, gus,
+             fl / gus / 1e6, bcfg, best, gus / best);
     }
   }
 }
@@ -219,6 +373,16 @@ void bench_index(const std::vector<int>& ctxs) {
           index_select(IdxQuery{q.p, w.p}, pos.p, nullptr, rows, rope.p, ik_at(l), 0, 0, IdxScratch{scores.p, ld, work.p}, tk.p,
                        nullptr, s);
         });
+        for (int v = 0; v < 5; ++v) {  // the scoring kernel's key-load variants
+          index_score_config(v);
+          const double us = time_graph(L, [&](int l, cudaStream_t s) {
+            index_select(IdxQuery{q.p, w.p}, pos.p, nullptr, rows, rope.p, ik_at(l), 0, 0, IdxScratch{scores.p, ld, work.p},
+                         tk.p, nullptr, s);
+          });
+          index_score_config(-1);
+          result("index	ctx %d	%s keys	rows %d	key loads %d	replicated %.1f us (%.1f GB/s of keys)", T, f8 ? "FP8" : "BF16",
+                 rows, v, us, per / us / 1e3);
+        }
         // a rank's quarter of the positions (the last quarter: every quarter has the same work), then the merge
         const int part = (T + kTP - 1) / kTP;
         const size_t ldp = (size_t)(part + 1023) / 1024 * 1024;
@@ -278,7 +442,6 @@ void bench_prefill(const std::vector<int>& ctxs) {
   std::vector<uint32_t> rope_h((size_t)(ctxs.back() + 64) * 32, 0x3F80u);
   Dev<uint32_t> rope(rope_h);
   for (int T : ctxs) {
-    if (T > 131072) continue;
     Dev<uint16_t> keys((size_t)T * kIdxDim), cache((size_t)T * kLat);
     fill(keys.p, keys.n * 2, 41, 1);
     fill(cache.p, cache.n * 2, 43, 1);
@@ -292,18 +455,23 @@ void bench_prefill(const std::vector<int>& ctxs) {
     fill(qa.p, qa.n * 2, 59, 1);
     Dev<float> w((size_t)R * kIdxHeads);
     fill(w.p, w.n * 4, 61, 2);
-    const int sub = 512;  // rows a selection call (scores [512][T] f32)
     const size_t ld = (size_t)(T + 1023) / 1024 * 1024;
-    Dev<float> scores((size_t)sub * ld);
-    Dev<uint32_t> work(index_scratch_words(sub));
     Dev<int> tk((size_t)R * kTopK);
     IdxCache ik;
     ik.k = reinterpret_cast<uint8_t*>(keys.p);
-    const double ius = time_graph(1, [&](int, cudaStream_t s) {
-      for (int a = 0; a < R; a += sub)
-        index_select(IdxQuery{q.p + (size_t)a * kIdxHeads * kIdxDim, w.p + (size_t)a * kIdxHeads}, pos.p + a, nullptr, sub, rope.p,
-                     ik, 0, 0, IdxScratch{scores.p, ld, work.p}, tk.p + (size_t)a * kTopK, nullptr, s);
-    }, 3);
+    double ius = 0;
+    for (int sub : {512, 2048}) {  // rows a selection call (scores [sub][T] f32)
+      Dev<float> scores((size_t)sub * ld);
+      Dev<uint32_t> work(index_scratch_words(sub));
+      const double us = time_graph(1, [&](int, cudaStream_t s) {
+        for (int a = 0; a < R; a += sub)
+          index_select(IdxQuery{q.p + (size_t)a * kIdxHeads * kIdxDim, w.p + (size_t)a * kIdxHeads}, pos.p + a, nullptr, sub, rope.p,
+                       ik, 0, 0, IdxScratch{scores.p, ld, work.p}, tk.p + (size_t)a * kTopK, nullptr, s);
+      }, 3);
+      result("prefill\tchunk %d rows ending at %d\tindexer, calls of %d rows\t%.2f ms\t(%.1f TFLOPS of score MMAs)", R, T, sub,
+             us / 1e3, 2.0 * R * (T - R / 2.0) * kIdxHeads * kIdxDim / us / 1e6);
+      if (sub == 512) ius = us;
+    }
     KvCache kv;
     kv.kv = cache.p;
     const double aus = time_graph(1, [&](int, cudaStream_t s) {
@@ -318,7 +486,7 @@ void bench_prefill(const std::vector<int>& ctxs) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string only = "bw,gemv,index,attn,prefill", out;
+  std::string only = "bw,gemv,index,attn,prefill,pgemm", out;
   std::vector<int> ctxs = {32768, 131072, 262144};
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -329,7 +497,7 @@ int main(int argc, char** argv) {
       std::string s = argv[++i];
       size_t p = 0;
       while (p < s.size()) { ctxs.push_back(std::stoi(s.substr(p))); p = s.find(',', p); if (p == std::string::npos) break; ++p; }
-    } else die("usage: bench_attn [--out FILE] [--only bw,gemv,index,attn,prefill] [--ctx a,b,c]");
+    } else die("usage: bench_attn [--out FILE] [--only bw,gemv,index,attn,prefill,pgemm] [--ctx a,b,c]");
   }
   if (!out.empty()) g_out = fopen(out.c_str(), "a");
   cudaDeviceProp pr;
@@ -341,5 +509,6 @@ int main(int argc, char** argv) {
   if (want("index")) bench_index(ctxs);
   if (want("attn")) bench_attn(ctxs);
   if (want("prefill")) bench_prefill(ctxs);
+  if (want("pgemm")) bench_pgemm();
   return 0;
 }

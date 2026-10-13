@@ -1,4 +1,4 @@
-add_library(glmattn STATIC gemv.cu prep.cu indexer.cu sparse_attn.cu)
+add_library(glmattn STATIC gemv.cu gemm.cu prep.cu indexer.cu sparse_attn.cu)
 target_include_directories(glmattn PUBLIC ${CMAKE_SOURCE_DIR})
 
 add_executable(attn_tests tests/attn_tests.cu)
