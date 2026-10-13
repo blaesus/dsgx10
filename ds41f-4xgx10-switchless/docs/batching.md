@@ -907,6 +907,9 @@ before), three 54.1 (56.7–56.9), four 64.5 (67.1–67.3): 109.4 / 126.6 / 135.
 texts and up to 3.9 with one text, less than the 3 ms a further session that S separate passes cost: a
 pass over 10 or 15 rows reads the union of its rows' drafter experts and runs the GEMVs' 16-row builds,
 so it is not the 2.55 ms of one pass over 5.
+One stream is untouched by it (the one-session graph and `draft()` are as they were), and measured
+so: A/B/B/A of master's engine against phase 2a's, the drafted 1k golden run, two rounds (four runs each):
+8.343 ms a token (8.270–8.380) against 8.317 (8.280–8.348), B over A −0.32 %, every run the reference hash.
 
 **B4's runner half** (`--batch-tf`, [engine.md](engine.md#scheduling-time-slicing-and-batching)): a
 session's 256 golden positions through batch steps of 1, 4 and 8 rows give the teacher-forced hash of
