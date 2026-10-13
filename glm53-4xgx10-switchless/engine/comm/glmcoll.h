@@ -55,6 +55,12 @@ void allreduce_hidden(const DevChannel& ch, const float* part, int R, float* out
                       cudaStream_t st, bool pdl = false, int slices = 0);
 void allreduce_add_norm(const DevChannel& ch, const float* part, int R, const uint16_t* res, uint16_t* res_out,
                         const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st, bool pdl = false, int slices = 0);
+// The MoE layer's: two partials (the routed experts' yr and the shared expert's ys, experts.h moe_decode), each
+// all-reduced as above in one collective (2 R rows of 24,576 B a rank), then y = bf16(bf16(sum) + bf16(sum2))
+// (experts.h finalize) and the residual add and RMSNorm as allreduce_add_norm.
+void allreduce2_add_norm(const DevChannel& ch, const float* part, const float* part2, int R, const uint16_t* res,
+                         uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st,
+                         bool pdl = false, int slices = 0);
 
 // ---- (b) all-gathers by rows ---------------------------------------------------------------------------------
 // Segment g: this rank's rows of rb bytes at in + r ld_in (r < rows); rank k's row r lands at

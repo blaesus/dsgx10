@@ -242,6 +242,40 @@ void test_allreduce(Ring& ring, cudaStream_t st, Checker& ck) {
         ck.report(nm, bad, n, h1);
       }
     }
+    // the MoE layer's two partials (allreduce2_add_norm): y = bf16(bf16(sum) + bf16(sum2)), then as above
+    {
+      std::vector<float> hp2(n), hsum2(n);
+      std::vector<uint16_t> exp2_res(n), exp2_xn(n);
+      for (size_t i = 0; i < n; ++i) {
+        float s2 = test_value(0, i, salt ^ 0x99);
+        for (int k = 1; k < 4; ++k) s2 = s2 + test_value(k, i, salt ^ 0x99);
+        hsum2[i] = s2;
+        hp2[i] = test_value(me, i, salt ^ 0x99);
+      }
+      for (int r = 0; r < R; ++r) {
+        std::vector<float> h(kDim);
+        for (int c = 0; c < kDim; ++c) {
+          const size_t i = (size_t)r * kDim + c;
+          h[c] = bfr(bf2f(hres_in[i]) + bfr(bfr(hsum[i]) + bfr(hsum2[i])));
+          exp2_res[i] = f2bf(h[c]);
+        }
+        host_rmsnorm(h.data(), hw.data(), G::kNormEps, &exp2_xn[(size_t)r * kDim]);
+      }
+      CUDA_CHECK(cudaMemcpy(ref32, hp2.data(), n * 4, cudaMemcpyHostToDevice));
+      for (int pdl = 0; pdl < 2; ++pdl) {
+        CUDA_CHECK(cudaMemsetAsync(res2, 0xff, n * 2, st));
+        CUDA_CHECK(cudaMemsetAsync(xn, 0xff, n * 2, st));
+        G::allreduce2_add_norm(ch, part, ref32, R, res, res2, w, G::kNormEps, xn, st, pdl);
+        CUDA_CHECK(cudaMemcpyAsync(gres.data(), res2, n * 2, cudaMemcpyDeviceToHost, st));
+        CUDA_CHECK(cudaMemcpyAsync(gxn.data(), xn, n * 2, cudaMemcpyDeviceToHost, st));
+        sync_or_die(ring, st, 30, "allreduce2_add_norm");
+        size_t bad2 = 0;
+        for (size_t i = 0; i < n; ++i) bad2 += gres[i] != exp2_res[i] || gxn[i] != exp2_xn[i];
+        char nm2[160];
+        std::snprintf(nm2, sizeof nm2, "allreduce2_add_norm %2d rows%s (two partials, vs host)", R, pdl ? ", pdl" : "");
+        ck.report(nm2, bad2, n, fnv(gxn.data(), n * 2, fnv(gres.data(), n * 2)));
+      }
+    }
   }
   for (void* p : {(void*)part, (void*)ref32, (void*)out32, (void*)out16, (void*)res, (void*)res2, (void*)hres, (void*)xn,
                   (void*)xn_ref, (void*)w})
