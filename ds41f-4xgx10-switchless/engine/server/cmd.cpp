@@ -484,10 +484,25 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
   };
   struct Step {
     uint64_t id = 0;
+    bool late = false;  // a verify step whose Engram lookups wait for its rows (engram_late_rows)
     char on[model::ops::kMaxSess] = {};
   };
   std::deque<Step> q;  // launched, not yet waited for: the one running, then the one queued behind it
   auto on_now = [&](int k) { return live[k] && !(ending[k] && pend[k]); };
+  // a verify step's rows, as the device lays them out (the entries on in order, each its nx), for its
+  // Engram lookups: once the step before it has reported (nx), and before it is waited for
+  auto late_rows = [&](Step& s) {
+    int32_t t[model::kMaxRows], p[model::kMaxRows], sl[model::kMaxRows];
+    int R = 0;
+    for (int k = 0; k < n; ++k) {
+      if (!s.on[k]) continue;
+      if (nx[k].rows < 1 || nx[k].rows > model::ops::kSessTok || R + nx[k].rows > model::kMaxRows)
+        die("spec batch: entry %d brings %d rows to a step of %d", k, nx[k].rows, R);
+      for (int j = 0; j < nx[k].rows; ++j, ++R) t[R] = nx[k].tok[j], p[R] = nx[k].pos0 + j, sl[R] = e[k].slot;
+    }
+    m.engram_late_rows(R, t, p, sl);
+    s.late = false;
+  };
   // A launch: the entries on (live, or ending with their rows still to run), each with the drafts' cap
   // by their count; the first step given (one row per entry), the others verify steps (the rows the step
   // before chose), bound by their rows' last position at most: queued ahead, every draft of the step
@@ -517,6 +532,7 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     }
     b.pos_bound = std::min(bound, lim - 1);
     s.id = given ? m.launch_spec_batch(b) : m.launch_verify_batch(b);
+    s.late = !given;  // a given step's rows are the host's: launch_spec_batch looked them up
     q.push_back(s);
   };
   // the next step may be queued before the one running ends when every entry decoding fits it: its
@@ -550,18 +566,7 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       nx[k].rows = o.next_srows[k], nx[k].pos0 = o.next_spos0[k];
       std::copy(o.next_stok[k], o.next_stok[k] + model::ops::kSessTok, nx[k].tok);
     }
-    if (!q.empty()) {  // the step queued behind this one: its rows as the device lays them out
-      const Step& qs = q.front();
-      int32_t t[model::kMaxRows], p[model::kMaxRows], sl[model::kMaxRows];
-      int R = 0;
-      for (int k = 0; k < n; ++k) {
-        if (!qs.on[k]) continue;
-        if (nx[k].rows < 1 || nx[k].rows > model::ops::kSessTok || R + nx[k].rows > model::kMaxRows)
-          die("spec batch: entry %d brings %d rows to a step of %d", k, nx[k].rows, R);
-        for (int j = 0; j < nx[k].rows; ++j, ++R) t[R] = nx[k].tok[j], p[R] = nx[k].pos0 + j, sl[R] = e[k].slot;
-      }
-      m.engram_late_rows(R, t, p, sl);
-    }
+    if (!q.empty() && q.front().late) late_rows(q.front());  // the step queued ahead: its rows are known now
     g_t_late.push_back(now_s());
     if (i > 4)  // the step before (done; past the graphs' captures): its GPU time by its rows
       stats.gpu_ms[std::min(prev_R, model::kMaxRows)] += m.gpu_ms(prev_id), ++stats.gpu_n[std::min(prev_R, model::kMaxRows)];
@@ -636,7 +641,10 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     }
     bool any = false;
     for (int k = 0; k < n; ++k) any |= on_now(k);
-    if (q.empty() && any) launch(false, false);  // not queued ahead: the rows are known now
+    if (q.empty() && any) {  // not queued ahead: the rows are known now, its lookups go at once
+      launch(false, false);
+      late_rows(q.back());
+    }
     if (c.ahead && q.size() == 1 && fits()) launch(false, true);
     g_t_launch.push_back(now_s());
   }
