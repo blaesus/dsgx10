@@ -22,14 +22,21 @@ Scouting done on 2026-10-13; the plan is in [DESIGN.md](DESIGN.md). Nothing runs
   bandwidth floor, while NVFP4 reaches 95–96 % and the E2M1-subset code 91–93 %; only the E2M1-grid codes have the
   FP4 tensor-core path (429 TFLOPS against 107 for bf16). Trellis, whose quality per bit is better on the
   published evidence, stays open behind a tuned kernel and the KL bake-off.
-- **Built so far:** the front-end `glmfront` (tokenizer and template byte-exact against the reference,
-  [docs/protocol.md](docs/protocol.md)); the microbenchmarks (`micro/`). In progress: the CPU reference
-  (experiment 2), the quantiser prototype on two layers' BF16 experts, the expert kernels, the attention side.
-- **Exactness** for a quantised model: a hashed artefact made reproducibly from the hashed master, a written
-  numerics contract with a torch reference the engine must agree with, and quality against the master on one
-  harness with NVFP4-as-published as the anchor.
-- **The published bar** on four GB10s is code 49 / prose 30 tok/s (a from-scratch engine on a 3.25 bpw trellis).
-
+- **Built so far (2026-10-14):** the front-end `glmfront` (tokenizer and template byte-exact,
+  [docs/protocol.md](docs/protocol.md)); the attention side (FP8 projections at 95–103 % of bandwidth, the
+  indexer, sparse MLA attention at 16 µs a layer at 256k, prefill GEMMs at 52–64 TFLOPS,
+  [docs/attention.md](docs/attention.md)); the expert kernels (decode at 95–100 % of bandwidth in both formats
+  at 6–16 rows, prefill at 35–37 % of the bf16 peak, [docs/experts.md](docs/experts.md)); the ring collectives
+  (a step's 256 collectives in 4.40 ms, [docs/ring.md](docs/ring.md)); the per-rank weight files with every
+  non-expert tensor converted and verified byte for byte (zai's FP8 rule reproduced bit for bit,
+  [docs/layout.md](docs/layout.md)); the layer runner and the TP=4 decode step on all four ranks (46.4 ms at
+  one row on synthetic experts, 1.35× the floor; layers 0–3 match the golden hidden states,
+  [docs/engine.md](docs/engine.md)); the CPU reference with golden data over 38k tokens
+  ([docs/reference.md](docs/reference.md)). Every experiment is indexed in
+  [docs/experiments.md](docs/experiments.md).
+- **Not yet:** the routed experts in the rank files (disk: the fill is ~96 GiB a rank at NVFP4, ~80 at the
+  mixture), the quantiser's 3-bit fill and the KL bake-off against the master, the server, MTP speculation,
+  the end-to-end check of logits against the golden data.
 | | |
 |---|---|
 | [DESIGN.md](DESIGN.md) | target, budgets, decisions, risks, the experiments in order, milestones |
