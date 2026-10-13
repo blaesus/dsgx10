@@ -11,14 +11,28 @@ with the quantisation question, and with what "exact output" means once the weig
 
 ## Where it stands
 
-Scouting. Nothing runs yet. The documents so far:
+Scouting done on 2026-10-13; the plan is in [DESIGN.md](DESIGN.md). Nothing runs yet. The findings:
+
+- **Nothing published fits.** NVIDIA's NVFP4 checkpoint is 109.9 GiB a rank as shipped against a defensible
+  weight budget of 87 GiB a rank (the KV cache is 52.7 KiB a token in FP8 and every rank holds it). The
+  routed experts go to ~3.75 bits a weight in a code of our own, made from the BF16 master, and the
+  non-expert weights to zai's own FP8: ~86 GiB a rank, a decode floor of ~32 ms a token before drafting.
+- **The leading code is a trellis** (EXL3/QTIP family): a data-free 3.42 bpw trellis of this model scores
+  inside NVFP4's quality range at three quarters of the bytes. A 3-bit code on the E2M1 grid is the fallback.
+  The first experiment, a decode-GEMV microbenchmark, decides.
+- **Exactness** for a quantised model: a hashed artefact made reproducibly from the hashed master, a written
+  numerics contract with a torch reference the engine must agree with, and quality against the master on one
+  harness with NVFP4-as-published as the anchor.
+- **The published bar** on four GB10s is code 49 / prose 30 tok/s (a from-scratch engine on a 3.25 bpw trellis).
 
 | | |
 |---|---|
-| [docs/scouting.md](docs/scouting.md) | what is published for GLM-5.3 on GB10-class and other memory-limited hardware: engines, recipes, checkpoints, speeds, quality |
-| [docs/quantisation.md](docs/quantisation.md) | the per-rank memory budget, what each tensor class costs at each precision, the candidate formats and how to produce and validate them, and the definition of exactness for this configuration |
-| [docs/model.md](docs/model.md) | the model's exact math, as the reference code defines it, and the tokenizer and chat template |
-| [docs/reuse.md](docs/reuse.md) | what of the DeepSeek engine carries over, what must be re-specialised, and what is new |
+| [DESIGN.md](DESIGN.md) | target, budgets, decisions, risks, the experiments in order, milestones |
+| [docs/scouting.md](docs/scouting.md) | what is published for GLM-5.3 on GB10-class and other memory-limited hardware: the release, every quantised checkpoint, engines and their speeds, speculative decoding, quality against bits |
+| [docs/quantisation.md](docs/quantisation.md) | the per-rank memory budget, what each tensor class costs at each precision, the candidate formats, how to produce and validate a requantisation, the exactness standard |
+| [docs/model.md](docs/model.md) | the model's exact math as the reference code defines it, the NVFP4 and FP8 formats, the comparison with DeepSeek-V4.1-Flash, the tokenizer and chat template, the reference implementations |
+| [docs/reuse.md](docs/reuse.md) | what of the DeepSeek engine carries over (~55 % by lines), what must be re-specialised, the build plan |
+| `tools/` | `tally.py` (bytes by tensor class from safetensors headers), `nvfp4_entropy.py`, `provenance.py` (NVFP4 and FP8 against the BF16 master) |
 
 ## Memory per box
 
@@ -28,5 +42,7 @@ leaves 21–23 GiB available on each box.
 ## The checkpoint on disk
 
 `nvidia/GLM-5.3-NVFP4` (ModelOpt, revision `e3b8f9f2`), 432.2 GiB, SHA-256 verified, on rank 0 only:
-experts NVFP4 (355.5 GiB of E2M1 values, 42.2 GiB of E4M3 block scales at group 16), the three dense
-MLPs FP8, everything else BF16 (attention 24.3 GiB, shared experts 5.3, head 1.8, embeddings 1.8).
+the 75 MoE layers' experts NVFP4 (337.5 GiB of E2M1 values, 42.2 GiB of E4M3 block scales at group 16: plain
+round-to-nearest of the BF16 master, no weight calibration), the MTP layer's 256 experts plain BF16 (18.0 GiB),
+the three dense MLPs FP8, everything else BF16 (attention 24.3 GiB, shared experts 5.3, head 1.8, embeddings
+1.8). Its BF16 tensors are the master's own values ([quantisation § 3.0](docs/quantisation.md#30-what-the-checkpoints-numbers-are-measured)).
