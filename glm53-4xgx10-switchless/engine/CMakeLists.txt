@@ -31,5 +31,5 @@ endforeach()
 # fleet.conf, where they look by default; run4.sh and service.sh install their FLEET beside the copies
 # they run, and --fleet FILE reads another.
 foreach(dir server comm model)
-  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/../../ds41f-4xgx10-switchless/fleet/homelab.conf ${CMAKE_BINARY_DIR}/${dir}/fleet.conf COPYONLY)
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/../fleet/homelab.conf ${CMAKE_BINARY_DIR}/${dir}/fleet.conf COPYONLY)
 endforeach()
