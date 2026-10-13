@@ -203,7 +203,11 @@ engine/server/service.sh status        # exit 0: serving
 default) and `fleet.conf` to every box, drops the model files' page cache, wants 100 GiB available on each
 box, starts the ranks and dsfront on `DSGB10_ADDR`:`DSGB10_PORT` (127.0.0.1:18893; never 0.0.0.0) and
 restarts what fails. `DSGB10_ENGINE_ARGS` (`--max-ctx 262144`) takes engine flags such as `--weights`
-([all settings](docs/engine.md#as-a-service-servicesh)). To check it (these ran against a test port):
+([all settings](docs/engine.md#as-a-service-servicesh)). For several agents at once, add `--slots 4` to it
+(`DSGB10_ENGINE_ARGS="--max-ctx 262144 --slots 4"`): up to four sessions keep their state live and decode
+together, each with its own drafts, ~240 MB a slot ([Where it stands](#where-it-stands-2026-10-13),
+[batching.md](docs/batching.md#b3-the-build-2026-10-13)); with one slot (the default, as production runs)
+requests take turns of 64 tokens. To check it (these ran against a test port):
 
 ```bash
 (umask 077; { printf 'Authorization: Bearer '; cat ~/api-key; } > ~/api-key.header)
