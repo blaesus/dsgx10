@@ -33,15 +33,17 @@ any kernel was written. When it was written the engine ran one request at a time
       first drafts see stale windows: they are still verified, so only acceptance suffers, until the
       windows fill again.
     - The 2,048-row prefill interleave.
-- **B3** was estimated from measured step times and acceptance ([B3 from
-  measurements](#b3-from-measurements)). With 2–4 agent sessions decoding at once, it would decode
-  18–32 % more in all than the better of B1 and B2, and one session alone would not change. But the
-  owner runs several agents at once only occasionally, so it gains only in those minutes, 8–14 % end
-  to end: it is not built for now, and production stays on `--slots 1`.
+- **B3** was estimated from measured step times and acceptance on 2026-10-12 ([B3 from
+  measurements](#b3-from-measurements)): with 2–4 agent sessions decoding at once, 18–32 % more in all
+  than the better of B1 and B2, and one session alone unchanged. The owner ran several agents at once
+  only occasionally then, so it was parked, with production on `--slots 1`; built the next day (the
+  bullet below). Measured against B2 on one bench, it came out at +22 / +14 / +8 % at 2 / 3 / 4
+  streams, and +10 / +25 / +35 % over one stream at a time.
 - **B4:** the kernels agent's half (GEMVs and the MoE up to 16 rows, the same bits) and the attention
-  agent's half (9–16 rows in groups of 8) are on master. The runner's half (step buffers and graphs
-  past 8 rows) is not wired for B3's sake. Drafts of one session past 8 rows (prompt lookup) would
-  need it, and `kMaxSessRows` past 8, which decode_prep's race at 16 rows of one session forbids today.
+  agent's half (9–16 rows in groups of 8) are on master since 2026-10-12, the runner's half (step
+  buffers and graphs to 16 rows, `kMaxRows` 16) since 2026-10-13, with B3. One session's rows stay
+  within `kMaxSessRows` = 8: drafts of one session past 8 rows (prompt lookup) would need that raised,
+  which decode_prep's race at 16 rows of one session forbids today.
 - **B3 is built and measured** (2026-10-13, [B3: the build](#b3-the-build-2026-10-13)): the owner asked
   for 2–4 streams at once, with one stream kept as fast as it is, within 2 %. B4's runner half goes with
   it. Four different streams decode 131 tok/s in all (one alone 97; B2's undrafted batches 122), two
@@ -262,8 +264,8 @@ B1 is built.
 |---|---|---|---|
 | B1 | Time-slicing ([A cheaper step first](#a-cheaper-step-first)). A request that arrives while another decodes pauses that decode at its next step and is prefilled. Then the decoding sessions take turns of 64 tokens, switching through the store as today (~25 ms a switch) | runner | the first token of a small turn behind busy clients in ~0.3–0.5 s instead of 3 s |
 | B2 | Rows of several sessions in one step, without drafts: slots for 4 live sessions, the slot table, sampling and Engram per row, and the batch loop | attention agent: slot-aware kernels; runner: the rest | sessions decode together, without turns or switches; the base for B3 |
-| B3 | Drafts across sessions: one draft pass over every session's anchor, and one gate over all of their survivals ([What it would take](#what-it-would-take), item 4) | runner | measured: 18–32 % more tokens per second in all with 2–4 agent sessions, at up to 16 rows ([B3 from measurements](#b3-from-measurements)); not built for now |
-| B4 | A budget of 12–16 rows | kernels agent: dsk to 16 rows; attention agent: `kMaxDecodeRows` 16, with `index_dense`'s shared memory per group of at most 8 rows ([Interfaces](#interfaces)); runner: step buffers and graphs | up to 33–47 % more |
+| B3 | Drafts across sessions: one draft pass over every session's anchor, and one gate over all of their survivals ([What it would take](#what-it-would-take), item 4) | runner | estimated at 18–32 % more tokens per second in all with 2–4 agent sessions ([B3 from measurements](#b3-from-measurements)); built and merged 2026-10-13 with the gates per session ([B3: the build](#b3-the-build-2026-10-13)): +22 / +14 / +8 % over B2 at 2 / 3 / 4 streams, 109 / 127 / 136 tok/s in all, one stream unchanged |
+| B4 | A budget of 12–16 rows | kernels agent: dsk to 16 rows; attention agent: `kMaxDecodeRows` 16, with `index_dense`'s shared memory per group of at most 8 rows ([Interfaces](#interfaces)); runner: step buffers and graphs | up to 33–47 % more; the kernels' and attention's halves merged 2026-10-12, the runner's 2026-10-13 (`kMaxRows` 16, one session's rows still ≤ 8) |
 
 ### Interfaces
 

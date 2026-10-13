@@ -57,7 +57,7 @@ Levers that were measured or costed and not taken. Sizes are as the write-ups gi
 
 | lever | size | why it was not taken | write-up |
 |---|---|---|---|
-| B3: drafts across 2–4 overlapping sessions | +25–32 / +22–32 / +18–31 % decode for 2 / 3 / 4 sessions; 8–14 % end to end; 2 sessions within 8 rows +21–28 % | the owner runs several agents only occasionally; **being built since 2026-10-13** ([batching § B3: the build](batching.md#b3-the-build-2026-10-13)) | [batching § B3](batching.md#b3-from-measurements) |
+| B3: drafts across 2–4 overlapping sessions | +25–32 / +22–32 / +18–31 % decode for 2 / 3 / 4 sessions; 8–14 % end to end; 2 sessions within 8 rows +21–28 % | the owner ran several agents only occasionally; **taken on 2026-10-13** at their request: built and merged, +22 / +14 / +8 % over B2 at 2 / 3 / 4 streams, one stream unchanged ([batching § B3: the build](batching.md#b3-the-build-2026-10-13)) | [batching § B3](batching.md#b3-from-measurements) |
 | Prompt-lookup drafts | best gate +4.3 % (8 rows), +5.0 % (16 rows) on the edit traces; bound +8.9 / +17.8 %; hindsight +5.9 / +8.3 % | under the 10 % bar | [engine § Prompt-lookup drafts](engine.md#prompt-lookup-drafts-a-feasibility-study-2026-10-12) |
 | FP8 with a 3-bit exponent code | with free decoding 0.63 ms at k = 1 (3.5 %), 0.74 ms at 6 rows (2.0 %); nothing at v2's exposure | 1–2 weeks, medium-high risk | [engine § Lossless weight compression](engine.md#lossless-weight-compression-a-feasibility-study-2026-10-12) |
 | The expert scales' exceptions table: the raw scales kept only for the 1.9 % of groups read raw | ~4.2 GB a rank back (the raw scales' 4.25 GB for a ~0.08 GB table; ~3.6 net of the codes), room for 16,384-row prefill chunks (3.2 GiB, 2.6 % less a token) | not built: every reader on the codes (`k_moe_down_g` too), the raw groups addressed by rank (a popc in up), and a compacted weight arena or a rank-file change | [engine § The experts' scales coded](engine.md#the-experts-scales-coded-and-the-exact-compression-bundles-ab-2026-10-12) |
@@ -392,7 +392,7 @@ recovered from the session log; the three collectives measurements) and
 10. **SGLang's prompt logprobs on `long.tokens.json`,** which "would confirm" the collapse for the
     serving path. Evidence: [golden README § Checks](../golden/README.md#checks).
 
-**In progress** (2026-10-12, evening).
+**In progress, then finished** (2026-10-12 evening to 2026-10-13; every item below is closed).
 
 1. **The draft pass's bundle B, built in measured stages** (attention line, branch
    attn-dpbuild, 2026-10-12 ~20:30 to 2026-10-13 ~05:10; done: it failed its A/B): the FP8 Markov
@@ -430,6 +430,13 @@ recovered from the session log; the three collectives measurements) and
    (`ring_test race`, in ring_test's defaults), an audit of the hazard class (no other suspect kernel) and a
    wider sweep on release candidate 5 (0 faults in 1,370 repeats) were merged as 0b0604f:
    [ring § The pipelined reduce-scatters' send-buffer race](ring.md#the-pipelined-reduce-scatters-send-buffer-race-2026-10-13).
+4. **B3, drafts across 2–4 sessions, with B4's runner half and one draft pass over the sessions**
+   (runner, 2026-10-13 14:10 to 18:20; done, merged as 5666f78 and d8912e6): every reference hash in
+   drafted batches and alone, the serve tests with four slots, every session's teacher-forced hash
+   through 12- and 16-row batch steps; 109 / 127 / 136 tok/s in all at 2 / 3 / 4 streams against B2's
+   88 / 107 / 122 and one stream's 97; one stream unchanged (A/B/B/A, 8.322 against 8.322 ms a token).
+   Release candidate 7 validated on the way (official hashes 8 of 8, serve test 17 of 17), not deployed.
+   [batching § B3: the build](batching.md#b3-the-build-2026-10-13).
 4. **The pre-release review** (orchestrator with five one-off Opus reviewers, 2026-10-13 from ~06:40):
    the owner is about to release the repository and asked whether it works as a kit, produces correct results,
    is correctly documented, and measures objectively and fairly against the other kits' numbers. Five

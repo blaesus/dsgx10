@@ -641,8 +641,9 @@ the design, steps B1 and B2).
   than the five the drafter makes (5 for two, 4 for three, 3 for four, 2 for five, 1 for six to
   eight), laid out on the device in request order. The verdicts are per request, the accepts run per
   request in its own slot, and the drafts in one pass over the requests on (each request's rows in its
-  slot, every row computed as in a pass of its own; B3 phase 2a, built on 2026-10-13 and not yet run
-  on the ring), so every request's tokens and log-probabilities are its run's alone. Its end, stop ids, cancel (its slot's bit) and a pause act per
+  slot, every row computed as in a pass of its own; B3 phase 2a, 2026-10-13, the drafts bit for bit
+  with each request's own pass by `--bgraph-check`), so every request's tokens and log-probabilities
+  are its run's alone. Its end, stop ids, cancel (its slot's bit) and a pause act per
   request as in the speculative loop; a request that ends keeps its rows in the step already queued
   (their KV counts, their tokens do not); the last one decoding pauses to go on alone with its five
   drafts. Larger runs take the plain batch loop. The batch log line adds `drafts: T tokens and R rows
@@ -719,7 +720,17 @@ the design, steps B1 and B2).
   steps of 12 and 16 rows of 2–4 sessions (`--batch-tf`); alone, 8 of 8 reference hashes. Four streams
   of different text (1k prompts, 512 tokens each) decode 131.3 tok/s in all, three 121.9, two 106.9, one
   alone 97.3; a drafted batch's step is one session's step at the same rows plus about 3 ms a further
-  session. One session against master, A/B/B/A: +0.2 % at k = 1, +0.8 % with drafts (two runs each).
+  session. One session against master, A/B/B/A: +0.2 % at k = 1 (two runs each), 8.322 against 8.322
+  ms a token with drafts (six runs each). Phase 2a the same day (one draft pass over the requests on,
+  engine 6da6160): the drafts bit for bit (`--bgraph-check`: 0 words differ in four drafted batches),
+  109.4 / 126.6 / 135.5 tok/s in all at two, three and four streams, the steps 1.3–2.7 ms shorter, one
+  stream 8.343 against 8.317 ms a token (A/B/B/A, four runs each). The flags: `--slots N` (with drafts
+  on, a run of up to kMaxRows / 2 = 8 requests takes the batch spec loop); `--mode batch --spec
+  [--draft-fp8]` runs the golden sessions as a drafted batch; `--batch-tf --batch-rows R` feeds the
+  golden positions through batch steps and prints each session's teacher-forced hash; `--bench-groups
+  G` runs the bench's 9–16 rows as G sessions; and the diagnostics `--bgraph-check` (each request's
+  one-session draft after the pass, the differing words counted), `--bgraph-bodies N` and
+  `--bgraph-noif` (the batch graph's shape when it fails to instantiate).
 
 ## Launch and stop
 
@@ -4130,7 +4141,8 @@ about two per layer that the chain's 4 rows do not.
   rotated rows): T = 18.64 + 1.10 (R − 1) + 0.713 (U − 6), over 30 steps with rms 1.05.
 - **9–16 rows.** bench_chain's 16-row kernels cost +1.8 at 9 rows, +2.6–2.7 at 12 and +3.8–4.2 at
   16, over a fit of its own ≤ 8-row points. The mean, +3.09 ms, is charged above 8 rows. The runner's
-  half of B4 is not built.
+  half of B4 was not built then (it came with B3 on 2026-10-13, for several sessions' rows; one
+  session's stay within 8).
 - **Drafting.** One pass for any shape. A tree adds +0.15 ms (a rough estimate).
 
 **Acceptance by shape.** E[a] is the drafts accepted per step over every anchor, with the gate off.
@@ -6358,8 +6370,10 @@ vocab_script.py build and score the subsets.
 
 ### Bundle B, built in stages (2026-10-12)
 
-The study's bundle B ([above](#the-draft-passs-approximations-a-study-2026-10-12)) is being built on
-attn-dpbuild, one stage at a time. Every piece is behind a flag, and today's drafter stays the default.
+The study's bundle B ([above](#the-draft-passs-approximations-a-study-2026-10-12)) was built on
+attn-dpbuild, one stage at a time (2026-10-12 to 2026-10-13); its A/B gained +1.50 % end to end on the
+sampled edit bench, under the 2 % bar, so nothing of it is merged ([Bundle B's
+A/B](#bundle-bs-ab-under-the-bar-2026-10-13)). Every piece is behind a flag, and today's drafter stays the default.
 Each stage's measured saving is set against the study's model before the next one starts.
 `dp_stage.py` replays a stage's spectf records through today's chain with the measured saving, next to
 the study's model of the same levers.

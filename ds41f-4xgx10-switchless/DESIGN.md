@@ -261,14 +261,19 @@ Before M9 (shipping on rank 0:8888 in place of the kit), the hardening list:
   engine on a private unix socket and refuses 0.0.0.0, and port 8888 without `DSGB10_PROD=1`
   ([engine.md](docs/engine.md#as-a-service-servicesh)). M9 took :8888
   (2026-10-12); whether a systemd unit should start it after a reboot is still the owner's call.
-- **Several requests at once: B1 in production, B2 merged off, B3 not built.** Since 2026-10-12 12:59
+- **Several requests at once: B1 in production, B2 and B3 merged, production on one slot.** Since 2026-10-12 12:59
   production time-slices requests (B1): behind a request decoding 600 tokens, a 16k request's first
   token comes after 1.9 s instead of 7.1 s. B2, the rows of several sessions in one step, is merged
   (`--slots N`, 1 by default); each request in a batch equals its run alone, and a batch runs without
-  drafts, so it buys fairness and first tokens, not throughput. B3, drafts across sessions, would
-  decode 18–32 % more in all with 2–4 sessions; it is not built, as the owner runs several agents at
-  once only occasionally ([docs/batching.md](docs/batching.md#status-2026-10-12)). A stop with
-  requests in flight is clean (the cut request ends with an error event).
+  drafts, so it buys fairness and first tokens, not throughput. B3, drafts across sessions, was
+  estimated at 18–32 % more in all with 2–4 sessions and parked while the owner ran one agent; built at
+  their request on 2026-10-13 (decision 12), with B4's runner half (16 rows a step) and one draft pass
+  over the sessions: two, three and four streams of different text decode 109 / 127 / 136 tok/s in all
+  against 97 for one alone and 88 / 107 / 122 with B2's undrafted batches, every request's tokens its
+  run's alone, and one stream unchanged (A/B/B/A against the engine before)
+  ([docs/batching.md](docs/batching.md#b3-the-build-2026-10-13)). Production stays on `--slots 1`; a
+  deploy with `--slots 4` is the owner's call. A stop with requests in flight is clean (the cut request
+  ends with an error event).
 - **Both stacks benchmarked: done** with `bench/bench.py` (the kit on 2026-10-11, [Baseline](#baseline);
   dsgb10 in [README.md](README.md#where-it-stands-2026-10-13)); how to switch back is in
   [docs/operations.md](docs/operations.md).

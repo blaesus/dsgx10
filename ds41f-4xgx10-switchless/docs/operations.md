@@ -31,7 +31,11 @@ and a request held meanwhile waits up to 15. Production starts, from `~/dsgb10/p
 hash's fix b47c510 and the fleet file; `ENGINE_BUILT_FROM` there) is validated and not deployed: every reference hash on
 the variant files (8 of 8) and on the official checkpoint (8 of 8: tf c7605e0b6ba8d9d2, k = 1 7941647b162df1a8 and the drafted
 variants, sampled 02ef3e0858d7eb45, 16k CED 8790ee9388f4abd8, 28k CED de99bfce6ea96ba8), and serve_test `--ced` on the
-official checkpoint 17 of 17 (2026-10-13, 12:55–16:31, between the kit's turns). Deploying it is the owner's call.
+official checkpoint 17 of 17 (2026-10-13, 12:55–16:31, between the kit's turns). Deploying it is the owner's call. Master
+since 5666f78 and d8912e6 (2026-10-13) also has B3, drafts across sessions: with `--slots 4` up to eight requests decode
+together, each with its own drafts (109 / 127 / 136 tok/s in all at 2 / 3 / 4 streams on the variant weights, one stream
+unchanged; [batching.md](batching.md#b3-the-build-2026-10-13)); production stays on one slot until the owner deploys a build
+from it.
 
 ```
 DSGB10_PROD=1 DSGB10_ADDR="127.0.0.1 <tailnet address>" DSGB10_PORT=8888 DSGB10_KEY_FILE=~/ai/dsv41-4x-ring/state-tp4/api-key \

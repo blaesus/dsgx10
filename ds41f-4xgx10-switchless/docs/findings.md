@@ -322,9 +322,11 @@ line, and the hardware drops much of that: read 300 µs later, 4 MB came back at
   1.4–1.5 TB/s). A decode step whose GEMVs prefetched their own next weights into L2 during the PDL
   window got slower (19.34 against 18.63 ms).
 
-Whether a paced side prefetch of the next layer's weights during the collectives pays in the engine
-is being measured (the six-row step study, [experiments § In progress](experiments.md)). It was
-projected at −1.5 to −3.0 ms a six-row step, depending on what the prefetch costs the collective.
+A paced side prefetch of the next layer's weights during the collectives does pay in the engine: B′,
+one warp on a side stream issuing 8 KiB L2 prefetches in the step's four windows, merged on 2026-10-12
+(k = 1 16.71 ms a token against 17.47 without; −3.95 % end to end, −3.0 % on the sampled edit bench
+with drafts; [engine § A paced L2 prefetch](engine.md#a-paced-l2-prefetch-in-the-steps-windows-2026-10-12)).
+It was projected at −1.5 to −3.0 ms a six-row step, depending on what the prefetch costs the collective.
 
 ### Tensor cores
 
