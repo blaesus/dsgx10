@@ -710,6 +710,15 @@ the design, steps B1 and B2).
     captures its graphs at startup. Six requests in a row in one serve process gave the same first
     tokens with both builds: the first request's in 342 ms (382 with 33de65fd), the later five's in
     328.8 ms (328.1), median.
+- **With drafts across sessions** (B3 and B4's runner half, engine ee748c1, 2026-10-13;
+  [batching.md](batching.md#measured-2026-10-13-engine-ee748c1-on-the-integration-branch)). With
+  `--slots 4`: batch_test (its two drafted scenarios included) 0 failed, serve_test `--ced` 17 of 17,
+  slice_test 0 failed; the reference hashes hold in drafted batches (`--mode batch --spec`: 1k ×2, 1k +
+  16k CED + 1k, 1k ×4, the sampled trio) and every session's teacher-forced hash holds through batch
+  steps of 12 and 16 rows of 2–4 sessions (`--batch-tf`); alone, 8 of 8 reference hashes. Four streams
+  of different text (1k prompts, 512 tokens each) decode 131.3 tok/s in all, three 121.9, two 106.9, one
+  alone 97.3; a drafted batch's step is one session's step at the same rows plus about 3 ms a further
+  session. One session against master, A/B/B/A: +0.2 % at k = 1, +0.8 % with drafts (two runs each).
 
 ## Launch and stop
 
