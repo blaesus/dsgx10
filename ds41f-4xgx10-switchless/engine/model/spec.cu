@@ -16,6 +16,7 @@
 
 #include "model/nvtx.h"
 #include "model/prefill.h"
+#include "model/spec_batch.h"
 
 namespace model {
 
@@ -139,35 +140,8 @@ __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, cons
     reinterpret_cast<uint32_t*>(d)[i] = reinterpret_cast<const volatile uint32_t*>(ring + slot)[i];
   __syncthreads();
   if (threadIdx.x == 0) {
-    const int ns = min(max(d->nsess, 1), ops::kMaxSess);
-    if (d->spec == ops::kSpecVerify) {
-      int R = 0;
-      for (int k = 0; k < ns; ++k) {
-        row0[k] = R;
-        if (!d->sess_on[k]) continue;
-        const int nk = min(max(ss[k].next_rows, 1), ops::kSessTok);
-        for (int j = 0; j < nk && R < kMaxRows; ++j, ++R) {  // the host keeps the entries' sum within kMaxRows
-          d->tokens[R] = ss[k].next_tok[j];
-          d->pos[R] = ss[k].next_pos0 + j;
-          d->slot[R] = d->sess_slot[k];
-          d->sess[R] = k;
-        }
-      }
-      if (R < 1) R = 1;  // never: the host launches with an entry on
-      d->rows = R;
-      for (int r = R; r < kMaxRows; ++r) {  // the entries past R repeat the last row's
-        d->tokens[r] = 0;
-        d->pos[r] = d->pos[R - 1], d->slot[r] = d->slot[R - 1], d->sess[r] = d->sess[R - 1];
-      }
-    } else {  // a given step: the host's layout, one row per entry on
-      int r = 0;
-      for (int k = 0; k < ns; ++k) {
-        row0[k] = r;
-        if (!d->sess_on[k]) continue;
-        while (r < d->rows && d->sess[r] == k) ++r;
-      }
-    }
-    for (int k = ns; k < ops::kMaxSess; ++k) row0[k] = 0;
+    if (d->spec == ops::kSpecVerify) ops::spec_batch_layout(*d, ss, row0);  // spec_batch.h
+    else ops::spec_batch_row0(*d, row0);  // a given step: the host's layout, one row per entry on
     for (int k = 0; k < ops::kMaxSess; ++k)
       for (int j = 0; j < dspark::kMaxAcc; ++j) stab[k * dspark::kMaxAcc + j] = d->sess_slot[k];
     *counter += 1;

@@ -8,6 +8,7 @@
 #include "comm/ring_dev.cuh"
 #include "common/check.h"
 #include "model/ops.h"
+#include "model/spec_batch.h"
 
 namespace model::ops {
 namespace {
@@ -345,27 +346,18 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     const volatile int32_t* vfb = fb;
     if (in->sbatch) {
       // A batch spec step (docs/batching.md, B3): the verdict per entry over its own rows, each by exactly the
-      // one-session rule below (no row reads another entry's). Entry k's rows are consecutive, sess[r] = k;
-      // the step is published after the entries' draft passes (spec.cu, k_spec_publish_batch).
+      // one-session rule below (spec_batch.h; no row reads another entry's). Entry k's rows are consecutive,
+      // sess[r] = k; the step is published after the entries' draft passes (spec.cu, k_spec_publish_batch).
+      SpecVerdict v[kMaxSess];
+      spec_batch_verdicts(*in, vfb, spec == kSpecVerify, v);
       for (int k = 0; k < kMaxSess; ++k) {
-        o.sess_row0[k] = 0, o.sess_step_rows[k] = 0, o.sess_rows[k] = 0, o.sess_pos0[k] = 0;
+        o.sess_row0[k] = v[k].row0, o.sess_step_rows[k] = v[k].step_rows, o.sess_rows[k] = v[k].rows;
+        o.sess_pos0[k] = v[k].pos0;
         o.next_srows[k] = 0, o.next_spos0[k] = 0;
-      }
-      int r0 = 0;
-      while (r0 < R) {
-        const int k = min(max(in->sess[r0], 0), kMaxSess - 1);
-        int nk = 1;
-        while (r0 + nk < R && in->sess[r0 + nk] == in->sess[r0]) ++nk;
-        int n = nk - 1;
-        if (spec == kSpecVerify) {
-          n = 0;
-          while (n < nk - 1 && vfb[r0 + n] == in->tokens[r0 + n + 1]) ++n;
-        }
-        o.sess_row0[k] = r0, o.sess_step_rows[k] = nk, o.sess_rows[k] = n + 1, o.sess_pos0[k] = in->pos[r0];
-        ss[k].count = n + 1;
-        ss[k].pos0 = in->pos[r0];
-        ss[k].bonus = in->force >= 0 ? in->force : vfb[r0 + n];
-        r0 += nk;
+        if (!v[k].step_rows) continue;
+        ss[k].count = v[k].rows;
+        ss[k].pos0 = v[k].pos0;
+        ss[k].bonus = in->force >= 0 ? in->force : v[k].bonus;
       }
       o.rows = R;
       o.pos0 = in->pos[0];
