@@ -1,0 +1,27 @@
+[package]
+name = "dsfront"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible front-end for the dsgb10 DeepSeek-V4.1-Flash engine: tokeniser, chat encoding, HTTP server"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "dsfront"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = { version = "0.3", default-features = false }
+
+[profile.release]
+opt-level = 3
+debug = 1
+codegen-units = 4
+lto = "thin"

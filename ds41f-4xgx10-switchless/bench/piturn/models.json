@@ -1,0 +1,30 @@
+{
+  "providers": {
+    "dsgb10": {
+      "baseUrl": "http://127.0.0.1:18897/v1",
+      "api": "openai-completions",
+      "apiKey": "$DSGB10_DEV_KEY",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "thinkingFormat": "chat-template",
+        "chatTemplateKwargs": {
+          "thinking": { "$var": "thinking.enabled" },
+          "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true }
+        }
+      },
+      "models": [
+        {
+          "id": "deepseek-v4.1-flash-uncensored",
+          "name": "dsgb10",
+          "reasoning": true,
+          "thinkingLevelMap": { "minimal": null, "low": "low", "medium": null, "high": "high", "xhigh": null, "max": "max" },
+          "input": ["text"],
+          "contextWindow": 245000,
+          "maxTokens": 16384,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}

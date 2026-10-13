@@ -1,0 +1,437 @@
+     1 BF16     [5120]                           0.00GiB aligner.w1.bias
+     1 BF16     [5120, 9216]                     0.09GiB aligner.w1.weight
+     1 BF16     [5120]                           0.00GiB aligner.w2.bias
+     1 BF16     [5120, 5120]                     0.05GiB aligner.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.0.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.0.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.0.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.0.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.0.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.0.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.0.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.0.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.1.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.1.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.1.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.1.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.1.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.1.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.1.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.1.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.10.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.10.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.10.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.10.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.10.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.10.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.10.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.10.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.11.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.11.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.11.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.11.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.11.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.11.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.11.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.11.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.12.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.12.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.12.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.12.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.12.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.12.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.12.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.12.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.13.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.13.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.13.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.13.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.13.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.13.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.13.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.13.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.14.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.14.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.14.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.14.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.14.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.14.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.14.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.14.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.15.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.15.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.15.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.15.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.15.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.15.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.15.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.15.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.16.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.16.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.16.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.16.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.16.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.16.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.16.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.16.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.17.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.17.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.17.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.17.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.17.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.17.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.17.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.17.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.18.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.18.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.18.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.18.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.18.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.18.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.18.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.18.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.19.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.19.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.19.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.19.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.19.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.19.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.19.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.19.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.2.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.2.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.2.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.2.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.2.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.2.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.2.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.2.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.20.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.20.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.20.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.20.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.20.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.20.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.20.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.20.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.21.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.21.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.21.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.21.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.21.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.21.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.21.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.21.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.22.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.22.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.22.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.22.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.22.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.22.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.22.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.22.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.23.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.23.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.23.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.23.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.23.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.23.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.23.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.23.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.24.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.24.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.24.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.24.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.24.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.24.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.24.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.24.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.25.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.25.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.25.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.25.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.25.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.25.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.25.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.25.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.26.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.26.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.26.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.26.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.26.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.26.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.26.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.26.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.27.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.27.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.27.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.27.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.27.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.27.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.27.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.27.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.28.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.28.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.28.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.28.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.28.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.28.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.28.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.28.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.29.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.29.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.29.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.29.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.29.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.29.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.29.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.29.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.3.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.3.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.3.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.3.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.3.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.3.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.3.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.3.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.30.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.30.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.30.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.30.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.30.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.30.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.30.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.30.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.31.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.31.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.31.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.31.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.31.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.31.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.31.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.31.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.4.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.4.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.4.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.4.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.4.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.4.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.4.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.4.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.5.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.5.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.5.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.5.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.5.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.5.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.5.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.5.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.6.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.6.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.6.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.6.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.6.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.6.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.6.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.6.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.7.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.7.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.7.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.7.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.7.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.7.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.7.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.7.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.8.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.8.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.8.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.8.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.8.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.8.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.8.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.8.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.9.attn.wo.bias
+     1 BF16     [1024, 1024]                     0.00GiB vision.blocks.9.attn.wo.weight
+     1 BF16     [3072]                           0.00GiB vision.blocks.9.attn.wqkv.bias
+     1 BF16     [3072, 1024]                     0.01GiB vision.blocks.9.attn.wqkv.weight
+     1 BF16     [5632, 1024]                     0.01GiB vision.blocks.9.mlp.w1.weight
+     1 BF16     [1024, 2816]                     0.01GiB vision.blocks.9.mlp.w2.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.9.norm1.weight
+     1 BF16     [1024]                           0.00GiB vision.blocks.9.norm2.weight
+     1 BF16     [1024]                           0.00GiB vision.norm.weight
+     1 BF16     [1024]                           0.00GiB vision.patch_embed.proj.bias
+     1 BF16     [1024, 588]                      0.00GiB vision.patch_embed.proj.weight
+     1 BF16     [129280, 5120]                   1.23GiB embed.weight
+     1 BF16     [5120]                           0.00GiB image_end
+     1 BF16     [5120]                           0.00GiB image_newline
+     1 BF16     [5120]                           0.00GiB image_start
+    40 F32      [64]                             0.00GiB layers.N.attn.attn_sink
+    40 F32      [384]                            0.00GiB layers.N.ffn.gate.bias
+    40 F32      [384]                            0.00GiB layers.N.ffn.gate.bias_vl
+    40 F32      [24]                             0.00GiB layers.N.hc_attn_base
+    40 F32      [24, 20480]                      0.07GiB layers.N.hc_attn_fn
+    40 F32      [3]                              0.00GiB layers.N.hc_attn_scale
+    40 F32      [24]                             0.00GiB layers.N.hc_ffn_base
+    40 F32      [24, 20480]                      0.07GiB layers.N.hc_ffn_fn
+    40 F32      [3]                              0.00GiB layers.N.hc_ffn_scale
+    40 BF16     [512]                            0.00GiB layers.N.attn.kv_norm.weight
+    40 BF16     [1280]                           0.00GiB layers.N.attn.q_norm.weight
+    40 BF16     [5120]                           0.00GiB layers.N.attn_norm.weight
+    40 BF16     [384, 5120]                      0.15GiB layers.N.ffn.gate.weight
+    40 BF16     [5120]                           0.00GiB layers.N.ffn_norm.weight
+    40 F8_E8M0  [16, 160]                        0.00GiB layers.N.attn.wkv.scale
+    40 F8_E8M0  [256, 128]                       0.00GiB layers.N.attn.wo_a.scale
+    40 F8_E8M0  [160, 256]                       0.00GiB layers.N.attn.wo_b.scale
+    40 F8_E8M0  [40, 160]                        0.00GiB layers.N.attn.wq_a.scale
+    40 F8_E8M0  [1024, 40]                       0.00GiB layers.N.attn.wq_b.scale
+ 15360 F8_E8M0  [2304, 160]                      5.27GiB layers.N.ffn.experts.E.w1.scale
+ 15360 F8_E8M0  [5120, 72]                       5.27GiB layers.N.ffn.experts.E.w2.scale
+ 15360 F8_E8M0  [2304, 160]                      5.27GiB layers.N.ffn.experts.E.w3.scale
+    40 F8_E8M0  [72, 160]                        0.00GiB layers.N.ffn.shared_experts.w1.scale
+    40 F8_E8M0  [160, 72]                        0.00GiB layers.N.ffn.shared_experts.w2.scale
+    40 F8_E8M0  [72, 160]                        0.00GiB layers.N.ffn.shared_experts.w3.scale
+    40 F8_E4M3  [512, 5120]                      0.10GiB layers.N.attn.wkv.weight
+    40 F8_E4M3  [8192, 4096]                     1.25GiB layers.N.attn.wo_a.weight
+    40 F8_E4M3  [5120, 8192]                     1.56GiB layers.N.attn.wo_b.weight
+    40 F8_E4M3  [1280, 5120]                     0.24GiB layers.N.attn.wq_a.weight
+    40 F8_E4M3  [32768, 1280]                    1.56GiB layers.N.attn.wq_b.weight
+    40 F8_E4M3  [2304, 5120]                     0.44GiB layers.N.ffn.shared_experts.w1.weight
+    40 F8_E4M3  [5120, 2304]                     0.44GiB layers.N.ffn.shared_experts.w2.weight
+    40 F8_E4M3  [2304, 5120]                     0.44GiB layers.N.ffn.shared_experts.w3.weight
+ 15360 I8       [2304, 2560]                    84.38GiB layers.N.ffn.experts.E.w1.weight
+ 15360 I8       [5120, 1152]                    84.38GiB layers.N.ffn.experts.E.w2.weight
+ 15360 I8       [2304, 2560]                    84.38GiB layers.N.ffn.experts.E.w3.weight
+     4 BF16     [512]                            0.00GiB layers.N.attn.compressor.norm.weight
+     3 BF16     [512, 5120]                      0.01GiB layers.N.attn.compressor.wgate.weight
+     4 BF16     [512, 5120]                      0.02GiB layers.N.attn.compressor.wkv.weight
+     4 BF16     [128]                            0.00GiB layers.N.attn.indexer.k_norm.weight
+     8 BF16     [32, 5120]                       0.00GiB layers.N.attn.indexer.weights_proj.weight
+     4 BF16     [128, 512]                       0.00GiB layers.N.attn.indexer.wk.weight
+     8 F8_E8M0  [128, 40]                        0.00GiB layers.N.attn.indexer.wq_b.scale
+     8 F8_E4M3  [4096, 1280]                     0.04GiB layers.N.attn.indexer.wq_b.weight
+     1 BF16     [129280, 5120]                   1.23GiB head.weight
+     1 BF16     [5120]                           0.00GiB norm.weight
+     1 F32      [64]                             0.00GiB mtp.0.attn.attn_sink
+     1 F32      [128]                            0.00GiB mtp.0.ffn.gate.bias
+     1 F32      [128]                            0.00GiB mtp.0.ffn.gate.bias_vl
+     1 F32      [24]                             0.00GiB mtp.0.hc_attn_base
+     1 F32      [24, 20480]                      0.00GiB mtp.0.hc_attn_fn
+     1 F32      [3]                              0.00GiB mtp.0.hc_attn_scale
+     1 F32      [24]                             0.00GiB mtp.0.hc_ffn_base
+     1 F32      [24, 20480]                      0.00GiB mtp.0.hc_ffn_fn
+     1 F32      [3]                              0.00GiB mtp.0.hc_ffn_scale
+     1 BF16     [512]                            0.00GiB mtp.0.attn.kv_norm.weight
+     1 BF16     [1280]                           0.00GiB mtp.0.attn.q_norm.weight
+     1 BF16     [5120]                           0.00GiB mtp.0.attn_norm.weight
+     1 BF16     [128, 5120]                      0.00GiB mtp.0.ffn.gate.weight
+     1 BF16     [5120]                           0.00GiB mtp.0.ffn_norm.weight
+     1 BF16     [5120]                           0.00GiB mtp.0.main_norm.weight
+     1 F8_E8M0  [16, 160]                        0.00GiB mtp.0.attn.wkv.scale
+     1 F8_E8M0  [256, 128]                       0.00GiB mtp.0.attn.wo_a.scale
+     1 F8_E8M0  [160, 256]                       0.00GiB mtp.0.attn.wo_b.scale
+     1 F8_E8M0  [40, 160]                        0.00GiB mtp.0.attn.wq_a.scale
+     1 F8_E8M0  [1024, 40]                       0.00GiB mtp.0.attn.wq_b.scale
+   128 F8_E8M0  [2304, 160]                      0.04GiB mtp.0.ffn.experts.E.w1.scale
+   128 F8_E8M0  [5120, 72]                       0.04GiB mtp.0.ffn.experts.E.w2.scale
+   128 F8_E8M0  [2304, 160]                      0.04GiB mtp.0.ffn.experts.E.w3.scale
+     1 F8_E8M0  [72, 160]                        0.00GiB mtp.0.ffn.shared_experts.w1.scale
+     1 F8_E8M0  [160, 72]                        0.00GiB mtp.0.ffn.shared_experts.w2.scale
+     1 F8_E8M0  [72, 160]                        0.00GiB mtp.0.ffn.shared_experts.w3.scale
+     1 F8_E8M0  [160, 480]                       0.00GiB mtp.0.main_proj.scale
+     1 F8_E4M3  [512, 5120]                      0.00GiB mtp.0.attn.wkv.weight
+     1 F8_E4M3  [8192, 4096]                     0.03GiB mtp.0.attn.wo_a.weight
+     1 F8_E4M3  [5120, 8192]                     0.04GiB mtp.0.attn.wo_b.weight
+     1 F8_E4M3  [1280, 5120]                     0.01GiB mtp.0.attn.wq_a.weight
+     1 F8_E4M3  [32768, 1280]                    0.04GiB mtp.0.attn.wq_b.weight
+     1 F8_E4M3  [2304, 5120]                     0.01GiB mtp.0.ffn.shared_experts.w1.weight
+     1 F8_E4M3  [5120, 2304]                     0.01GiB mtp.0.ffn.shared_experts.w2.weight
+     1 F8_E4M3  [2304, 5120]                     0.01GiB mtp.0.ffn.shared_experts.w3.weight
+     1 F8_E4M3  [5120, 15360]                    0.07GiB mtp.0.main_proj.weight
+   128 I8       [2304, 2560]                     0.70GiB mtp.0.ffn.experts.E.w1.weight
+   128 I8       [5120, 1152]                     0.70GiB mtp.0.ffn.experts.E.w2.weight
+   128 I8       [2304, 2560]                     0.70GiB mtp.0.ffn.experts.E.w3.weight
+     1 F32      [64]                             0.00GiB mtp.1.attn.attn_sink
+     1 F32      [128]                            0.00GiB mtp.1.ffn.gate.bias
+     1 F32      [128]                            0.00GiB mtp.1.ffn.gate.bias_vl
+     1 F32      [24]                             0.00GiB mtp.1.hc_attn_base
+     1 F32      [24, 20480]                      0.00GiB mtp.1.hc_attn_fn
+     1 F32      [3]                              0.00GiB mtp.1.hc_attn_scale
+     1 F32      [24]                             0.00GiB mtp.1.hc_ffn_base
+     1 F32      [24, 20480]                      0.00GiB mtp.1.hc_ffn_fn
+     1 F32      [3]                              0.00GiB mtp.1.hc_ffn_scale
+     1 BF16     [512]                            0.00GiB mtp.1.attn.kv_norm.weight
+     1 BF16     [1280]                           0.00GiB mtp.1.attn.q_norm.weight
+     1 BF16     [5120]                           0.00GiB mtp.1.attn_norm.weight
+     1 BF16     [128, 5120]                      0.00GiB mtp.1.ffn.gate.weight
+     1 BF16     [5120]                           0.00GiB mtp.1.ffn_norm.weight
+     1 F8_E8M0  [16, 160]                        0.00GiB mtp.1.attn.wkv.scale
+     1 F8_E8M0  [256, 128]                       0.00GiB mtp.1.attn.wo_a.scale
+     1 F8_E8M0  [160, 256]                       0.00GiB mtp.1.attn.wo_b.scale
+     1 F8_E8M0  [40, 160]                        0.00GiB mtp.1.attn.wq_a.scale
+     1 F8_E8M0  [1024, 40]                       0.00GiB mtp.1.attn.wq_b.scale
+   128 F8_E8M0  [2304, 160]                      0.04GiB mtp.1.ffn.experts.E.w1.scale
+   128 F8_E8M0  [5120, 72]                       0.04GiB mtp.1.ffn.experts.E.w2.scale
+   128 F8_E8M0  [2304, 160]                      0.04GiB mtp.1.ffn.experts.E.w3.scale
+     1 F8_E8M0  [72, 160]                        0.00GiB mtp.1.ffn.shared_experts.w1.scale
+     1 F8_E8M0  [160, 72]                        0.00GiB mtp.1.ffn.shared_experts.w2.scale
+     1 F8_E8M0  [72, 160]                        0.00GiB mtp.1.ffn.shared_experts.w3.scale
+     1 F8_E4M3  [512, 5120]                      0.00GiB mtp.1.attn.wkv.weight
+     1 F8_E4M3  [8192, 4096]                     0.03GiB mtp.1.attn.wo_a.weight
+     1 F8_E4M3  [5120, 8192]                     0.04GiB mtp.1.attn.wo_b.weight
+     1 F8_E4M3  [1280, 5120]                     0.01GiB mtp.1.attn.wq_a.weight
+     1 F8_E4M3  [32768, 1280]                    0.04GiB mtp.1.attn.wq_b.weight
+     1 F8_E4M3  [2304, 5120]                     0.01GiB mtp.1.ffn.shared_experts.w1.weight
+     1 F8_E4M3  [5120, 2304]                     0.01GiB mtp.1.ffn.shared_experts.w2.weight
+     1 F8_E4M3  [2304, 5120]                     0.01GiB mtp.1.ffn.shared_experts.w3.weight
+   128 I8       [2304, 2560]                     0.70GiB mtp.1.ffn.experts.E.w1.weight
+   128 I8       [5120, 1152]                     0.70GiB mtp.1.ffn.experts.E.w2.weight
+   128 I8       [2304, 2560]                     0.70GiB mtp.1.ffn.experts.E.w3.weight
+     1 F32      [64]                             0.00GiB mtp.2.attn.attn_sink
+     1 F32      [128]                            0.00GiB mtp.2.ffn.gate.bias
+     1 F32      [128]                            0.00GiB mtp.2.ffn.gate.bias_vl
+     1 F32      [24]                             0.00GiB mtp.2.hc_attn_base
+     1 F32      [24, 20480]                      0.00GiB mtp.2.hc_attn_fn
+     1 F32      [3]                              0.00GiB mtp.2.hc_attn_scale
+     1 F32      [24]                             0.00GiB mtp.2.hc_ffn_base
+     1 F32      [24, 20480]                      0.00GiB mtp.2.hc_ffn_fn
+     1 F32      [3]                              0.00GiB mtp.2.hc_ffn_scale
+     1 BF16     [512]                            0.00GiB mtp.2.attn.kv_norm.weight
+     1 BF16     [1280]                           0.00GiB mtp.2.attn.q_norm.weight
+     1 BF16     [5120]                           0.00GiB mtp.2.attn_norm.weight
+     1 BF16     [1, 5376]                        0.00GiB mtp.2.confidence_head.proj.weight
+     1 BF16     [128, 5120]                      0.00GiB mtp.2.ffn.gate.weight
+     1 BF16     [5120]                           0.00GiB mtp.2.ffn_norm.weight
+     1 BF16     [129280, 256]                    0.06GiB mtp.2.markov_head.embed.weight
+     1 BF16     [129280, 256]                    0.06GiB mtp.2.markov_head.head.weight
+     1 BF16     [5120]                           0.00GiB mtp.2.norm.weight
+     1 F8_E8M0  [16, 160]                        0.00GiB mtp.2.attn.wkv.scale
+     1 F8_E8M0  [256, 128]                       0.00GiB mtp.2.attn.wo_a.scale
+     1 F8_E8M0  [160, 256]                       0.00GiB mtp.2.attn.wo_b.scale
+     1 F8_E8M0  [40, 160]                        0.00GiB mtp.2.attn.wq_a.scale
+     1 F8_E8M0  [1024, 40]                       0.00GiB mtp.2.attn.wq_b.scale
+   128 F8_E8M0  [2304, 160]                      0.04GiB mtp.2.ffn.experts.E.w1.scale
+   128 F8_E8M0  [5120, 72]                       0.04GiB mtp.2.ffn.experts.E.w2.scale
+   128 F8_E8M0  [2304, 160]                      0.04GiB mtp.2.ffn.experts.E.w3.scale
+     1 F8_E8M0  [72, 160]                        0.00GiB mtp.2.ffn.shared_experts.w1.scale
+     1 F8_E8M0  [160, 72]                        0.00GiB mtp.2.ffn.shared_experts.w2.scale
+     1 F8_E8M0  [72, 160]                        0.00GiB mtp.2.ffn.shared_experts.w3.scale
+     1 F8_E4M3  [512, 5120]                      0.00GiB mtp.2.attn.wkv.weight
+     1 F8_E4M3  [8192, 4096]                     0.03GiB mtp.2.attn.wo_a.weight
+     1 F8_E4M3  [5120, 8192]                     0.04GiB mtp.2.attn.wo_b.weight
+     1 F8_E4M3  [1280, 5120]                     0.01GiB mtp.2.attn.wq_a.weight
+     1 F8_E4M3  [32768, 1280]                    0.04GiB mtp.2.attn.wq_b.weight
+     1 F8_E4M3  [2304, 5120]                     0.01GiB mtp.2.ffn.shared_experts.w1.weight
+     1 F8_E4M3  [5120, 2304]                     0.01GiB mtp.2.ffn.shared_experts.w2.weight
+     1 F8_E4M3  [2304, 5120]                     0.01GiB mtp.2.ffn.shared_experts.w3.weight
+   128 I8       [2304, 2560]                     0.70GiB mtp.2.ffn.experts.E.w1.weight
+   128 I8       [5120, 1152]                     0.70GiB mtp.2.ffn.experts.E.w2.weight
+   128 I8       [2304, 2560]                     0.70GiB mtp.2.ffn.experts.E.w3.weight
+     1 F8_E4M3  [384006168, 256]                91.55GiB layers.N.engram.embed.weight
+     1 F8_E8M0  [384006168, 8]                   2.86GiB layers.N.engram.embed.scale
+     2 BF16     [4, 5120]                        0.00GiB layers.N.engram.q_weight
+     2 BF16     [4, 5120]                        0.00GiB layers.N.engram.k_weight
+     2 F8_E4M3  [25600, 6144]                    0.29GiB layers.N.engram.wkv.weight
+     2 F8_E8M0  [800, 192]                       0.00GiB layers.N.engram.wkv.scale
+     1 F8_E4M3  [384016682, 256]                91.56GiB layers.N.engram.embed.weight
+     1 F8_E8M0  [384016682, 8]                   2.86GiB layers.N.engram.embed.scale
+total GiB 475.2408927306533

@@ -1,0 +1,11 @@
+# repo-wide; each configuration keeps its own .gitignore beside its files
+.claude/
+build/
+build-*/
+target/
+__pycache__/
+*.o
+*.so
+# never commit secrets
+*.key
+.env

@@ -1,0 +1,409 @@
+{
+ "about": "Agentic-edit tasks driven like pi 0.84.3 (pi -p --tools read,edit,write): its system prompt and tool definitions as captured from its requests, user turns as text blocks, tool results as pi's own texts. Files come from the repo at `commit` (checked by sha256) into a scratch workspace that stands in for `cwd` ({cwd} in the system prompt; {pi_dir}: where pi's docs are, a neutral install path); `setup` plants a change first. `checks`: a regex that must (want true) or must not match the file at the end.",
+ "license": "The system prompt and tool definitions are pi's (pi-coding-agent 0.84.3, MIT, Copyright (c) 2025 Mario Zechner): see THIRD_PARTY.md.",
+ "pi_version": "0.84.3",
+ "commit": "e522153",
+ "prefix": "ds41f-4xgx10-switchless/",
+ "cwd": "/src/dsgb10/ds41f-4xgx10-switchless",
+ "pi_dir": "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent",
+ "model": "deepseek-v4.1-flash-uncensored",
+ "max_completion_tokens": 16384,
+ "system": "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n- read: Read file contents\n- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n- write: Create or overwrite files\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n- Use read to examine files instead of cat or sed.\n- Use edit for precise changes (edits[].oldText must match exactly)\n- When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls\n- Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.\n- Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.\n- Use write only for new files or complete rewrites.\n- Be concise in your responses\n- Show file paths clearly when working with files\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {pi_dir}/README.md\n- Additional docs: {pi_dir}/docs\n- Examples: {pi_dir}/examples (extensions, custom tools, SDK)\n- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\nCurrent working directory: {cwd}",
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "read",
+    "description": "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+    "parameters": {
+     "type": "object",
+     "required": [
+      "path"
+     ],
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "Path to the file to read (relative or absolute)"
+      },
+      "offset": {
+       "type": "number",
+       "description": "Line number to start reading from (1-indexed)"
+      },
+      "limit": {
+       "type": "number",
+       "description": "Maximum number of lines to read"
+      }
+     }
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "edit",
+    "description": "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+    "parameters": {
+     "type": "object",
+     "required": [
+      "path",
+      "edits"
+     ],
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "Path to the file to edit (relative or absolute)"
+      },
+      "edits": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "required": [
+         "oldText",
+         "newText"
+        ],
+        "properties": {
+         "oldText": {
+          "type": "string",
+          "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."
+         },
+         "newText": {
+          "type": "string",
+          "description": "Replacement text for this targeted edit."
+         }
+        }
+       },
+       "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."
+      }
+     }
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "write",
+    "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+    "parameters": {
+     "type": "object",
+     "required": [
+      "path",
+      "content"
+     ],
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "Path to the file to write (relative or absolute)"
+      },
+      "content": {
+       "type": "string",
+       "description": "Content to write to the file"
+      }
+     }
+    },
+    "strict": false
+   }
+  }
+ ],
+ "sha256": {
+  "golden/cmp_drift.py": "dc379d561d157e59395abb88dca167d97439f45aa75cc205656162174c6fa12f",
+  "frontend/tools/fe_bench.py": "19bab7a9c5d11a8516c6b24bc161039754ac539ca7f1f53267ee373943f81beb",
+  "engine/server/npy.h": "83aa40918f2ef13ecb74b2785266a0d9984b57e3f1b01755d19069b6919f5c36",
+  "engine/server/run4.sh": "0267ddbc01889d1b1b22e9e9066943f29cfe89a40191b23ae1213492e76d127a",
+  "golden/doc_tokens.py": "9319e53d4168160a424e6f7f8335364aaa63c77379ae6d8ce7986fbc8cde75e0",
+  "engine/dspark/ref/verify_policy.py": "1ef30f04401039319f72827887f5d74da043cf94285bef91c36ef1ac44321a9e",
+  "frontend/src/guard.rs": "6d12f324ef23059e38efeba9bc38f48061338c0e53ba1f6dc33fc9736f0af7ab",
+  "golden/check_prose.py": "1620b41a2c1410c1c9797524a7cb6aa01c1105ac64182fe8bb9684f2e2d3d520",
+  "engine/dspark/ref/tree_costs.py": "48d1781fe61a219c85af5faa34baa27a5c08dfa49eacfb45754eb6596c5eaa7d",
+  "frontend/src/server.rs": "385ec7a16cf419941685961400e891b32b31f8443dfcf354bbce001273690373",
+  "golden/cut_long.py": "dcec4d53b3113255a6351aa3847313d1f1c4a365b795916ca933923849cb710a",
+  "golden/cmp_runs.py": "992dd0a6113ec35e62a5538c7c18ce6b8ae69f811df8eccff3e91e957fe68587"
+ },
+ "tasks": [
+  {
+   "id": "rename_helper",
+   "size": "small edit",
+   "prompt": "In golden/cmp_drift.py, rename the helper `rel` to `rel_error` and update every call to it.",
+   "files": [
+    "golden/cmp_drift.py"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "golden/cmp_drift.py",
+     "re": "def rel_error\\(",
+     "want": true
+    },
+    {
+     "path": "golden/cmp_drift.py",
+     "re": "\\brel\\(",
+     "want": false
+    }
+   ]
+  },
+  {
+   "id": "add_param",
+   "size": "small edit",
+   "prompt": "frontend/tools/fe_bench.py: give stream() a timeout parameter (default 600) and pass it to the HTTPConnection instead of the hard-coded 600.",
+   "files": [
+    "frontend/tools/fe_bench.py"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "frontend/tools/fe_bench.py",
+     "re": "def stream\\([^)]*timeout",
+     "want": true
+    },
+    {
+     "path": "frontend/tools/fe_bench.py",
+     "re": "timeout=timeout",
+     "want": true
+    }
+   ]
+  },
+  {
+   "id": "fix_comment",
+   "size": "tiny edit",
+   "prompt": "The comment on ival() in engine/server/npy.h doesn't describe what the function does. Fix the comment and nothing else.",
+   "files": [
+    "engine/server/npy.h"
+   ],
+   "setup": [
+    {
+     "path": "engine/server/npy.h",
+     "old": "// element i of an integer array, any width",
+     "new": "// element i of a float array, as a double"
+    }
+   ],
+   "checks": [
+    {
+     "path": "engine/server/npy.h",
+     "re": "float array, as a double",
+     "want": false
+    },
+    {
+     "path": "engine/server/npy.h",
+     "re": "int64_t ival\\(size_t i\\) const \\{",
+     "want": true
+    }
+   ]
+  },
+  {
+   "id": "env_override",
+   "size": "small edit",
+   "prompt": "In engine/server/run4.sh, let the environment override the three worker addresses (W1, W2 and W3), keeping the current addresses as the defaults.",
+   "files": [
+    "engine/server/run4.sh"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "engine/server/run4.sh",
+     "re": "\\$\\{W1:-10\\.0\\.0\\.4\\}",
+     "want": true
+    },
+    {
+     "path": "engine/server/run4.sh",
+     "re": "\\$\\{W2:-10\\.0\\.0\\.3\\}",
+     "want": true
+    },
+    {
+     "path": "engine/server/run4.sh",
+     "re": "\\$\\{W3:-10\\.0\\.0\\.2\\}",
+     "want": true
+    }
+   ]
+  },
+  {
+   "id": "usage_error",
+   "size": "small edit",
+   "prompt": "golden/doc_tokens.py fails with an IndexError when it is given too few arguments. Make it print its usage line and exit with status 2 instead.",
+   "files": [
+    "golden/doc_tokens.py"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "golden/doc_tokens.py",
+     "re": "len\\(sys\\.argv\\)",
+     "want": true
+    },
+    {
+     "path": "golden/doc_tokens.py",
+     "re": "(exit|SystemExit)\\(",
+     "want": true
+    }
+   ]
+  },
+  {
+   "id": "convert_loop",
+   "size": "medium edit",
+   "prompt": "In engine/dspark/ref/verify_policy.py, replace the nested loop that builds `surv` with a small helper function survival(s) that returns one row, and build `surv` with a list comprehension.",
+   "files": [
+    "engine/dspark/ref/verify_policy.py"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "engine/dspark/ref/verify_policy.py",
+     "re": "def survival\\(",
+     "want": true
+    },
+    {
+     "path": "engine/dspark/ref/verify_policy.py",
+     "re": "surv = \\[survival\\(",
+     "want": true
+    }
+   ]
+  },
+  {
+   "id": "rust_consts",
+   "size": "medium edit",
+   "prompt": "In frontend/src/guard.rs, move the LoopGuard default numbers (32, 256, 4, 64, 8 and 16) into named pub consts next to LINE_WINDOW_TOKENS, and use them in its Default impl.",
+   "files": [
+    "frontend/src/guard.rs"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "frontend/src/guard.rs",
+     "re": "ngram: 32,",
+     "want": false
+    },
+    {
+     "path": "frontend/src/guard.rs",
+     "re": "impl Default for LoopGuard",
+     "want": true
+    }
+   ]
+  },
+  {
+   "id": "extract_function",
+   "size": "medium edit",
+   "prompt": "In golden/check_prose.py, move the optional tokenizer loading into a function load_tokenizer() that returns the tokenizer, or None when it can't be loaded, and use it where tok is set.",
+   "files": [
+    "golden/check_prose.py"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "golden/check_prose.py",
+     "re": "def load_tokenizer\\(",
+     "want": true
+    },
+    {
+     "path": "golden/check_prose.py",
+     "re": "tok = load_tokenizer\\(",
+     "want": true
+    }
+   ]
+  },
+  {
+   "id": "docstrings",
+   "size": "medium edit",
+   "prompt": "Add a one-line docstring to each function in engine/dspark/ref/tree_costs.py that doesn't have one.",
+   "files": [
+    "engine/dspark/ref/tree_costs.py"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "engine/dspark/ref/tree_costs.py",
+     "re": "def engine_points\\(log\\):\\n\\s+\"\"\"",
+     "want": true
+    },
+    {
+     "path": "engine/dspark/ref/tree_costs.py",
+     "re": "def bench_chain_points\\(logs\\):\\n\\s+\"\"\"",
+     "want": true
+    },
+    {
+     "path": "engine/dspark/ref/tree_costs.py",
+     "re": "def main\\(\\):\\n\\s+\"\"\"",
+     "want": true
+    }
+   ]
+  },
+  {
+   "id": "two_file_rename",
+   "size": "big read, small edits",
+   "prompt": "Rename the constant LINE_WINDOW_TOKENS in frontend/src/guard.rs to LOOP_LINE_WINDOW_TOKENS, and update its uses in frontend/src/server.rs too.",
+   "files": [
+    "frontend/src/guard.rs",
+    "frontend/src/server.rs"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "frontend/src/guard.rs",
+     "re": "\\bLINE_WINDOW_TOKENS",
+     "want": false
+    },
+    {
+     "path": "frontend/src/server.rs",
+     "re": "\\bLINE_WINDOW_TOKENS",
+     "want": false
+    },
+    {
+     "path": "frontend/src/guard.rs",
+     "re": "pub const LOOP_LINE_WINDOW_TOKENS",
+     "want": true
+    },
+    {
+     "path": "frontend/src/server.rs",
+     "re": "LOOP_LINE_WINDOW_TOKENS\\)",
+     "want": true
+    }
+   ]
+  },
+  {
+   "id": "rewrite_small",
+   "size": "full rewrite (write)",
+   "prompt": "Rewrite golden/cut_long.py to use argparse (src, out and an optional n) and a main() function. Write out the whole file.",
+   "files": [
+    "golden/cut_long.py"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "golden/cut_long.py",
+     "re": "argparse",
+     "want": true
+    },
+    {
+     "path": "golden/cut_long.py",
+     "re": "def main\\(",
+     "want": true
+    }
+   ]
+  },
+  {
+   "id": "rewrite_medium",
+   "size": "full rewrite (write)",
+   "prompt": "Rewrite golden/cmp_runs.py with functions, a main() and argparse: the two run directories, and a --top option for the 5 in top-5. Keep its output the same. Write out the whole file.",
+   "files": [
+    "golden/cmp_runs.py"
+   ],
+   "setup": [],
+   "checks": [
+    {
+     "path": "golden/cmp_runs.py",
+     "re": "argparse",
+     "want": true
+    },
+    {
+     "path": "golden/cmp_runs.py",
+     "re": "def main\\(",
+     "want": true
+    },
+    {
+     "path": "golden/cmp_runs.py",
+     "re": "--top",
+     "want": true
+    }
+   ]
+  }
+ ]
+}

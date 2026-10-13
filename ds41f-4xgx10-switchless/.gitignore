@@ -1,0 +1,21 @@
+# large or regenerable artefacts
+golden/*.pt
+golden/*.log
+ref/techreport.txt
+ref/inventory.json
+ref/ext/
+ref/inference/examples/
+micro/bw
+micro/mma
+micro/rdma_lat
+build/
+build-*/
+target/
+.claude/
+*.o
+*.so
+__pycache__/
+# never commit secrets (API key files, .env files)
+*.key
+.env
+micro/hostmem

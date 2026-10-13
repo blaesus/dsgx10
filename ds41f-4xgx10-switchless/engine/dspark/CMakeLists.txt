@@ -1,0 +1,10 @@
+add_library(dspark STATIC dspark.cu)
+target_include_directories(dspark PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(dspark PUBLIC dsattn dsk_kernels dsw_loader)
+
+add_executable(dspark_tests tests/dspark_tests.cu)
+target_link_libraries(dspark_tests dspark)
+add_executable(bench_dspark tests/bench_dspark.cu)
+target_link_libraries(bench_dspark dspark)
+add_executable(lite_tests tests/lite_tests.cu)
+target_link_libraries(lite_tests dspark)
