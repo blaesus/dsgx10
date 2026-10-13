@@ -67,6 +67,7 @@ void copy_rows(const uint16_t* in, size_t ldi, uint16_t* out, size_t ldo, int n,
 // parameters; the same token on every rank. Out: outs[in->step % kOutSlots] (seq written last when publish, else
 // left to ops::publish) and the tokens in fb.
 void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in, SampleOut* outs, int32_t* fb,
-            uint32_t* counter, cudaStream_t s, bool publish, int max_rows);
+            uint32_t* counter, cudaStream_t s, bool publish, int max_rows, const uint32_t* ctl = nullptr);
+// (ctl: rank 0's control word in mapped host memory, null: 0; every rank's SampleOut::ctl gets rank 0's)
 
 }  // namespace glm::model::ops

@@ -34,7 +34,9 @@ const char* kclass_name(int c) {
 
 Model::Impl::Impl(int r, const Options& opts) : rank(r), opt(opts) {
   if (opt.max_ctx < 1 || opt.max_ctx > (1 << 20)) die("model: max_ctx %d (1 .. 1,048,576)", opt.max_ctx);
-  if (opt.slots < 1 || opt.slots > kMaxSess) die("model: %d slots (1 .. %d)", opt.slots, kMaxSess);
+  if (opt.page < 0 || opt.page > opt.max_ctx) die("model: pages of %d positions (0 .. max_ctx %d)", opt.page, opt.max_ctx);
+  if (opt.slots < 1 || opt.slots > (opt.page ? kMaxPages : kMaxSess))
+    die("model: %d slots (1 .. %d)", opt.slots, opt.page ? kMaxPages : kMaxSess);
   if (opt.drafts < 0 || opt.drafts > kMaxDrafts) die("model: %d draft passes (0 .. %d)", opt.drafts, kMaxDrafts);
   if (opt.prefill_rows < 16 || opt.prefill_rows > kMaxChunk || opt.prefill_rows % 16)
     die("model: prefill chunks of %d rows (16 .. %d, a multiple of 16)", opt.prefill_rows, kMaxChunk);
@@ -52,16 +54,9 @@ Model::Impl::Impl(int r, const Options& opts) : rank(r), opt(opts) {
   for (auto& e : ev_end) CUDA_CHECK(cudaEventCreate(&e));
   for (auto& e : ev_pf) CUDA_CHECK(cudaEventCreate(&e));
 
-  // caches: every slot holds max_ctx positions of every layer (and the MTP layer)
-  const size_t P = (size_t)opt.slots * opt.max_ctx;
-  for (int l = 0; l < kCacheLayers; ++l) kv[l] = dalloc<uint16_t>(P * ::glm::kLat);
-  for (int i = 0; i < kIdxCaches; ++i) {
-    IdxCache& c = ik[i];
-    c.fp8 = opt.fp8_index_keys;
-    c.slot_stride = opt.max_ctx;
-    c.k = dalloc<uint8_t>(P * (c.fp8 ? ::glm::kIdxDim : ::glm::kIdxEntryBf16));
-    if (c.fp8) c.ks = dalloc<float>(P);
-  }
+  stride = opt.page ? (size_t)opt.page : (size_t)opt.max_ctx;
+  alloc_caches();
+  ctl_h = halloc<uint32_t>(1);
 
   const int R = kMaxRows;
   h = dalloc<uint16_t>((size_t)R * kDim);
@@ -100,8 +95,6 @@ Model::Impl::Impl(int r, const Options& opts) : rank(r), opt(opts) {
   m_cand = dalloc<comm::glm::Cand>(R);
   m_best = dalloc<comm::glm::Cand>(R);
   m_draft = dalloc<int32_t>((size_t)kMaxDrafts * R);
-  m_pend = dalloc<uint16_t>((size_t)opt.slots * kDim);
-  pend_pos.assign(opt.slots, -1);
 
   in_h = halloc<ops::StepIn>(ops::kInSlots);
   in_d = dalloc<ops::StepIn>(1);
@@ -109,6 +102,33 @@ Model::Impl::Impl(int r, const Options& opts) : rank(r), opt(opts) {
   fb = dalloc<int32_t>(kMaxRows);
   out_h = halloc<SampleOut>(ops::kOutSlots);
   samp_ctr = dalloc<uint32_t>(1);
+}
+
+// caches: every slot holds `stride` positions of every layer (and the MTP layer); a paged session runs on across
+// the slots after its own
+void Model::Impl::alloc_caches() {
+  if (st) CUDA_CHECK(cudaStreamSynchronize(st));
+  for (auto& p : kv) {
+    if (p) CUDA_CHECK(cudaFree(p));
+    p = nullptr;
+  }
+  for (IdxCache& c : ik) {
+    if (c.k) CUDA_CHECK(cudaFree(c.k));
+    if (c.ks) CUDA_CHECK(cudaFree(c.ks));
+    c = IdxCache{};
+  }
+  if (m_pend) CUDA_CHECK(cudaFree(m_pend));
+  const size_t P = pool_positions();
+  for (int l = 0; l < kCacheLayers; ++l) kv[l] = dalloc<uint16_t>(P * ::glm::kLat);
+  for (int i = 0; i < kIdxCaches; ++i) {
+    IdxCache& c = ik[i];
+    c.fp8 = opt.fp8_index_keys;
+    c.slot_stride = stride;
+    c.k = dalloc<uint8_t>(P * (c.fp8 ? ::glm::kIdxDim : ::glm::kIdxEntryBf16));
+    if (c.fp8) c.ks = dalloc<float>(P);
+  }
+  m_pend = dalloc<uint16_t>((size_t)opt.slots * kDim);
+  pend_pos.assign(opt.slots, -1);
 }
 
 Model::Impl::~Impl() {
@@ -342,7 +362,7 @@ void Model::Impl::forward(int R, uint32_t flags, Sink* sink) {
   mark(kKHead, -1);
   if (flags & kFlagDump) dump_rows(sink, -1, "final", pos, R, xn, kEmbRow);
   if (flags & kFlagLogits) gather_logits(sink, logits, pos, R, false);
-  ops::sample(ch, logits, rank * kVocabRank, in_d, out_h, fb, samp_ctr, st, opt.drafts == 0, R);
+  ops::sample(ch, logits, rank * kVocabRank, in_d, out_h, fb, samp_ctr, st, opt.drafts == 0, R, ctl_h);
   mark(kKSample, -1);
   if (opt.drafts) drafts(R, flags, sink);
 }
@@ -367,7 +387,8 @@ uint64_t Model::Impl::launch(const Batch& b, Sink* sink) {
   if (R < 1 || R > kMaxRows || b.nsess < 1 || b.nsess > kMaxSess) die("model: a step of %d rows, %d sessions", R, b.nsess);
   for (int r = 0; r < R; ++r) {
     const bool same = r > 0 && b.sess[r] == b.sess[r - 1];
-    bool ok = b.pos[r] >= 0 && b.pos[r] < opt.max_ctx && b.slot[r] >= 0 && b.slot[r] < opt.slots && b.sess[r] >= 0 &&
+    bool ok = b.pos[r] >= 0 && b.pos[r] < opt.max_ctx && b.slot[r] >= 0 && b.slot[r] < opt.slots &&
+              (size_t)b.slot[r] * stride + b.pos[r] + opt.drafts < pool_positions() && b.sess[r] >= 0 &&
               b.sess[r] < b.nsess;
     if (r > 0 && !same) ok &= b.sess[r] == b.sess[r - 1] + 1;
     if (same) ok &= b.slot[r] == b.slot[r - 1] && b.pos[r] == b.pos[r - 1] + 1;
@@ -495,7 +516,7 @@ std::vector<uint64_t> Model::cache_hashes(int slot, int n) const {
   for (int l = 0; l < kCacheLayers; ++l) {
     const size_t bytes = (size_t)n * ::glm::kLat * 2;
     b.resize(bytes);
-    CUDA_CHECK(cudaMemcpy(b.data(), I.kv[l] + (size_t)slot * I.opt.max_ctx * ::glm::kLat, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b.data(), I.kv[l] + (size_t)slot * I.stride * ::glm::kLat, bytes, cudaMemcpyDeviceToHost));
     uint64_t hsh = fnv(b.data(), bytes, 0xcbf29ce484222325ull);
     if (full_layer(l)) {
       const ::glm::IdxCache c = I.ik_of(l);
@@ -515,6 +536,85 @@ std::vector<uint16_t> Model::last_hidden(int R) const {
   CUDA_CHECK(cudaMemcpy(v.data(), d_->xn, v.size() * 2, cudaMemcpyDeviceToHost));
   return v;
 }
+// ---- serving ----------------------------------------------------------------------------------------------------
+
+void Model::set_ctl(uint32_t v) { __atomic_store_n(d_->ctl_h, v, __ATOMIC_RELEASE); }
+void Model::prefill_init() { d_->prefill_alloc(); }
+void Model::resize_slots(int slots) {
+  Impl& I = *d_;
+  if (slots < 1 || slots > (I.opt.page ? kMaxPages : kMaxSess)) die("model: resize to %d slots", slots);
+  drain();
+  for (auto& g : I.graphs) CUDA_CHECK(cudaGraphExecDestroy(g.second));
+  I.graphs.clear();
+  I.opt.slots = slots;
+  I.alloc_caches();
+}
+size_t Model::cache_pos_bytes() const {
+  const Impl& I = *d_;
+  size_t b = (size_t)kCacheLayers * ::glm::kLat * 2;
+  for (const IdxCache& c : I.ik) b += c.fp8 ? ::glm::kIdxDim + 4 : ::glm::kIdxEntryBf16;
+  return b;
+}
+namespace {
+// n elements of `width` bytes from src to dst positions apart in one array (overlap allowed): pieces no longer than
+// the distance, front to back when moving down, back to front when moving up
+void move_entries(uint8_t* base, size_t dst, size_t src, size_t n, size_t width, cudaStream_t s) {
+  if (dst == src || n == 0) return;
+  const size_t d = dst > src ? dst - src : src - dst, piece = std::min(n, d);
+  for (size_t k = 0; k < n; k += piece) {
+    const size_t m = std::min(piece, n - k), off = dst < src ? k : n - k - m;
+    CUDA_CHECK(cudaMemcpyAsync(base + (dst + off) * width, base + (src + off) * width, m * width,
+                               cudaMemcpyDeviceToDevice, s));
+  }
+}
+}  // namespace
+void Model::cache_copy(int dst, int src, int n) {
+  Impl& I = *d_;
+  const size_t a = (size_t)dst * I.stride, b = (size_t)src * I.stride;
+  if (dst < 0 || src < 0 || n < 0 || std::max(a, b) + n > I.pool_positions()) die("model: cache_copy(%d, %d, %d)", dst, src, n);
+  for (int l = 0; l < kCacheLayers; ++l)
+    move_entries(reinterpret_cast<uint8_t*>(I.kv[l]), a, b, n, ::glm::kLat * 2, I.st);
+  for (IdxCache& c : I.ik) {
+    move_entries(c.k, a, b, n, c.fp8 ? ::glm::kIdxDim : ::glm::kIdxEntryBf16, I.st);
+    if (c.fp8) move_entries(reinterpret_cast<uint8_t*>(c.ks), a, b, n, 4, I.st);
+  }
+  if (dst != src) I.pend_pos.at(dst) = -1;
+}
+namespace {
+template <class F>
+void each_cache(const Model::Impl& I, F&& f) {  // f(device base, entry bytes) in cache_get's order
+  for (int l = 0; l < kCacheLayers; ++l) f(reinterpret_cast<uint8_t*>(I.kv[l]), (size_t)::glm::kLat * 2);
+  for (const IdxCache& c : I.ik) f(c.k, c.fp8 ? (size_t)::glm::kIdxDim : (size_t)::glm::kIdxEntryBf16);
+  for (const IdxCache& c : I.ik)
+    if (c.fp8) f(reinterpret_cast<uint8_t*>(c.ks), (size_t)4);
+}
+}  // namespace
+void Model::cache_get(int slot, int a, int n, void* host, int block) const {
+  const Impl& I = *d_;
+  const size_t p0 = (size_t)slot * I.stride + a;
+  if (slot < 0 || a < 0 || n < 0 || n > block || p0 + n > I.pool_positions()) die("model: cache_get(%d, %d, %d)", slot, a, n);
+  CUDA_CHECK(cudaStreamSynchronize(I.st));
+  uint8_t* h = static_cast<uint8_t*>(host);
+  each_cache(I, [&](uint8_t* base, size_t w) {
+    if (n) CUDA_CHECK(cudaMemcpyAsync(h, base + p0 * w, (size_t)n * w, cudaMemcpyDeviceToHost, I.st));
+    h += (size_t)block * w;
+  });
+  CUDA_CHECK(cudaStreamSynchronize(I.st));
+}
+void Model::cache_put(int slot, int a, int n, const void* host, int block) {
+  Impl& I = *d_;
+  const size_t p0 = (size_t)slot * I.stride + a;
+  if (slot < 0 || a < 0 || n < 0 || n > block || p0 + n > I.pool_positions()) die("model: cache_put(%d, %d, %d)", slot, a, n);
+  drain();
+  const uint8_t* h = static_cast<const uint8_t*>(host);
+  each_cache(I, [&](uint8_t* base, size_t w) {
+    if (n) CUDA_CHECK(cudaMemcpyAsync(base + p0 * w, h, (size_t)n * w, cudaMemcpyHostToDevice, I.st));
+    h += (size_t)block * w;
+  });
+  CUDA_CHECK(cudaStreamSynchronize(I.st));
+  I.pend_pos.at(slot) = -1;
+}
+
 void Model::drain() {
   if (d_->n_steps) d_->wait(d_->n_steps - 1);
   CUDA_CHECK(cudaStreamSynchronize(d_->st));

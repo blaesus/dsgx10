@@ -243,7 +243,8 @@ void Model::Impl::mtp_fill(int sl, int a, int M) {
 
 uint64_t Model::Impl::prefill(int sl, int a, int M, const int32_t* tokens, const Sampling* sp, uint32_t flags, Sink* sink) {
   if (!bound) die("model: prefill before bind");
-  if (sl < 0 || sl >= opt.slots || a < 0 || M < 1 || a + M > opt.max_ctx - kMaxDrafts)
+  if (sl < 0 || sl >= opt.slots || a < 0 || M < 1 || a + M > opt.max_ctx - kMaxDrafts ||
+      (size_t)sl * stride + a + M + opt.drafts > pool_positions())
     die("model: prefill of positions [%d, %d) in slot %d (max_ctx %d)", a, a + M, sl, opt.max_ctx);
   prefill_alloc();
   if (n_steps) wait(n_steps - 1);  // the steps queued before have finished with the shared buffers
@@ -267,7 +268,7 @@ uint64_t Model::Impl::prefill(int sl, int a, int M, const int32_t* tokens, const
     ::glm::GemvSeg s;
     s.w = head, s.n = kVocabRank, s.y = logits, s.ldy = kVocabRank;
     ::glm::gemv(false, xn, kDim, 1, kDim, &s, 1, GemvOut::kF32, 1, st);
-    ops::sample(ch, logits, rank * kVocabRank, in_d, out_h, fb, samp_ctr, st, opt.drafts == 0, 1);
+    ops::sample(ch, logits, rank * kVocabRank, in_d, out_h, fb, samp_ctr, st, opt.drafts == 0, 1, ctl_h);
     if (opt.drafts) {
       drafts(1, 0, nullptr);
       pend_pos[sl] = -1;

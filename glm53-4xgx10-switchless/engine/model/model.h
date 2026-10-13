@@ -28,6 +28,7 @@ namespace glm::model {
 
 inline constexpr int kTopLogprobs = 20;  // top logprobs a row, at most
 inline constexpr int kMaxDrafts = 4;     // chained MTP draft passes a step, at most
+inline constexpr int kMaxPages = 65536;  // Options::slots with paged caches (Options::page), at most
 
 // How a session's rows are sampled; every rank must pass the same.
 struct Sampling {
@@ -54,6 +55,7 @@ struct SampleOut {
   int32_t top_id[kMaxRows][kTopLogprobs];
   float top_lp[kMaxRows][kTopLogprobs];
   int32_t draft[kMaxRows][kMaxDrafts];  // pass k's greedy draft for row r (the token after position pos[r] + k + 1)
+  uint32_t ctl;  // rank 0's control word as the step's sampler read it (Model::set_ctl), the same on every rank
 };
 
 // A step: R rows; row r is position pos[r] of the session in slot slot[r], fed tokens[r] (>= 0, or -1 - j: row j
@@ -81,6 +83,11 @@ struct Sink {
 struct Options {
   int max_ctx = 65536;   // positions a slot's caches hold (<= the RoPE table's 1,048,576)
   int slots = 1;         // session slots: each one a whole cache of max_ctx positions
+  // Positions from one slot's caches to the next (0: max_ctx, a whole cache a slot). With page < max_ctx the caches
+  // are a pool of `slots` pages (at most kMaxPages) of `page` positions: a session in slot s runs on into pages
+  // s + 1, s + 2, ... as far as its positions go (position p of slot s is pool position s * page + p), so a server
+  // gives each session a run of pages of its own (engine/server, docs/serving.md).
+  int page = 0;
   bool fp8_index_keys = false;  // the indexer keys as e4m3 + a scale (132 B), not BF16 (docs/attention.md)
   bool graphs = true;    // replay steps as one CUDA graph per row count (eager steps: flags, profile)
   bool pdl = true;       // programmatic dependent launch between the step's kernels
@@ -144,6 +151,25 @@ class Model {
                    Sink* sink = nullptr);
   // Forget slot's MTP pending row (a new sequence in the slot).
   void reset_slot(int slot);
+
+  // ---- serving (engine/server, docs/serving.md) ----
+  // Rank 0's control word: every step's sampler reads it when it runs and hands it to every rank (SampleOut::ctl),
+  // so that a decode loop running ahead of the host stops after the same step on all ranks (a cancel, a pause).
+  void set_ctl(uint32_t v);
+  // The prefill path's buffers now, not at the first prefill (a server sizes its cache pool after them).
+  void prefill_init();
+  // The caches again with `slots` slots (pages), contents zeroed: before anything is kept in them (drops the
+  // captured graphs and every slot's MTP pending row). Every rank must make the same call.
+  void resize_slots(int slots);
+  // Bytes one position of a slot's caches takes on this rank: every layer's KV entry, the index keys (and scales).
+  size_t cache_pos_bytes() const;
+  // Positions [0, n) of slot src's caches to slot dst's (queued on the model's stream; the two ranges may overlap).
+  void cache_copy(int dst, int src, int n);
+  // Positions [a, a + n) of slot's caches to / from host memory (pinned for speed): cache by cache (layers 0-78's
+  // KV, then the index keys, then their scales), each a block of `block` >= n positions starting at the block's
+  // first position; cache_pos_bytes() * block bytes in all. Synchronous.
+  void cache_get(int slot, int a, int n, void* host, int block) const;
+  void cache_put(int slot, int a, int n, const void* host, int block);
 
   // The GPU time of step n (one of the last 4 launched; waits for it), and of the last prefill call.
   float gpu_ms(uint64_t n) const;
