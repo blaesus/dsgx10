@@ -51,6 +51,23 @@ struct SpecCfg {
   float step_ms[ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};  // 0..5 drafts
 };
 
+// A batch spec step (docs/batching.md, B3: drafts across sessions; Model::launch_spec_batch and
+// launch_verify_batch): n entries, each one session in a slot of its own, taking part when on[k]. In a
+// given step entry k is one row, token[k] at pos0[k]; in a verify step its rows are what the step before
+// chose for it (its bonus token, then at most cap[k] drafts, every row below pos_end[k], thresh[k] its
+// kGateThresh threshold; cfg's gate, step_ms, force and probe serve every entry, its thresh, max_drafts
+// and pos_end are unused). The entries on, in entry order, make the step's rows; the caller keeps their
+// next rows (1 + cap[k] each) within kMaxRows. Every rank must pass the same.
+struct SpecBatch {
+  int n = 0;
+  int32_t on[ops::kMaxSess] = {}, slot[ops::kMaxSess] = {}, token[ops::kMaxSess] = {}, pos0[ops::kMaxSess] = {};
+  int32_t cap[ops::kMaxSess] = {}, pos_end[ops::kMaxSess] = {};
+  float thresh[ops::kMaxSess] = {};
+  Sampling sp[ops::kMaxSess];
+  SpecCfg cfg;
+  int pos_bound = 0;  // launch_verify_batch: the rows' last position at most (the context bucket)
+};
+
 // One step, as rank 0 decided it (the golden and bench modes: every rank receives the same).
 struct Ctl {
   int32_t op = 0;     // kOpStep / kOpStop
@@ -168,6 +185,19 @@ class Model {
   bool spec() const;
   uint64_t launch_spec(int R, int pos0, const int32_t* tokens, const Sampling& sp, const SpecCfg& c);
   uint64_t launch_verify(const Sampling& sp, const SpecCfg& c, int pos_bound);
+  // B3 (docs/batching.md): drafts across sessions, a spec step of several sessions' rows (SpecBatch;
+  // Options::slots > 1). launch_spec_batch: a given step, one row per entry on; launch_verify_batch: the
+  // rows the step before chose for each entry on (queued before it ends). The step samples its rows with
+  // the verdicts per entry and runs each entry's draft pass in its own slot; every row computes what it
+  // would in a step of its session alone, bit for bit. SampleOut: sess_* per entry (its rows, the tokens
+  // it emits), next_s* for the step after (0 rows: the entry was off). spec_batch_entries(): entries a
+  // batch step takes at most (0 without DSpark or slots).
+  int spec_batch_entries() const;
+  uint64_t launch_spec_batch(const SpecBatch& b);
+  uint64_t launch_verify_batch(const SpecBatch& b);
+  // engram_late() of a batch verify step: its rows as the device laid them out (the entries on in entry
+  // order, each its next_s* of the step before): their tokens, positions and slots.
+  void engram_late_rows(int R, const int32_t* tokens, const int32_t* pos, const int32_t* slot);
   // Spin until step n's sample is in. The result stays valid until step n + ops::kOutSlots is launched.
   const SampleOut& wait(uint64_t n);
   // Rank 0's control word: every step's sampling reads it when it runs and hands it to every rank
