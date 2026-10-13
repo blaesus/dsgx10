@@ -174,6 +174,12 @@ agentic use are, until attention at long context and Engram reads set the limit.
     as a 1-bit code over two neighbours and the head's exponents as 4-bit offsets per tile, both made
     and checked at load ([engine § Lossless weight compression](docs/engine.md#lossless-weight-compression-a-feasibility-study-2026-10-12)).
     Only the drafter may be approximated (its FP8 head copy), since every draft is verified.
+12. **Two to four streams at once, and one stream first** (the owner, 2026-10-13: "Optimise for small
+    multi-stream (up to 4). I want to keep single stream as fast as well. Be careful if single stream
+    suffers more than 2%"). Sessions decode together with drafts, each row computing what it would
+    alone ([docs/batching.md, B3](docs/batching.md#b3-the-build-2026-10-13)). A lone session runs the
+    one-session path, untouched, and no change may cost it more than 2 % (the project's own bar stays
+    the run-to-run spread, A/B in both orders).
 
 ## Risks and open questions
 

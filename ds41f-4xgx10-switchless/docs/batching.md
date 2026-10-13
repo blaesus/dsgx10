@@ -42,6 +42,8 @@ any kernel was written. When it was written the engine ran one request at a time
   agent's half (9–16 rows in groups of 8) are on master. The runner's half (step buffers and graphs
   past 8 rows) is not wired for B3's sake. Drafts of one session past 8 rows (prompt lookup) would
   need it, and `kMaxSessRows` past 8, which decode_prep's race at 16 rows of one session forbids today.
+- **B3 is being built** (2026-10-13, [B3: the build](#b3-the-build-2026-10-13)): the owner asked for
+  2–4 streams at once, with one stream kept as fast as it is, within 2 %. B4's runner half goes with it.
 
 ## Why
 
@@ -581,3 +583,78 @@ So:
 
 If several agents at once become common, the first step is B3 for two sessions within 8 rows
 (d ≤ 3): 21–28 % more, with no runner work past 8 rows.
+That came on 2026-10-13: [B3: the build](#b3-the-build-2026-10-13).
+
+## B3: the build (2026-10-13)
+
+The owner asked for it on 2026-10-13: "Optimise for small multi-stream (up to 4). I want to keep single
+stream as fast as well. Be careful if single stream suffers more than 2%." So B3 is built, for two to
+four sessions, under two bars:
+- **One session's speed.** The project's bar stays: the 1k golden run at k = 1 and with drafts, and
+  bench.py's prompts, within the run-to-run spread of master in an A/B run in both orders (ABBA). The
+  owner's limit is 2 %: a build that costs a lone session more than that is not merged, whatever it
+  gains for several.
+- **Outputs.** Bit-identical to each session's run alone, tokens and log-probabilities, in every batch,
+  and every reference hash ([golden/README.md](../golden/README.md)).
+
+### Design
+
+1. **A path of its own.** The one-session speculative path (`spec_graph`, `k_spec_in`, `k_spec_next`,
+   `launch_spec` / `launch_verify`, `spec_loop`) stays as it is, and a lone session never runs the
+   batch code: that is how one stream keeps its speed. The batch path adds `spec_batch_graph(ctx)`,
+   `launch_spec_batch` / `launch_verify_batch` (the model) and `spec_batch_loop` (cmd.cpp). serve's
+   `decode_batch` takes it when drafts are on and the budget gives every session at least one draft;
+   else B2's plain batch. When one session is left decoding, it pauses and goes on alone with drafts,
+   as B2's `kBatchSolo` does.
+2. **Spec state per entry.** `SpecState ss[kMaxSess]` on the device, one per batch entry, and each
+   entry's first row in the step (`row0[kMaxSess]`, device, written by the step's `k_spec_in_batch`).
+   `StepIn` gains, per entry: whether it is in the step (`sess_on`, host-written for every launch; an
+   entry that ended is off from the step after the one already queued), its slot (`sess_slot`), its
+   gate's threshold and cap (`sthresh`, `scap`). A verify step's rows are laid out on the device: the
+   entries on, in order, each its `next_rows` rows (its bonus token, then its drafts), with `slot[r]`
+   and `sess[r]` per row; the switch takes the total.
+3. **The forward.** The spec switch's bodies, unchanged: `forward_rows` reads the slot table from
+   `StepIn`, as B2's batch steps do. A session's rows stay within `kMaxSessRows`.
+4. **Verdicts per entry** (`k_sample`). Entry k's rows are [row0, row0 + n): row row0 is final, and row
+   row0 + j + 1 is accepted while its token is row row0 + j's sample; the entry's count, pos0 and bonus
+   go to `ss[k]`. `SampleOut` keeps `row[r]` as row r's sample (today's layout) and adds, per entry,
+   the rows it emits (`sess_rows`), its first row (`sess_row0`), and the next step's rows, pos0 and
+   tokens.
+5. **The draft passes.** One per entry on: the accept of its final rows from its row0 (`Draft::accept`
+   takes a device row offset), then its draft from its bonus, each pass under a conditional node of
+   the graph (`sess_on[k]`) with a per-entry slot table (device, host-filled when the loop starts).
+   That is today's pass, run per session, so the drafts are the same bits as alone. One pass over
+   every anchor is phase 2.
+6. **The gate.** Per entry, today's gates (thresh, ratio, marginal) under its cap. The caps come from
+   the budget: cap = min(5, (kMaxRows − S) / S) with S entries on. The marginal gate across sessions
+   (the batch's tokens per ms against a row's marginal cost) is phase 2.
+7. **Engram.** Late lookups per entry, each in its own slot, as `engram_late_batch` does for B2.
+8. **The loop** (`spec_batch_loop`). Per entry: the tokens it emits, its stop ids, max_new, its slot's
+   cancel bit, `kCtlPause`, the context's end. An entry that ends keeps its rows in the step already
+   queued (their tokens dropped, their KV written past its end, as today), and is off from the step
+   after. `SpecRate` per entry; `Flight` carries it across runs, as it does for slices.
+9. **The budget** is `kMaxRows`: 8 today, 16 with B4's runner half.
+
+### B4's runner half
+
+`kMaxRows` 16 (config.h) with `kMaxSessRows` still 8: the step buffers (activations, split-K partials,
+the gathered logits), graphs for 9–16 rows, the `StepIn` / `SampleOut` rings, the sampler's
+candidates, the Engram segments. The attention and kernel halves are on master. The bench mode covers
+9–16 rows as runs of 2–4 sessions (`--bench-groups`); a step with more than 8 rows of one session is
+refused.
+
+### Checks
+
+- The reference hashes in batches with drafts (`--mode batch --spec`): 1k febc7dc54ee40a39, 16k CED
+  81f772ab79a950e4 and sampled a8f7a08f8cd1c5e8, in every slot and mixed.
+- batch_test.py with drafts (greedy with top logprobs, sampled, staggered, cancels, stop ids, kept
+  sessions): 0 failed. serve_test `--ced` 17 of 17, slice_test, disk_test, kept_test.
+- Throughput at 2, 3 and 4 sessions, bench.py's four contents, against B1 (101 tok/s agentic) and B2
+  (86.2 / 108.7 / 119.0 in all).
+- One session, ABBA against master: the 1k golden run at k = 1 and with drafts (ms per token) and
+  bench.py's prompts. Within the spread, and never more than 2 % slower.
+
+### Where it is
+
+- 2026-10-13 14:10: the design above; the runner builds B3 and B4's runner half on two branches, with no
+  ring time until both are built (the kit serves an agent; its interruptions come last).
