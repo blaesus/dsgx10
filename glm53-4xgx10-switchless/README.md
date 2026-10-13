@@ -17,9 +17,14 @@ Scouting done on 2026-10-13; the plan is in [DESIGN.md](DESIGN.md). Nothing runs
   weight budget of 87 GiB a rank (the KV cache is 52.7 KiB a token in FP8 and every rank holds it). The
   routed experts go to ~3.75 bits a weight in a code of our own, made from the BF16 master, and the
   non-expert weights to zai's own FP8: ~86 GiB a rank, a decode floor of ~32 ms a token before drafting.
-- **The leading code is a trellis** (EXL3/QTIP family): a data-free 3.42 bpw trellis of this model scores
-  inside NVFP4's quality range at three quarters of the bytes. A 3-bit code on the E2M1 grid is the fallback.
-  The first experiment, a decode-GEMV microbenchmark, decides.
+- **The code is a 3-bit E2M1-grid code mixed with NVFP4** ([experiment 1](docs/findings.md), 2026-10-13 21:38):
+  on the GB10's 48 SMs a faithful EXL3 trellis decode GEMV is bound by instruction issue at 55–75 % of the
+  bandwidth floor, while NVFP4 reaches 95–96 % and the E2M1-subset code 91–93 %; only the E2M1-grid codes have the
+  FP4 tensor-core path (429 TFLOPS against 107 for bf16). Trellis, whose quality per bit is better on the
+  published evidence, stays open behind a tuned kernel and the KL bake-off.
+- **Built so far:** the front-end `glmfront` (tokenizer and template byte-exact against the reference,
+  [docs/protocol.md](docs/protocol.md)); the microbenchmarks (`micro/`). In progress: the CPU reference
+  (experiment 2), the quantiser prototype on two layers' BF16 experts, the expert kernels, the attention side.
 - **Exactness** for a quantised model: a hashed artefact made reproducibly from the hashed master, a written
   numerics contract with a torch reference the engine must agree with, and quality against the master on one
   harness with NVFP4-as-published as the anchor.
