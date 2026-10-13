@@ -42,8 +42,10 @@ any kernel was written. When it was written the engine ran one request at a time
   agent's half (9–16 rows in groups of 8) are on master. The runner's half (step buffers and graphs
   past 8 rows) is not wired for B3's sake. Drafts of one session past 8 rows (prompt lookup) would
   need it, and `kMaxSessRows` past 8, which decode_prep's race at 16 rows of one session forbids today.
-- **B3 is being built** (2026-10-13, [B3: the build](#b3-the-build-2026-10-13)): the owner asked for
-  2–4 streams at once, with one stream kept as fast as it is, within 2 %. B4's runner half goes with it.
+- **B3 is built and measured** (2026-10-13, [B3: the build](#b3-the-build-2026-10-13)): the owner asked
+  for 2–4 streams at once, with one stream kept as fast as it is, within 2 %. B4's runner half goes with
+  it. Four different streams decode 131 tok/s in all (one alone: 97), each with drafts; one session is
+  within 1 % of master. Its phase 2 (one draft pass over all sessions, a gate across them) is not built.
 
 ## Why
 
@@ -732,3 +734,41 @@ two runs each per variant, both orders; every run the reference hash):
 
 Both within the owner's 2 %. The drafted figure is not clearly inside the run-to-run spread with two runs
 each (the ranges do not overlap); a longer A/B of the drafted variant follows the serve tests.
+
+**Serving** (`--mode serve --slots 4 --max-ctx 131072`): batch_test.py `--slots 4` 0 failed in its eight
+scenarios, the two drafted ones included (pairs A+C and B+D, triples C+E+F and A+B+D, every request's
+tokens and log-probabilities its run's alone; then a pause inside a drafted pair, E's first token 0.39 s
+after its submit, 0.11 s later than alone, a cancel at its 40th token and a stop id); serve_test.py
+`--ced` 17 of 17; slice_test.py 0 failed. Over that run, with batch_test's six prompts (different texts,
+0.8k–4k positions), a step's GPU time by its rows: 3 rows 30.3 ms, 4: 33.8, 6: 39.9, 8: 46.1, 10: 58.4,
+12: 66.2, 14: 75.6, 16: 82.0; its batches of two ran 47.3 ms a step at 7.97 rows and 6.39 tokens (76 % of
+the drafts accepted), of three 54.9 ms at 9.37 rows and 7.28 tokens (71 %), of four 64.4 ms at 11.12 rows
+and 8.57 tokens (68 %).
+
+**Streams** ([bench/multistream.py](../bench/multistream.py) `--socket`: S prompts of 1,024 tokens cut from
+the synthetic 270k text at different offsets, submitted at once, 512 new tokens each, greedy; two
+repetitions, which agreed to 0.1 tok/s; the step figures from the engine's log):
+
+| streams | tok/s in all, from the first submit to the last end | decoding, from the first token | each stream, tok/s | a step: ms (median), tokens, rows | drafts accepted |
+|---|---|---|---|---|---|
+| 1 | 97.3 | 102.7 | 102.7 | the speculative loop alone | |
+| 2 | 106.9 | 110.0 | 65.0, 56.8 | 41.2–41.4, 4.93, 6.51 | 65 % |
+| 3 | 121.9 | 124.4 | 46.8, 42.5, 49.5 | 56.7–56.9, 7.68, 9.69 | 71 % |
+| 4 | 131.3 | 133.5 | 36.0, 34.0, 37.6, 38.4 | 67.1–67.3, 9.78, 12.01 | 73 % |
+
+The first tokens came 0.29 s apart (the prefills run one after another); the streams' ends spread
+by 0.7–1.7 s as their drafts fared. Four different streams decode 35 % more in all than one alone, three
+25 %, two 10 %; one stream at a time (B1) would give each of them the 102.7 of one alone, in turn.
+B2's figure with the same prompts and bench follows (its earlier medians, with batch_test's prompts:
+86.2 / 108.7 / 119.0).
+
+**What a step costs.** A drafted batch's step is one session's step at the same number of rows plus
+about 3 ms for every further session: one session's steps are 26.4 ms at 3 rows and 36.2 at 6 (3.3 ms a
+row over 16.6), and 16.6 + 3.3 × rows + 3 × (S − 1) gives 41.1, 54.6 and 65.2 ms for the three batches
+above against the measured 41.2, 56.8 and 67.2. The rows' cost is their experts: every row routes to its
+own six, and the same text at the same positions in four slots (P2's 1k ×4) ran 16 rows in 47.5 ms where
+four different texts take 82.0. The 3 ms a session is the drafter's pass, the accept and the gate, run
+once per entry in its own conditional node ([design item 5](#design)). So the two items phase 2 named
+are worth, at the measured rows: one draft pass over all anchors, 3, 6 and 9 ms of a 41, 57 and 67 ms
+step (7, 11 and 13 %); and a gate across the sessions, which today verifies 2.3 drafts a session in a
+pair whose cap is 5, judging each entry's drafts as its one-session gate would.
