@@ -22,14 +22,76 @@ struct Segs {
   int tile_end;  // total tiles
   int n;
 };
+// the index weights fused into the x-projection's launch: CTAs past the GEMV's run prep.cu's k_index_weights
+// for one head and up to 16 rows, each of the 128 threads doing two of its 256 threads' work (the same sums in
+// the same order)
+struct IwDev {
+  const uint16_t* wp;
+  float* w;
+  int ldw, nh, cta0;  // cta0: the first index-weights CTA
+};
 
-template <bool FP8, int OUT, bool HI, int P>
-__global__ void __launch_bounds__(128) k_gemv(const uint16_t* __restrict__ x, int ldx, int rows, int K, Segs segs,
-                                              int splitk) {
-  __shared__ float red[4][32][4];
+__device__ __forceinline__ void index_weights_cta(const uint16_t* __restrict__ x, int ldx, int rows, const IwDev& iw,
+                                                  int blk) {
+  __shared__ float red[16][8];
+  constexpr int kPer = kDim / 256;  // 24 a (virtual) thread
+  const int h = blk % iw.nh, r0 = (blk / iw.nh) * 16, tid = threadIdx.x;
+  float wv[2][kPer];
+#pragma unroll
+  for (int v = 0; v < 2; ++v) {
+    const uint16_t* wr = iw.wp + (size_t)h * kDim + (tid + 128 * v) * kPer;
+#pragma unroll
+    for (int i = 0; i < kPer; i += 8) {
+      const uint4 q = *reinterpret_cast<const uint4*>(wr + i);
+      const uint32_t ww[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) { wv[v][i + 2 * j] = bf2f(ww[j]); wv[v][i + 2 * j + 1] = bf2f_hi(ww[j]); }
+    }
+  }
+  pdl_wait();
+  const int nr = min(16, rows - r0);
+  for (int rr = 0; rr < nr; ++rr) {
+#pragma unroll
+    for (int v = 0; v < 2; ++v) {
+      const uint16_t* xr = x + (size_t)(r0 + rr) * ldx + (tid + 128 * v) * kPer;
+      float sum = 0.f;
+#pragma unroll
+      for (int i = 0; i < kPer; i += 8) {
+        const uint4 q = *reinterpret_cast<const uint4*>(xr + i);
+        const uint32_t ww[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          sum = __fadd_rn(sum, __fmul_rn(bf2f(ww[j]), wv[v][i + 2 * j]));
+          sum = __fadd_rn(sum, __fmul_rn(bf2f_hi(ww[j]), wv[v][i + 2 * j + 1]));
+        }
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, o));
+      if ((tid & 31) == 0) red[rr][(tid >> 5) + 4 * v] = sum;
+    }
+  }
+  __syncthreads();
+  if (tid < nr) {
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sum = __fadd_rn(sum, red[tid][i]);
+    iw.w[(size_t)(r0 + tid) * iw.ldw + h] = __fmul_rn(sum, kIdxWScale);
+  }
+}
+
+template <bool FP8, int OUT, bool HI, int P, int NWP, bool IW>
+__global__ void __launch_bounds__(NWP * 32) k_gemv(const uint16_t* __restrict__ x, int ldx, int rows, int K, Segs segs,
+                                                  int splitk, IwDev iw) {
+  __shared__ float red[NWP][32][4];
   pdl_trigger();
+  if constexpr (IW) {
+    if ((int)blockIdx.x >= iw.cta0) {
+      index_weights_cta(x, ldx, rows, iw, blockIdx.x - iw.cta0);
+      return;
+    }
+  }
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-  const int per_cta = 4 / splitk;
+  const int per_cta = NWP / splitk;
   const int tile = blockIdx.x * per_cta + warp / splitk, kpart = warp % splitk;
   const bool valid = tile < segs.tile_end;
   int si = 0;
@@ -167,19 +229,54 @@ int ilog2(int v, const char* what) {
   return l;
 }
 
-template <bool FP8, int OUT, bool HI>
-void launch_gemv(const uint16_t* x, int ldx, int rows, int K, const Segs& sd, int splitk, cudaStream_t s, bool pdl) {
-  constexpr int P = FP8 ? 8 : 4;
-  const int per_cta = 4 / splitk;
+template <bool FP8, int OUT, bool HI, int P, int NW, bool IW>
+void launch_gemv_cfg(const uint16_t* x, int ldx, int rows, int K, const Segs& sd, int splitk, IwDev iw, cudaStream_t s,
+                     bool pdl) {
+  const int per_cta = NW / splitk;
   const int grid = (sd.tile_end + per_cta - 1) / per_cta;
-  launch(k_gemv<FP8, OUT, HI, P>, dim3(grid), dim3(128), 0, s, pdl, x, ldx, rows, K, sd, splitk);
+  iw.cta0 = grid;
+  const int extra = IW ? iw.nh * ((rows + 15) / 16) : 0;
+  launch(k_gemv<FP8, OUT, HI, P, NW, IW>, dim3(grid + extra), dim3(NW * 32), 0, s, pdl, x, ldx, rows, K, sd, splitk, iw);
   CUDA_CHECK(cudaGetLastError());
+}
+
+int g_gemv_cfg = -1;  // a bench knob: loads in flight a lane and warps a CTA (bit-neutral); -1: by shape
+
+template <bool FP8, int OUT, bool HI>
+void launch_gemv(const uint16_t* x, int ldx, int rows, int K, const Segs& sd, int splitk, const IwDev* iw,
+                 cudaStream_t s, bool pdl) {
+  if (iw) {  // 128-thread CTAs (the index weights' emulation)
+    if constexpr (FP8) launch_gemv_cfg<FP8, OUT, HI, 8, 4, true>(x, ldx, rows, K, sd, splitk, *iw, s, pdl);
+    else die("gemv: index weights fuse with the FP8 x-projection only");
+    return;
+  }
+  const IwDev none{};
+  int want = g_gemv_cfg;
+  if (want < 0) {  // by shape (measured on GB10): 16 loads a lane for the grouped W_UV (K 512), else 8 warps a CTA
+    bool grouped = false;
+    for (int i = 0; i < sd.n; ++i) grouped = grouped || sd.s[i].group_rows > 0;
+    want = grouped && K >= 512 ? 1 : 4;
+  }
+  const int cfg = FP8 && splitk <= 2 ? want : FP8 && (want <= 2 || want == 4) ? want : 0;
+  if constexpr (FP8) {
+    switch (cfg) {
+      case 1: launch_gemv_cfg<FP8, OUT, HI, 16, 4, false>(x, ldx, rows, K, sd, splitk, none, s, pdl); return;
+      case 2: launch_gemv_cfg<FP8, OUT, HI, 24, 4, false>(x, ldx, rows, K, sd, splitk, none, s, pdl); return;
+      case 3: launch_gemv_cfg<FP8, OUT, HI, 8, 2, false>(x, ldx, rows, K, sd, splitk, none, s, pdl); return;
+      case 4: launch_gemv_cfg<FP8, OUT, HI, 8, 8, false>(x, ldx, rows, K, sd, splitk, none, s, pdl); return;
+      case 5: launch_gemv_cfg<FP8, OUT, HI, 16, 2, false>(x, ldx, rows, K, sd, splitk, none, s, pdl); return;
+      default: break;
+    }
+  }
+  launch_gemv_cfg<FP8, OUT, HI, FP8 ? 8 : 4, 4, false>(x, ldx, rows, K, sd, splitk, none, s, pdl);
 }
 
 }  // namespace
 
+void gemv_config(int cfg) { g_gemv_cfg = cfg; }
+
 void gemv(bool fp8, const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
-          cudaStream_t s, bool pdl) {
+          cudaStream_t s, bool pdl, const GemvIw* iw) {
   if (rows < 1 || rows > kMaxRows) die("gemv: %d rows", rows);
   if (K % 64 || nseg < 1 || nseg > kMaxSegs) die("gemv: K %d, %d segments", K, nseg);
   if (splitk != 1 && splitk != 2 && splitk != 4) die("gemv: splitk %d", splitk);
@@ -205,9 +302,18 @@ void gemv(bool fp8, const uint16_t* x, int ldx, int rows, int K, const GemvSeg* 
   sd.tile_end = t0;
   sd.n = nseg;
   const bool hi = rows > 8;
-#define GL(F, O)                                                                \
-  (hi ? launch_gemv<F, (int)O, true>(x, ldx, rows, K, sd, splitk, s, pdl)     \
-      : launch_gemv<F, (int)O, false>(x, ldx, rows, K, sd, splitk, s, pdl))
+  IwDev iwd{};
+  if (iw) {
+    if (!fp8 || out != GemvOut::kBF16 || K != kDim) die("gemv: index weights with a %s GEMV of K %d", fp8 ? "FP8" : "BF16", K);
+    iwd.wp = iw->wproj;
+    iwd.w = iw->w;
+    iwd.ldw = iw->ldw;
+    iwd.nh = iw->nh;
+  }
+  const IwDev* ip = iw ? &iwd : nullptr;
+#define GL(F, O)                                                                    \
+  (hi ? launch_gemv<F, (int)O, true>(x, ldx, rows, K, sd, splitk, ip, s, pdl)     \
+      : launch_gemv<F, (int)O, false>(x, ldx, rows, K, sd, splitk, ip, s, pdl))
   if (fp8) {
     if (out == GemvOut::kBF16) GL(true, GemvOut::kBF16);
     else if (out == GemvOut::kF32) GL(true, GemvOut::kF32);

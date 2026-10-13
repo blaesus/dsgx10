@@ -10,8 +10,8 @@ D=$HOME/dsgb10-data/glm53-attn
 BIN=${BIN:-$D/build/attn}
 DATA=${DATA:-$D/data}
 OUT=${1:-$D/results.tsv}
-STEPS=${STEPS:-memcheck test300 test4600 gemv index attn prefill}
-SRC=$(cd "$(dirname "$0")/.." && cat attn.h attn_common.cuh gemv.cu prep.cu indexer.cu sparse_attn.cu tests/attn_tests.cu tests/bench_attn.cu | sha256sum | cut -c1-16)
+STEPS=${STEPS:-memcheck memcheck-e test300 test4600 gemv index attn prefill pgemm}
+SRC=$(cd "$(dirname "$0")/.." && cat attn.h attn_common.cuh gemv.cu gemm.cu prep.cu indexer.cu sparse_attn.cu tests/attn_tests.cu tests/bench_attn.cu | sha256sum | cut -c1-16)
 mkdir -p "$(dirname "$OUT")"
 {
   echo "RUN	$(date '+%F %T %z')	sources sha256 $SRC"
@@ -25,7 +25,9 @@ for s in $STEPS; do
   LOG=${OUT%.tsv}.$s.log
   case $s in
     memcheck) timeout -s TERM 300 /usr/local/cuda-13.0/bin/compute-sanitizer --tool memcheck --error-exitcode 9 \
-                "$BIN/attn_tests" "$DATA/s300" --only ACBF > "$LOG" 2>&1 ;;
+                "$BIN/attn_tests" "$DATA/s300" --only ACBFP > "$LOG" 2>&1 ;;
+    memcheck-e) timeout -s TERM 300 /usr/local/cuda-13.0/bin/compute-sanitizer --tool memcheck --error-exitcode 9 \
+                "$BIN/attn_tests" "$DATA/s4600" --only E > "$LOG" 2>&1 ;;
     test300) timeout -s TERM 240 "$BIN/attn_tests" "$DATA/s300" > "$LOG" 2>&1 ;;
     test4600) timeout -s TERM 300 "$BIN/attn_tests" "$DATA/s4600" > "$LOG" 2>&1 ;;
     *) timeout -s TERM 300 "$BIN/bench_attn" --only "$s" --out "$OUT" > "$LOG" 2>&1 ;;

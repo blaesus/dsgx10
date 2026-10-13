@@ -80,6 +80,12 @@ void gemv_rows(bool fp8, const uint16_t* x, int ldx, int rows, int K, std::vecto
   }
 }
 
+// a projection as the engine runs it: the GEMM for prefill chunks (more than 16 rows), else the GEMV
+void proj_rows(const uint16_t* x, int ldx, int rows, int K, std::vector<GemvSeg> segs, GemvOut out, int splitk = 1) {
+  if (rows <= kMaxRows) gemv(true, x, ldx, rows, K, segs.data(), (int)segs.size(), out, splitk, 0);
+  else gemm(x, ldx, rows, K, segs.data(), (int)segs.size(), out, splitk, 0);
+}
+
 // ---- A: the tiles decode to zai's values through the kernel's own fragment mapping ---------------------------
 void test_dequant() {
   const auto& qc = L("zai_q_a_codes");
@@ -188,6 +194,39 @@ void test_gemvs(int S, int nd) {
     check_bf16("B q_a (FP8 GEMV, 16 rows, 4 ranks' slices gathered)", eq.data(), qa + (size_t)r0 * kQLora, rows, kQLora, kQLora, kQLora);
     check_bf16("B kv_a_proj_with_mqa", ec.data(), ckv + (size_t)r0 * kLat, rows, kLat, kLat, kLat);
     check_bf16("B indexer wk", ek.data(), kpre + (size_t)r0 * kIdxDim, rows, kIdxDim, kIdxDim, kIdxDim);
+  }
+  // the index weights fused into the x-projection's launch = the two launches; the GEMV's launch configurations
+  // (loads in flight, warps a CTA) agree, bit for bit
+  {
+    Dev<uint16_t> g1((size_t)nd * kXRows), g2((size_t)nd * kXRows);
+    Dev<float> w1((size_t)nd * kIdxHeadsRank), w2((size_t)nd * kIdxHeadsRank);
+    GemvSeg s1 = seg(g_rw[1].x, kXRows, g1.p, kXRows), s2 = seg(g_rw[1].x, kXRows, g2.p, kXRows);
+    Dev<uint16_t> wpd = tu::to_dev<uint16_t>(L("wp"));
+    const uint16_t* wp1 = wpd.p + (size_t)kIdxHeadsRank * kDim;  // rank 1's 8 heads
+    gemv(true, dx.p, kDim, nd, kDim, &s1, 1, GemvOut::kBF16, 4, 0);
+    index_weights(dx.p, nd, wp1, kIdxHeadsRank, w1.p, kIdxHeadsRank, 0);
+    GemvIw iw;
+    iw.wproj = wp1;
+    iw.nh = kIdxHeadsRank;
+    iw.w = w2.p;
+    iw.ldw = kIdxHeadsRank;
+    gemv(true, dx.p, kDim, nd, kDim, &s2, 1, GemvOut::kBF16, 4, 0, false, &iw);
+    sync();
+    T(g1.down() == g2.down() && w1.down() == w2.down(),
+      "B x-projection with the index weights in its launch = the two launches, bit for bit (%d rows)", nd);
+    Dev<uint16_t> q1((size_t)nd * kOProjK), q2((size_t)nd * kOProjK);
+    GemvSeg b1 = seg(g_rw[1].qb, kOProjK, q1.p, kOProjK), b2 = seg(g_rw[1].qb, kOProjK, q2.p, kOProjK);
+    gemv(true, dqr.p, kQLora, nd, kQLora, &b1, 1, GemvOut::kBF16, 1, 0);
+    bool same = true;
+    for (int cfg = 0; cfg < 6; ++cfg) {
+      gemv_config(cfg);
+      gemv(true, dx.p, kDim, nd, kDim, &s2, 1, GemvOut::kBF16, 4, 0);
+      gemv(true, dqr.p, kQLora, nd, kQLora, &b2, 1, GemvOut::kBF16, 1, 0);
+      sync();
+      same = same && g1.down() == g2.down() && q1.down() == q2.down();
+    }
+    gemv_config(-1);
+    T(same, "B GEMV launch configurations 0-5 = the default (by shape), bit for bit (x-projection split-K 4, q_b)");
   }
   // q_b and the indexer's wq_b in one launch (two segments), every rank
   for (int r = 0; r < kTP; ++r) {
@@ -333,25 +372,48 @@ void test_indexer(int S, int nd) {
   auto c = cmp_topk(ht.data(), L("topk").as<int>(), rs, R, S, 1e-5);
   T(c.far == 0, "E top-2048 vs the reference's torch.topk: %d of %d rows identical, %d elements differ, %d not near-ties",
     c.equal_rows, c.rows, c.diff_elems, c.far);
-  // decode rows (1 row, 6 rows, 16 rows) = the prefill rows, bit for bit; work must be left zero
-  // the histograms (the first 5120 words of each row's scratch) must be left zero; params and chunk counts are
-  // rewritten by every call
+  // the first-level histogram (the first 8192 words of each row's scratch) and the row's counters (words 8196-8198)
+  // must be left zero; the other params, chunk segments and candidates are rewritten by every call
   auto wz = work.down();
   const size_t rw_words = wz.size() / R;
   bool hz = true;
-  for (int r = 0; r < R; ++r)
-    for (size_t i = 0; i < 5120; ++i) hz = hz && wz[r * rw_words + i] == 0;
-  T(hz, "E selection histograms left zeroed");
+  for (int r = 0; r < R; ++r) {
+    for (size_t i = 0; i < 8192; ++i) hz = hz && wz[r * rw_words + i] == 0;
+    for (size_t i = 8196; i < 8199; ++i) hz = hz && wz[r * rw_words + i] == 0;
+  }
+  T(hz, "E selection histograms and counters left zeroed");
+  // the fallback (more candidates than the cap: the row selected from its scores directly) = the candidates' path
+  for (int cap : {0, 2100}) {
+    Dev<int> tf((size_t)R * kTopK);
+    index_candidate_cap(cap);
+    index_select(q, pos, nullptr, R, C->rope.p, ik, 0, 0, IdxScratch{scores.p, ld, work.p}, tf.p, nullptr, 0);
+    sync();
+    index_candidate_cap(1 << 30);
+    T(tf.down() == ht, "E selection with a candidate cap of %d (rows over it select from their scores) = the default, bit for bit",
+      cap);
+  }
+  // decode rows (1 row, 6 rows, 16 rows) = the prefill rows, bit for bit (scores and top-2048), with each of the
+  // decode scoring kernel's key-load variants
   for (int rows : {1, 6, 16}) {
     if (rows > nd || rows > R) continue;
     const int a0 = R - rows;
-    Dev<int> t2((size_t)rows * kTopK);
-    IdxQuery q2{q.q + (size_t)a0 * kIdxHeads * kIdxDim, q.w + (size_t)a0 * kIdxHeads};
-    index_select(q2, pos + a0, nullptr, rows, C->rope.p, ik, 0, 0, IdxScratch{scores.p, ld, work.p}, t2.p, nullptr, 0);
-    sync();
-    auto h2 = t2.down();
-    T(std::memcmp(h2.data(), ht.data() + (size_t)a0 * kTopK, h2.size() * 4) == 0,
-      "E decode call of %d rows = the prefill rows' top-2048, bit for bit", rows);
+    for (int ldv = 0; ldv < 5; ++ldv) {
+      Dev<int> t2((size_t)rows * kTopK);
+      IdxQuery q2{q.q + (size_t)a0 * kIdxHeads * kIdxDim, q.w + (size_t)a0 * kIdxHeads};
+      index_score_config(ldv);
+      index_select(q2, pos + a0, nullptr, rows, C->rope.p, ik, 0, 0, IdxScratch{scores.p, ld, work.p}, t2.p, nullptr, 0);
+      sync();
+      index_score_config(-1);
+      auto h2 = t2.down();
+      auto s2 = scores.down();
+      bool se = true;
+      for (int i = 0; i < rows; ++i) {
+        const int n = kTopK + a0 + i + 1;  // row a0 + i's keys
+        se = se && std::memcmp(s2.data() + (size_t)i * ld, hs.data() + (size_t)(a0 + i) * ld, (size_t)n * 4) == 0;
+      }
+      T(se && std::memcmp(h2.data(), ht.data() + (size_t)a0 * kTopK, h2.size() * 4) == 0,
+        "E decode call of %d rows (key loads %d) = the prefill rows' scores and top-2048, bit for bit", rows, ldv);
+    }
   }
   // chunking: rows in two calls
   {
@@ -411,6 +473,29 @@ void test_indexer(int S, int nd) {
     index_select(q, pos, nullptr, R, C->rope.p, i8, 0, 0, IdxScratch{scores.p, ld, work.p}, t8.p, nullptr, 0);
     sync();
     auto h8 = t8.down();
+    auto hs8 = scores.down();
+    // FP8 decode rows (each key-load variant) = the FP8 prefill rows, bit for bit
+    for (int rows : {1, 6}) {
+      if (rows > nd || rows > R) continue;
+      const int a0 = R - rows;
+      IdxQuery q2{q.q + (size_t)a0 * kIdxHeads * kIdxDim, q.w + (size_t)a0 * kIdxHeads};
+      for (int ldv = 0; ldv < 5; ++ldv) {
+        Dev<int> t2((size_t)rows * kTopK);
+        index_score_config(ldv);
+        index_select(q2, pos + a0, nullptr, rows, C->rope.p, i8, 0, 0, IdxScratch{scores.p, ld, work.p}, t2.p, nullptr, 0);
+        sync();
+        index_score_config(-1);
+        auto h2 = t2.down();
+        auto s2 = scores.down();
+        bool se = true;
+        for (int i = 0; i < rows; ++i)
+          se = se && std::memcmp(s2.data() + (size_t)i * ld, hs8.data() + (size_t)(a0 + i) * ld,
+                                 (size_t)(kTopK + a0 + i + 1) * 4) == 0;
+        T(se && std::memcmp(h2.data(), h8.data() + (size_t)a0 * kTopK, h2.size() * 4) == 0,
+          "E FP8 keys: decode call of %d rows (key loads %d) = the prefill rows' scores and top-2048, bit for bit", rows,
+          ldv);
+      }
+    }
     double ov = 0, mn = 1;
     for (int i = 0; i < R; ++i) {
       std::set<int> A(ht.begin() + (size_t)i * kTopK, ht.begin() + (size_t)(i + 1) * kTopK);
@@ -452,10 +537,10 @@ void run_attention(const Dev<uint16_t>& q, const Dev<uint16_t>& cache, const Dev
   for (int r = 0; r < kTP; ++r) {
     CUDA_CHECK(cudaMemcpy2D(qr.p, kOProjK * 2, q.p + (size_t)a * kHeadsAll * kQkDim + r * kOProjK, kHeadsAll * kQkDim * 2,
                             kOProjK * 2, rows, cudaMemcpyDeviceToDevice));
-    gemv_rows(true, qr.p, kOProjK, rows, kNope, {seg(g_rw[r].uk, kHeads * kKvLora, ql.p, kHeads * kKvLora, kKvLora, kQkDim)},
+    proj_rows(qr.p, kOProjK, rows, kNope, {seg(g_rw[r].uk, kHeads * kKvLora, ql.p, kHeads * kKvLora, kKvLora, kQkDim)},
               GemvOut::kBF16);
     sparse_attn(ql.p, qr.p, C->pos.p + a, nullptr, C->rope.p, kv, topk.p + (size_t)a * kTopK, rows, splits, sc, u.p, 0);
-    gemv_rows(true, u.p, kHeads * kKvLora, rows, kKvLora, {seg(g_rw[r].uv, kOProjK, orr.p, kOProjK, kVDim, kKvLora)},
+    proj_rows(u.p, kHeads * kKvLora, rows, kKvLora, {seg(g_rw[r].uv, kOProjK, orr.p, kOProjK, kVDim, kKvLora)},
               GemvOut::kBF16);
     CUDA_CHECK(cudaMemcpy2D(o.p + (size_t)a * kHeadsAll * kVDim + r * kOProjK, kHeadsAll * kVDim * 2, orr.p, kOProjK * 2,
                             kOProjK * 2, rows, cudaMemcpyDeviceToDevice));
@@ -469,7 +554,7 @@ std::vector<uint16_t> run_oproj(const Dev<uint16_t>& o, int S) {
   std::vector<float> acc((size_t)S * kDim, 0.f);
   for (int r = 0; r < kTP; ++r) {
     CUDA_CHECK(cudaMemcpy2D(orr.p, kOProjK * 2, o.p + r * kOProjK, kHeadsAll * kVDim * 2, kOProjK * 2, S, cudaMemcpyDeviceToDevice));
-    gemv_rows(true, orr.p, kOProjK, S, kOProjK, {seg(g_rw[r].o, kDim, part.p, kDim)}, GemvOut::kF32);
+    proj_rows(orr.p, kOProjK, S, kOProjK, {seg(g_rw[r].o, kDim, part.p, kDim)}, GemvOut::kF32);
     auto h = part.down();
     for (size_t i = 0; i < acc.size(); ++i) acc[i] += h[i];
   }
@@ -572,7 +657,7 @@ struct Chain {
     const int rows = b - a;
     rmsnorm(x_raw.p + (size_t)a * kDim, kDim, C->w_in.p, kNormEps, kDim, x.p + (size_t)a * kDim, kDim, rows, 0);
     for (int r = 0; r < kTP; ++r)
-      gemv_rows(true, x.p + (size_t)a * kDim, kDim, rows, kDim,
+      proj_rows(x.p + (size_t)a * kDim, kDim, rows, kDim,
                 {seg(g_rw[r].x, kXRows, xg.p + (size_t)a * kTP * kXRows + r * kXRows, kTP * kXRows)}, GemvOut::kBF16, 4);
     PrepArgs p;
     p.xg = xg.p + (size_t)a * kTP * kXRows;
@@ -584,7 +669,7 @@ struct Chain {
     p.ik.k = reinterpret_cast<uint8_t*>(kidx.p);
     attn_prep(p, rows, 0);
     for (int r = 0; r < kTP; ++r)
-      gemv_rows(true, qr.p + (size_t)a * kQLora, kQLora, rows, kQLora,
+      proj_rows(qr.p + (size_t)a * kQLora, kQLora, rows, kQLora,
                 {seg(g_rw[r].qb, kOProjK, q.p + (size_t)a * kHeadsAll * kQkDim + r * kOProjK, kHeadsAll * kQkDim),
                  seg(g_rw[r].iq, 1024, iq.p + (size_t)a * kIdxHeads * kIdxDim + r * 1024, kIdxHeads * kIdxDim)},
                 GemvOut::kBF16);
@@ -774,12 +859,86 @@ void test_mlp(int S, int nd) {
   check_bf16("H head (BF16 GEMV, rank 0's 38,720 rows)", hl.data(), L("logits_r0").as<uint16_t>(), nd, kVocabRank, kVocabRank, kVocabRank);
 }
 
+// ---- P: the prefill GEMM = the 16-row GEMV, bit for bit, every projection and tile configuration --------------
+void test_gemm(int S) {
+  struct Case {
+    std::string name;
+    const uint16_t* x;
+    int ldx, K;
+    std::vector<GemvSeg> segs;  // y set below
+    std::vector<size_t> ysz;    // elements a row
+    GemvOut out;
+    int splitk;
+  };
+  Dev<uint16_t> x = tu::to_dev<uint16_t>(L("x")), q = tu::to_dev<uint16_t>(L("q")), qr = tu::to_dev<uint16_t>(L("qr"));
+  // W_UK / W_UV / o_proj inputs: rank 0's 16 heads of q; a latent-like input (q's values, 512 a head); o rows
+  Dev<uint16_t> q0((size_t)S * kOProjK), lat((size_t)S * kHeads * kKvLora);
+  CUDA_CHECK(cudaMemcpy2D(q0.p, kOProjK * 2, q.p, kHeadsAll * kQkDim * 2, kOProjK * 2, S, cudaMemcpyDeviceToDevice));
+  CUDA_CHECK(cudaMemcpy2D(lat.p, kHeads * kKvLora * 2, q.p, kHeadsAll * kQkDim * 2, kHeads * kKvLora * 2, S,
+                          cudaMemcpyDeviceToDevice));
+  std::vector<Case> cs;
+  std::vector<FP8W> keep;
+  for (int r = 0; r < kTP; r += 3) {
+    const std::string rn = " rank " + std::to_string(r);
+    cs.push_back({"x-projection 688x6144 split-K 4" + rn, x.p, kDim, kDim, {seg(g_rw[r].x, kXRows, nullptr, kXRows)}, {kXRows}, GemvOut::kBF16, 4});
+    cs.push_back({"x-projection, shared-layer rows 656" + rn, x.p, kDim, kDim, {seg(g_rw[r].x, kXRowsShared, nullptr, kXRowsShared)},
+                  {kXRowsShared}, GemvOut::kBF16, 4});
+    cs.push_back({"q_b + wq_b (two segments)" + rn, qr.p, kQLora, kQLora,
+                  {seg(g_rw[r].qb, kOProjK, nullptr, kOProjK), seg(g_rw[r].iq, 1024, nullptr, 1024)}, {kOProjK, 1024}, GemvOut::kBF16, 1});
+    cs.push_back({"W_UK^T grouped" + rn, q0.p, kOProjK, kNope, {seg(g_rw[r].uk, kHeads * kKvLora, nullptr, kHeads * kKvLora, kKvLora, kQkDim)},
+                  {(size_t)kHeads * kKvLora}, GemvOut::kBF16, 1});
+    cs.push_back({"W_UV grouped" + rn, lat.p, kHeads * kKvLora, kKvLora, {seg(g_rw[r].uv, kOProjK, nullptr, kOProjK, kVDim, kKvLora)},
+                  {kOProjK}, GemvOut::kBF16, 1});
+    cs.push_back({"o_proj (f32)" + rn, q0.p, kOProjK, kOProjK, {seg(g_rw[r].o, kDim, nullptr, kDim)}, {kDim}, GemvOut::kF32, 1});
+  }
+  if (has("dense_y"))
+    for (auto [nm, inter] : {std::pair<const char*, int>{"dense", kDenseInterRank}, {"shared", kSharedInterRank}}) {
+      keep.push_back(fp8w(std::string("r0_") + nm + "_gu", 128, 128));
+      keep.push_back(fp8w(std::string("r0_") + nm + "_down", 128, 128));
+      const FP8W& gu = keep[keep.size() - 2];
+      const FP8W& dn = keep.back();
+      const int sk = inter >= 2048 ? 1 : 4;
+      cs.push_back({std::string(nm) + " gate/up SwiGLU split-K " + std::to_string(sk), x.p, kDim, kDim, {seg(gu, 2 * inter, nullptr, inter)},
+                    {(size_t)inter}, GemvOut::kSwiGLU, sk});
+      cs.push_back({std::string(nm) + " down (f32)", x.p, kDim, inter, {seg(dn, kDim, nullptr, kDim)}, {kDim}, GemvOut::kF32, 1});
+    }
+  for (auto& c : cs) {
+    const size_t es = c.out == GemvOut::kF32 ? 4 : 2;
+    std::vector<Dev<uint8_t>> ya, yb;
+    for (size_t i = 0; i < c.segs.size(); ++i) {
+      ya.emplace_back((size_t)S * c.ysz[i] * es);
+      yb.emplace_back((size_t)S * c.ysz[i] * es);
+    }
+    std::vector<GemvSeg> sa = c.segs, sb = c.segs;
+    for (size_t i = 0; i < c.segs.size(); ++i) { sa[i].y = ya[i].p; sb[i].y = yb[i].p; }
+    gemv_rows(true, c.x, c.ldx, S, c.K, sa, c.out, c.splitk);
+    sync();
+    std::vector<std::vector<uint8_t>> ref;
+    for (auto& y : ya) ref.push_back(y.down());
+    bool ok = true;
+    std::string which;
+    for (int cfg = 0; cfg < 6; ++cfg) {
+      for (auto& y : yb) y.zero();
+      gemm_config(cfg);
+      gemm(c.x, c.ldx, S, c.K, sb.data(), (int)sb.size(), c.out, c.splitk, 0);
+      sync();
+      bool e = true;
+      for (size_t i = 0; i < yb.size(); ++i) e = e && yb[i].down() == ref[i];
+      if (!e) which += " " + std::to_string(cfg);
+      ok = ok && e;
+    }
+    gemm_config(-1);
+    T(ok, "P GEMM %s, %d rows: = the 16-row GEMV bit for bit in tile configurations 0-5%s%s", c.name.c_str(), S,
+      ok ? "" : "; differ in", which.c_str());
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 2) die("usage: attn_tests DIR [--only ABCEFGHS]");
+  if (argc < 2) die("usage: attn_tests DIR [--only ABCPEFGHS]");
   g_dir = argv[1];
-  std::string only = argc > 3 && std::string(argv[2]) == "--only" ? argv[3] : "ACBEFGSH";
+  std::string only = argc > 3 && std::string(argv[2]) == "--only" ? argv[3] : "ACBPEFGSH";
   const int S = manifest_int("S"), nd = manifest_int("decode");
   std::printf("case %s: S %d, decode rows %d\n", g_dir.c_str(), S, nd);
   load_weights();
@@ -800,6 +959,7 @@ int main(int argc, char** argv) {
       case 'G': test_chain(S); break;
       case 'S': test_slots(S); break;
       case 'H': test_mlp(S, nd); break;
+      case 'P': test_gemm(S); break;
     }
   }
   std::printf("%d passed, %d failed\n", T.pass, T.fail);
