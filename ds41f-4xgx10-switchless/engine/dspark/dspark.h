@@ -6,7 +6,8 @@
 // Per step, after the main model's verify: accept() the newly accepted positions (their main_hidden goes
 // through main_proj and main_norm into each block's sliding-window KV), then draft() the block after the last
 // of them: the next token and four noise tokens, through the three blocks, the head and a 5-step Markov chain,
-// giving 5 greedy draft tokens and the confidence head's survival probabilities.
+// giving 5 greedy draft tokens and the confidence head's survival probabilities. A batch spec step of several
+// sessions runs their accepts, then one draft_batch() over their blocks side by side (B3 phase 2a).
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +27,10 @@ inline constexpr int kBlocks = 3;   // mtp.0 .. mtp.2
 inline constexpr int kDraft = 5;    // block rows = drafts per pass (dspark_block_size)
 inline constexpr int kMaxAcc = 8;   // positions per accept() call
 inline constexpr int kMaxHidden = 16;  // rows of a main_hidden buffer, at most: a batch spec step's (docs/batching.md, B3)
+// A batch spec step's draft pass over several entries (Draft::draft_batch, docs/batching.md B3 phase 2a): a pass
+// takes at most kBatchEnts entries, kDraft rows each, within the kernels' 16 rows (dsk::kMaxRows,
+// attn::kMaxDecodeRows); kMaxEnts entries keep an anchor and results (the runner's ops::kMaxSess).
+inline constexpr int kBatchEnts = 3, kBatchRows = kDraft * kBatchEnts, kMaxEnts = 16;
 inline constexpr int kRanks = 4;
 inline constexpr int kDim = 5120, kHc = 4, kQLora = 1280;
 inline constexpr int kVocab = 129280, kVocabRank = kVocab / kRanks, kMarkov = 256;
@@ -129,6 +134,11 @@ class Comm {
   virtual void all_reduce(const void* src, bool f32, uint16_t* dst, size_t n, cudaStream_t s) = 0;
   // dst = the largest candidate over the ranks (ties: the lowest id)
   virtual void argmax(const Cand* src, Cand* dst, cudaStream_t s) = 0;
+  // The same for `rows` candidates at once (dst[r] from src[r] of every rank, rows independent; a batch pass's
+  // entries): by default one argmax() per row, in order; the runner's ring does them in one collective.
+  virtual void argmax_rows(const Cand* src, Cand* dst, int rows, cudaStream_t s) {
+    for (int r = 0; r < rows; ++r) argmax(src + r, dst + r, s);
+  }
 };
 // STAND-INs for timing one rank alone: every collective is one local PDL kernel that puts this rank's data where
 // the result would land (gathers fill every rank's slot with it, reductions take it as the sum).
@@ -196,14 +206,41 @@ class Draft {
   // Session slots: the windows are the current slot's (use_slot), or with `slot` (device, at least kMaxAcc
   // entries; a step's table) row r's slot's: a step captured once serves sessions in any slot. row0 (device, one
   // int): the rows are main_hidden's [*row0, *row0 + *count), not [0, *count) (a batch step's entry; the buffer
-  // then holds at least *row0 + *count rows).
+  // then holds at least *row0 + *count rows). start_out (device, one int): where the anchor goes instead of
+  // draft()'s (a batch step's entry k: batch_start() + k, which draft_batch() reads).
   void accept(const uint16_t* mh, const int* count, const int* pos0, cudaStream_t s, const int* slot = nullptr,
-              const int* row0 = nullptr);
+              const int* row0 = nullptr, int* start_out = nullptr);
   // The draft after the anchor p: *token (the token at p + 1) and four noise tokens at positions p + 1 .. p + 5
   // through the blocks and the head; then tokens() holds d1..d5, greedy drafts for positions p + 2 .. p + 6.
   // `slot` as accept()'s (kDraft entries, all the anchor's session's).
   void draft(const int* token, cudaStream_t s, const int* slot = nullptr);
   void use_slot(int s);
+
+  // B3 phase 2a (docs/batching.md): one pass over the drafts of several entries (sessions), their rows side by
+  // side, the weights read once. Rows [kDraft q, kDraft q + kDraft) are entry ent[q]'s, q < n <= kBatchEnts: its
+  // token tok[ent[q] * tok_stride] (the token at its anchor + 1), its anchor batch_start()[ent[q]] (accept() with
+  // start_out wrote it this step), its rows' slots slot[kDraft q + j] (the rows' session slots, as accept()'s
+  // tables; required). The results of entry k: batch_ids(k) [6] (the token, then d1..d5), batch_tokens(k) [5],
+  // batch_confidence(k) [5], batch_survival(k) [5], the same bits on every rank. Every row computes, bit for
+  // bit, what draft() computes for it alone: the kernels take the rows as they take draft()'s (an activation
+  // row per MMA lane group, its own k order, warp and split-K folds; the attention over its own window; its
+  // own Markov chain and confidence), and nothing of one row enters another's (the MoE runs the union of the
+  // rows' experts, each row summing its own picks in expert-id order). Buffers of its own, sized for kBatchRows
+  // rows: enable_batch() once, before any capture; draft() and accept() keep theirs.
+  struct BatchPass {
+    const int* ent;    // device [n]: the entries, in row order
+    int n;             // entries in the pass, 1..kBatchEnts
+    const int* tok;    // device: entry k's token at tok[k * tok_stride]
+    int tok_stride;    // in ints
+    const int* slot;   // device [kDraft * n]: each row's session slot
+  };
+  void enable_batch();
+  void draft_batch(const BatchPass& p, cudaStream_t s);
+  int* batch_start() const;                      // device [kMaxEnts]: accept()'s start_out + k
+  const int* batch_ids(int k) const;             // [6]
+  const int* batch_tokens(int k) const { return batch_ids(k) + 1; }
+  const float* batch_confidence(int k) const;    // [5]
+  const float* batch_survival(int k) const { return batch_confidence(k) + 8; }
   // Weights::head_coded from now on (the runner's head coded in place after the module was made); before any
   // draft() a graph captures.
   void set_head_coded(const uint8_t* hc) { w_.head_coded = hc; }
@@ -231,6 +268,10 @@ class Draft {
   struct Buf;
   void mix(const uint16_t* x, const float* fn, const float* fn_all, const float* scale, const float* base,
            const uint16_t* norm, cudaStream_t s);
+  // mix() over a batch pass's rows, in the batch buffers (hc_project's rows per CTA group and hc_mix's CTA per
+  // row keep every row's arithmetic its own)
+  void bmix(const uint16_t* x, int rows, const float* fn, const float* fn_all, const float* scale, const float* base,
+            const uint16_t* norm, cudaStream_t s);
   attn::Window win(int b, const int* slot) const;  // the current slot's, or through a step's table
   Weights w_;
   int rank_;
