@@ -146,7 +146,7 @@ def main():
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--list", action="store_true", help="with --plan: every tensor")
     ap.add_argument("--only", help="a test file: only tensors whose names contain this")
-    ap.add_argument("--shared-layout", choices=["t64", "t128"], default="t64")
+    ap.add_argument("--shared-layout", choices=["t64", "t128"], default="t128")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--commit", default="", help="the repo commit the tools were taken from, for the manifest")
     ap.add_argument("--suffix", default="", help="file name suffix (test files)")

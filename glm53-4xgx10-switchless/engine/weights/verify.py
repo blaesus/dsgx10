@@ -352,7 +352,7 @@ def main():
     ap.add_argument("--indep", action="store_true")
     ap.add_argument("--ckpt")
     ap.add_argument("--cache")
-    ap.add_argument("--shared-layout", choices=["t64", "t128"], default="t64")
+    ap.add_argument("--shared-layout", choices=["t64", "t128"], default="t128")
     ap.add_argument("--threads", type=int, default=4)
     a = ap.parse_args()
     import torch

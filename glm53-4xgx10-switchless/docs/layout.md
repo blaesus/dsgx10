@@ -22,7 +22,7 @@ kernels read, cut on the CPU from NVIDIA's checkpoint (the BF16 master) and zai'
 
 ## 1. Status
 
-- **Non-expert files for all four ranks written and verified**: 5.178 GiB each (5,559,750,656 B), 21,225 TOC
+- **Non-expert files for all four ranks written and verified**: 5.178 GiB each (5,560,139,776 B), 21,377 TOC
   entries of which 19,532 are reserved routed-expert entries. Every byte checked against the master by an
   independent description, against a fresh conversion, and by CRC; the host binding against `attn.h` and
   `experts.h` passes on every rank.
@@ -92,8 +92,8 @@ re-cuts are pack.py's own functions, called by the converter.
 | `layers.L.indexer.k_norm.{weight,bias}` | `indexer.k_norm` | BF16 | all | 0.5 KB |
 | `layers.{0,1,2}.mlp.gate_up` | `mlp.gate_proj`, `up_proj` **from zai's BF16 mirror** | FP8 T64, interleaved, scales [24][2][48] | intermediates [3072r, +3072), rows 2i gate, 2i+1 up | 37.75 MB |
 | `layers.{0,1,2}.mlp.down` | `mlp.down_proj` (mirror) | FP8 T64, 128 × 128 | cols [3072r, +3072) | 18.87 MB |
-| `layers.L.shared.gate_up` (L = 3…78) | `shared_experts.gate_proj`, `up_proj` | FP8 T64, interleaved, [4][2][48] | intermediates [512r, +512) | 6.29 MB |
-| `layers.L.shared.down` | `shared_experts.down_proj` | FP8 T64, 128 × 128 | cols [512r, +512) | 3.15 MB |
+| `layers.L.shared.{gate,up}` (L = 3…78) | `shared_experts.gate_proj`, `up_proj` | FP8 **T128** (the expert kernels' `SharedW`), scales [4][48] | rows [512r, +512) | 3.15 MB each |
+| `layers.L.shared.down` | `shared_experts.down_proj` | FP8 T128, scales [48][4] | cols [512r, +512) | 3.15 MB |
 | `layers.L.router.weight`, `.bias` | `mlp.gate.weight` BF16 [256, 6144], `e_score_correction_bias` F32 | as shipped | all | 3.15 MB |
 | `layers.78.mtp.{enorm,hnorm,head_norm}.weight` | `enorm`, `hnorm`, `shared_head.norm` | BF16 | all | 36 KB |
 | `layers.78.mtp.eh_proj` | `eh_proj` [6144, 12288] | FP8 T64, 128 × 128 (our RTN by zai's rule; BF16 in zai's release) | rows [1536r, +1536) | 18.87 MB |
@@ -142,8 +142,8 @@ scales 26,249 / 56,480 (46.5 %), every differing scale one ulp away; with zai's 
 equal, which isolated the scale. Candidates tried on three tensors: `amax/448` in f32 or f64, `1/(448/amax)`
 in f32 or f64; only `amax × f32(1/448)` matched (48/48, 768/768, 240/240). `pack.py` is the attention
 agent's test-data generator (its random masters are not zai's tensors), so its re-cut functions stay the
-reference and only the quantiser here differs; `fp8_from_master` should adopt the multiply if its outputs are
-ever compared with zai's.
+reference and only the quantiser here differs; `fp8_from_master` must adopt the multiply (the attention side's
+change; § 10).
 
 **Error against the master** (relative RMS, per source tensor, in every manifest): 0.0258–0.0265 for every
 class (q_a, kv_a, q_b, kv_b, o_proj, indexer wq_b and wk, shared and dense gate/up/down, eh_proj), matching the
@@ -197,27 +197,28 @@ tail (truncate at the first expert entry, append again), leaving the non-expert 
 | Check | Tool | What | Result on the four files |
 |---|---|---|---|
 | Structure and CRCs | `glw_check` (C++), `verify.py --crc` | header geometry, TOC CRC, offsets in order, shape × dtype = bytes, reserved entries empty, every CRC32C, zero padding; the manifest's per-tensor and whole-file SHA-256s | OK, 3 s a file |
-| Fresh conversion | `verify.py --fresh` | every tensor rebuilt by the converter's own code and compared byte for byte (determinism) | 6,772 of 6,772 equal |
-| **Independent** | `verify.py --indep` | without pack.py, quant.py or the plan: the natural matrix each FP8 tensor should hold, written out again from attention.md as source row/column pieces (transposes, interleaving); scales by the rule in numpy; every element's scale read through the TOC's rs × ks must be its source block's; every code un-tiled with glw.h's formula must be `e4m3_rne(master / scale)`; BF16/F32 tensors byte-equal to their source rows; the RoPE table equal to rope_table.py's; replicated tensors equal across ranks | 4,468 checks, 0 bad; a flipped code bit and a flipped scale bit are both caught |
-| Kernel binding | `glw_kcheck --rank R` | every layer against attn.h (`kXRows`, `kHeads`, …, the GemvSeg rs/ks, `full_indexer`), experts.h (`mat_bytes`, `MatDesc`, `SharedW` when T128), the head/embed/RoPE shapes; binds each FP8 tensor into a `glm::GemvSeg` | 101,509 checks a rank, 0 bad |
+| Fresh conversion | `verify.py --fresh` | every tensor rebuilt by the converter's own code and compared byte for byte (determinism) | 7,380 of 7,380 equal |
+| **Independent** | `verify.py --indep` | without pack.py, quant.py or the plan: the natural matrix each FP8 tensor should hold, written out again from attention.md as source row/column pieces (transposes, interleaving); scales by the rule in numpy; every element's scale read through the TOC's rs × ks must be its source block's; every code un-tiled with glw.h's formula must be `e4m3_rne(master / scale)`; BF16/F32 tensors byte-equal to their source rows; the RoPE table equal to rope_table.py's; replicated tensors equal across ranks | 4,772 checks, 0 bad; a flipped code bit and a flipped scale bit are both caught |
+| Kernel binding | `glw_kcheck --rank R` | every layer against attn.h (`kXRows`, `kHeads`, …, the GemvSeg rs/ks, `full_indexer`), experts.h (`mat_bytes`, `MatDesc`, `SharedW` when T128), the head/embed/RoPE shapes; binds each FP8 tensor into a `glm::GemvSeg` | 101,053 checks a rank, 0 bad |
 | Rank refusal | `glw_rank_test --file F R` | the loader refuses the three other ranks | all ok |
 | Device | `glw_kcheck --gpu` | the chosen layers' GEMVs (`glm::gemv`, SwiGLU pairs, grouped W_UK/W_UV, the BF16 head) against a double reference from the file's own bytes | **built, not run** (a ring job) |
 
-`verify.py --crc --fresh --indep` over all four files: 6 min 49 s, 5.6 GB peak, nice 19, no GPU.
+`verify.py --crc --fresh --indep` over all four files: ~7 min, 5.6 GB peak, nice 19, no GPU.
 
 ## 8. Files written
 
-`/data/dsgb10/glm53/weights/` on rank 0 (2026-10-13; tool `5dafdb3eaeef89ba7ccfb619ed3cdc882e9dbf8428ea5fc918cfe7463da482d9`):
+`/data/dsgb10/glm53/weights/` on rank 0 (2026-10-13 23:19; tool `63b15f221d924873f8a6358e1e2e8cd46bf41cb290005df4715788c41a75e4a5`, `--commit e33e73f`,
+shared expert in T128):
 
 | File | Bytes | SHA-256 | TOC CRC |
 |---|---:|---|---|
-| `rank0.glw` | 5,559,750,656 | `7c6c027115126a1e666ced27bbd896cc71aeea035d0a902a2b5eed823b2471ab` | `841ae4b7` |
-| `rank1.glw` | 5,559,750,656 | `eba837593b58a88ced9dec481fa718ce2786891243d42d29c2f0927782fab4c9` | `53fbc6e5` |
-| `rank2.glw` | 5,559,750,656 | `0182c5c76cc2befee9b6ba913dd3c14750ef4c9d076fbd7b26bbe9991c04c0c5` | `c8a031f3` |
-| `rank3.glw` | 5,559,750,656 | `a980a9f5636f6ee7bfa7ebef49680ed76068972562bb38a61e8ea61c17040b08` | `c57e1898` |
-| `test-l3/rank0.l3.glw` (layer 3 with its NVFP4 experts) | 1,413,062,656 | `2d60e39ff59294f51e05f6154f58fc0d0ac11b5c5a9d333a37d6d2af18ee068e` | `a7e87fee` |
+| `rank0.glw` | 5,560,139,776 | `c7d3341fb94849104bebbeca3ba79d1b4325827c8ada646ab154bf77e3b1094e` | `836dc158` |
+| `rank1.glw` | 5,560,139,776 | `6e740f1533b4b0d0a3ab32f4e151c2edd1bf367ae5da21280f19ac4a24d53734` | `9cf9364f` |
+| `rank2.glw` | 5,560,139,776 | `f5d179aa996f8ca19ab1ca2a679a2c17bed95c7668e57b3d02580c1870e9132c` | `751ad407` |
+| `rank3.glw` | 5,560,139,776 | `3feef748c4fb71a7c8f4a34bf637738edca720ce0d27fa1e525ff4f9de0cc1c7` | `781d1799` |
+| `test-l3/rank0.l3.glw` (layer 3 with its NVFP4 experts; cut before the T128 decision, tool `5dafdb3e…`, so its shared expert is T64) | 1,413,062,656 | `2d60e39ff59294f51e05f6154f58fc0d0ac11b5c5a9d333a37d6d2af18ee068e` | `a7e87fee` |
 
-All four ranks in one pass: **2 min 7 s** wall, 5.0 GB peak resident, nice 19, 4 torch threads, CPU only
+All four ranks in one pass: **2 min 47 s** wall (2 min 7 s in an earlier run), 5.0 GB peak resident, nice 19, 4 torch threads, CPU only
 (reads ~60 GB of sources; page cache dropped after every read and write). The fetched sources (zai's FP8
 tensors for the check, the dense MLPs' master, 2.2 GB) are in `/data/dsgb10/glm53/fetch/` with their SHA-256s.
 
@@ -241,17 +242,16 @@ glw_load FILE --rank R [--verify-crc];  glw_expert_fill_test FILE R D L E ...
 
 ## 10. What remains
 
-- **The shared expert has two consumers with different layouts.** attention.md/pack.py tile it for the attention
-  GEMV (gate/up interleaved, T64, `kSwiGLU`); experts.md has `moe_decode` run it inside the expert kernels from
-  `SharedW` in T128 (`pack_fp8`, scales `[N/128][K/128]`). The files hold pack.py's form, as planned;
-  `convert.py --shared-layout t128` writes the experts' form instead (kcheck checks either). The orchestrator
-  chooses; a rerun is 2 minutes.
+- **The shared expert is in the expert kernels' layout** (decided 2026-10-13): the MoE launch fuses it
+  (`moe_decode`/`moe_prefill` read `SharedW`: gate, up, down in T128 with `[N/128][K/128]` scales), so that is the
+  path the engine runs and the attention side's shared-expert GEMV (pack.py's interleaved T64 form) is unused.
+  T128 is the default; `--shared-layout t64` still writes the other form (kcheck and verify check either).
 - **The full expert fill** (NVFP4 first: ~96 GiB a rank, ~10 s a layer a rank of CPU, so the time is disk) is for
   the orchestrator to schedule; rank 1 needs ~20 GB freed (quantisation § 4). The MTP layer's experts (NVFP4 by
   our RTN of its BF16) and the S3 fill from the quantiser are later items.
 - `glw_kcheck --gpu` and `glw_load` on the device, in a ring window.
-- `pack.py`'s `fp8_from_master` divides by 448 where zai multiplies by f32(1/448) (§ 4).
+- **`engine/attn/tools/pack.py`'s `fp8_from_master` still computes `amax / 448`** and must be changed to zai's
+  rule (`amax × f32(1/448)`, § 4) by the attention side; the converter does not use it (only pack.py's re-cuts).
 - The router is replicated (0.22 GiB, as quantisation § 2); a split by output (64 rows a rank, logits
   all-gathered) is a one-line plan change if G4 prefers it.
 - Ranks 1–3's files are on rank 0's disk; copying them to their boxes (and recording the copies' hashes) is G4's.
-- The manifest records no commit yet (`--commit` when run from a committed tree).

@@ -252,7 +252,7 @@ def attn_unit(ck, L):
     return Unit(f"layer {L} attention", "attention" if L != MTP else "MTP attention", srcs, outs, build)
 
 
-def mlp_unit(ck, L, shared_layout="t64"):
+def mlp_unit(ck, L, shared_layout="t128"):
     p = f"model.layers.{L}.mlp."
     ln = f"layers.{L}."
     if L < 3:  # dense: the master from zai's BF16 mirror (NVIDIA's file holds a per-tensor FP8 requantisation)
@@ -367,7 +367,7 @@ def reserved_unit(L):
     return Unit(f"layer {L} routed experts (reserved)", "routed experts (reserved)", [], outs, lambda S, r: {})
 
 
-def make_plan(ck, shared_layout="t64"):
+def make_plan(ck, shared_layout="t128"):
     """The units in file order."""
     units = [global_unit(ck)]
     for L in range(N_LAYERS + 1):
