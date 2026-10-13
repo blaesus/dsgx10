@@ -1,0 +1,280 @@
+// glm53_rank: one rank of the GLM-5.3 engine as a service (docs/serving.md). Every rank runs it with the same
+// arguments (run4.sh, service.sh); rank 0 serves the front-end (glmfront) on --socket, ranks 1-3 follow its commands.
+//   glm53_rank [--fleet FILE] [--rank R] --mode serve [options]
+// Weights: --weights PATH ("%d": the rank; "fleet", the default: the fleet file's RANK<r>_WEIGHTS) with
+//   --fill-experts (routed-expert pools the file has not filled yet run synthetic: the text is meaningless, the
+//   serving is real), or --synthetic (no file). --pools N, --seed S: the synthetic pools.
+// Serving: --socket PATH (/tmp/dsgb10-glm53-engine.sock), --max-ctx N (262144: positions a session may reach),
+//   --slots N (4: sessions a decode step, B2), --slice N (64: time-slicing's turns, B1), --chunk N (8192: rows a
+//   prefill chunk), --splits N (16: sparse attention's split-K at every row count, so that a session's tokens do
+//   not depend on the others in its steps), --name NAME (glm-5.3).
+// The cache pool (paged, docs/serving.md): pages of --page N positions (1024); every rank offers its free device
+//   memory and its available host memory after the weights and the prefill buffers, less --margin-gib (4 on rank
+//   0, --worker-margin-gib 2 on the others: the DeepSeek engine's margins, quantisation.md § 1.2), and all take the
+//   smallest offer, at most --kv-gib (default: no cap).
+// The disk tier: --disk-gib N (32; 0: none) in --disk-dir (the fleet's RANK<r>_SPILL), files rank<r>[.tag].spill
+//   (--disk-tag T); each rank offers its directory's free space less 32 GiB, and all take the smallest offer.
+// Kept sessions: --keep-gib N (0): a planned stop (SIGTERM) keeps up to N GiB of sessions for the next start, none
+//   unused for --keep-days (7).
+// --step-timeout S (120): the watchdog's limit for one step or chunk.
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <cuda_runtime.h>
+
+#include "comm/ring.h"
+#include "comm/ring_config.h"
+#include "common/check.h"
+#include "model/model.h"
+#include "server/cmd.h"
+#include "server/disk.h"
+#include "server/keepfile.h"
+#include "server/protocol.h"
+#include "server/serve.h"
+#include "weights/glw.h"
+#include "weights/loader.h"
+
+using namespace srv;
+
+namespace {
+
+constexpr double kGiB = 1073741824.0;
+
+std::string expand(const std::string& p) {
+  const char* h = std::getenv("HOME");
+  return p.rfind("~/", 0) == 0 && h ? std::string(h) + p.substr(1) : p;
+}
+
+size_t meminfo(const char* key) {  // /proc/meminfo's key, bytes
+  FILE* f = std::fopen("/proc/meminfo", "r");
+  if (!f) return 0;
+  char line[256];
+  size_t kb = 0;
+  const size_t kl = std::strlen(key);
+  while (std::fgets(line, sizeof line, f))
+    if (std::strncmp(line, key, kl) == 0 && line[kl] == ':') {
+      kb = std::strtoull(line + kl + 1, nullptr, 10);
+      break;
+    }
+  std::fclose(f);
+  return kb << 10;
+}
+
+struct Args {
+  int rank = -1;
+  std::string fleet, mode, weights = "fleet", socket = fe::kDefaultSocket, name = "glm-5.3";
+  bool synthetic = false, fill_experts = false;
+  int pools = 16;
+  uint64_t seed = 1;
+  int max_ctx = 262144, page = 1024, slots = 4, slice = 64, chunk = 8192, splits = 16, grow = 1024;
+  double kv_gib = 1e9, margin_gib = 4, worker_margin_gib = 2;
+  double disk_gib = 32, keep_gib = 0, keep_days = 7;
+  std::string disk_dir, disk_tag;
+  int step_timeout = 120;
+};
+
+// What a kept session's caches depend on: this binary's bytes, the weights (path, size, time), the synthetic
+// experts' options, and the geometry. A start whose id differs from the stop's starts clean.
+uint64_t run_id(const Args& a, const std::string& weights, size_t pos_bytes) {
+  uint64_t h = keepfile::fnv("glm53 kept sessions", 19);
+  const int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) die("run id: /proc/self/exe: %s", std::strerror(errno));
+  std::vector<uint8_t> buf(1 << 20);
+  for (ssize_t r; (r = read(fd, buf.data(), buf.size())) > 0;) h = keepfile::fnv(buf.data(), (size_t)r, h);
+  close(fd);
+  struct stat s{};
+  const int64_t v[3] = {stat(weights.c_str(), &s) == 0 ? (int64_t)s.st_size : -1, (int64_t)s.st_mtim.tv_sec,
+                        (int64_t)s.st_mtim.tv_nsec};
+  h = keepfile::fnv(weights.data(), weights.size(), h);
+  h = keepfile::fnv(v, sizeof v, h);
+  const int64_t o[] = {a.synthetic, a.fill_experts, a.pools, (int64_t)a.seed, a.page, (int64_t)pos_bytes};
+  return keepfile::fnv(o, sizeof o, h);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  setvbuf(stdout, nullptr, _IOLBF, 0);
+  Args a;
+  for (int i = 1; i < argc; ++i) {
+    const std::string s = argv[i];
+    auto val = [&]() -> std::string {
+      if (i + 1 >= argc) die("%s needs a value", s.c_str());
+      return argv[++i];
+    };
+    if (s == "--rank") a.rank = std::stoi(val());
+    else if (s == "--fleet") a.fleet = val();
+    else if (s == "--mode") a.mode = val();
+    else if (s == "--weights") a.weights = val();
+    else if (s == "--synthetic") a.synthetic = true;
+    else if (s == "--fill-experts") a.fill_experts = true;
+    else if (s == "--pools") a.pools = std::stoi(val());
+    else if (s == "--seed") a.seed = std::stoull(val());
+    else if (s == "--socket") a.socket = val();
+    else if (s == "--name") a.name = val();
+    else if (s == "--max-ctx") a.max_ctx = std::stoi(val());
+    else if (s == "--page") a.page = std::stoi(val());
+    else if (s == "--slots") a.slots = std::stoi(val());
+    else if (s == "--slice") a.slice = std::stoi(val());
+    else if (s == "--chunk") a.chunk = std::stoi(val());
+    else if (s == "--splits") a.splits = std::stoi(val());
+    else if (s == "--grow") a.grow = std::stoi(val());
+    else if (s == "--kv-gib") a.kv_gib = std::atof(val().c_str());
+    else if (s == "--margin-gib") a.margin_gib = std::atof(val().c_str());
+    else if (s == "--worker-margin-gib") a.worker_margin_gib = std::atof(val().c_str());
+    else if (s == "--disk-gib") a.disk_gib = std::atof(val().c_str());
+    else if (s == "--disk-dir") a.disk_dir = val();
+    else if (s == "--disk-tag") a.disk_tag = val();
+    else if (s == "--keep-gib") a.keep_gib = std::atof(val().c_str());
+    else if (s == "--keep-days") a.keep_days = std::atof(val().c_str());
+    else if (s == "--step-timeout") a.step_timeout = std::stoi(val());
+    else die("unknown option %s (the header of engine/server/main.cpp lists them)", s.c_str());
+  }
+  if (a.mode != "serve") die("glm53_rank: --mode serve");
+  if (a.page < 256 || a.page % 256) die("--page: a multiple of 256");
+  if (a.chunk < 16 || a.chunk > model::kMaxChunk || a.chunk % 16) die("--chunk: 16 .. %d, a multiple of 16", model::kMaxChunk);
+  if (a.disk_tag.size() > 32 || a.disk_tag.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos)
+    die("--disk-tag: at most 32 of a-z, 0-9, _ and -");
+  if (a.keep_gib < 0 || !(a.keep_days > 0)) die("--keep-gib must be >= 0 and --keep-days > 0");
+  const double t0 = now_s();
+  CUDA_CHECK(cudaSetDevice(0));
+  CUDA_CHECK(cudaFree(nullptr));
+  comm::Options co;
+  co.fleet = a.fleet;
+  co.rank = a.rank;
+  co.cap = 4 << 20;
+  co.bootstrap_timeout_s = 300;
+  comm::Ring ring(co);
+  const int rk = ring.rank();
+  a.rank = rk;
+  const comm::Fleet& fl = comm::fleet(a.fleet);
+  if (a.disk_dir.empty()) a.disk_dir = comm::fleet_path(fl.rank[rk].spill, rk);
+  a.disk_dir = expand(a.disk_dir);
+
+  // 1. the model: a pool of one page for now (resized below), the weights, the prefill buffers
+  model::Options mo;
+  mo.max_ctx = a.max_ctx, mo.page = a.page, mo.slots = 1, mo.prefill_rows = a.chunk, mo.attn_splits = a.splits;
+  model::Model m(rk, mo);
+  std::unique_ptr<glw::WeightFile> wf;
+  model::SynthOptions so;
+  so.seed = a.seed, so.expert_pools = a.pools;
+  std::string wpath = "synthetic";
+  double file_gib = 0;  // the rank file's weights with its reserved experts at their reserved size
+  if (a.synthetic) {
+    m.bind_synthetic(so, ring);
+  } else {
+    char path[1024];
+    if (a.weights == "fleet") std::snprintf(path, sizeof path, "%s", comm::fleet_path(fl.rank[rk].weights, rk).c_str());
+    else std::snprintf(path, sizeof path, expand(a.weights).c_str(), rk);
+    wpath = path;
+    wf = std::make_unique<glw::WeightFile>(wpath, rk, model::kRanks);
+    for (const glw::DeviceTensor& t : wf->tensors()) file_gib += (t.reserved() ? t.reserve_bytes : t.bytes) / kGiB;
+    wf->load();
+    m.bind(*wf, ring, a.fill_experts ? &so : nullptr);
+  }
+  m.prefill_init();
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // 2. the disk tier first (its staging is pinned host memory), with the kept sessions of a planned stop
+  const size_t pos_bytes = m.cache_pos_bytes(), page_bytes = pos_bytes * (size_t)a.page;
+  const std::string base = a.disk_dir + "/rank" + std::to_string(rk) + (a.disk_tag.empty() ? "" : "." + a.disk_tag);
+  const uint64_t id = run_id(a, wpath, pos_bytes);
+  std::unique_ptr<Disk> disk;
+  uint64_t kept_gen = 0;
+  if (a.disk_gib > 0) {
+    std::error_code ec;
+    std::filesystem::create_directories(a.disk_dir, ec);
+    chmod(a.disk_dir.c_str(), 0700);
+    struct statvfs v{};
+    uint64_t fr = statvfs(a.disk_dir.c_str(), &v) == 0 ? (uint64_t)v.f_bavail * v.f_frsize : 0;
+    struct stat st{};
+    if (stat((base + ".spill").c_str(), &st) == 0) fr += (uint64_t)st.st_size;  // its own file counts as free
+    const uint64_t margin = 32ull << 30;
+    std::string why;
+    int kpages = 0;
+    const uint64_t gen = a.keep_gib > 0 ? Disk::kept_check(base, id, page_bytes, a.keep_days * 86400, &kpages, &why) : 0;
+    if (!why.empty()) std::printf("rank %d: kept sessions: none reused (%s)\n", rk, why.c_str());
+    const uint64_t mine[3] = {std::min<uint64_t>((uint64_t)(a.disk_gib * kGiB), fr > margin ? fr - margin : 0) / page_bytes,
+                              gen, (uint64_t)kpages};
+    uint64_t all[4][3];
+    ring.allgather_host(mine, all, sizeof mine);
+    uint64_t pages = mine[0];
+    bool reuse = gen != 0;
+    for (const auto& x : all) pages = std::min(pages, x[0]), reuse = reuse && x[1] == gen && x[2] == (uint64_t)kpages;
+    reuse = reuse && (uint64_t)kpages <= std::max<uint64_t>(pages, kpages) && kpages > 0;
+    if (reuse) pages = kpages;
+    if (pages > 0) {
+      disk = std::make_unique<Disk>(base, (int)pages, page_bytes, reuse, id);
+      kept_gen = reuse ? gen : 0;
+    } else {
+      unlink((base + ".index").c_str());
+      unlink((base + ".spill").c_str());
+    }
+    if (rk == 0)
+      std::printf("disk tier: %llu pages, %.1f GiB a rank in %s (offers, ranks 0-3: %llu %llu %llu %llu pages); kept "
+                  "sessions: %s\n",
+                  (unsigned long long)pages, pages * (double)page_bytes / kGiB, base.c_str(), (unsigned long long)all[0][0],
+                  (unsigned long long)all[1][0], (unsigned long long)all[2][0], (unsigned long long)all[3][0],
+                  reuse ? "the files of the last planned stop are reused" : "none, a clean start");
+  }
+
+  // 3. the cache pool: every rank's offer, the smallest taken
+  size_t dfree = 0, dtotal = 0;
+  CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
+  const size_t avail = meminfo("MemAvailable"), total = meminfo("MemTotal");
+  const size_t margin = (size_t)((rk == 0 ? a.margin_gib : a.worker_margin_gib) * kGiB);
+  const size_t offer = std::min(dfree, avail) > margin ? std::min(dfree, avail) - margin : 0;
+  const double wgib = m.weight_bytes() / kGiB;
+  const double mine[5] = {(double)offer, dfree / kGiB, avail / kGiB, wgib, file_gib};
+  double all[4][5];
+  ring.allgather_host(mine, all, sizeof mine);
+  size_t pool = (size_t)std::min(a.kv_gib * kGiB, 1e18);
+  for (const auto& r : all) pool = std::min(pool, (size_t)r[0]);
+  const int pages = (int)std::min<size_t>(pool / page_bytes, model::kMaxPages);
+  if (pages < 1) die("rank %d: no memory for the cache pool (offers: %.2f %.2f %.2f %.2f GiB)", rk, all[0][0] / kGiB,
+                     all[1][0] / kGiB, all[2][0] / kGiB, all[3][0] / kGiB);
+  m.resize_slots(pages);
+  if (rk == 0) {
+    std::printf("cache pool: %d pages of %d positions = %d positions, %.2f GiB a rank (%zu B a position); free device / "
+                "available host memory before it, ranks 0-3:",
+                pages, a.page, pages * a.page, pages * (double)page_bytes / kGiB, pos_bytes);
+    for (const auto& r : all) std::printf(" %.2f / %.2f", r[1], r[2]);
+    std::printf(" GiB, less margins of %.1f (rank 0) and %.1f GiB\n", a.margin_gib, a.worker_margin_gib);
+    std::printf("weights: %s, %.2f GiB a rank bound (%d MoE layers' experts from the file); the file at its reserved "
+                "size: %.2f GiB; MemTotal %.2f GiB\n",
+                wpath.c_str(), wgib, m.file_expert_layers(), file_gib, total / kGiB);
+  }
+  ring.barrier();
+  pin_self(15);
+  std::printf("rank %d: ready after %.1f s\n", rk, now_s() - t0);
+
+  Watchdog wd(a.step_timeout, ring);
+  if (rk != 0) {
+    follow(m, ring, wd, disk.get(), id);
+    std::printf("rank %d: done\n", rk);
+    return 0;
+  }
+  ServeOptions s;
+  s.socket = a.socket, s.name = a.name, s.max_ctx = a.max_ctx, s.chunk = a.chunk, s.slots = a.slots, s.slice = a.slice;
+  s.grow = a.grow;
+  s.keep_index = a.disk_dir + "/server" + (a.disk_tag.empty() ? "" : "." + a.disk_tag) + ".index";
+  s.keep_bytes = disk ? std::min<size_t>((size_t)disk->pages() * page_bytes, (size_t)(a.keep_gib * kGiB)) : 0;
+  s.keep_age_s = a.keep_days * 86400;
+  s.kept_gen = kept_gen;
+  s.run_id = id;
+  const int rc = serve(m, ring, wd, disk.get(), s);
+  std::printf("rank 0: done\n");
+  return rc;
+}

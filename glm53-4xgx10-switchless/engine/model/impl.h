@@ -99,10 +99,14 @@ struct Model::Impl {
   const uint32_t* rope = nullptr;
   int rope_positions = 0;
 
-  // caches: per layer [slots][max_ctx][576] bf16; per full layer the index keys
+  // caches: per layer [slots][stride][576] bf16; per full layer the index keys (stride: Options::page, or max_ctx)
   uint16_t* kv[kCacheLayers] = {};
   ::glm::IdxCache ik[kIdxCaches] = {};
-  ::glm::KvCache kv_of(int l) const { return ::glm::KvCache{kv[l], (size_t)opt.max_ctx}; }
+  size_t stride = 0;
+  size_t pool_positions() const { return (size_t)opt.slots * stride; }
+  void alloc_caches();  // kv, ik, the MTP pending rows for opt.slots slots (freed first if there were any)
+  uint32_t* ctl_h = nullptr;  // rank 0's control word (mapped host memory, read by the sampler)
+  ::glm::KvCache kv_of(int l) const { return ::glm::KvCache{kv[l], stride}; }
   ::glm::IdxCache ik_of(int l) const { return full_layer(l) ? ik[l == kMtpLayer ? kIdxCaches - 1 : idx_slot(l)] : ::glm::IdxCache{}; }
 
   // decode step buffers (kMaxRows rows)

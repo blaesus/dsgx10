@@ -109,7 +109,7 @@ __device__ __forceinline__ int bin_of(float m, float l) {
 template <int RB>
 __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const float* logits_, int vocab0,
                                                      const StepIn* in, SampleOut* outs, int32_t* fb, uint32_t* counter,
-                                                     int publish) {
+                                                     int publish, const uint32_t* ctl) {
   __shared__ float sv[32];
   __shared__ int si[32];
   __shared__ int hist[257];
@@ -120,6 +120,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
   __shared__ __align__(16) RowCand all[kRanks];
   __shared__ float uv[kRanks * kCand];
   __shared__ int ui[kRanks * kCand];
+  __shared__ uint32_t s_ctl;
 
   wait_prev();
   const int b = blockIdx.x, t = threadIdx.x;
@@ -135,7 +136,10 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
 
   const uint64_t s = comm::next_seq(ch);
   uint8_t* sb = comm::send_buf(ch, s);
-  if (b == 0 && t == 0) *reinterpret_cast<uint4*>(sb) = make_uint4(0, 0, 0, 0);
+  if (b == 0 && t == 0) {  // the header: rank 0's control word
+    const uint32_t c = ch.rank == 0 && ctl ? *reinterpret_cast<const volatile uint32_t*>(ctl) : 0u;
+    *reinterpret_cast<uint4*>(sb) = make_uint4(c, 0, 0, 0);
+  }
   RowCand* mine = reinterpret_cast<RowCand*>(sb + kHdr) + b;
   if (b < R) {
     // ids >= kVocabUsed (the head's padding rows, rank 3's last 24) never win: -inf
@@ -257,6 +261,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
       const int r = k / kChunks, c = k % kChunks;
       reinterpret_cast<uint4*>(&all[r])[c] = comm::ld_cv16(comm::src(ch, s, r) + kHdr + (size_t)b * sizeof(RowCand) + 16 * c);
     }
+  if (t == 0) s_ctl = comm::ld_cv16(comm::src(ch, s, 0)).x;
   comm::finish_grid(ch, s);  // starts with a barrier: the copies above are done
 
   SampleOut& o = outs[in->step % kOutSlots];
@@ -353,6 +358,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     for (int i = 0; i < min(in->nsess, kMaxSess); ++i) nt = max(nt, min(max(in->samp[i].n_top, 0), kTopLogprobs));
     o.n_top = nt;
     o.rows = R;
+    o.ctl = s_ctl;
     o.drafts = 0;
     if (publish) {
       __threadfence_system();
@@ -364,14 +370,14 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
 }  // namespace
 
 void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in, SampleOut* outs, int32_t* fb,
-            uint32_t* counter, cudaStream_t s, bool publish, int max_rows) {
+            uint32_t* counter, cudaStream_t s, bool publish, int max_rows, const uint32_t* ctl) {
   if (kBytes<kMaxRows> > ch.cap) die("sample: %u bytes exceed the channel's %u", kBytes<kMaxRows>, ch.cap);
   if (max_rows <= kLowRows)
     ::glm::launch(k_sample<kLowRows>, dim3(kLowRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, outs, fb,
-                  counter, publish ? 1 : 0);
+                  counter, publish ? 1 : 0, ctl);
   else
     ::glm::launch(k_sample<kMaxRows>, dim3(kMaxRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, outs, fb,
-                  counter, publish ? 1 : 0);
+                  counter, publish ? 1 : 0, ctl);
 }
 
 }  // namespace glm::model::ops

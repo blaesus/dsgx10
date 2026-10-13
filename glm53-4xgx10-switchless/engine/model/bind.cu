@@ -293,11 +293,12 @@ void Model::Impl::bind_file(glw::WeightFile& wf, const SynthOptions* fill) {
 
 void Model::fill_cache(int slot, int n, uint64_t seed) {
   Impl& I = *d_;
-  if (slot < 0 || slot >= I.opt.slots || n < 0 || n > I.opt.max_ctx) die("model: fill_cache(%d, %d)", slot, n);
+  if (slot < 0 || slot >= I.opt.slots || n < 0 || n > I.opt.max_ctx || (size_t)slot * I.stride + n > I.pool_positions())
+    die("model: fill_cache(%d, %d)", slot, n);
   if (n == 0) return;
   for (int l = 0; l < kCacheLayers; ++l) {
     const size_t e = (size_t)n * ::glm::kLat;
-    k_fill_bf16<<<grid_of(e), 256, 0, I.st>>>(I.kv[l] + (size_t)slot * I.opt.max_ctx * ::glm::kLat, e, seed * 131 + l, 0.f, 1.f);
+    k_fill_bf16<<<grid_of(e), 256, 0, I.st>>>(I.kv[l] + (size_t)slot * I.stride * ::glm::kLat, e, seed * 131 + l, 0.f, 1.f);
     if (!full_layer(l)) continue;
     const ::glm::IdxCache c = I.ik_of(l);
     if (c.fp8) {
