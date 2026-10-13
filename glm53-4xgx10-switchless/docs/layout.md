@@ -136,8 +136,8 @@ master from `zai-org/GLM-5.3-BF16` at `9d2398f478cab2de883137db3a36ad2c96205e24`
 | L0–2 dense gate, up, down (9) | zai's BF16 mirror | all | all |
 | **20 of 20 identical** | | **924,975,104 / 924,975,104** | **56,480 / 56,480** |
 
-**The first rule tried was not zai's.** `pack.py`'s `fp8_from_master` computes `scale = amax / 448` (a
-division). On the same 20 tensors: 0 of 20 identical, codes 924,205,615 / 924,975,104 equal (99.917 %),
+**The first rule tried was not zai's.** `pack.py`'s `fp8_from_master` computed `scale = amax / 448` (a
+division) until 2026-10-14, when it was changed to zai's rule (byte-identical to the converter on 3 of 3 tensors). On the same 20 tensors: 0 of 20 identical, codes 924,205,615 / 924,975,104 equal (99.917 %),
 scales 26,249 / 56,480 (46.5 %), every differing scale one ulp away; with zai's own scales the codes were 100 %
 equal, which isolated the scale. Candidates tried on three tensors: `amax/448` in f32 or f64, `1/(448/amax)`
 in f32 or f64; only `amax × f32(1/448)` matched (48/48, 768/768, 240/240). `pack.py` is the attention
@@ -270,8 +270,8 @@ glw_load FILE --rank R [--verify-crc];  glw_expert_fill_test FILE R D L E ...
   the orchestrator to schedule; rank 1 needs ~20 GB freed (quantisation § 4). The MTP layer's experts (NVFP4 by
   our RTN of its BF16) and the S3 fill from the quantiser are later items.
 - `glw_load` on the device, in a ring window (`glw_kcheck --gpu` ran 2026-10-14, § 7).
-- **`engine/attn/tools/pack.py`'s `fp8_from_master` still computes `amax / 448`** and must be changed to zai's
-  rule (`amax × f32(1/448)`, § 4) by the attention side; the converter does not use it (only pack.py's re-cuts).
+- `engine/attn/tools/pack.py`'s `fp8_from_master` used `amax / 448` until 2026-10-14; it now uses zai's rule
+  (`amax × f32(1/448)`, § 4), checked byte for byte against the converter by `engine/attn/tools/fp8_vs_converter.py`.
 - The router is replicated (0.22 GiB, as quantisation § 2); a split by output (64 rows a rank, logits
   all-gathered) is a one-line plan change if G4 prefers it.
 - Ranks 1–3's files are on rank 0's disk; copying them to their boxes (and recording the copies' hashes) is G4's.

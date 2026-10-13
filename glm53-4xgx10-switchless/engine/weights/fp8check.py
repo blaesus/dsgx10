@@ -6,8 +6,9 @@ zai-org/GLM-5.3-BF16), and zai's FP8 codes and weight_scale_inv fetched from zai
 fetch.py). The converter's rule (quant.py fp8_rtn: per 128x128 block scale = f32(amax) * f32(1/448) (a multiply by the
 rounded reciprocal, not a division), codes = e4m3(w / scale) in f32, round to nearest even) is applied to the master
 and the codes and scales are compared bit for bit with the release. --rule pack applies engine/attn/tools/pack.py's
-fp8_from_master instead (scale = amax / 448, a division), which differs from the release by one ulp in about
-half the scales and so in ~0.1 % of the codes.
+fp8_from_master instead; until 2026-10-14 that was scale = amax / 448 (a division), which differed from the
+release by one ulp in about half the scales and so in ~0.1 % of the codes; since then pack.py uses zai's rule too
+and the two agree byte for byte (engine/attn/tools/fp8_vs_converter.py).
 
     python -I fp8check.py --ckpt NV --cache DIR [--json OUT] [NAME ...]
 """
