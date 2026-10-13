@@ -26,6 +26,13 @@ enum : int32_t { kSpecOff = 0, kSpecGiven = 1, kSpecVerify = 2 };
 //   being the tokens per ms of the steps so far.
 enum : int32_t { kGateThresh = 0, kGateRatio = 1, kGateMarginal = 2 };
 constexpr int kMaxSess = kMaxRows;  // sessions in a step, at most (docs/batching.md, B2)
+// The runner's kernels whose launch geometry holds the rows (sample's grid and posted bytes, fused.cu's block
+// sizes) launch as they did before B4 up to kLowRows rows, and sized for kMaxRows past them (as dsk's
+// row_budget): a step of at most 8 rows runs the kernels and launches it ran.
+constexpr int kLowRows = 8;
+constexpr int row_budget(int R) { return R <= kLowRows ? kLowRows : kMaxRows; }
+constexpr int kSessTok = 1 + kDrafts;  // a session's rows in a spec step, at most: its bonus token and its drafts
+static_assert(kSessTok <= kMaxSessRows, "a session's spec rows fit its rows of a step");
 struct StepSamp {  // one session's sampling (model::Sampling)
   uint64_t seed;
   float temperature;  // 0: greedy
@@ -57,7 +64,17 @@ struct StepIn {
   float step_ms[kDrafts + 1];  // kGateRatio, kGateMarginal: the modelled ms of a step verifying n drafts
                                // (n + 1 rows), its draft pass included
   StepSamp samp[kMaxSess];     // each session's sampling
+  // Batch spec steps (spec.cu, docs/batching.md B3: drafts across sessions). Entry k (0 .. nsess - 1) is one
+  // session; its rows are consecutive (sess[r] = k), its bonus token then its drafts. Read only when
+  // sbatch = 1; the one-session path never reads them.
+  int32_t sbatch;               // 1: a batch spec step (k_spec_in_batch's layout, verdicts per entry)
+  int32_t sess_on[kMaxSess];    // entry k takes part in this step (the host writes it before every launch)
+  int32_t sess_slot[kMaxSess];  // entry k's session slot
+  int32_t scap[kMaxSess];       // entry k's drafts for the next step, at most (0..kDrafts)
+  int32_t spos_end[kMaxSess];   // entry k's rows stay below this position
+  float sthresh[kMaxSess];      // entry k's threshold (kGateThresh)
 };
+static_assert(sizeof(StepIn) % 4 == 0, "StepIn is copied word by word");
 // slot = *counter % kInSlots of ring -> dev, feedback tokens resolved from fb, ++*counter.
 void step_in(const StepIn* ring, uint32_t* counter, const int32_t* fb, StepIn* dev, cudaStream_t s);
 
@@ -73,7 +90,8 @@ struct SampleRow {
   uint32_t flags;  // kSampApprox: the kept candidates reached past the exactly known ones
 };
 enum : uint32_t { kSampApprox = 1 };
-// One step's result in pinned memory (a ring of kOutSlots, by StepIn::step), the same on every rank.
+// One step's result in pinned memory (a ring of kOutSlots, by StepIn::step), the same on every rank. Its
+// rows are the step's, up to kMaxRows (a batch step's) or kMaxSessRows (one session's).
 struct SampleOut {
   uint32_t seq;  // StepIn::step + 1, written last
   uint32_t ctl;  // rank 0's control word as the step read it
@@ -90,6 +108,12 @@ struct SampleOut {
   int32_t drafts[kDrafts];
   float survival[kDrafts];
   uint32_t probe[kProbeWords];  // EXPERIMENT (Options::tree_probe): the draft pass's dspark::ProbeOut
+  // Batch spec steps (StepIn::sbatch): entry k's rows of this step and the device's choice for its next
+  int32_t sess_row0[kMaxSess], sess_step_rows[kMaxSess];  // its rows: row[sess_row0 .. sess_row0 + sess_step_rows)
+  int32_t sess_rows[kMaxSess];  // of them, the tokens it emits (accepted drafts, then the token after them)
+  int32_t sess_pos0[kMaxSess];  // its first row's position
+  int32_t next_srows[kMaxSess], next_spos0[kMaxSess];  // its rows of the next step (0: it was off this step)
+  int32_t next_stok[kMaxSess][kSessTok];
 };
 // The device's side of speculative steps (spec.cu), in device memory: what a spec step's sampling
 // decided, and the rows of the verify step after it.
@@ -115,8 +139,12 @@ struct SpecState {
 // the non-speculative sampler's (noise from the seed and position), so the tokens are its tokens. The
 // step's final rows and the token after them go to ss and row[] (SampleOut::rows); the step is
 // published later, after its draft pass (spec.cu).
+// max_rows (kLowRows or kMaxRows, row_budget): the grid, a block per row, and the bytes each rank posts; the
+// step's rows must not exceed it (a captured launch serves every step of its graph: the one-session spec graph's
+// kLowRows, a batch graph's kMaxRows).
 void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in, const uint32_t* ctl,
-            SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss = nullptr);
+            SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss = nullptr,
+            int max_rows = kMaxRows);
 
 // x [R][4][5120] = embed[tokens[r]] in every copy; pre_mix [R][4] = (1, 0, 0, 0).
 void embed(const bf16* table, const int* tokens, int R, bf16* x, float* pre_mix, cudaStream_t s);

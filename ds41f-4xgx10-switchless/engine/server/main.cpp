@@ -24,13 +24,20 @@
 //                --bench-groups G,...: then, for each G dividing k (1 < G < k), steps of k / G runs of
 //                G consecutive rows (B3's verify rows of k / G sessions: docs/batching.md), each run
 //                from its own scattered golden position, the runs S apart; natural, then each run's
-//                routing rotated 48 experts further than the run before
+//                routing rotated 48 experts further than the run before. A k past 8 (B4: up to 16) runs
+//                the grouped kinds only, as a batch of k / G sessions (--slots at least that; session g
+//                in slot g, G consecutive positions per step, the sessions S positions apart): one
+//                session's step holds at most model::kMaxSessRows rows
 //     decode     end-to-end decode speed: --ctx golden positions as prefill, then --steps greedy (or
 //                --temp, --top-p, --top-k) tokens through the self-driving decode loop
 //     batch      sessions decoding together (docs/batching.md, B2; --big): --batch 1024,16384c,1024
 //                prefills each of these golden contexts (c: with CED) in a session slot of its own
 //                (--slots; the last slot first), then decodes --steps tokens of each in one batch loop.
-//                Each session's tokens hash is its decode-mode run's at that context
+//                Each session's tokens hash is its decode-mode run's at that context. --batch-tf
+//                [--batch-rows G] (B4): instead, each session's golden continuation teacher-forced, G
+//                (1..8) consecutive rows of each per step for --steps steps (a step of at most 16 rows in
+//                all); its samples hash is the same whatever the other sessions and G, and tf mode's
+//                over the same positions (--big --prompt C --k G --limit C + G * steps)
 //     serve      rank 0 serves the front-end (docs/protocol.md) on --socket (default
 //                /tmp/dsgb10-engine.sock): sessions with exact prefix reuse (--snap-every positions
 //                between window snapshots, thinned with the distance from a session's end unless
@@ -267,6 +274,8 @@ struct Args {
   std::vector<int> ks{1}, ctxs;  // ctxs: decode and bench at each of these contexts in turn (else ctx)
   std::vector<int> bench_groups;  // bench: runs of consecutive rows (--bench-groups)
   std::string batch;             // --mode batch: the sessions' contexts
+  bool batch_tf = false;         // --mode batch: teacher-forced, batch_rows rows of each session per step
+  int batch_rows = 1;
   std::string tree_probe;        // --mode spectf, EXPERIMENT: the probe's records
   int tree_sib = 0;
   std::string seq_list, route_file, props;  // EXPERIMENT (spectf, generate --loop): prompt-lookup drafts
@@ -284,6 +293,8 @@ struct Args {
   double keep_gib = 0, keep_days = 7;  // kept sessions: written at a planned stop, at most; their age
   int snap_every = 1024, small_rows = 8;
   int slots = 1, slot = 0;  // session slots (model::Options::slots); the golden modes' slot
+  int bgraph_bodies = 0;      // DIAGNOSTICS (spec.cu, the batch graph): switch bodies to capture (0: kMaxRows)
+  bool bgraph_noif = false;   // DIAGNOSTICS: the entries' draft passes without if nodes
   int slice = 64;  // serve: time-slicing's turns, in tokens (0: none)
   bool snap_all = false;
   size_t ring_cap = 4u << 20;  // the ring's per-rank collective size (prefill's bulk collectives post cap / 4)
@@ -369,8 +380,12 @@ Args parse(int argc, char** argv) {
     else if (s == "--keep-days") a.keep_days = std::atof(val().c_str());
     else if (s == "--snap-every") a.snap_every = std::atoi(val().c_str());
     else if (s == "--slots") a.slots = std::atoi(val().c_str());
+    else if (s == "--bgraph-bodies") a.bgraph_bodies = std::atoi(val().c_str());
+    else if (s == "--bgraph-noif") a.bgraph_noif = true;
     else if (s == "--slot") a.slot = std::atoi(val().c_str());
     else if (s == "--batch") a.batch = val();
+    else if (s == "--batch-tf") a.batch_tf = true;
+    else if (s == "--batch-rows") a.batch_rows = std::atoi(val().c_str());
     else if (s == "--slice") a.slice = std::atoi(val().c_str());
     else if (s == "--snap-all") a.snap_all = true;
     else if (s == "--small-rows") a.small_rows = std::atoi(val().c_str());
@@ -448,7 +463,13 @@ Args parse(int argc, char** argv) {
   }
   if (a.mode == "serve") path(a.disk_dir, me.spill, "SPILL", "--disk-dir");
   a.engram_read_batch = me.engram_read_batch;
-  if (a.chunk < 1 || a.chunk > model::kMaxRows || a.k < 1 || a.k > model::kMaxRows) die("--chunk and --k must be 1..8");
+  // steps of one session hold at most kMaxSessRows rows (config.h); a step of up to kMaxRows takes several sessions
+  if (a.chunk < 1 || a.chunk > model::kMaxSessRows || a.k < 1 || a.k > model::kMaxSessRows)
+    die("--chunk and --k must be 1..%d (one session's rows in a step)", model::kMaxSessRows);
+  if (a.small_rows < 0 || a.small_rows > model::kMaxSessRows)
+    die("--small-rows must be 0..%d (a small turn runs as one step of one session)", model::kMaxSessRows);
+  if (a.batch_rows < 1 || a.batch_rows > model::kMaxSessRows)
+    die("--batch-rows must be 1..%d (one session's rows in a step)", model::kMaxSessRows);
   if (a.mode == "serve") a.spec = !a.no_spec;  // the drafts change the speed, never the tokens
   if (a.mode == "serve") a.draft_fp8 = !a.draft_bf16;  // nor does the drafter's FP8 head
   if (a.draft_fp8 && a.draft_bf16) die("--draft-fp8 or --draft-bf16");
@@ -461,14 +482,23 @@ Args parse(int argc, char** argv) {
   if (!a.seq_list.empty() && !(a.mode == "spectf" || (a.mode == "generate" && a.loop && a.big)))
     die("--seq-list FILE: --mode spectf, or generate --loop --big");
   if ((!a.route_file.empty() || !a.props.empty() || a.route_every || a.chain_every) &&
-      (a.mode != "spectf" || a.route_file.empty() || a.route_every < 0 || a.route_every > model::kMaxRows ||
+      (a.mode != "spectf" || a.route_file.empty() || a.route_every < 0 || a.route_every > model::kMaxSessRows ||
        a.chain_every < 0))
-    die("--route-file FILE [--route-every 1..8] [--chain-every N] [--props FILE]: --mode spectf only");
+    die("--route-file FILE [--route-every 1..%d] [--chain-every N] [--props FILE]: --mode spectf only",
+        model::kMaxSessRows);
   if (a.spec_drafts < 0 || a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..5");
   if (a.spec && (a.mode == "decode" || a.mode == "generate") && !a.big)
     die("--spec: the prompt goes through the prefill path (--big), which fills the draft module's windows");
-  for (int k : a.ks)
-    if (k < 1 || k > model::kMaxRows) die("--ks: %d is not 1..8", k);
+  for (int k : a.ks) {
+    if (k < 1 || k > model::kMaxRows) die("--ks: %d is not 1..%d", k, model::kMaxRows);
+    if (k <= model::kMaxSessRows) continue;
+    // past one session's rows: runs of several sessions only (bench), each a slot of its own
+    bool ok = false;
+    for (int G : a.bench_groups) ok |= G > 1 && G <= model::kMaxSessRows && G < k && k % G == 0 && k / G <= a.slots;
+    if (a.mode != "bench" || a.bench_stride <= 0 || !ok)
+      die("--ks %d: more than %d rows take runs of several sessions: --mode bench --bench-stride S --bench-groups G "
+          "with G <= %d dividing %d, and --slots at least %d / G", k, model::kMaxSessRows, model::kMaxSessRows, k, k);
+  }
   return a;
 }
 
@@ -549,6 +579,7 @@ int main(int argc, char** argv) {
   mo.draft_head4 = a.draft_head4, mo.draft_markov8 = a.draft_markov8;
   mo.tree_probe = !a.tree_probe.empty();
   mo.slots = a.slots;
+  mo.bgraph_bodies = a.bgraph_bodies, mo.bgraph_noif = a.bgraph_noif;
   mo.l2pf = !a.no_l2pf;
   model::Model m(a.rank, mo);
   m.use_slot(a.slot);
@@ -963,10 +994,15 @@ int main(int argc, char** argv) {
     }
     if (!a.big || ss.empty() || (int)ss.size() > a.slots)
       die("batch: %zu sessions (--batch) in %d slots (--slots), through the prefill path (--big)", ss.size(), a.slots);
+    const int per = a.batch_tf ? a.steps * a.batch_rows : a.steps;  // positions each session goes on by
+    if (a.batch_tf && (int)ss.size() * a.batch_rows > model::kMaxRows)
+      die("batch: %zu sessions of %d rows a step: at most %d rows", ss.size(), a.batch_rows, model::kMaxRows);
+    if (a.spec && (int)ss.size() > model::kMaxRows / 2)  // B3: a draft each at least
+      die("batch: %zu sessions with drafts (--spec): at most %d (kMaxRows / 2)", ss.size(), model::kMaxRows / 2);
     for (size_t k = 0; k < ss.size(); ++k) {  // each session's prompt in its slot
       Sess& s = ss[k];
       s.slot = a.slots - 1 - (int)k;
-      if (s.ctx < 128 || s.ctx + a.steps >= L) die("batch: context %d and %d steps, %d golden tokens", s.ctx, a.steps, L);
+      if (s.ctx < 128 || s.ctx + per >= L) die("batch: context %d and %d positions, %d golden tokens", s.ctx, per, L);
       Cmd c{};
       c.op = kCmdState;
       c.slot = s.slot;
@@ -978,6 +1014,51 @@ int main(int argc, char** argv) {
       std::printf("batch: session %zu in slot %d: context %d%s, prefill %.2f s, first token %d\n", k, s.slot, s.ctx,
                   s.ced ? " (CED)" : "", t_pref, s.first);
     }
+    if (a.batch_tf) {
+      // B4's check (docs/batching.md): every session's golden continuation teacher-forced, --batch-rows rows of
+      // each per step (kCmdBatchTf). Each row computes what it computes alone, so a session's samples hash is
+      // the same whatever the other sessions and the rows per step, and tf mode's over the same positions
+      // (--big --prompt C --k G --limit C + G * steps: the same (token, logit) folds in the same order).
+      std::vector<BatchEntry> e(ss.size());
+      std::vector<std::vector<int32_t>> t(ss.size());
+      for (size_t k = 0; k < ss.size(); ++k) {
+        BatchEntry& x = e[k];
+        x.slot = ss[k].slot, x.pos0 = ss[k].ctx, x.max_new = per, x.limit = a.max_ctx;
+        x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
+        t[k].assign(toks.begin() + ss[k].ctx, toks.begin() + ss[k].ctx + per);
+      }
+      Cmd c{};
+      c.op = kCmdBatchTf;
+      c.n = (int)e.size();
+      c.rows = a.batch_rows;
+      bcast(ring, c);
+      bcast_tf(ring, c, e, t, 0);
+      const std::vector<float> ms = batch_tf_loop(m, c, e, t, wd, [&](int k, const model::SampleOut& o, int row) {
+        Sess& s = ss[k];
+        s.out.push_back(o.row[row].token);  // the sample at its position: the golden token after it when equal
+        uint32_t bits;
+        std::memcpy(&bits, &o.row[row].value, 4);
+        s.hash = (s.hash ^ (uint32_t)o.row[row].token) * 1099511628211ull;
+        s.hash = (s.hash ^ bits) * 1099511628211ull;
+      });
+      bcast(ring, Cmd{});  // stop
+      for (size_t k = 0; k < ss.size(); ++k) {
+        const Sess& s = ss[k];
+        int same = 0;
+        for (size_t i = 0; i < s.out.size(); ++i) same += s.out[i] == toks[s.ctx + 1 + i];
+        std::printf("batch-tf: session %zu (slot %d, context %d%s): %zu rows in steps of %d, samples hash %016llx; %d of "
+                    "them equal the golden next token\n",
+                    k, s.slot, s.ctx, s.ced ? ", CED" : "", s.out.size(), a.batch_rows, (unsigned long long)s.hash, same);
+      }
+      const int skip = std::min(3, (int)ms.size() / 2);  // the first steps run eagerly or capture
+      std::vector<double> d(ms.begin() + skip, ms.end());
+      std::sort(d.begin(), d.end());
+      if (!d.empty())
+        std::printf("batch-tf: %zu steps of %zu sessions, %d rows each: gpu (ms) median %.3f min %.3f p90 %.3f max %.3f\n",
+                    ms.size(), ss.size(), (int)ss.size() * a.batch_rows, d[d.size() / 2], d[0], d[d.size() * 9 / 10],
+                    d.back());
+      return 0;
+    }
     std::vector<BatchEntry> e(ss.size());
     for (size_t k = 0; k < ss.size(); ++k) {
       BatchEntry& x = e[k];
@@ -986,18 +1067,36 @@ int main(int argc, char** argv) {
       x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
     }
     Cmd c{};
-    c.op = kCmdBatch;
+    c.op = a.spec ? kCmdSpecBatch : kCmdBatch;  // B3 (--spec): drafts across the sessions, every one to its end
     c.n = (int)e.size();
+    if (a.spec) {
+      c.spec = 1;
+      c.spec_drafts = a.spec_drafts;
+      c.spec_thresh = a.spec_thresh;
+      std::copy(a.spec_cost, a.spec_cost + 3, c.spec_cost);
+      c.spec_gate = a.spec_gate;
+      std::copy(a.spec_row_ms, a.spec_row_ms + model::ops::kDrafts + 1, c.spec_row_ms);
+    }
     bcast(ring, c);
     bcast_payload(ring, e.data(), e.size() * sizeof(BatchEntry), 0);
-    const std::vector<BatchEnd> ends = batch_loop(m, c, e, wd, [&](int k, const model::SampleOut& o, int row) {
+    const OnBatch cb = [&](int k, const model::SampleOut& o, int row) {
       Sess& s = ss[k];
       s.out.push_back(o.row[row].token);
       uint32_t bits;
       std::memcpy(&bits, &o.row[row].value, 4);
       s.hash = (s.hash ^ (uint32_t)o.row[row].token) * 1099511628211ull;
       s.hash = (s.hash ^ bits) * 1099511628211ull;
-    });
+    };
+    std::vector<BatchEnd> ends(ss.size());
+    std::vector<DecodeEnd> dends;
+    SpecBatchStats st;
+    if (a.spec) {
+      dends = spec_batch_loop(m, c, e, wd, cb, &st);
+      for (size_t k = 0; k < ss.size(); ++k)
+        ends[k].sampled = dends[k].sampled, ends[k].fed = dends[k].fed, ends[k].why = dends[k].why;
+    } else {
+      ends = batch_loop(m, c, e, wd, cb);
+    }
     bcast(ring, Cmd{});  // stop
     for (size_t k = 0; k < ss.size(); ++k) {
       const Sess& s = ss[k];
@@ -1007,6 +1106,7 @@ int main(int argc, char** argv) {
                   "%016llx; the first %d tokens equal the golden continuation\n",
                   k, s.slot, s.ctx, s.ced ? ", CED" : "", s.out.size(), ends[k].fed, ends[k].why,
                   (unsigned long long)s.hash, same);
+      if (a.spec) spec_report(dends[k]);
     }
     // the steps' times, by when each one's samples came (the first ones run eagerly and capture graphs)
     const std::vector<double>& t = g_t_wait;
@@ -1016,9 +1116,20 @@ int main(int argc, char** argv) {
       std::vector<double> d;
       for (int i = skip + 1; i < ns; ++i) d.push_back(1e3 * (t[i] - t[i - 1]));
       std::sort(d.begin(), d.end());
-      std::printf("batch: %d steps of %zu rows: %.3f ms per step (median %.3f, p90 %.3f, max %.3f), %.1f tok/s in "
-                  "all, %.1f per session\n",
-                  ns, ss.size(), ms, d[d.size() / 2], d[d.size() * 9 / 10], d.back(), 1e3 * ss.size() / ms, 1e3 / ms);
+      if (!a.spec) {
+        std::printf("batch: %d steps of %zu rows: %.3f ms per step (median %.3f, p90 %.3f, max %.3f), %.1f tok/s in "
+                    "all, %.1f per session\n",
+                    ns, ss.size(), ms, d[d.size() / 2], d[d.size() * 9 / 10], d.back(), 1e3 * ss.size() / ms, 1e3 / ms);
+      } else {
+        const double tps = st.steps ? (double)st.emitted / st.steps : 0.0;  // tokens per step, every session's
+        std::printf("batch: %d steps of %.2f rows (%zu sessions with drafts): %.3f ms per step (median %.3f, p90 %.3f, "
+                    "max %.3f), %.2f tokens per step, %.1f tok/s in all, %.1f per session; spec step GPU ms by rows:",
+                    ns, st.steps ? (double)st.rows / st.steps : 0.0, ss.size(), ms, d[d.size() / 2],
+                    d[d.size() * 9 / 10], d.back(), tps, 1e3 * tps / ms, 1e3 * tps / ms / (double)ss.size());
+        for (int r = 1; r <= model::kMaxRows; ++r)
+          if (st.gpu_n[r]) std::printf(" %d: %.2f (%d)", r, st.gpu_ms[r] / st.gpu_n[r], st.gpu_n[r]);
+        std::printf("\n");
+      }
     }
     return 0;
   }
@@ -1096,8 +1207,8 @@ int main(int argc, char** argv) {
       // rows at [anchor, anchor + R) read the positions before the anchor; what they write past the history
       // must leave the carries' slot of anchor - 1 alone, for the next spectf step (16 slots: R <= 15)
       if (R < 1 || R > 15) die("spectf: %d rows to route at %d (1..15)", R, anchor);
-      for (int q = 0; q < R; q += model::kMaxRows) {
-        const int nr = std::min(model::kMaxRows, R - q);
+      for (int q = 0; q < R; q += model::kMaxSessRows) {  // steps of one session: at most kMaxSessRows rows
+        const int nr = std::min(model::kMaxSessRows, R - q);
         ExpertSink es;
         const double t0 = now_s();
         route(anchor + q, nr, t + q, es);
@@ -1126,8 +1237,8 @@ int main(int argc, char** argv) {
       if (!a.seq_list.empty()) std::snprintf(pre, sizeof pre, "seq %zu ", sq);
       if (a.big)  // the prompt through the prefill path: its seeding of the windows
         big_prefill(0, first, tk);
-      else
-        for (int p = 0; p < first; p += model::kMaxRows) rows(p, std::min(model::kMaxRows, first - p), -1);
+      else  // spec steps of one session: at most kMaxSessRows rows each
+        for (int p = 0; p < first; p += model::kMaxSessRows) rows(p, std::min(model::kMaxSessRows, first - p), -1);
       sib_at = -1;
       for (int i = first; i + 1 < SL; ++i, ++n) {
         int32_t path[model::ops::kDrafts];
@@ -1220,10 +1331,15 @@ int main(int argc, char** argv) {
   if (a.mode == "bench") {
     int need = ctxs.back();
     for (int k : a.ks) {
-      need += k * (a.bench_stride > 0 ? 3 * a.steps + 18 : a.steps);
+      const bool multi = k > model::kMaxSessRows;  // runs of several sessions only (B4)
+      if (!multi) need += k * (a.bench_stride > 0 ? 3 * a.steps + 18 : a.steps);
       for (int G : a.bench_groups)
-        if (a.bench_stride > 0 && G > 1 && G < k && k % G == 0) need += k * (2 * a.steps + 12);
+        if (a.bench_stride > 0 && G > 1 && G < k && k % G == 0 && (!multi || (G <= model::kMaxSessRows && k / G <= a.slots)))
+          need += k * (2 * a.steps + 12);
     }
+    // the rotated kinds: row r's (or run r's) router logits rotated kRouteShift experts further than the one
+    // before (model.h set_route_shift), kExperts / 8 as measured since 2026-10-12, whatever kMaxRows
+    constexpr int kRouteShift = model::kExperts / model::kMaxSessRows;
     if (ctxs[0] < 1 || a.steps < 4 || need > L)
       die("bench: context %d plus %d steps per k do not fit the %d golden tokens", ctxs.back(), a.steps, L);
     auto stat = [](std::vector<double> v) {  // the first 3 steps run eagerly or capture
@@ -1246,6 +1362,91 @@ int main(int argc, char** argv) {
       RouteSink route_all;  // every consecutive row routed in this context's eager steps
       p = ctx;
       for (size_t j = 0; j < a.ks.size(); ++j) {
+        if (a.ks[j] > model::kMaxSessRows) {
+          // B4: a step of 9..16 rows holds runs of several sessions only (one session's at most kMaxSessRows: the
+          // one-session kinds below are skipped), through Model::launch_batch (kCmdBatchTf) with a session slot per
+          // run: session g in slot g, G consecutive positions per step from base - (n - 1 - g) * S (S = --bench-stride:
+          // the sessions as far apart as a one-session step's runs), its tokens from its own scattered golden
+          // position (run_tok, as the runs below); natural, then each session's routing rotated kRouteShift experts
+          // further than the one before (rank 0's, as the kinds below); then a few eager steps of each kind for
+          // their distinct experts. The slots past the context's hold no state (their rows attend to empty windows
+          // and caches: the same work), and every slot's Engram history is the golden tokens (set_tokens), so that
+          // each session's rows hash their n-grams from it.
+          const int k = a.ks[j];
+          std::printf("  k %d: past one session's %d rows; runs of several sessions only\n", k, model::kMaxSessRows);
+          const int base = (int)p;
+          for (int G : a.bench_groups) {
+            if (G <= 1 || G > model::kMaxSessRows || G >= k || k % G || k / G > a.slots) continue;
+            const int n = k / G;
+            if (base < (n - 1) * a.bench_stride)
+              die("bench: k %d in %d runs %d apart needs a context of at least %d", k, n, a.bench_stride, (n - 1) * a.bench_stride);
+            for (int s = 0; s < n; ++s) {  // the sessions' Engram histories: the golden tokens, in every slot
+              Cmd c{};
+              c.op = kCmdTokens;
+              c.slot = s;
+              c.pos0 = 0;
+              c.n = L;
+              bcast(ring, c);
+              bcast_payload(ring, toks.data(), toks.size() * 4, 0);
+              m.use_slot(s);
+              m.set_tokens(0, L, toks.data());
+            }
+            {
+              Cmd c{};
+              c.op = kCmdState;
+              c.slot = a.slot;
+              bcast(ring, c);
+              m.use_slot(a.slot);
+            }
+            auto run_tok = [&](size_t q, int r) {
+              const uint64_t g = (uint64_t)(r / G);
+              return toks[(size_t)(((q + g) * 2654435761ull + g * 40503ull) % (uint64_t)(L - G)) + r % G];
+            };
+            // one step: the sessions' step i (their positions go on by G each), tokens drawn at q; eager with its
+            // routed experts into rs when given; its GPU ms
+            auto tf_step = [&](size_t q, int i, RouteSink* rs) {
+              Cmd c{};
+              c.op = kCmdBatchTf;
+              c.n = n;
+              c.rows = G;
+              c.flags = rs ? model::kFlagDump : 0;
+              std::vector<BatchEntry> e(n);
+              std::vector<std::vector<int32_t>> t(n);
+              for (int g = 0; g < n; ++g) {
+                e[g].slot = g;
+                e[g].pos0 = base - (n - 1 - g) * a.bench_stride + i * G;
+                e[g].max_new = G;
+                e[g].limit = a.max_ctx;
+                e[g].sp.temperature = a.temp, e[g].sp.seed = a.seed;
+                for (int r = 0; r < G; ++r) t[g].push_back(run_tok(q, g * G + r));
+              }
+              bcast(ring, c);
+              bcast_tf(ring, c, e, t, 0);
+              const std::vector<float> ms =
+                  batch_tf_loop(m, c, e, t, wd, [&](int, const model::SampleOut& o, int row) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &o.row[row].value, 4);
+                    chosen_hash = (chosen_hash ^ (uint32_t)o.row[row].token) * 1099511628211ull;
+                    chosen_hash = (chosen_hash ^ bits) * 1099511628211ull;
+                  }, rs);
+              return ms.empty() ? 0.0 : (double)ms[0];
+            };
+            std::vector<double> gg[2];
+            RouteSink gs[2];
+            int i = 0;
+            for (int v = 0; v < 2; ++v) {
+              m.set_route_shift(v ? kRouteShift : 0, G);
+              for (int s = 0; s < a.steps; ++s, ++i, p += k) gg[v].push_back(tf_step(p, i, nullptr));
+              for (int s = 0; s < 6; ++s, ++i, p += k) tf_step(p, i, a.rank == 0 ? &gs[v] : nullptr);
+            }
+            m.set_route_shift(0);
+            std::printf("  k %d in %d runs of %d rows %d apart (a session a slot, B4), gpu (ms): natural %s, %.1f experts per "
+                        "layer; rotated %s, %.1f\n",
+                        k, n, G, a.bench_stride, stat(gg[0]).c_str(), gs[0].distinct / std::max(1, gs[0].n),
+                        stat(gg[1]).c_str(), gs[1].distinct / std::max(1, gs[1].n));
+          }
+          continue;
+        }
         for (int i = 0; i < a.steps; ++i, p += a.ks[j]) {
           // nsys --capture-range=cudaProfilerApi: the first context's replays from the first k's on (tools:
           // kprof drops each k's first 3 steps, which run eagerly or capture)
@@ -1259,7 +1460,6 @@ int main(int argc, char** argv) {
         // the same row count, unrelated rows: golden tokens from scattered positions, the rows
         // bench_stride positions apart (every rank draws the same); then the same with each row's router
         // logits rotated kRouteShift experts further than the last row's, so the rows share few experts
-        constexpr int kRouteShift = model::kExperts / model::kMaxRows;
         auto scattered = [&](size_t q, int r) {
           return toks[(size_t)(((uint64_t)(q + r) * 2654435761ull + (uint64_t)r * 40503ull) % (uint64_t)L)];
         };
@@ -1354,6 +1554,7 @@ int main(int argc, char** argv) {
       else if (n_pref)
         std::printf("  prefill: %d chunks of %d rows, %.2f ms each\n", n_pref, a.chunk, 1e3 * t_pref / n_pref);
       for (size_t j = 0; j < a.ks.size(); ++j) {
+        if (host[j].empty()) continue;  // a k past kMaxSessRows: its runs of several sessions are printed above
         std::printf("  k %d step, host (ms): %s\n", a.ks[j], stat(host[j]).c_str());
         std::printf("  k %d step, gpu  (ms): %s\n", a.ks[j], stat(gpu[j]).c_str());
         std::printf("  k %d bcast      (ms): %s\n", a.ks[j], stat(bc[j]).c_str());
@@ -1371,6 +1572,7 @@ int main(int argc, char** argv) {
       const int g0 = m.graph_count();
       CUDA_CHECK(cudaMemGetInfo(&free0, &total));
       for (int k : a.ks) {
+        if (k > model::kMaxSessRows) continue;  // one session's steps only
         std::vector<double> t;
         for (int b = model::kCtxBucket; b <= a.max_ctx; b += model::kCtxBucket) {
           const int n0 = m.graph_count();

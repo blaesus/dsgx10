@@ -427,6 +427,295 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
   return end;
 }
 
+void bcast_tf(comm::Ring& ring, const Cmd& c, std::vector<BatchEntry>& e, std::vector<std::vector<int32_t>>& tokens,
+              int rank) {
+  if (rank != 0) e.assign(c.n, BatchEntry{}), tokens.assign(c.n, {});
+  if (c.n < 1 || (int)e.size() != c.n || (int)tokens.size() != c.n) die("batch_tf: %d entries", c.n);
+  bcast_payload(ring, e.data(), e.size() * sizeof(BatchEntry), rank);
+  size_t total = 0;
+  for (int k = 0; k < c.n; ++k) total += (size_t)std::max(0, e[k].max_new);
+  std::vector<int32_t> all;
+  if (rank == 0)
+    for (const std::vector<int32_t>& t : tokens) all.insert(all.end(), t.begin(), t.end());
+  else
+    all.resize(total);
+  if (all.size() != total) die("batch_tf: %zu tokens for %zu", all.size(), total);
+  if (total) bcast_payload(ring, all.data(), total * 4, rank);
+  if (rank != 0)
+    for (int k = 0, off = 0; k < c.n; off += e[k].max_new, ++k)
+      tokens[k].assign(all.begin() + off, all.begin() + off + std::max(0, e[k].max_new));
+}
+
+std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e,
+                                 const std::vector<std::vector<int32_t>>& tokens, Watchdog& wd, const OnBatch& on,
+                                 model::Sink* sink) {
+  const int n = (int)e.size(), G = c.rows;
+  if (n < 1 || n > model::ops::kMaxSess || G < 1 || G > model::kMaxSessRows || (int)tokens.size() != n)
+    die("batch_tf: %d entries, %d rows of each per step (1..%d)", n, G, model::kMaxSessRows);
+  for (int k = 0; k < n; ++k)
+    if (e[k].max_new < 0 || (int)tokens[k].size() != e[k].max_new || e[k].pos0 < 0 ||
+        e[k].pos0 + e[k].max_new > e[k].limit)
+      die("batch_tf: entry %d: %d tokens at %d, limit %d", k, e[k].max_new, e[k].pos0, e[k].limit);
+  std::vector<int> fed(n, 0);
+  std::vector<float> ms;
+  for (;;) {
+    model::Batch b;
+    int ent[model::kMaxRows] = {};  // row r's entry
+    for (int k = 0; k < n; ++k) {
+      const int rows = std::min(G, e[k].max_new - fed[k]);
+      if (rows <= 0) continue;
+      if (b.R + rows > model::kMaxRows) die("batch_tf: a step of more than %d rows", model::kMaxRows);
+      const int s = b.nsess++;
+      b.sp[s] = e[k].sp;
+      for (int i = 0; i < rows; ++i) {
+        const int r = b.R++;
+        b.tokens[r] = tokens[k][fed[k] + i];
+        b.pos[r] = e[k].pos0 + fed[k] + i;
+        b.slot[r] = e[k].slot;
+        b.sess[r] = s;
+        ent[r] = k;
+      }
+      fed[k] += rows;
+    }
+    if (!b.R) break;
+    b.flags = c.flags;
+    b.sink = sink;
+    wd.started = now_s();
+    const model::SampleOut& o = m.wait(m.launch_batch(b));
+    ms.push_back(m.last_gpu_ms());
+    wd.started = 0;
+    if (on)
+      for (int r = 0; r < b.R; ++r) on(ent[r], o, r);
+  }
+  return ms;
+}
+
+// B3 (cmd.h): spec_loop's accounting per entry, over batch spec steps
+std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
+                                       const OnBatch& on, SpecBatchStats* st) {
+  constexpr int kD = model::ops::kDrafts;
+  g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
+  const int n = (int)e.size(), slot0 = m.slot();
+  if (n < 1 || n > model::ops::kMaxSess || n > m.spec_batch_entries())
+    die("spec batch: %d entries (the model takes %d)", n, m.spec_batch_entries());
+  std::vector<DecodeEnd> end(n);
+  SpecBatchStats stats;
+  // per entry: the rows' bounds (spec_loop's pos_end and feed), live (not finished), ending (stopped, its
+  // rows of one more step still to run: queued already (pend), or in the next step launched), the rows
+  // of its next step as the last result chose them (nx), the drafts' rate, its history and snapshots
+  std::vector<int> pos_end(n), feed(n), next_snap(n), F(n, 0), H(n, 0);
+  std::vector<char> live(n, 1), ending(n, 0), pend(n, 0);
+  std::vector<SpecRate> rate(n);
+  std::vector<std::vector<int32_t>> toks(n);  // tok_0, tok_1, ..: positions pos0, pos0 + 1, ..
+  struct Next {
+    int rows = 1, pos0 = 0;
+    int32_t tok[model::ops::kSessTok] = {};
+  };
+  std::vector<Next> nx(n);
+  std::vector<int> pin;
+  for (const int32_t h : c.live)
+    if (h > 0) pin.push_back(h);
+  for (int k = 0; k < n; ++k) {
+    const BatchEntry& x = e[k];
+    DecodeEnd& d = end[k];
+    d.written = x.pos0;
+    d.spec_tok = x.spec_tok, d.spec_ms = x.spec_ms;
+    rate[k] = SpecRate{x.spec_tok, x.spec_ms};
+    pos_end[k] = (int)std::min<int64_t>(x.limit, (int64_t)x.pos0 + x.max_new);
+    feed[k] = std::min(pos_end[k], x.limit - 1);
+    toks[k].push_back(x.token);
+    nx[k].pos0 = x.pos0, nx[k].tok[0] = x.token;
+    next_snap[k] = x.snap_every > 0 ? (x.pos0 / x.snap_every + 1) * x.snap_every : INT32_MAX;
+    if (x.handle >= 0) pin.push_back(x.handle);
+    if (x.max_new < 1 || x.pos0 >= x.limit) live[k] = 0, d.why = x.max_new < 1 ? kEndLength : kEndContext;
+  }
+  m.state_pin(pin);  // the sessions' stored state, while snapshots make room
+  // entry k's window snapshots up to kv_end (positions below it hold its history's KV; the ring holds
+  // s - 128 .. s - 1), in its slot
+  auto snaps = [&](int k, int kv_end) {
+    for (; next_snap[k] <= kv_end; next_snap[k] += e[k].snap_every)
+      if (e[k].handle >= 0 && next_snap[k] > e[k].pos0 && next_snap[k] >= 128) {
+        m.use_slot(e[k].slot);
+        m.state_snap(e[k].handle, next_snap[k]);
+      }
+  };
+  // entry k is done: positions [pos0, kv_end) hold its history's KV
+  auto finish = [&](int k, int kv_end) {
+    live[k] = 0, ending[k] = 0, pend[k] = 0;
+    end[k].fed = kv_end - e[k].pos0;
+    end[k].last = toks[k][end[k].fed - 1];
+  };
+  struct Step {
+    uint64_t id = 0;
+    bool late = false;  // a verify step whose Engram lookups wait for its rows (engram_late_rows)
+    char on[model::ops::kMaxSess] = {};
+  };
+  std::deque<Step> q;  // launched, not yet waited for: the one running, then the one queued behind it
+  auto on_now = [&](int k) { return live[k] && !(ending[k] && pend[k]); };
+  // a verify step's rows, as the device lays them out (the entries on in order, each its nx), for its
+  // Engram lookups: once the step before it has reported (nx), and before it is waited for
+  auto late_rows = [&](Step& s) {
+    int32_t t[model::kMaxRows], p[model::kMaxRows], sl[model::kMaxRows];
+    int R = 0;
+    for (int k = 0; k < n; ++k) {
+      if (!s.on[k]) continue;
+      if (nx[k].rows < 1 || nx[k].rows > model::ops::kSessTok || R + nx[k].rows > model::kMaxRows)
+        die("spec batch: entry %d brings %d rows to a step of %d", k, nx[k].rows, R);
+      for (int j = 0; j < nx[k].rows; ++j, ++R) t[R] = nx[k].tok[j], p[R] = nx[k].pos0 + j, sl[R] = e[k].slot;
+    }
+    m.engram_late_rows(R, t, p, sl);
+    s.late = false;
+  };
+  // A launch: the entries on (live, or ending with their rows still to run), each with the drafts' cap
+  // by their count; the first step given (one row per entry), the others verify steps (the rows the step
+  // before chose), bound by their rows' last position at most: queued ahead, every draft of the step
+  // before accepted and kD more rows after them.
+  auto launch = [&](bool given, bool ahead) {
+    model::SpecBatch b;
+    Step s;
+    int S = 0, bound = 0, lim = INT32_MAX;
+    for (int k = 0; k < n; ++k)
+      if (on_now(k)) ++S;
+    const int cap = S ? std::min({kD, c.spec_drafts, (model::kMaxRows - S) / S}) : 0;
+    b.n = n;
+    b.cfg.max_drafts = std::max(0, std::min(kD, c.spec_drafts));
+    b.cfg.gate = c.spec_gate;
+    std::copy(c.spec_row_ms, c.spec_row_ms + kD + 1, b.cfg.step_ms);
+    for (int k = 0; k < n; ++k) {
+      b.on[k] = s.on[k] = on_now(k) ? 1 : 0;
+      b.slot[k] = e[k].slot, b.sp[k] = e[k].sp, b.cap[k] = cap, b.pos_end[k] = pos_end[k];
+      b.token[k] = nx[k].tok[0], b.pos0[k] = nx[k].pos0;
+      b.cfg.pos_end = std::max(b.cfg.pos_end, pos_end[k]);
+      if (!b.on[k]) continue;
+      b.thresh[k] = rate[k].thresh(c);
+      end[k].gate(b.thresh[k]);
+      bound = std::max(bound, ahead ? nx[k].pos0 + nx[k].rows + kD : nx[k].pos0 + nx[k].rows - 1);
+      lim = std::min(lim, e[k].limit);
+      if (ending[k]) pend[k] = 1;
+    }
+    b.pos_bound = std::min(bound, lim - 1);
+    s.id = given ? m.launch_spec_batch(b) : m.launch_verify_batch(b);
+    s.late = !given;  // a given step's rows are the host's: launch_spec_batch looked them up
+    q.push_back(s);
+  };
+  // the next step may be queued before the one running ends when every entry decoding fits it: its
+  // rows start at most where the running step's end (every draft accepted), at or below feed
+  auto fits = [&] {
+    int any = 0;
+    for (int k = 0; k < n; ++k) {
+      if (!live[k] || ending[k]) continue;
+      if (nx[k].pos0 + nx[k].rows > feed[k]) return false;
+      ++any;
+    }
+    return any > 0;
+  };
+  bool any_live = false;
+  for (int k = 0; k < n; ++k) any_live |= live[k] != 0;
+  if (any_live) {
+    launch(true, false);
+    if (c.ahead && fits()) launch(false, true);
+  }
+  uint64_t prev_id = 0;
+  int prev_R = 0;
+  for (int i = 0; !q.empty(); ++i) {
+    const Step s = q.front();
+    q.pop_front();
+    wd.started = now_s();
+    const model::SampleOut& o = m.wait(s.id);
+    wd.started = 0;
+    g_t_wait.push_back(now_s());
+    for (int k = 0; k < n; ++k) {  // each entry's next rows, the device's choice
+      if (!s.on[k]) continue;
+      nx[k].rows = o.next_srows[k], nx[k].pos0 = o.next_spos0[k];
+      std::copy(o.next_stok[k], o.next_stok[k] + model::ops::kSessTok, nx[k].tok);
+    }
+    if (!q.empty() && q.front().late) late_rows(q.front());  // the step queued ahead: its rows are known now
+    g_t_late.push_back(now_s());
+    if (i > 4)  // the step before (done; past the graphs' captures): its GPU time by its rows
+      stats.gpu_ms[std::min(prev_R, model::kMaxRows)] += m.gpu_ms(prev_id), ++stats.gpu_n[std::min(prev_R, model::kMaxRows)];
+    prev_id = s.id, prev_R = o.step_rows;
+    ++stats.steps, stats.rows += o.step_rows;
+    for (int k = 0; k < n; ++k) {
+      if (!s.on[k]) continue;
+      DecodeEnd& d = end[k];
+      const int p0 = o.sess_pos0[k], sr = o.sess_step_rows[k], er = o.sess_rows[k], r0 = o.sess_row0[k];
+      if (sr < 1 || er < 1 || er > sr || r0 < 0 || r0 + sr > o.step_rows)
+        die("spec batch: entry %d: rows %d (%d emitted) from row %d of %d", k, sr, er, r0, o.step_rows);
+      d.written = std::max(d.written, p0 + std::max(sr, er + kD));
+      if (ending[k]) {  // its rows behind its end: their KV counts, their tokens do not
+        snaps(k, H[k] + 1);
+        finish(k, H[k] + 1);
+        continue;
+      }
+      if (i > 0) {
+        ++d.vsteps, d.verified += sr - 1, d.accepted += er - 1;
+        ++d.rows_hist[std::min(sr - 1, kD)];
+      }
+      rate[k].add(c, er, sr);
+      d.spec_tok = rate[k].tok, d.spec_ms = rate[k].ms;
+      // the tokens it emits, until a stop
+      bool stop = false;
+      int u = 0;
+      for (int j = 0; j < er && !stop; ++j) {
+        const int r = r0 + j;
+        const int32_t t = o.row[r].token;
+        if (on) on(k, o, r);
+        ++d.sampled, ++u, ++stats.emitted;
+        toks[k].push_back(t);
+        if (o.ctl & (1u << e[k].slot)) stop = true, d.why = kEndCancel;
+        for (int q2 = 0; !stop && q2 < e[k].n_stop; ++q2)
+          if (t == e[k].stop[q2]) stop = true, d.why = kEndStop;
+        if (!stop && d.sampled >= e[k].max_new) stop = true, d.why = kEndLength;
+      }
+      if (!stop && (o.ctl & kCtlPause)) stop = true, d.why = kEndPause;
+      if (!stop && nx[k].pos0 >= pos_end[k]) stop = true, d.why = kEndContext;
+      // positions p0 .. F hold their final KV; the history now ends at H
+      F[k] = p0 + er - 1, H[k] = p0 + u;
+      if (!stop) {
+        snaps(k, H[k]);
+        continue;
+      }
+      ending[k] = 1;
+      if (!q.empty() && q.front().on[k]) {  // its rows in the step queued still run: the KV of its last token too
+        pend[k] = 1;
+      } else if (H[k] > F[k] && H[k] <= feed[k] && d.why != kEndPause) {  // the next step launched feeds its last token
+        pend[k] = 0;
+      } else {
+        const int kv_end = H[k] <= F[k] ? H[k] + 1 : F[k] + 1;
+        snaps(k, kv_end);
+        finish(k, kv_end);
+      }
+    }
+    if ((c.flags & kBatchSolo) && n > 1) {  // one entry left decoding: it pauses, to go on alone
+      int left = 0, k1 = -1;
+      for (int k = 0; k < n; ++k)
+        if (live[k] && !ending[k]) ++left, k1 = k;
+      if (left == 1) {
+        end[k1].why = kEndPause;
+        ending[k1] = 1;
+        if (!q.empty() && q.front().on[k1]) {
+          pend[k1] = 1;
+        } else {
+          const int kv_end = H[k1] <= F[k1] ? H[k1] + 1 : F[k1] + 1;
+          snaps(k1, kv_end);
+          finish(k1, kv_end);
+        }
+      }
+    }
+    bool any = false;
+    for (int k = 0; k < n; ++k) any |= on_now(k);
+    if (q.empty() && any) {  // not queued ahead: the rows are known now, its lookups go at once
+      launch(false, false);
+      late_rows(q.back());
+    }
+    if (c.ahead && q.size() == 1 && fits()) launch(false, true);
+    g_t_launch.push_back(now_s());
+  }
+  m.use_slot(slot0);
+  if (st) *st = stats;
+  return end;
+}
+
 void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
   bool prof = false;
   int32_t sampled[model::kMaxRows];
@@ -446,10 +735,16 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       wd.started = 0;
     } else if (c.op == kCmdDecode) {
       decode_loop(m, c, wd, nullptr);
-    } else if (c.op == kCmdBatch) {
+    } else if (c.op == kCmdBatch || c.op == kCmdSpecBatch) {
       std::vector<BatchEntry> e(c.n);
       bcast_payload(ring, e.data(), e.size() * sizeof(BatchEntry), rank);
-      batch_loop(m, c, e, wd, nullptr);
+      if (c.op == kCmdSpecBatch) spec_batch_loop(m, c, e, wd, nullptr);
+      else batch_loop(m, c, e, wd, nullptr);
+    } else if (c.op == kCmdBatchTf) {
+      std::vector<BatchEntry> e;
+      std::vector<std::vector<int32_t>> t;
+      bcast_tf(ring, c, e, t, rank);
+      batch_tf_loop(m, c, e, t, wd, nullptr);
     } else if (c.op == kCmdTokens) {
       std::vector<int32_t> t(c.n);
       bcast_payload(ring, t.data(), t.size() * 4, rank);

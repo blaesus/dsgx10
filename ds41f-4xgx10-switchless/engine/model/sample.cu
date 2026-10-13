@@ -8,6 +8,7 @@
 #include "comm/ring_dev.cuh"
 #include "common/check.h"
 #include "model/ops.h"
+#include "model/spec_batch.h"
 
 namespace model::ops {
 namespace {
@@ -30,7 +31,9 @@ struct RowCand {   // one rank's view of one row
 };
 static_assert(sizeof(RowCand) % 16 == 0, "RowCand");
 constexpr int kHdr = 16;  // rank 0's control word, padded
-constexpr uint32_t kBytes = kHdr + kMaxRows * sizeof(RowCand);
+// a rank's contribution: the control word and a RowCand per block (RB = sample's max_rows: kLowRows or kMaxRows)
+template <int RB>
+constexpr uint32_t kBytes = kHdr + RB * sizeof(RowCand);
 constexpr int kChunks = sizeof(RowCand) / 16;
 
 __device__ __forceinline__ void wait_prev() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
@@ -95,6 +98,9 @@ __device__ __forceinline__ int bin_of(float m, float l) {
   return d < 256.f ? (int)d : 256;
 }
 
+// RB blocks (one per row of the step's at most RB): the instance of kLowRows is the kernel of before B4, launch
+// and bytes alike, the one of kMaxRows serves steps of 9..16 rows.
+template <int RB>
 __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const float* logits, int vocab0,
                                                      const StepIn* in, const uint32_t* ctl, SampleOut* outs,
                                                      int32_t* fb, uint32_t* counter, SpecState* ss) {
@@ -230,7 +236,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     mine->gv = -INFINITY, mine->gi = INT_MAX, mine->gl = 0.f;
     mine->t = -INFINITY, mine->n = 0;
   }
-  comm::post_grid(ch, s, kBytes);
+  comm::post_grid(ch, s, kBytes<RB>);
   comm::wait_all(ch, s);
   if (b < R)
     for (int k = t; k < kRanks * kChunks; k += kThreads) {
@@ -342,10 +348,30 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
       st_release_sys_u32(&o.seq, in->step + 1);
       return;
     }
+    const volatile int32_t* vfb = fb;
+    if (in->sbatch) {
+      // A batch spec step (docs/batching.md, B3): the verdict per entry over its own rows, each by exactly the
+      // one-session rule below (spec_batch.h; no row reads another entry's). Entry k's rows are consecutive,
+      // sess[r] = k; the step is published after the entries' draft passes (spec.cu, k_spec_publish_batch).
+      SpecVerdict v[kMaxSess];
+      spec_batch_verdicts(*in, vfb, spec == kSpecVerify, v);
+      for (int k = 0; k < kMaxSess; ++k) {
+        o.sess_row0[k] = v[k].row0, o.sess_step_rows[k] = v[k].step_rows, o.sess_rows[k] = v[k].rows;
+        o.sess_pos0[k] = v[k].pos0;
+        o.next_srows[k] = 0, o.next_spos0[k] = 0;
+        if (!v[k].step_rows) continue;
+        ss[k].count = v[k].rows;
+        ss[k].pos0 = v[k].pos0;
+        ss[k].bonus = in->force >= 0 ? in->force : v[k].bonus;
+      }
+      o.rows = R;
+      o.pos0 = in->pos[0];
+      o.step_rows = R;
+      return;
+    }
     // A spec step's final rows: a verify step's up to the first draft that is not the sample of the row
     // before it (row[] then holds exactly the tokens it emits), and the token after them. Published
     // after the draft pass (spec.cu).
-    const volatile int32_t* vfb = fb;
     int n = R - 1;
     if (spec == kSpecVerify) {
       n = 0;
@@ -363,10 +389,16 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
 }  // namespace
 
 void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in, const uint32_t* ctl,
-            SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss) {
-  if (kBytes > ch.cap) die("sample: %u bytes exceed the channel's %u", kBytes, ch.cap);
-  attn::launch(k_sample, dim3(kMaxRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb, counter,
-               ss);
+            SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss, int max_rows) {
+  if (kBytes<kMaxRows> > ch.cap) die("sample: %u bytes exceed the channel's %u", kBytes<kMaxRows>, ch.cap);
+  if (max_rows == kLowRows)
+    attn::launch(k_sample<kLowRows>, dim3(kLowRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb,
+                 counter, ss);
+  else if (max_rows == kMaxRows)
+    attn::launch(k_sample<kMaxRows>, dim3(kMaxRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb,
+                 counter, ss);
+  else
+    die("sample: max_rows %d (kLowRows %d or kMaxRows %d)", max_rows, kLowRows, kMaxRows);
 }
 
 }  // namespace model::ops

@@ -634,6 +634,18 @@ the design, steps B1 and B2).
   request joins a run at its next token, the last one sent, at position prompt + sent − 1. The step
   queued behind a pause may have written that position's KV already; it is written again, with the same
   values.
+- **Drafts across sessions** (B3, [batching.md](batching.md#b3-the-build-2026-10-13), 2026-10-13).
+  With drafts, a run of up to kMaxRows / 2 requests (eight at kMaxRows 16) decodes with drafts across
+  them ([`spec_batch_loop`](../engine/server/cmd.cpp), `kCmdSpecBatch`): a batch spec step holds each
+  request's bonus token and its drafts, at most (kMaxRows − S) / S each for S requests and never more
+  than the five the drafter makes (5 for two, 4 for three, 3 for four, 2 for five, 1 for six to
+  eight), laid out on the device in request order. The verdicts are per
+  request and the draft passes run one per request in its own slot, so every request's tokens and
+  log-probabilities are its run's alone. Its end, stop ids, cancel (its slot's bit) and a pause act per
+  request as in the speculative loop; a request that ends keeps its rows in the step already queued
+  (their KV counts, their tokens do not); the last one decoding pauses to go on alone with its five
+  drafts. Larger runs take the plain batch loop. The batch log line adds `drafts: T tokens and R rows
+  per step, A of V drafts accepted; GPU ms by rows: …`.
 - **Turns.** While more requests decode than there are slots, a run is a turn of `--slice` tokens
   (64). A request whose turn is over goes to the back of the queue; paused ones go back to the front,
   in order. A request whose slot went to another resumes from the store when its turn comes: its prompt
@@ -698,6 +710,15 @@ the design, steps B1 and B2).
     captures its graphs at startup. Six requests in a row in one serve process gave the same first
     tokens with both builds: the first request's in 342 ms (382 with 33de65fd), the later five's in
     328.8 ms (328.1), median.
+- **With drafts across sessions** (B3 and B4's runner half, engine ee748c1, 2026-10-13;
+  [batching.md](batching.md#measured-2026-10-13-engine-ee748c1-on-the-integration-branch)). With
+  `--slots 4`: batch_test (its two drafted scenarios included) 0 failed, serve_test `--ced` 17 of 17,
+  slice_test 0 failed; the reference hashes hold in drafted batches (`--mode batch --spec`: 1k ×2, 1k +
+  16k CED + 1k, 1k ×4, the sampled trio) and every session's teacher-forced hash holds through batch
+  steps of 12 and 16 rows of 2–4 sessions (`--batch-tf`); alone, 8 of 8 reference hashes. Four streams
+  of different text (1k prompts, 512 tokens each) decode 131.3 tok/s in all, three 121.9, two 106.9, one
+  alone 97.3; a drafted batch's step is one session's step at the same rows plus about 3 ms a further
+  session. One session against master, A/B/B/A: +0.2 % at k = 1, +0.8 % with drafts (two runs each).
 
 ## Launch and stop
 

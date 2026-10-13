@@ -156,7 +156,8 @@ struct Model::Impl {
   cudaEvent_t ev_pf[5];    // the last prefill chunk: begin, layers 0-19 done, replay done, head done, end
   cudaEvent_t ev_mark[4];  // Model::mark
 
-  // captured steps: one graph per (rows, context bucket); a row count runs eagerly once first
+  // captured steps: one graph per (rows, context bucket), captured on first use (up to kMaxRows rows: a row
+  // count never used costs nothing); a row count runs eagerly once first
   std::map<std::pair<int, int>, cudaGraphExec_t> graphs;
   bool warm[kMaxRows + 1] = {};
   // side streams: the mHC mixes (sa); the window/compressed KV writes and the indexer's head weights (sb)
@@ -333,6 +334,13 @@ struct Model::Impl {
   void spec_fill(ops::StepIn& in, int mode, const SpecCfg& c);
   uint64_t launch_spec(int R, int pos0, const int32_t* tokens, const Sampling& sp, const SpecCfg& c);
   uint64_t launch_verify(const Sampling& sp, const SpecCfg& c, int pos_bound);
+  // B3 (docs/batching.md): the batch spec step, drafts across sessions
+  cudaGraphExec_t spec_batch_graph(int ctx);
+  void spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b);
+  int spec_batch_check(const SpecBatch& b, bool given);
+  uint64_t launch_spec_batch(const SpecBatch& b);
+  uint64_t launch_verify_batch(const SpecBatch& b);
+  void engram_late_rows(int R, const int32_t* tok, const int32_t* pos, const int32_t* slot);
 };
 
 }  // namespace model

@@ -61,6 +61,10 @@ enum : int32_t {
   kCmdState = 5,    // nothing but the state operations (every command applies ops[0 .. n_ops) first)
   kCmdRows = 6,     // a step of `rows` rows with explicit tokens, sampled with sp, then snaps[] from the ring
   kCmdBatch = 7,    // batch_loop: n sessions decoding together, their BatchEntry's follow as a payload
+  // batch_tf_loop: n sessions' teacher-forced rows, `rows` of each per step (B4's checks and bench); the
+  // BatchEntry's and then their tokens follow as payloads. (20: clear of the batch commands added beside it.)
+  kCmdBatchTf = 20,
+  kCmdSpecBatch = 8,  // spec_batch_loop (B3): the same with drafts; the Cmd's spec_* fields as kCmdDecode's
 };
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
@@ -181,6 +185,7 @@ struct BatchEntry {
   int32_t n_stop = 0;
   int32_t stop[kMaxStop] = {};
   model::Sampling sp{};
+  double spec_tok = 1, spec_ms = 0;  // kCmdSpecBatch: the entry's drafts' rate (SpecRate) to start from
 };
 constexpr uint32_t kCtlPause = 1u << 31;
 enum : uint32_t { kBatchSolo = 1 };  // kCmdBatch's flags
@@ -192,6 +197,42 @@ struct BatchEnd {
 using OnBatch = std::function<void(int k, const model::SampleOut& o, int row)>;  // entry k's next token: o.row[row]
 std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
                                  const OnBatch& on);
+
+// kCmdBatchTf (docs/batching.md, B4): the entries' rows teacher-forced, in steps of up to c.rows rows of each
+// (1..model::kMaxSessRows; a step of at most kMaxRows rows in all). Entry k feeds tokens[k] (e[k].max_new of
+// them) at positions e[k].pos0 .., its next c.rows per step in slot e[k].slot, sampled with e[k].sp; a step
+// holds the entries with tokens left, in entry order (Model::launch_batch). Every rank runs it alike: the
+// tokens go with the command (bcast_tf_tokens). c.flags and sink are the steps' (model::Batch: kFlagDump with
+// rank 0's sink, an eager step with its dumps, e.g. the bench's routed experts); no step is queued ahead.
+// on(k, o, row): entry k's sample for the row's position (o.row[row]). Returns each step's GPU time, ms.
+std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e,
+                                 const std::vector<std::vector<int32_t>>& tokens, Watchdog& wd, const OnBatch& on,
+                                 model::Sink* sink = nullptr);
+// kCmdBatchTf's payloads after bcast: the entries (c.n of them), then every entry's e[k].max_new tokens in entry
+// order; rank 0 sends them, the others receive them.
+void bcast_tf(comm::Ring& ring, const Cmd& c, std::vector<BatchEntry>& e, std::vector<std::vector<int32_t>>& tokens,
+              int rank);
+// kCmdSpecBatch (docs/batching.md, B3): the sessions decoding together with drafts, a batch spec step
+// each step (Model::launch_spec_batch, launch_verify_batch). Entry k's rows of a step are its bonus
+// token and the drafts the step before chose for it, at most cap = min(spec_drafts, (kMaxRows - S) / S)
+// with S entries on, so that the step fits kMaxRows; each entry emits, verifies and ends as a session
+// alone does in decode_loop with drafts (its stop ids, max_new, context; its slot's cancel bit, after
+// the token that read it; kCtlPause after its tokens of the step, and with kBatchSolo the last entry
+// decoding pauses). The next step is queued before a step ends when every entry's rows fit (as the
+// speculative loop's); an entry that ends keeps its rows in the step already queued (their KV counts,
+// their tokens are dropped) and is off from the step after; one whose last token has no step queued
+// gets it fed by the next step launched (not on a pause: its next run feeds it). Per entry a DecodeEnd
+// as decode_loop's (sampled, fed, last, written, why, its draft statistics and SpecRate); the run's
+// figures in st, when given.
+struct SpecBatchStats {
+  int steps = 0;    // steps run
+  int rows = 0;     // their rows, summed
+  int emitted = 0;  // tokens emitted, every entry's
+  double gpu_ms[model::kMaxRows + 1] = {};  // the steps' GPU ms by their rows, summed (past the first few)
+  int gpu_n[model::kMaxRows + 1] = {};
+};
+std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
+                                       const OnBatch& on, SpecBatchStats* st = nullptr);
 
 // Host timeline of the last decode loop (diagnostics): per step, when its sample arrived, when the
 // next step's Engram lookups were submitted, and when the step after was launched.

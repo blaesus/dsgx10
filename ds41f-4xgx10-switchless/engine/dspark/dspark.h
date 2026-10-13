@@ -25,6 +25,7 @@ namespace dspark {
 inline constexpr int kBlocks = 3;   // mtp.0 .. mtp.2
 inline constexpr int kDraft = 5;    // block rows = drafts per pass (dspark_block_size)
 inline constexpr int kMaxAcc = 8;   // positions per accept() call
+inline constexpr int kMaxHidden = 16;  // rows of a main_hidden buffer, at most: a batch spec step's (docs/batching.md, B3)
 inline constexpr int kRanks = 4;
 inline constexpr int kDim = 5120, kHc = 4, kQLora = 1280;
 inline constexpr int kVocab = 129280, kVocabRank = kVocab / kRanks, kMarkov = 256;
@@ -99,7 +100,7 @@ void sim_fp8_l2(uint8_t* w, int N, int K, cudaStream_t st);
 
 // The runner's part, at the start of layers 37, 38 and 39 (their input stream x [rows][4][5120], after Engram
 // where there is one): the mean of the 4 copies (torch's bf16 mean) into columns [5120 * slot, +5120) of
-// main_hidden [kMaxAcc][15360], slot = layer - 37.
+// main_hidden [rows][15360] (rows <= kMaxHidden: a step's; accept() reads at most kMaxAcc of them), slot = layer - 37.
 void main_hidden(const uint16_t* x, int rows, int slot, uint16_t* mh, bool pdl, cudaStream_t s);
 
 // A rank's argmax candidate over its vocab slice (id: the global token id).
@@ -193,8 +194,11 @@ class Draft {
   // positions *pos0 + r, 1 <= *count <= 8 (a prompt: its last 128 positions, 8 per call). Their main_kv goes
   // into each block's window; the last of them, *pos0 + *count - 1, is the next draft's anchor.
   // Session slots: the windows are the current slot's (use_slot), or with `slot` (device, at least kMaxAcc
-  // entries; a step's table) row r's slot's: a step captured once serves sessions in any slot.
-  void accept(const uint16_t* mh, const int* count, const int* pos0, cudaStream_t s, const int* slot = nullptr);
+  // entries; a step's table) row r's slot's: a step captured once serves sessions in any slot. row0 (device, one
+  // int): the rows are main_hidden's [*row0, *row0 + *count), not [0, *count) (a batch step's entry; the buffer
+  // then holds at least *row0 + *count rows).
+  void accept(const uint16_t* mh, const int* count, const int* pos0, cudaStream_t s, const int* slot = nullptr,
+              const int* row0 = nullptr);
   // The draft after the anchor p: *token (the token at p + 1) and four noise tokens at positions p + 1 .. p + 5
   // through the blocks and the head; then tokens() holds d1..d5, greedy drafts for positions p + 2 .. p + 6.
   // `slot` as accept()'s (kDraft entries, all the anchor's session's).

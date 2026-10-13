@@ -27,7 +27,11 @@ once, as one wrong first-token logprob in RC4's first validation run. This one h
 force the race's window as a regression test
 ([ring § The pipelined reduce-scatters' send-buffer race](ring.md#the-pipelined-reduce-scatters-send-buffer-race-2026-10-13)).
 The owner put development first (2026-10-12): the ring is lent after 2 idle minutes,
-and a request held meanwhile waits up to 15. Production starts, from `~/dsgb10/prod/ds41f-4xgx10-switchless`, with
+and a request held meanwhile waits up to 15. Production starts, from `~/dsgb10/prod/ds41f-4xgx10-switchless`, with Release candidate 7 (`~/dsgb10/candbin7`, built from f7c8f81: this engine's code with the teacher-forced
+hash's fix b47c510 and the fleet file; `ENGINE_BUILT_FROM` there) is validated and not deployed: every reference hash on
+the variant files (8 of 8) and on the official checkpoint (8 of 8: tf c7605e0b6ba8d9d2, k = 1 7941647b162df1a8 and the drafted
+variants, sampled 02ef3e0858d7eb45, 16k CED 8790ee9388f4abd8, 28k CED de99bfce6ea96ba8), and serve_test `--ced` on the
+official checkpoint 17 of 17 (2026-10-13, 12:55–16:31, between the kit's turns). Deploying it is the owner's call.
 
 ```
 DSGB10_PROD=1 DSGB10_ADDR="127.0.0.1 <tailnet address>" DSGB10_PORT=8888 DSGB10_KEY_FILE=~/ai/dsv41-4x-ring/state-tp4/api-key \

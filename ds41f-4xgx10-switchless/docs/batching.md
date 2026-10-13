@@ -42,8 +42,12 @@ any kernel was written. When it was written the engine ran one request at a time
   agent's half (9–16 rows in groups of 8) are on master. The runner's half (step buffers and graphs
   past 8 rows) is not wired for B3's sake. Drafts of one session past 8 rows (prompt lookup) would
   need it, and `kMaxSessRows` past 8, which decode_prep's race at 16 rows of one session forbids today.
-- **B3 is being built** (2026-10-13, [B3: the build](#b3-the-build-2026-10-13)): the owner asked for
-  2–4 streams at once, with one stream kept as fast as it is, within 2 %. B4's runner half goes with it.
+- **B3 is built and measured** (2026-10-13, [B3: the build](#b3-the-build-2026-10-13)): the owner asked
+  for 2–4 streams at once, with one stream kept as fast as it is, within 2 %. B4's runner half goes with
+  it. Four different streams decode 131 tok/s in all (one alone 97; B2's undrafted batches 122), two
+  107 (B2: 88), each stream with its drafts; one session is unchanged (A/B/B/A, six runs each: 8.322
+  against 8.322 ms a token with drafts). Its phase 2a (one draft pass over all sessions) is built on a
+  branch and being checked; a gate across the sessions is not built.
 
 ## Why
 
@@ -658,3 +662,133 @@ refused.
 
 - 2026-10-13 14:10: the design above; the runner builds B3 and B4's runner half on two branches, with no
   ring time until both are built (the kit serves an agent; its interruptions come last).
+- 2026-10-13, B4's runner half (branch runner-b4rows, built, untested on the ring): `kMaxRows` 16 with
+  `kMaxSessRows` 8. Everything sized by `kMaxRows` follows it (the step buffers, the `StepIn` / `SampleOut`
+  rings, the sampler's candidates, the Engram segments, `Cmd::tokens`, the graphs' `warm`); the runner's own
+  kernels whose launch holds the rows come in two instances by a row budget of 8 or 16 (`ops::row_budget`:
+  the sampler's grid and posted bytes, `allreduce_hc`'s and `mix_allreduce`'s block sizes), so a step of at
+  most 8 rows launches the kernels it launched before, and the one-session spec graph keeps its 8 bodies
+  (serve's small turns run spec steps of up to `--small-rows` = 8 rows: no change to its startup or memory).
+  A step with more than 8 rows of one session is refused with a message (`next_in`, `launch_batch`,
+  `launch_spec`; main.cpp's `--chunk`, `--k`, `--small-rows`, `--batch-rows`, `--route-every`, spectf's
+  chunks). New: `kCmdBatchTf` / `batch_tf_loop` (teacher-forced rows of several sessions, G of each per
+  step; `Batch::flags` / `sink` for an eager dumped step), `--mode bench` at 9–16 rows as runs of 2–4
+  sessions in slots (`--bench-groups`, `--slots`), `--mode batch --batch-tf [--batch-rows G]` whose
+  per-session hash must equal the session's run alone and tf mode's. Untested: every GPU run (the
+  equalities above, the ABBA at one session, the 12- and 16-row step times).
+- 2026-10-13 15:10, branch `runner-b3`: built, warning-free, not yet run on the ring. The model: the
+  batch spec step graph (`spec_batch_graph`: `k_spec_in_batch` lays the entries' rows out on the device
+  and sets the switch's and the ifs' values, the spec switch's bodies, `k_sample`'s verdicts per entry,
+  one if node per entry with its accept (from its `row0`), draft and gate in its own slot table, then
+  `k_spec_publish_batch`), `SpecState[kMaxSess]`, `SpecBatch`, `launch_spec_batch` /
+  `launch_verify_batch` / `engram_late_rows`; `spec_graphs` captures the batch graphs too and prints
+  their own line. The loop: `spec_batch_loop` (`kCmdSpecBatch`; cmd.h has its semantics), serve's
+  `decode_batch` taking it for batches of at most kMaxRows / 2 with the drafts' figures on the batch log
+  line, `--mode batch --spec` for the reference hashes in drafted batches. Checks written:
+  batch_test.py's scenarios 7–8 (pairs, triples, a pause, a cancel and a stop id in drafted batches),
+  bench/multistream.py, bench/abba.sh. The layout and the verdicts per entry live in
+  [spec_batch.h](../engine/model/spec_batch.h), one code for the device and the host:
+  `spec_batch_test` (host only, no GPU) passes, 656k checks over 20k random steps against the
+  one-session rule per entry. **Untested on a GPU**: everything else, first of all the batch graph's
+  capture (if nodes whose bodies hold the draft module's collectives), then the reference hashes in
+  drafted batches, batch_test with drafts, the throughput at 2–4 sessions and the one-session ABBA.
+  Two choices to note: a paused entry's last token is not fed by an extra step (its next run feeds it,
+  as B2's pause does), and the ahead launch waits for the step before when any entry's worst-case rows
+  would pass its `feed` (the speculative loop's rule, applied to the batch as a whole).
+- 2026-10-13 15:25, the integration branch `b3-int` (B4's runner half merged first, then B3; one closing brace
+  between `batch_tf_loop` and `spec_batch_loop` added by hand). On the ring, preemptible, the owner's agent
+  paused: the merged engine gives every reference hash (tf 842278b28d87dad0, k1 / nol2pf / fp8 / bf16
+  febc7dc54ee40a39, temp a8f7a08f8cd1c5e8, ced16 81f772ab79a950e4, ced28 8f08a153d415c5c8; golden/refhash.sh
+  8 of 8, 52–65 s a run), so one session computes as before. The first drafted batch died at the batch
+  graph's capture: `dspark::main_hidden` refused more than `kMaxAcc` = 8 rows, while the batch graph's bodies
+  go to 16; it now takes `kMaxHidden` = 16 (accept still reads at most 8, from its entry's row0). The
+  drafted-batch hashes, the one-session ABBA and the serve tests follow.
+- 2026-10-13 15:35, the second fault, found by the next run: `cudaGraphInstantiate` refused the batch graph
+  (invalid argument) because a conditional handle was created for every `kMaxSess` entry while only `bents`
+  if nodes used one. One handle per node (ee748c1), and the graph of 4 entries instantiates: 14,584 nodes in
+  its bodies, 483–490 MiB of device memory, 0.29 s. Then the checks below passed.
+
+### Measured (2026-10-13, engine ee748c1 on the integration branch)
+
+**Every reference hash in drafted batches** (`--mode batch --spec --draft-fp8 --slots 4`, 256 steps a
+session, 128 sampled; the same text in every 1k session, so these sessions share experts):
+
+| sessions (context) | hashes | steps, rows a step | tokens a step | ms a step | tok/s in all, per session |
+|---|---|---|---|---|---|
+| 1k, 1k | febc7dc54ee40a39 twice | 74, 8.30 | 6.92 | 37.0 | 187.1, 93.6 |
+| 1k, 16k CED, 1k | febc7dc54ee40a39, 81f772ab79a950e4, febc7dc54ee40a39 | 88, 10.47 | 8.73 | 51.1 | 170.8, 56.9 |
+| 1k ×4 | febc7dc54ee40a39 four times | 89, 13.66 | 11.51 | 44.3 | 259.7, 64.9 |
+| sampled (T 0.8, top-p 0.95, top-k 40, seed 7): 1k, 4k, 1k | a8f7a08f8cd1c5e8 twice (the 4k one has no reference) | 54, 10.43 | 7.11 | 49.1 | 144.7, 48.2 |
+
+- A step's GPU time by its rows, 4 sessions of one text: 8 rows 32.8 ms (16 steps), 12 rows 40.4 (7), 16
+  rows 47.5 (60). Two sessions: 4 rows 25.9, 6 rows 30.1, 8 rows 33.2, 12 rows 44.6 (33 of 74 steps).
+  Three sessions with the 16k one: 9–15 rows 49.5–62.4 ms.
+- One session alone decodes this text at 8.29 ms a token with drafts (120.7 tok/s; the ABBA below), so two
+  sessions of it decode 55 % more in all and four 115 % more.
+
+**One session, A/B/B/A** (bench/abba.sh: master 4e2bae9 against the integration engine, the 1k golden run,
+two runs each per variant, both orders; every run the reference hash):
+
+| variant | master, ms a token | integration | B over A |
+|---|---|---|---|
+| k = 1 | 16.730 (16.677, 16.784) | 16.768 (16.743, 16.794) | +0.23 % |
+| drafts (fp8) | 8.285 (8.270, 8.301) | 8.352 (8.313, 8.391) | +0.80 % |
+
+Both within the owner's 2 %. The drafted figure was not clearly inside the run-to-run spread with two runs
+each, so three more rounds of it ran after the serve tests (A B B A, A B B A, A B B A; six runs each):
+master's median 8.322 ms a token (8.301–8.362), the integration engine's 8.322 (8.310–8.362), B over A
+−0.01 %, every run the reference hash. One stream is unchanged.
+
+**Serving** (`--mode serve --slots 4 --max-ctx 131072`): batch_test.py `--slots 4` 0 failed in its eight
+scenarios, the two drafted ones included (pairs A+C and B+D, triples C+E+F and A+B+D, every request's
+tokens and log-probabilities its run's alone; then a pause inside a drafted pair, E's first token 0.39 s
+after its submit, 0.11 s later than alone, a cancel at its 40th token and a stop id); serve_test.py
+`--ced` 17 of 17; slice_test.py 0 failed. Over that run, with batch_test's six prompts (different texts,
+0.8k–4k positions), a step's GPU time by its rows: 3 rows 30.3 ms, 4: 33.8, 6: 39.9, 8: 46.1, 10: 58.4,
+12: 66.2, 14: 75.6, 16: 82.0; its batches of two ran 47.3 ms a step at 7.97 rows and 6.39 tokens (76 % of
+the drafts accepted), of three 54.9 ms at 9.37 rows and 7.28 tokens (71 %), of four 64.4 ms at 11.12 rows
+and 8.57 tokens (68 %).
+
+**Streams** ([bench/multistream.py](../bench/multistream.py) `--socket`: S prompts of 1,024 tokens cut from
+the synthetic 270k text at different offsets, submitted at once, 512 new tokens each, greedy; two
+repetitions, which agreed to 0.1 tok/s; the step figures from the engine's log):
+
+| streams | tok/s in all, from the first submit to the last end | decoding, from the first token | each stream, tok/s | a step: ms (median), tokens, rows | drafts accepted |
+|---|---|---|---|---|---|
+| 1 | 97.3 | 102.7 | 102.7 | the speculative loop alone | |
+| 2 | 106.9 | 110.0 | 65.0, 56.8 | 41.2–41.4, 4.93, 6.51 | 65 % |
+| 3 | 121.9 | 124.4 | 46.8, 42.5, 49.5 | 56.7–56.9, 7.68, 9.69 | 71 % |
+| 4 | 131.3 | 133.5 | 36.0, 34.0, 37.6, 38.4 | 67.1–67.3, 9.78, 12.01 | 73 % |
+
+The first tokens came 0.29 s apart (the prefills run one after another); the streams' ends spread
+by 0.7–1.7 s as their drafts fared. Four different streams decode 35 % more in all than one alone, three
+25 %, two 10 %; one stream at a time (B1) would give each of them the 102.7 of one alone, in turn.
+Master's engine (B2: batches without drafts, 4e2bae9) on the same prompts and bench, the same day: one
+stream 95.8–97.0 tok/s in all (102.4–102.5 decoding), two 87.7 (89.7; 21.5 ms a step), three 106.9–107.1
+(108.8–109.0; 26.2 ms), four 121.4–121.6 (123.3–123.5; 30.5 ms). So drafts across sessions add 22 % at
+two streams, 14 % at three and 8 % at four over B2, and at two streams the batch beats one stream at a
+time for the first time (B2's pair decoded 10 % less in all than one stream alone).
+
+**What a step costs.** A drafted batch's step is one session's step at the same number of rows plus
+about 3 ms for every further session: one session's steps are 26.4 ms at 3 rows and 36.2 at 6 (3.3 ms a
+row over 16.6), and 16.6 + 3.3 × rows + 3 × (S − 1) gives 41.1, 54.6 and 65.2 ms for the three batches
+above against the measured 41.2, 56.8 and 67.2. The rows' cost is their experts: every row routes to its
+own six, and the same text at the same positions in four slots (P2's 1k ×4) ran 16 rows in 47.5 ms where
+four different texts take 82.0. The 3 ms a session is the drafter's pass, the accept and the gate, run
+once per entry in its own conditional node ([design item 5](#design)). So the two items phase 2 named
+are worth, at the measured rows: one draft pass over all anchors, 3, 6 and 9 ms of a 41, 57 and 67 ms
+step (7, 11 and 13 %); and a gate across the sessions, which today verifies 2.3 drafts a session in a
+pair whose cap is 5, judging each entry's drafts as its one-session gate would.
+
+**B4's runner half** (`--batch-tf`, [engine.md](engine.md#scheduling-time-slicing-and-batching)): a
+session's 256 golden positions through batch steps of 1, 4 and 8 rows give the teacher-forced hash of
+`--mode tf` (1k: cbf28c20d4a29e35; 2k: c612bb419cd6aeb4; 4k: d095975dd8969f11), and so do four sessions
+(1k, 2k, 4k, 1k) at 4 rows each (16 rows a step, 57.8 ms median), two (1k, 2k) at 8 rows each (16 rows,
+63.0 ms) and three (1k, 2k, 4k) at 4 rows each (12 rows, 54.5 ms): every session its own hash. One
+session's steps: 16.76 ms at 1 row, 27.5 at 4, 37.4 at 8. `--mode bench --ks 8,12,16 --bench-groups 4,8`
+(context 1k, 40 steps a k): 8 rows as two sessions of 4, 35.6 ms (26.1 experts a layer; the sessions'
+routing rotated, 39.5); 12 rows as three of 4, 53.1 (39.4 experts; rotated 62.6); 16 rows as four of 4,
+62.6 (50.9; rotated 78.0) and as two of 8, 62.2 (rotated 70.3); one session's 8 consecutive rows 38.1.
+
+**Everything else as before.** The final integration engine (ee748c1) gives every reference hash alone
+(tf, k = 1, the drafted variants, sampled, 16k CED, 28k CED: 8 of 8), as it did before the two fixes.

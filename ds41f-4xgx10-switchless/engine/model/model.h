@@ -1,7 +1,8 @@
 // The TP=4 forward of DeepSeek-V4.1-Flash on one rank (docs/engine.md). Every rank holds a Model and
 // runs the same steps in the same order; the residual stream, the routing and the index choices are
-// bit-identical on all four (collectives sum in rank order). A step takes R <= 8 consecutive positions:
-// a decode step (R = 1), a verify step (R <= 6) or a prefill chunk (exact mode: every layer, every row).
+// bit-identical on all four (collectives sum in rank order). A step takes R <= kMaxRows rows: one session's
+// R <= kMaxSessRows consecutive positions (a decode step, R = 1; a verify step, R <= 6; a prefill chunk by
+// steps, exact mode: every layer, every row), or several sessions' runs of consecutive positions (Batch).
 #pragma once
 #include <cstdint>
 #include <memory>
@@ -26,15 +27,21 @@ struct Sampling {
 };
 using ops::SampleOut;
 
+struct Sink;
+
 // A step of rows from several sessions (docs/batching.md, B2; Model::launch_batch). Row r is position
 // pos[r] of the session in slot slot[r], fed tokens[r] (>= 0, or -1 - j: row j of the previous step's
-// sample, as launch()'s). A session's rows are consecutive and ascend one position at a time; sess[r]
-// numbers the step's sessions in row order from 0, each in a slot of its own, and session k is sampled
-// by sp[k].
+// sample, as launch()'s). A session's rows are consecutive and ascend one position at a time, at most
+// kMaxSessRows of them (B4: up to kMaxRows rows in all); sess[r] numbers the step's sessions in row order
+// from 0, each in a slot of its own, and session k is sampled by sp[k]. flags and sink are launch()'s
+// (kFlagDump with a sink: an eager step handing rank 0's sink each layer's results, e.g. the bench's
+// routed experts; the tokens must then be given).
 struct Batch {
   int R = 0, nsess = 0;
   int32_t tokens[kMaxRows] = {}, pos[kMaxRows] = {}, slot[kMaxRows] = {}, sess[kMaxRows] = {};
   Sampling sp[ops::kMaxSess];
+  uint32_t flags = 0;
+  Sink* sink = nullptr;
 };
 
 // What a spec step (spec.cu) lets its draft pass choose for the step after it: by default draft j is
@@ -49,6 +56,23 @@ struct SpecCfg {
   int probe[ops::kDrafts] = {-1, -1, -1, -1, -1};  // EXPERIMENT (Options::tree_probe): the probe's path
   int gate = ops::kGateThresh;
   float step_ms[ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};  // 0..5 drafts
+};
+
+// A batch spec step (docs/batching.md, B3: drafts across sessions; Model::launch_spec_batch and
+// launch_verify_batch): n entries, each one session in a slot of its own, taking part when on[k]. In a
+// given step entry k is one row, token[k] at pos0[k]; in a verify step its rows are what the step before
+// chose for it (its bonus token, then at most cap[k] drafts, every row below pos_end[k], thresh[k] its
+// kGateThresh threshold; cfg's gate, step_ms, force and probe serve every entry, its thresh, max_drafts
+// and pos_end are unused). The entries on, in entry order, make the step's rows; the caller keeps their
+// next rows (1 + cap[k] each) within kMaxRows. Every rank must pass the same.
+struct SpecBatch {
+  int n = 0;
+  int32_t on[ops::kMaxSess] = {}, slot[ops::kMaxSess] = {}, token[ops::kMaxSess] = {}, pos0[ops::kMaxSess] = {};
+  int32_t cap[ops::kMaxSess] = {}, pos_end[ops::kMaxSess] = {};
+  float thresh[ops::kMaxSess] = {};
+  Sampling sp[ops::kMaxSess];
+  SpecCfg cfg;
+  int pos_bound = 0;  // launch_verify_batch: the rows' last position at most (the context bucket)
 };
 
 // One step, as rank 0 decided it (the golden and bench modes: every rank receives the same).
@@ -104,6 +128,8 @@ struct Options {
   int slots = 1;            // session slots (docs/batching.md): live sessions' states side by side (each one's
                             // window rings, compressed caches, index keys, carries and draft windows), up to
                             // kMaxSlots; ~240 MB a slot at 262,144 positions
+  int bgraph_bodies = 0;    // DIAGNOSTICS (spec.cu, 2026-10-13): the batch spec graph's switch bodies (0: kMaxRows)
+  bool bgraph_noif = false; // DIAGNOSTICS: the entries' draft passes at the top level, without if nodes
   bool l2pf = true;         // the decode step's paced L2 prefetch in its windows (kernels/l2pf.cu, docs/engine.md
                             // "A paced L2 prefetch"): a side stream, the same bits
   // EXPERIMENT, bench only (docs/engine.md, "Draft trees"): every spec step's draft pass also runs the
@@ -168,6 +194,19 @@ class Model {
   bool spec() const;
   uint64_t launch_spec(int R, int pos0, const int32_t* tokens, const Sampling& sp, const SpecCfg& c);
   uint64_t launch_verify(const Sampling& sp, const SpecCfg& c, int pos_bound);
+  // B3 (docs/batching.md): drafts across sessions, a spec step of several sessions' rows (SpecBatch;
+  // Options::slots > 1). launch_spec_batch: a given step, one row per entry on; launch_verify_batch: the
+  // rows the step before chose for each entry on (queued before it ends). The step samples its rows with
+  // the verdicts per entry and runs each entry's draft pass in its own slot; every row computes what it
+  // would in a step of its session alone, bit for bit. SampleOut: sess_* per entry (its rows, the tokens
+  // it emits), next_s* for the step after (0 rows: the entry was off). spec_batch_entries(): entries a
+  // batch step takes at most (0 without DSpark or slots).
+  int spec_batch_entries() const;
+  uint64_t launch_spec_batch(const SpecBatch& b);
+  uint64_t launch_verify_batch(const SpecBatch& b);
+  // engram_late() of a batch verify step: its rows as the device laid them out (the entries on in entry
+  // order, each its next_s* of the step before): their tokens, positions and slots.
+  void engram_late_rows(int R, const int32_t* tokens, const int32_t* pos, const int32_t* slot);
   // Spin until step n's sample is in. The result stays valid until step n + ops::kOutSlots is launched.
   const SampleOut& wait(uint64_t n);
   // Rank 0's control word: every step's sampling reads it when it runs and hands it to every rank
