@@ -128,6 +128,8 @@ struct Options {
   int slots = 1;            // session slots (docs/batching.md): live sessions' states side by side (each one's
                             // window rings, compressed caches, index keys, carries and draft windows), up to
                             // kMaxSlots; ~240 MB a slot at 262,144 positions
+  int bgraph_bodies = 0;    // DIAGNOSTICS (spec.cu, 2026-10-13): the batch spec graph's switch bodies (0: kMaxRows)
+  bool bgraph_noif = false; // DIAGNOSTICS: the entries' draft passes at the top level, without if nodes
   bool l2pf = true;         // the decode step's paced L2 prefetch in its windows (kernels/l2pf.cu, docs/engine.md
                             // "A paced L2 prefetch"): a side stream, the same bits
   // EXPERIMENT, bench only (docs/engine.md, "Draft trees"): every spec step's draft pass also runs the

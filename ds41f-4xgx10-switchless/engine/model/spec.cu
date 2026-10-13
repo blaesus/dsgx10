@@ -131,6 +131,7 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
 // slot); then the switch's value (the row count - 1) and each entry's if (on or not).
 struct IfHandles {
   cudaGraphConditionalHandle h[ops::kMaxSess];
+  int n;  // entries with an if node (the batch graph's bents); the others' handles do not exist
 };
 __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, const ops::SpecState* ss, ops::StepIn* d,
                                 int* row0, int* stab, cudaGraphConditionalHandle hsw, IfHandles hif) {
@@ -146,7 +147,7 @@ __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, cons
       for (int j = 0; j < dspark::kMaxAcc; ++j) stab[k * dspark::kMaxAcc + j] = d->sess_slot[k];
     *counter += 1;
     cudaGraphSetConditional(hsw, (unsigned)(d->rows - 1));
-    for (int k = 0; k < ops::kMaxSess; ++k) cudaGraphSetConditional(hif.h[k], d->sess_on[k] ? 1u : 0u);
+    for (int k = 0; k < hif.n; ++k) cudaGraphSetConditional(hif.h[k], d->sess_on[k] ? 1u : 0u);
   }
 }
 
@@ -686,8 +687,14 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   CUDA_CHECK(cudaGraphCreate(&g, 0));
   cudaGraphConditionalHandle hsw;
   CUDA_CHECK(cudaGraphConditionalHandleCreate(&hsw, g, 0, 0));
+  // DIAGNOSTICS (the batch graph's first instantiation failed on the ring, 2026-10-13): --bgraph-bodies N
+  // captures N switch bodies only; --bgraph-noif runs the entries' draft passes without if nodes (every
+  // entry's, on or not: a check of the graph's structure, not of the outputs)
+  const int bodies = opt.bgraph_bodies > 0 ? std::min(kMaxRows, opt.bgraph_bodies) : kMaxRows;
+  const bool noif = opt.bgraph_noif;
   IfHandles hif{};
-  for (int k = 0; k < ops::kMaxSess; ++k) CUDA_CHECK(cudaGraphConditionalHandleCreate(&hif.h[k], g, 0, 0));
+  hif.n = noif ? 0 : sp.bents;  // a handle per if node, no more: a handle no node uses is an error at instantiate
+  for (int k = 0; k < hif.n; ++k) CUDA_CHECK(cudaGraphConditionalHandleCreate(&hif.h[k], g, 0, 0));
   // the step's rows, the switch's value and the ifs'
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, nullptr, nullptr, 0, mode));
   k_spec_in_batch<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, sp.row0, sp.stab, hsw, hif);
@@ -703,18 +710,18 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   cp.type = cudaGraphNodeTypeConditional;
   cp.conditional.handle = hsw;
   cp.conditional.type = cudaGraphCondTypeSwitch;
-  cp.conditional.size = kMaxRows;
+  cp.conditional.size = bodies;
   cudaGraphNode_t sw;
   CUDA_CHECK(cudaGraphAddNode(&sw, g, head.data(), nullptr, head.size(), &cp));
   mh_on = true;
-  for (int R = 1; R <= kMaxRows; ++R) {
+  for (int R = 1; R <= bodies; ++R) {
     CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, cp.conditional.phGraph_out[R - 1], nullptr, nullptr, 0, mode));
     forward_rows(R, ctx, 0, nullptr, 0);
     CUDA_CHECK(cudaStreamEndCapture(st, &cap));
   }
   mh_on = false;
   size_t nodes = 0;
-  for (int R = 1; R <= kMaxRows; ++R) {
+  for (int R = 1; R <= bodies; ++R) {
     size_t k = 0;
     CUDA_CHECK(cudaGraphGetNodes(cp.conditional.phGraph_out[R - 1], nullptr, &k));
     nodes += k;
@@ -726,25 +733,39 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   std::vector<cudaGraphNode_t> tail(deps, deps + nd);
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
   // the entries' draft passes, each under its if
+  std::vector<cudaGraph_t> ifbody;
   for (int k = 0; k < sp.bents; ++k) {
-    cudaGraphNodeParams ip{};
-    ip.type = cudaGraphNodeTypeConditional;
-    ip.conditional.handle = hif.h[k];
-    ip.conditional.type = cudaGraphCondTypeIf;
-    ip.conditional.size = 1;
-    cudaGraphNode_t node;
-    CUDA_CHECK(cudaGraphAddNode(&node, g, tail.data(), nullptr, tail.size(), &ip));
-    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, ip.conditional.phGraph_out[0], nullptr, nullptr, 0, mode));
+    cudaGraph_t body = nullptr;
+    cudaGraphNode_t node = nullptr;
+    if (!noif) {
+      cudaGraphNodeParams ip{};
+      ip.type = cudaGraphNodeTypeConditional;
+      ip.conditional.handle = hif.h[k];
+      ip.conditional.type = cudaGraphCondTypeIf;
+      ip.conditional.size = 1;
+      CUDA_CHECK(cudaGraphAddNode(&node, g, tail.data(), nullptr, tail.size(), &ip));
+      body = ip.conditional.phGraph_out[0];
+      CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, body, nullptr, nullptr, 0, mode));
+    } else {
+      CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, tail.data(), nullptr, tail.size(), mode));
+    }
     const int* slot = sp.stab + (size_t)k * dspark::kMaxAcc;
     sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k);
     sp.draft->draft(&sp.ss[k].bonus, st, slot);
     k_spec_gate_batch<<<1, 32, 0, st>>>(in_d, sp.ss, k, sp.draft->tokens(), sp.draft->survival(), out_h);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamEndCapture(st, &cap));
-    size_t kn = 0;
-    CUDA_CHECK(cudaGraphGetNodes(ip.conditional.phGraph_out[0], nullptr, &kn));
-    nodes += kn;
-    tail.assign(1, node);
+    if (!noif) {
+      CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+      size_t kn = 0;
+      CUDA_CHECK(cudaGraphGetNodes(body, nullptr, &kn));
+      nodes += kn;
+      ifbody.push_back(body);
+      tail.assign(1, node);
+    } else {
+      CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &deps, nullptr, &nd));
+      tail.assign(deps, deps + nd);
+      CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    }
   }
   sp.bnodes = nodes;
   // the publication
@@ -753,7 +774,30 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
   cudaGraphExec_t e;
-  CUDA_CHECK(cudaGraphInstantiate(&e, g, cudaGraphInstantiateFlagUseNodePriority));
+  const cudaError_t ie = cudaGraphInstantiate(&e, g, cudaGraphInstantiateFlagUseNodePriority);
+  if (ie != cudaSuccess) {  // DIAGNOSTICS: what the graph holds, then the error
+    size_t ng = 0;
+    cudaGraphGetNodes(g, nullptr, &ng);
+    std::fprintf(stderr, "spec batch graph: instantiate failed (%s): %zu top nodes, %d switch bodies, %d if bodies\n",
+                 cudaGetErrorString(ie), ng, bodies, (int)ifbody.size());
+    for (size_t b = 0; b < ifbody.size() && b < 1; ++b) {
+      size_t kn = 0;
+      cudaGraphGetNodes(ifbody[b], nullptr, &kn);
+      std::vector<cudaGraphNode_t> nodes_(kn);
+      cudaGraphGetNodes(ifbody[b], nodes_.data(), &kn);
+      int types[16] = {};
+      for (size_t i = 0; i < kn; ++i) {
+        cudaGraphNodeType t;
+        if (cudaGraphNodeGetType(nodes_[i], &t) == cudaSuccess && (int)t < 16) ++types[(int)t];
+      }
+      std::fprintf(stderr, "spec batch graph: if body %zu: %zu nodes; by type:", b, kn);
+      for (int t = 0; t < 16; ++t)
+        if (types[t]) std::fprintf(stderr, " %d:%d", t, types[t]);
+      std::fprintf(stderr, "\n");
+    }
+    cudaGetLastError();
+    CUDA_CHECK(ie);
+  }
   CUDA_CHECK(cudaGraphDestroy(g));
   sp.bgraphs.emplace(ctx, e);
   CUDA_CHECK(cudaMemGetInfo(&free1, &total));

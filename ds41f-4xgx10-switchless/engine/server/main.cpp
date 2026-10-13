@@ -293,6 +293,8 @@ struct Args {
   double keep_gib = 0, keep_days = 7;  // kept sessions: written at a planned stop, at most; their age
   int snap_every = 1024, small_rows = 8;
   int slots = 1, slot = 0;  // session slots (model::Options::slots); the golden modes' slot
+  int bgraph_bodies = 0;      // DIAGNOSTICS (spec.cu, the batch graph): switch bodies to capture (0: kMaxRows)
+  bool bgraph_noif = false;   // DIAGNOSTICS: the entries' draft passes without if nodes
   int slice = 64;  // serve: time-slicing's turns, in tokens (0: none)
   bool snap_all = false;
   size_t ring_cap = 4u << 20;  // the ring's per-rank collective size (prefill's bulk collectives post cap / 4)
@@ -378,6 +380,8 @@ Args parse(int argc, char** argv) {
     else if (s == "--keep-days") a.keep_days = std::atof(val().c_str());
     else if (s == "--snap-every") a.snap_every = std::atoi(val().c_str());
     else if (s == "--slots") a.slots = std::atoi(val().c_str());
+    else if (s == "--bgraph-bodies") a.bgraph_bodies = std::atoi(val().c_str());
+    else if (s == "--bgraph-noif") a.bgraph_noif = true;
     else if (s == "--slot") a.slot = std::atoi(val().c_str());
     else if (s == "--batch") a.batch = val();
     else if (s == "--batch-tf") a.batch_tf = true;
@@ -575,6 +579,7 @@ int main(int argc, char** argv) {
   mo.draft_head4 = a.draft_head4, mo.draft_markov8 = a.draft_markov8;
   mo.tree_probe = !a.tree_probe.empty();
   mo.slots = a.slots;
+  mo.bgraph_bodies = a.bgraph_bodies, mo.bgraph_noif = a.bgraph_noif;
   mo.l2pf = !a.no_l2pf;
   model::Model m(a.rank, mo);
   m.use_slot(a.slot);
