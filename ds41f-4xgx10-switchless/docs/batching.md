@@ -44,8 +44,10 @@ any kernel was written. When it was written the engine ran one request at a time
   need it, and `kMaxSessRows` past 8, which decode_prep's race at 16 rows of one session forbids today.
 - **B3 is built and measured** (2026-10-13, [B3: the build](#b3-the-build-2026-10-13)): the owner asked
   for 2–4 streams at once, with one stream kept as fast as it is, within 2 %. B4's runner half goes with
-  it. Four different streams decode 131 tok/s in all (one alone: 97), each with drafts; one session is
-  within 1 % of master. Its phase 2 (one draft pass over all sessions, a gate across them) is not built.
+  it. Four different streams decode 131 tok/s in all (one alone 97; B2's undrafted batches 122), two
+  107 (B2: 88), each stream with its drafts; one session is unchanged (A/B/B/A, six runs each: 8.322
+  against 8.322 ms a token with drafts). Its phase 2a (one draft pass over all sessions) is built on a
+  branch and being checked; a gate across the sessions is not built.
 
 ## Why
 
@@ -732,8 +734,10 @@ two runs each per variant, both orders; every run the reference hash):
 | k = 1 | 16.730 (16.677, 16.784) | 16.768 (16.743, 16.794) | +0.23 % |
 | drafts (fp8) | 8.285 (8.270, 8.301) | 8.352 (8.313, 8.391) | +0.80 % |
 
-Both within the owner's 2 %. The drafted figure is not clearly inside the run-to-run spread with two runs
-each (the ranges do not overlap); a longer A/B of the drafted variant follows the serve tests.
+Both within the owner's 2 %. The drafted figure was not clearly inside the run-to-run spread with two runs
+each, so three more rounds of it ran after the serve tests (A B B A, A B B A, A B B A; six runs each):
+master's median 8.322 ms a token (8.301–8.362), the integration engine's 8.322 (8.310–8.362), B over A
+−0.01 %, every run the reference hash. One stream is unchanged.
 
 **Serving** (`--mode serve --slots 4 --max-ctx 131072`): batch_test.py `--slots 4` 0 failed in its eight
 scenarios, the two drafted ones included (pairs A+C and B+D, triples C+E+F and A+B+D, every request's
@@ -759,8 +763,11 @@ repetitions, which agreed to 0.1 tok/s; the step figures from the engine's log):
 The first tokens came 0.29 s apart (the prefills run one after another); the streams' ends spread
 by 0.7–1.7 s as their drafts fared. Four different streams decode 35 % more in all than one alone, three
 25 %, two 10 %; one stream at a time (B1) would give each of them the 102.7 of one alone, in turn.
-B2's figure with the same prompts and bench follows (its earlier medians, with batch_test's prompts:
-86.2 / 108.7 / 119.0).
+Master's engine (B2: batches without drafts, 4e2bae9) on the same prompts and bench, the same day: one
+stream 95.8–97.0 tok/s in all (102.4–102.5 decoding), two 87.7 (89.7; 21.5 ms a step), three 106.9–107.1
+(108.8–109.0; 26.2 ms), four 121.4–121.6 (123.3–123.5; 30.5 ms). So drafts across sessions add 22 % at
+two streams, 14 % at three and 8 % at four over B2, and at two streams the batch beats one stream at a
+time for the first time (B2's pair decoded 10 % less in all than one stream alone).
 
 **What a step costs.** A drafted batch's step is one session's step at the same number of rows plus
 about 3 ms for every further session: one session's steps are 26.4 ms at 3 rows and 36.2 at 6 (3.3 ms a
