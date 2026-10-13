@@ -8,6 +8,7 @@
 #include "comm/ring_dev.cuh"
 #include "common/check.h"
 #include "model/ops.h"
+#include "model/spec_batch.h"
 
 namespace model::ops {
 namespace {
@@ -347,10 +348,30 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
       st_release_sys_u32(&o.seq, in->step + 1);
       return;
     }
+    const volatile int32_t* vfb = fb;
+    if (in->sbatch) {
+      // A batch spec step (docs/batching.md, B3): the verdict per entry over its own rows, each by exactly the
+      // one-session rule below (spec_batch.h; no row reads another entry's). Entry k's rows are consecutive,
+      // sess[r] = k; the step is published after the entries' draft passes (spec.cu, k_spec_publish_batch).
+      SpecVerdict v[kMaxSess];
+      spec_batch_verdicts(*in, vfb, spec == kSpecVerify, v);
+      for (int k = 0; k < kMaxSess; ++k) {
+        o.sess_row0[k] = v[k].row0, o.sess_step_rows[k] = v[k].step_rows, o.sess_rows[k] = v[k].rows;
+        o.sess_pos0[k] = v[k].pos0;
+        o.next_srows[k] = 0, o.next_spos0[k] = 0;
+        if (!v[k].step_rows) continue;
+        ss[k].count = v[k].rows;
+        ss[k].pos0 = v[k].pos0;
+        ss[k].bonus = in->force >= 0 ? in->force : v[k].bonus;
+      }
+      o.rows = R;
+      o.pos0 = in->pos[0];
+      o.step_rows = R;
+      return;
+    }
     // A spec step's final rows: a verify step's up to the first draft that is not the sample of the row
     // before it (row[] then holds exactly the tokens it emits), and the token after them. Published
     // after the draft pass (spec.cu).
-    const volatile int32_t* vfb = fb;
     int n = R - 1;
     if (spec == kSpecVerify) {
       n = 0;

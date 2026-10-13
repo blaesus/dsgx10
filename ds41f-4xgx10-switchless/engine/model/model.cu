@@ -643,6 +643,7 @@ ops::StepIn& Model::Impl::next_in(uint64_t n, int R, int pos0, const int32_t* to
   in.rows = R;
   in.nsess = 1;
   in.step = (uint32_t)n;
+  in.sbatch = 0;
   return in;
 }
 
@@ -715,6 +716,7 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
   in.rows = R;
   in.nsess = b.nsess;
   in.step = (uint32_t)n;
+  in.sbatch = 0;
   if (store) {
     const uint64_t seq[2] = {e_seq + 1, e_seq + 2};
     e_seq += 2;
@@ -764,9 +766,20 @@ void Model::Impl::engram_late(int pos0, int R, const int32_t* tokens) {
 
 void Model::Impl::engram_late_batch(const int32_t* tokens) {
   if (!store) return;
-  if (!late.on || !late.batch) die("model: engram_late_batch with no batch step waiting for its tokens");
+  if (!late.on || !late.batch || late.any) die("model: engram_late_batch with no batch step waiting for its tokens");
   if (n_steps >= 2) wait_done(n_steps - 2);  // the step before it has read the Engram buffers
   engram_rows(late.R, tokens, late.pos, late.slot, late.seq);
+  late.on = false;
+}
+
+// B3: a batch verify step's rows, as the device lays them out (spec.cu k_spec_in_batch), from the host's
+// copy of the step before's choices
+void Model::Impl::engram_late_rows(int R, const int32_t* tok, const int32_t* pos, const int32_t* slot) {
+  if (!store) return;
+  if (!late.on || !late.batch || !late.any) die("model: engram_late_rows with no batch verify step waiting for its tokens");
+  if (R < 1 || R > kMaxRows) die("model: engram_late_rows(%d)", R);
+  if (n_steps >= 2) wait_done(n_steps - 2);  // the step before it has read the Engram buffers
+  engram_rows(R, tok, pos, slot, late.seq);
   late.on = false;
 }
 
@@ -873,6 +886,9 @@ uint64_t Model::launch(int R, int pos0, const int32_t* tokens, const Sampling& s
 void Model::engram_late(int pos0, int R, const int32_t* tokens) { d_->engram_late(pos0, R, tokens); }
 uint64_t Model::launch_batch(const Batch& b) { return d_->launch_batch(b); }
 void Model::engram_late_batch(const int32_t* tokens) { d_->engram_late_batch(tokens); }
+void Model::engram_late_rows(int R, const int32_t* tokens, const int32_t* pos, const int32_t* slot) {
+  d_->engram_late_rows(R, tokens, pos, slot);
+}
 const SampleOut& Model::wait(uint64_t n) { return d_->wait(n); }
 void Model::set_ctl(uint32_t v) { __atomic_store_n(d_->ctl_h, v, __ATOMIC_RELEASE); }
 void Model::step(const Ctl& c, int32_t* sampled, Sink* sink) {

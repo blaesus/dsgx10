@@ -1254,10 +1254,12 @@ class Server {
                                                            : kTurn;
   }
 
-  // The flights' run together: batch_loop, a row of each per step, each in its own slot (with drafts the
-  // last one left pauses, to go on alone). Each one's end (fe::k*), or kPaused / kTurn, in why.
+  // The flights' run together, each in its own slot: a row of each per step (batch_loop), or with drafts
+  // (spec_batch_loop, B3) when the server has them and the batch is small enough for a draft each; with
+  // drafts the last one left pauses, to go on alone. Each one's end (fe::k*), or kPaused / kTurn, in why.
   void decode_batch(std::vector<Flight>& fl, bool turns, std::vector<uint32_t>& why) {
     const int n = (int)fl.size();
+    const bool drafts = o_.spec && m_.spec() && n <= model::kMaxRows / 2 && n <= m_.spec_batch_entries();
     std::vector<BatchEntry> e(n);
     std::vector<Session*> S(n);
     for (int k = 0; k < n; ++k) {
@@ -1273,19 +1275,28 @@ class Server {
       x.n_stop = (int)f.rq.stop.size();
       std::copy(f.rq.stop.begin(), f.rq.stop.end(), x.stop);
       x.sp = f.sp;
+      x.spec_tok = f.spec_tok, x.spec_ms = f.spec_ms;  // the drafts' rate goes on from the last run
     }
     Cmd c{};
-    c.op = kCmdBatch;
+    c.op = drafts ? kCmdSpecBatch : kCmdBatch;
     c.n = n;
     c.slot = e[0].slot;
     c.flags = o_.spec ? kBatchSolo : 0;
+    if (drafts) {
+      c.spec = 1;
+      c.spec_drafts = o_.spec_drafts;
+      c.spec_thresh = o_.spec_thresh;
+      std::copy(o_.spec_cost, o_.spec_cost + 3, c.spec_cost);
+      c.spec_gate = o_.spec_gate;
+      std::copy(o_.spec_row_ms, o_.spec_row_ms + model::ops::kDrafts + 1, c.spec_row_ms);
+    }
     const double t_dec = now_s();
     issue(c);
     bcast_payload(ring_, e.data(), e.size() * sizeof(BatchEntry), 0);
     uint32_t ctl = 0;
     std::vector<std::vector<int32_t>> samples(n);
     std::vector<char> cancel(n, 0);
-    const std::vector<BatchEnd> end = batch_loop(m_, c, e, wd_, [&](int k, const model::SampleOut& o, int row) {
+    const OnBatch cb = [&](int k, const model::SampleOut& o, int row) {
       Flight& f = fl[k];
       samples[k].push_back(o.row[row].token);
       if (f.tu.dec1_ms < 0) f.tu.dec1_ms = 1e3 * (now_s() - t_dec);
@@ -1303,7 +1314,16 @@ class Server {
       const bool ends = stop_id(f, t) || (int)f.out.size() >= (int)f.rq.h.max_new_tokens;
       if (!(ctl & kCtlPause) && (io_.submit_waiting() || !wait_.empty()) && (ends || admissible()))
         m_.set_ctl(ctl |= kCtlPause);
-    });
+    };
+    std::vector<BatchEnd> end(n);
+    std::vector<DecodeEnd> dend;
+    SpecBatchStats st;
+    if (drafts) {
+      dend = spec_batch_loop(m_, c, e, wd_, cb, &st);
+      for (int k = 0; k < n; ++k) end[k].sampled = dend[k].sampled, end[k].fed = dend[k].fed, end[k].why = dend[k].why;
+    } else {
+      end = batch_loop(m_, c, e, wd_, cb);
+    }
     if (ctl) m_.set_ctl(0);
     const double dt = now_s() - t_dec;
     std::string ends;
@@ -1313,7 +1333,13 @@ class Server {
       f.dec_s += dt;
       f.decoded += x.sampled, f.batched += x.sampled;
       ++f.slices;
-      S[k]->w = std::max(S[k]->w, e[k].pos0 + x.fed);
+      if (drafts) {
+        f.spec_tok = dend[k].spec_tok, f.spec_ms = dend[k].spec_ms;
+        add(f.de, dend[k]);
+        S[k]->w = std::max(S[k]->w, dend[k].written);
+      } else {
+        S[k]->w = std::max(S[k]->w, e[k].pos0 + x.fed);
+      }
       if (x.fed > 0) {  // the history: the token it started from, and the samples fed after it
         S[k]->hist.push_back(e[k].token);
         S[k]->hist.insert(S[k]->hist.end(), samples[k].begin(), samples[k].begin() + std::max(0, x.fed - 1));
@@ -1331,12 +1357,27 @@ class Server {
                     : why[k] == fe::kLength ? "length" : why[k] == fe::kCancelled ? "cancelled" : "context");
       ends += b;
     }
-    // the run for the log: its steps' median (g_t_wait: when each step's samples came)
+    // the run for the log: its steps' median (g_t_wait: when each step's samples came); with drafts, the
+    // tokens and rows per step, the drafts accepted of those verified, and the steps' GPU ms by rows
     std::vector<double> d;
     for (size_t i = 1; i < g_t_wait.size(); ++i) d.push_back(1e3 * (g_t_wait[i] - g_t_wait[i - 1]));
     std::sort(d.begin(), d.end());
-    std::printf("serve: batch of %d: %zu steps in %.1f ms, %.2f ms a step (median); req, tokens, end: %s\n", n,
-                g_t_wait.size(), 1e3 * dt, d.empty() ? 0.0 : d[d.size() / 2], ends.c_str());
+    std::string dr;
+    if (drafts) {
+      int ver = 0, acc = 0;
+      for (int k = 0; k < n; ++k) ver += dend[k].verified, acc += dend[k].accepted;
+      char b[160];
+      std::snprintf(b, sizeof b, "; drafts: %.2f tokens and %.2f rows per step, %d of %d drafts accepted; GPU ms by rows:",
+                    st.steps ? (double)st.emitted / st.steps : 0.0, st.steps ? (double)st.rows / st.steps : 0.0, acc, ver);
+      dr = b;
+      for (int r = 1; r <= model::kMaxRows; ++r)
+        if (st.gpu_n[r]) {
+          std::snprintf(b, sizeof b, " %d: %.2f (%d)", r, st.gpu_ms[r] / st.gpu_n[r], st.gpu_n[r]);
+          dr += b;
+        }
+    }
+    std::printf("serve: batch of %d: %zu steps in %.1f ms, %.2f ms a step (median); req, tokens, end: %s%s\n", n,
+                g_t_wait.size(), 1e3 * dt, d.empty() ? 0.0 : d[d.size() / 2], ends.c_str(), dr.c_str());
   }
 
   // Paused requests that their client cancelled, or that the server's stop ends, end now, not at their

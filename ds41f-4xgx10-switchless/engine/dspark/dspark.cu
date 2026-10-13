@@ -46,14 +46,15 @@ __global__ void __launch_bounds__(256) main_hidden_kernel(const uint16_t* x, int
 
 // accept, kernel 1: act_quant of main_hidden's rows [0, count) for main_proj (later rows: zeros), and the anchor
 // start = pos0 + count - 1. Block (c, r): 256 columns of row r; a warp is one scale block of 32.
+// row0 (device, may be null): the rows start at main_hidden's row *row0 (a batch step's entry; docs/batching.md B3).
 __global__ void __launch_bounds__(256) accept_prep_kernel(const uint16_t* mh, const int* count, const int* pos0,
-                                                          uint8_t* hq, uint8_t* hs, int* start) {
+                                                          const int* row0, uint8_t* hq, uint8_t* hs, int* start) {
   pdl_trigger();
   pdl_wait();
   const int r = blockIdx.y, c = blockIdx.x * 256 + threadIdx.x;
-  const int n = *count;
+  const int n = *count, off = row0 ? *row0 : 0;
   if (r == 0 && c == 0) *start = *pos0 + n - 1;
-  const float v = r < n ? bf2f(mh[(size_t)r * kMainK + c]) : 0.f;
+  const float v = r < n ? bf2f(mh[(size_t)(r + off) * kMainK + c]) : 0.f;
   const float sc = attn::fp8_block_scale(attn::warp_max(fabsf(v)));
   hq[(size_t)r * kMainK + c] = attn::fp8_code(v, sc);
   if ((threadIdx.x & 31) == 0) hs[(size_t)r * (kMainK / 32) + c / 32] = attn::f_to_ue8m0(sc);
@@ -820,12 +821,13 @@ void tap_mix(float* dst, const float* pre, const float* post, const float* comb,
 }
 }  // namespace
 
-void Draft::accept(const uint16_t* mh, const int* count, const int* pos0, cudaStream_t s, const int* slot) {
+void Draft::accept(const uint16_t* mh, const int* count, const int* pos0, cudaStream_t s, const int* slot,
+                   const int* row0) {
   Buf& b = *b_;
   dsk::GemvCfg c8{1, 1, 16}, c8k{1, 1, 8};
   c8.tiled = c8k.tiled = true;
   tap(taps.main_hidden, mh, (size_t)kMaxAcc * kMainK * 2, s);
-  launch(accept_prep_kernel, dim3(kMainK / 256, kMaxAcc), dim3(256), 0, s, true, mh, count, pos0, b.hq, b.hs,
+  launch(accept_prep_kernel, dim3(kMainK / 256, kMaxAcc), dim3(256), 0, s, true, mh, count, pos0, row0, b.hq, b.hs,
          b.start);
   dsk::gemv_fp8(b.hq, b.hs, kMaxAcc, w_.main_proj, w_.main_proj_s, kDim / kRanks, kMainK, bf(b.mp_r), c8, s);
   const GatherSeg g{b.mp_r, 1280 * 2, b.mp, kDim * 2, 1280 * 2, kMaxAcc};

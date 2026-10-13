@@ -193,8 +193,11 @@ class Draft {
   // positions *pos0 + r, 1 <= *count <= 8 (a prompt: its last 128 positions, 8 per call). Their main_kv goes
   // into each block's window; the last of them, *pos0 + *count - 1, is the next draft's anchor.
   // Session slots: the windows are the current slot's (use_slot), or with `slot` (device, at least kMaxAcc
-  // entries; a step's table) row r's slot's: a step captured once serves sessions in any slot.
-  void accept(const uint16_t* mh, const int* count, const int* pos0, cudaStream_t s, const int* slot = nullptr);
+  // entries; a step's table) row r's slot's: a step captured once serves sessions in any slot. row0 (device, one
+  // int): the rows are main_hidden's [*row0, *row0 + *count), not [0, *count) (a batch step's entry; the buffer
+  // then holds at least *row0 + *count rows).
+  void accept(const uint16_t* mh, const int* count, const int* pos0, cudaStream_t s, const int* slot = nullptr,
+              const int* row0 = nullptr);
   // The draft after the anchor p: *token (the token at p + 1) and four noise tokens at positions p + 1 .. p + 5
   // through the blocks and the head; then tokens() holds d1..d5, greedy drafts for positions p + 2 .. p + 6.
   // `slot` as accept()'s (kDraft entries, all the anchor's session's).

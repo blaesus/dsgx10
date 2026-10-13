@@ -16,6 +16,7 @@
 
 #include "model/nvtx.h"
 #include "model/prefill.h"
+#include "model/spec_batch.h"
 
 namespace model {
 
@@ -61,6 +62,8 @@ __global__ void k_gather_unpack(GatherArgs a, const uint32_t* recv) {
 __device__ __forceinline__ void st_release_sys_u32(uint32_t* p, uint32_t v) {
   asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
+
+ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temperature, s.top_p, s.top_k, s.n_top}; }
 
 // The step's input (as ops::step_in), a verify step's rows, tokens and positions from the spec state;
 // then the switch's value, the row count - 1.
@@ -116,6 +119,75 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
   o.next_pos0 = P;
   for (int j = 0; j < kMaxRows; ++j) o.next_tok[j] = ss->next_tok[j];
   for (int j = 0; j < ops::kDrafts; ++j) o.drafts[j] = drafts[j], o.survival[j] = surv[j];
+  __threadfence_system();
+  st_release_sys_u32(&o.seq, in->step + 1);
+}
+
+// ---- B3: the batch spec step (docs/batching.md), drafts across sessions ----------------------------
+// The batch step's input (as k_spec_in), its rows laid out on the device: the entries on (sess_on) in
+// entry order, each its rows (a verify step: the rows the step before chose for it, its bonus token then
+// its drafts; a given step: the host's one row per entry), with its slot in slot[] and its entry index
+// in sess[]; row0[k] entry k's first row; stab the entries' slot tables (every entry of entry k's its
+// slot); then the switch's value (the row count - 1) and each entry's if (on or not).
+struct IfHandles {
+  cudaGraphConditionalHandle h[ops::kMaxSess];
+};
+__global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, const ops::SpecState* ss, ops::StepIn* d,
+                                int* row0, int* stab, cudaGraphConditionalHandle hsw, IfHandles hif) {
+  constexpr int n = sizeof(ops::StepIn) / 4;
+  const uint32_t slot = *counter % ops::kInSlots;
+  for (int i = threadIdx.x; i < n; i += blockDim.x)
+    reinterpret_cast<uint32_t*>(d)[i] = reinterpret_cast<const volatile uint32_t*>(ring + slot)[i];
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (d->spec == ops::kSpecVerify) ops::spec_batch_layout(*d, ss, row0);  // spec_batch.h
+    else ops::spec_batch_row0(*d, row0);  // a given step: the host's layout, one row per entry on
+    for (int k = 0; k < ops::kMaxSess; ++k)
+      for (int j = 0; j < dspark::kMaxAcc; ++j) stab[k * dspark::kMaxAcc + j] = d->sess_slot[k];
+    *counter += 1;
+    cudaGraphSetConditional(hsw, (unsigned)(d->rows - 1));
+    for (int k = 0; k < ops::kMaxSess; ++k) cudaGraphSetConditional(hif.h[k], d->sess_on[k] ? 1u : 0u);
+  }
+}
+
+// After entry k's draft pass: the drafts its rows of the next step verify, by the gate (ops.h) under its
+// own cap (scap[k]), position bound (spos_end[k]) and threshold (sthresh[k]): k_spec_next's choice, for
+// its rows alone. Into its spec state (the next step's layout) and the step's SampleOut (next_s*[k]).
+__global__ void k_spec_gate_batch(const ops::StepIn* in, ops::SpecState* ss, int k, const int* drafts,
+                                  const float* surv, ops::SampleOut* outs) {
+  if (threadIdx.x != 0) return;
+  ops::SampleOut& o = outs[in->step % ops::kOutSlots];
+  ops::SpecState& s = ss[k];
+  const int P = s.pos0 + s.count;
+  const int maxk = min(min(ops::kDrafts, in->scap[k]), in->spos_end[k] - 1 - P);
+  const float thresh = in->sthresh[k];
+  int n = 0;
+  if (in->gate == ops::kGateRatio) {
+    float e = 1.f, best = 1.f / in->step_ms[0];
+    for (int j = 1; j <= maxk; ++j) {
+      e += surv[j - 1];
+      const float r = e / in->step_ms[j];
+      if (r > best) best = r, n = j;
+    }
+  } else if (in->gate == ops::kGateMarginal) {
+    while (n < maxk && surv[n] >= thresh * (in->step_ms[n + 1] - in->step_ms[n])) ++n;
+  } else {
+    while (n < maxk && surv[n] >= thresh) ++n;
+  }
+  s.next_rows = 1 + n;
+  s.next_pos0 = P;
+  s.next_tok[0] = s.bonus;
+  for (int j = 1; j < kMaxRows; ++j) s.next_tok[j] = j <= n ? drafts[j - 1] : 0;
+  o.next_srows[k] = 1 + n;
+  o.next_spos0[k] = P;
+  for (int j = 0; j < ops::kSessTok; ++j) o.next_stok[k][j] = s.next_tok[j];
+  __threadfence_system();
+}
+
+// The batch step's publication, after every entry's draft pass.
+__global__ void k_spec_publish_batch(const ops::StepIn* in, ops::SampleOut* outs) {
+  if (threadIdx.x != 0) return;
+  ops::SampleOut& o = outs[in->step % ops::kOutSlots];
   __threadfence_system();
   st_release_sys_u32(&o.seq, in->step + 1);
 }
@@ -304,10 +376,13 @@ class RingComm final : public dspark::Comm {
 
 Spec::~Spec() {
   for (auto& g : graphs) cudaGraphExecDestroy(g.second);
+  for (auto& g : bgraphs) cudaGraphExecDestroy(g.second);
   for (void* p : whole) cudaFree(p);
   cudaFree(rope);
   cudaFree(mh);
   cudaFree(ss);
+  cudaFree(row0);
+  cudaFree(stab);
   cudaFree(pf_mh);
   cudaFree(pf_acc);
   cudaFreeHost(pf_acc_h);
@@ -441,7 +516,10 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
   sp.draft->use_slot(cur_slot);
   if (opt.tree_probe) sp.draft->enable_probe();
   sp.mh = dalloc<uint16_t>((size_t)kMaxRows * dspark::kMainK);
-  sp.ss = dalloc<ops::SpecState>(1);
+  sp.ss = dalloc<ops::SpecState>(ops::kMaxSess);  // [0] the one-session step's; B3's entries' [k]
+  sp.bents = std::min(ops::kMaxSess, nslots);
+  sp.row0 = dalloc<int>(ops::kMaxSess);
+  sp.stab = dalloc<int>((size_t)ops::kMaxSess * dspark::kMaxAcc);
   // the prefill's seed rows, sized for a 4096-row chunk with snapshots every 1024 (768 rows in 96
   // groups, 384 on the last rank), so that a prefill rarely has to grow them (which synchronises)
   sp.pf_rows = kSpecPfRows + 2 * kSnapRows, sp.pf_groups = 128;
@@ -588,9 +666,106 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   return e;
 }
 
+// B3 (docs/batching.md): the batch spec step of a context bucket, drafts across sessions. The one-session
+// step's shape, with the rows laid out on the device (k_spec_in_batch), the verdicts per entry (k_sample),
+// and the draft passes under if nodes, one per entry: accept from its rows (row0) into its slot's windows
+// (its slot table), draft from its bonus token, its gate; then the publication. The passes run one after
+// the other (they share the draft module's buffers, and the ring's collectives run in one order on every
+// rank). Captured only with Options::slots > 1; the one-session graph above is not touched.
+cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
+  Spec& sp = *spec;
+  const auto it = sp.bgraphs.find(ctx);
+  if (it != sp.bgraphs.end()) return it->second;
+  if (sp.bents < 2) die("model: a batch spec step needs Options::slots > 1");
+  const clock_t t0 = clock();
+  size_t free0 = 0, free1 = 0, total = 0;
+  CUDA_CHECK(cudaMemGetInfo(&free0, &total));
+  const auto mode = cudaStreamCaptureModeThreadLocal;
+  cudaGraph_t g, cap;
+  CUDA_CHECK(cudaGraphCreate(&g, 0));
+  cudaGraphConditionalHandle hsw;
+  CUDA_CHECK(cudaGraphConditionalHandleCreate(&hsw, g, 0, 0));
+  IfHandles hif{};
+  for (int k = 0; k < ops::kMaxSess; ++k) CUDA_CHECK(cudaGraphConditionalHandleCreate(&hif.h[k], g, 0, 0));
+  // the step's rows, the switch's value and the ifs'
+  CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, nullptr, nullptr, 0, mode));
+  k_spec_in_batch<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, sp.row0, sp.stab, hsw, hif);
+  CUDA_CHECK(cudaGetLastError());
+  cudaStreamCaptureStatus cs;
+  const cudaGraphNode_t* deps = nullptr;
+  size_t nd = 0;
+  CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &deps, nullptr, &nd));
+  const std::vector<cudaGraphNode_t> head(deps, deps + nd);
+  CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+  // the switch: body R - 1 runs R rows (the one-session step's bodies, captured again)
+  cudaGraphNodeParams cp{};
+  cp.type = cudaGraphNodeTypeConditional;
+  cp.conditional.handle = hsw;
+  cp.conditional.type = cudaGraphCondTypeSwitch;
+  cp.conditional.size = kMaxRows;
+  cudaGraphNode_t sw;
+  CUDA_CHECK(cudaGraphAddNode(&sw, g, head.data(), nullptr, head.size(), &cp));
+  mh_on = true;
+  for (int R = 1; R <= kMaxRows; ++R) {
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, cp.conditional.phGraph_out[R - 1], nullptr, nullptr, 0, mode));
+    forward_rows(R, ctx, 0, nullptr, 0);
+    CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+  }
+  mh_on = false;
+  size_t nodes = 0;
+  for (int R = 1; R <= kMaxRows; ++R) {
+    size_t k = 0;
+    CUDA_CHECK(cudaGraphGetNodes(cp.conditional.phGraph_out[R - 1], nullptr, &k));
+    nodes += k;
+  }
+  // the verdicts, per entry
+  CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &sw, nullptr, 1, mode));
+  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss);
+  CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &deps, nullptr, &nd));
+  std::vector<cudaGraphNode_t> tail(deps, deps + nd);
+  CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+  // the entries' draft passes, each under its if
+  for (int k = 0; k < sp.bents; ++k) {
+    cudaGraphNodeParams ip{};
+    ip.type = cudaGraphNodeTypeConditional;
+    ip.conditional.handle = hif.h[k];
+    ip.conditional.type = cudaGraphCondTypeIf;
+    ip.conditional.size = 1;
+    cudaGraphNode_t node;
+    CUDA_CHECK(cudaGraphAddNode(&node, g, tail.data(), nullptr, tail.size(), &ip));
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, ip.conditional.phGraph_out[0], nullptr, nullptr, 0, mode));
+    const int* slot = sp.stab + (size_t)k * dspark::kMaxAcc;
+    sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k);
+    sp.draft->draft(&sp.ss[k].bonus, st, slot);
+    k_spec_gate_batch<<<1, 32, 0, st>>>(in_d, sp.ss, k, sp.draft->tokens(), sp.draft->survival(), out_h);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    size_t kn = 0;
+    CUDA_CHECK(cudaGraphGetNodes(ip.conditional.phGraph_out[0], nullptr, &kn));
+    nodes += kn;
+    tail.assign(1, node);
+  }
+  sp.bnodes = nodes;
+  // the publication
+  CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, tail.data(), nullptr, tail.size(), mode));
+  k_spec_publish_batch<<<1, 32, 0, st>>>(in_d, out_h);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+  cudaGraphExec_t e;
+  CUDA_CHECK(cudaGraphInstantiate(&e, g, cudaGraphInstantiateFlagUseNodePriority));
+  CUDA_CHECK(cudaGraphDestroy(g));
+  sp.bgraphs.emplace(ctx, e);
+  CUDA_CHECK(cudaMemGetInfo(&free1, &total));
+  if (rank == 0 && !sp.quiet)
+    std::printf("spec: the batch step graph of context %d (%d entries, %zu nodes in its bodies) in %.2f s (CPU), %.1f "
+                "MiB of device memory\n", ctx, sp.bents, nodes, (double)(clock() - t0) / CLOCKS_PER_SEC,
+                ((double)free0 - (double)free1) / 1048576.0);
+  return e;
+}
+
 // The step graphs of every context now (serve's startup): the device memory a graph takes (its conditional
 // bodies live on the device) would otherwise have to be free in the middle of a session. One graph serves
-// every context (scan_ctx), so the sweep captures one.
+// every context (scan_ctx), so the sweep captures one. With session slots, the batch step's graphs too.
 void Model::Impl::spec_graphs() {
   if (!spec) die("model: spec_graphs without bind_spec");
   const clock_t t0 = clock();
@@ -605,6 +780,18 @@ void Model::Impl::spec_graphs() {
     std::printf("spec: %zu step graph%s for contexts up to %d (%zu nodes in its bodies) in %.1f s (CPU), %.2f GiB of "
                 "device memory\n", spec->graphs.size(), spec->graphs.size() == 1 ? "" : "s", opt.max_ctx, spec->nodes,
                 (double)(clock() - t0) / CLOCKS_PER_SEC, ((double)free0 - (double)free1) / 1073741824.0);
+  if (spec->bents < 2) return;
+  const clock_t t1 = clock();
+  size_t free2 = 0;
+  spec->quiet = true;
+  for (int p = 0; p < opt.max_ctx; p += kCtxBucket) spec_batch_graph(scan_ctx(p));
+  spec_batch_graph(scan_ctx(opt.max_ctx - 1));
+  spec->quiet = false;
+  CUDA_CHECK(cudaMemGetInfo(&free2, &total));
+  if (rank == 0)
+    std::printf("spec: %zu batch step graph%s of up to %d entries (%zu nodes in its bodies) in %.1f s (CPU), %.2f GiB "
+                "of device memory\n", spec->bgraphs.size(), spec->bgraphs.size() == 1 ? "" : "s", spec->bents,
+                spec->bnodes, (double)(clock() - t1) / CLOCKS_PER_SEC, ((double)free1 - (double)free2) / 1073741824.0);
 }
 
 void Model::Impl::spec_use_slot(int s) {
@@ -677,9 +864,124 @@ uint64_t Model::Impl::launch_verify(const Sampling& sp, const SpecCfg& c, int po
   return n;
 }
 
+// ---- B3: batch spec steps ----------------------------------------------------------------------------
+
+void Model::Impl::spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b) {
+  spec_fill(in, mode, b.cfg);
+  in.sbatch = 1;
+  for (int k = 0; k < ops::kMaxSess; ++k) {
+    const bool has = k < b.n;
+    in.sess_on[k] = has && b.on[k] ? 1 : 0;
+    in.sess_slot[k] = has ? b.slot[k] : 0;
+    in.scap[k] = has ? std::max(0, std::min(ops::kDrafts, b.cap[k])) : 0;
+    in.spos_end[k] = has ? std::min(b.pos_end[k], opt.max_ctx) : 0;
+    in.sthresh[k] = has ? b.thresh[k] : 0.f;
+  }
+}
+
+// The checks a batch spec step needs (every rank passes the same): the entries on, each in a slot of its
+// own, and their next rows (1 + cap each) within kMaxRows and a session's rows. Returns the entries on.
+int Model::Impl::spec_batch_check(const SpecBatch& b, bool given) {
+  if (!spec) die("model: batch spec step without bind_spec");
+  if (spec->bents < 2) die("model: batch spec steps need Options::slots > 1");
+  if (b.n < 1 || b.n > spec->bents) die("model: a batch spec step of %d entries (at most %d)", b.n, spec->bents);
+  int S = 0, rows = 0;
+  for (int k = 0; k < b.n; ++k) {
+    if (!b.on[k]) continue;
+    ++S;
+    if (b.slot[k] < 0 || b.slot[k] >= nslots) die("model: batch spec entry %d in slot %d", k, b.slot[k]);
+    for (int q = 0; q < k; ++q)
+      if (b.on[q] && b.slot[q] == b.slot[k]) die("model: batch spec entries %d and %d share slot %d", q, k, b.slot[k]);
+    if (b.cap[k] < 0 || b.cap[k] > ops::kDrafts || 1 + b.cap[k] > kMaxSessRows)
+      die("model: batch spec entry %d with %d drafts", k, b.cap[k]);
+    rows += 1 + b.cap[k];
+    if (given && (b.token[k] < 0 || b.pos0[k] < 0 || b.pos0[k] >= opt.max_ctx))
+      die("model: batch spec entry %d: token %d at %d", k, b.token[k], b.pos0[k]);
+  }
+  if (S < 1) die("model: a batch spec step with no entry on");
+  if (rows > kMaxRows) die("model: a batch spec step of %d entries whose next rows could reach %d (kMaxRows %d)", S, rows, kMaxRows);
+  return S;
+}
+
+uint64_t Model::Impl::launch_spec_batch(const SpecBatch& b) {
+  spec_batch_check(b, true);
+  const uint64_t n = n_steps;
+  if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
+  ops::StepIn& in = in_h[n % ops::kInSlots];
+  int R = 0, pos_last = 0;
+  for (int k = 0; k < b.n; ++k) {  // one row per entry on, in entry order
+    if (!b.on[k]) continue;
+    in.tokens[R] = b.token[k], in.pos[R] = b.pos0[k], in.slot[R] = b.slot[k], in.sess[R] = k;
+    pos_last = std::max(pos_last, b.pos0[k]);
+    ++R;
+  }
+  for (int r = R; r < kMaxRows; ++r) {  // the entries past R repeat the last row's
+    in.tokens[r] = 0;
+    in.pos[r] = in.pos[R - 1], in.slot[r] = in.slot[R - 1], in.sess[r] = in.sess[R - 1];
+  }
+  for (int k = 0; k < ops::kMaxSess; ++k) in.samp[k] = samp_of(b.sp[std::min(k, b.n - 1)]);
+  in.rows = R;
+  in.nsess = b.n;
+  in.step = (uint32_t)n;
+  spec_fill_batch(in, ops::kSpecGiven, b);
+  if (store) {
+    if (late.on) die("model: a step waits for its tokens");
+    const uint64_t seq[2] = {e_seq + 1, e_seq + 2};
+    e_seq += 2;
+    in.e_wait[0] = seq[0], in.e_wait[1] = seq[1];
+    if (n) wait_done(n - 1);  // the previous step has read the Engram buffers
+    engram_rows(R, in.tokens, in.pos, in.slot, seq);
+  }
+  const cudaGraphExec_t e = spec_batch_graph(scan_ctx(pos_last));
+  const int slot = (int)(n % ops::kOutSlots);
+  CUDA_CHECK(cudaEventRecord(ev_beg[slot], st));
+  CUDA_CHECK(cudaGraphLaunch(e, st));
+  CUDA_CHECK(cudaEventRecord(ev_end[slot], st));
+  n_steps = n + 1;
+  return n;
+}
+
+uint64_t Model::Impl::launch_verify_batch(const SpecBatch& b) {
+  spec_batch_check(b, false);
+  if (b.pos_bound < 0) die("model: launch_verify_batch(%d)", b.pos_bound);
+  const uint64_t n = n_steps;
+  if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
+  ops::StepIn& in = in_h[n % ops::kInSlots];
+  int slot0 = 0;
+  for (int k = 0; k < b.n; ++k)
+    if (b.on[k]) {
+      slot0 = b.slot[k];
+      break;
+    }
+  for (int r = 0; r < kMaxRows; ++r) in.tokens[r] = 0, in.pos[r] = 0, in.slot[r] = slot0, in.sess[r] = 0;  // the device's
+  for (int k = 0; k < ops::kMaxSess; ++k) in.samp[k] = samp_of(b.sp[std::min(k, b.n - 1)]);
+  in.rows = 1;  // the device's
+  in.nsess = b.n;
+  in.step = (uint32_t)n;
+  spec_fill_batch(in, ops::kSpecVerify, b);
+  if (store) {
+    if (late.on) die("model: two steps wait for their tokens");
+    const uint64_t seq[2] = {e_seq + 1, e_seq + 2};
+    e_seq += 2;
+    in.e_wait[0] = seq[0], in.e_wait[1] = seq[1];
+    late.on = true, late.any = true, late.batch = true;
+    late.pos0 = -1, late.R = 0, late.seq[0] = seq[0], late.seq[1] = seq[1];
+  }
+  const cudaGraphExec_t e = spec_batch_graph(scan_ctx(std::min(b.pos_bound, opt.max_ctx - 1)));
+  const int slot = (int)(n % ops::kOutSlots);
+  CUDA_CHECK(cudaEventRecord(ev_beg[slot], st));
+  CUDA_CHECK(cudaGraphLaunch(e, st));
+  CUDA_CHECK(cudaEventRecord(ev_end[slot], st));
+  n_steps = n + 1;
+  return n;
+}
+
 // ---- Model ------------------------------------------------------------------------------------------
 
 void Model::bind_spec(dsw::WeightFile& wf) { d_->bind_spec(wf); }
+int Model::spec_batch_entries() const { return d_->spec ? d_->spec->bents : 0; }
+uint64_t Model::launch_spec_batch(const SpecBatch& b) { return d_->launch_spec_batch(b); }
+uint64_t Model::launch_verify_batch(const SpecBatch& b) { return d_->launch_verify_batch(b); }
 void Model::spec_graphs() { d_->spec_graphs(); }
 float Model::gpu_ms(uint64_t n) const {
   if (n >= d_->n_steps || n + ops::kOutSlots < d_->n_steps) die("model: gpu_ms of step %llu", (unsigned long long)n);

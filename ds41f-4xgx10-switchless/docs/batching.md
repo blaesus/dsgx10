@@ -672,3 +672,22 @@ refused.
   sessions in slots (`--bench-groups`, `--slots`), `--mode batch --batch-tf [--batch-rows G]` whose
   per-session hash must equal the session's run alone and tf mode's. Untested: every GPU run (the
   equalities above, the ABBA at one session, the 12- and 16-row step times).
+- 2026-10-13 15:10, branch `runner-b3`: built, warning-free, not yet run on the ring. The model: the
+  batch spec step graph (`spec_batch_graph`: `k_spec_in_batch` lays the entries' rows out on the device
+  and sets the switch's and the ifs' values, the spec switch's bodies, `k_sample`'s verdicts per entry,
+  one if node per entry with its accept (from its `row0`), draft and gate in its own slot table, then
+  `k_spec_publish_batch`), `SpecState[kMaxSess]`, `SpecBatch`, `launch_spec_batch` /
+  `launch_verify_batch` / `engram_late_rows`; `spec_graphs` captures the batch graphs too and prints
+  their own line. The loop: `spec_batch_loop` (`kCmdSpecBatch`; cmd.h has its semantics), serve's
+  `decode_batch` taking it for batches of at most kMaxRows / 2 with the drafts' figures on the batch log
+  line, `--mode batch --spec` for the reference hashes in drafted batches. Checks written:
+  batch_test.py's scenarios 7–8 (pairs, triples, a pause, a cancel and a stop id in drafted batches),
+  bench/multistream.py, bench/abba.sh. The layout and the verdicts per entry live in
+  [spec_batch.h](../engine/model/spec_batch.h), one code for the device and the host:
+  `spec_batch_test` (host only, no GPU) passes, 656k checks over 20k random steps against the
+  one-session rule per entry. **Untested on a GPU**: everything else, first of all the batch graph's
+  capture (if nodes whose bodies hold the draft module's collectives), then the reference hashes in
+  drafted batches, batch_test with drafts, the throughput at 2–4 sessions and the one-session ABBA.
+  Two choices to note: a paused entry's last token is not fed by an extra step (its next run feeds it,
+  as B2's pause does), and the ahead launch waits for the step before when any entry's worst-case rows
+  would pass its `feed` (the speculative loop's rule, applied to the batch as a whole).

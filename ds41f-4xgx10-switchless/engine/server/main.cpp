@@ -992,6 +992,8 @@ int main(int argc, char** argv) {
     const int per = a.batch_tf ? a.steps * a.batch_rows : a.steps;  // positions each session goes on by
     if (a.batch_tf && (int)ss.size() * a.batch_rows > model::kMaxRows)
       die("batch: %zu sessions of %d rows a step: at most %d rows", ss.size(), a.batch_rows, model::kMaxRows);
+    if (a.spec && (int)ss.size() > model::kMaxRows / 2)  // B3: a draft each at least
+      die("batch: %zu sessions with drafts (--spec): at most %d (kMaxRows / 2)", ss.size(), model::kMaxRows / 2);
     for (size_t k = 0; k < ss.size(); ++k) {  // each session's prompt in its slot
       Sess& s = ss[k];
       s.slot = a.slots - 1 - (int)k;
@@ -1060,18 +1062,36 @@ int main(int argc, char** argv) {
       x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
     }
     Cmd c{};
-    c.op = kCmdBatch;
+    c.op = a.spec ? kCmdSpecBatch : kCmdBatch;  // B3 (--spec): drafts across the sessions, every one to its end
     c.n = (int)e.size();
+    if (a.spec) {
+      c.spec = 1;
+      c.spec_drafts = a.spec_drafts;
+      c.spec_thresh = a.spec_thresh;
+      std::copy(a.spec_cost, a.spec_cost + 3, c.spec_cost);
+      c.spec_gate = a.spec_gate;
+      std::copy(a.spec_row_ms, a.spec_row_ms + model::ops::kDrafts + 1, c.spec_row_ms);
+    }
     bcast(ring, c);
     bcast_payload(ring, e.data(), e.size() * sizeof(BatchEntry), 0);
-    const std::vector<BatchEnd> ends = batch_loop(m, c, e, wd, [&](int k, const model::SampleOut& o, int row) {
+    const OnBatch cb = [&](int k, const model::SampleOut& o, int row) {
       Sess& s = ss[k];
       s.out.push_back(o.row[row].token);
       uint32_t bits;
       std::memcpy(&bits, &o.row[row].value, 4);
       s.hash = (s.hash ^ (uint32_t)o.row[row].token) * 1099511628211ull;
       s.hash = (s.hash ^ bits) * 1099511628211ull;
-    });
+    };
+    std::vector<BatchEnd> ends(ss.size());
+    std::vector<DecodeEnd> dends;
+    SpecBatchStats st;
+    if (a.spec) {
+      dends = spec_batch_loop(m, c, e, wd, cb, &st);
+      for (size_t k = 0; k < ss.size(); ++k)
+        ends[k].sampled = dends[k].sampled, ends[k].fed = dends[k].fed, ends[k].why = dends[k].why;
+    } else {
+      ends = batch_loop(m, c, e, wd, cb);
+    }
     bcast(ring, Cmd{});  // stop
     for (size_t k = 0; k < ss.size(); ++k) {
       const Sess& s = ss[k];
@@ -1081,6 +1101,7 @@ int main(int argc, char** argv) {
                   "%016llx; the first %d tokens equal the golden continuation\n",
                   k, s.slot, s.ctx, s.ced ? ", CED" : "", s.out.size(), ends[k].fed, ends[k].why,
                   (unsigned long long)s.hash, same);
+      if (a.spec) spec_report(dends[k]);
     }
     // the steps' times, by when each one's samples came (the first ones run eagerly and capture graphs)
     const std::vector<double>& t = g_t_wait;
@@ -1090,9 +1111,20 @@ int main(int argc, char** argv) {
       std::vector<double> d;
       for (int i = skip + 1; i < ns; ++i) d.push_back(1e3 * (t[i] - t[i - 1]));
       std::sort(d.begin(), d.end());
-      std::printf("batch: %d steps of %zu rows: %.3f ms per step (median %.3f, p90 %.3f, max %.3f), %.1f tok/s in "
-                  "all, %.1f per session\n",
-                  ns, ss.size(), ms, d[d.size() / 2], d[d.size() * 9 / 10], d.back(), 1e3 * ss.size() / ms, 1e3 / ms);
+      if (!a.spec) {
+        std::printf("batch: %d steps of %zu rows: %.3f ms per step (median %.3f, p90 %.3f, max %.3f), %.1f tok/s in "
+                    "all, %.1f per session\n",
+                    ns, ss.size(), ms, d[d.size() / 2], d[d.size() * 9 / 10], d.back(), 1e3 * ss.size() / ms, 1e3 / ms);
+      } else {
+        const double tps = st.steps ? (double)st.emitted / st.steps : 0.0;  // tokens per step, every session's
+        std::printf("batch: %d steps of %.2f rows (%zu sessions with drafts): %.3f ms per step (median %.3f, p90 %.3f, "
+                    "max %.3f), %.2f tokens per step, %.1f tok/s in all, %.1f per session; spec step GPU ms by rows:",
+                    ns, st.steps ? (double)st.rows / st.steps : 0.0, ss.size(), ms, d[d.size() / 2],
+                    d[d.size() * 9 / 10], d.back(), tps, 1e3 * tps / ms, 1e3 * tps / ms / (double)ss.size());
+        for (int r = 1; r <= model::kMaxRows; ++r)
+          if (st.gpu_n[r]) std::printf(" %d: %.2f (%d)", r, st.gpu_ms[r] / st.gpu_n[r], st.gpu_n[r]);
+        std::printf("\n");
+      }
     }
     return 0;
   }

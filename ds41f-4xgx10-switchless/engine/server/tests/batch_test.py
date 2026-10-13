@@ -4,7 +4,10 @@ requests that decode together, a row of each per step, must each give what they 
 (greedy and seeded sampling, tokens and log-probabilities); a request that comes while others decode gets
 its first token after its own prefill, not after their decode; more requests than slots take turns
 (--slice > 0) or wait for a slot (--slice 0); a cancel and a stop id inside a batch end only their own
-request; a kept session whose slot went to another continues from the store.
+request; a kept session whose slot went to another continues from the store. With drafts (serve's
+default, docs/batching.md B3) batches of up to kMaxRows / 2 sessions decode with drafts across them: the
+last two scenarios run pairs and triples (a draft cap of 3 and 1 each with kMaxRows 8), a pause, a
+cancel and a stop id inside a drafted batch; every request must still equal its run alone.
 
   python3 engine/server/tests/batch_test.py --socket S --slots 4
 """
@@ -169,6 +172,42 @@ def main():
         check(d['cached'] >= base - 2 and d['reason'] == 'length' and d['completion'] == 100,
               '%s: cached %d of %d (its session holds %d), %d tokens, %s' % (
                   e.recs[r]['name'], d['cached'], d['prompt'], base, d['completion'], d['reason']))
+
+    print('7. drafts across sessions (B3): pairs (a draft cap of 3 each with kMaxRows 8), then triples (1 each)')
+    # a server with drafts runs batches of up to kMaxRows / 2 sessions through the spec batch loop; the
+    # sampled B, D and F and C with its top 5 log-probabilities cover the verdicts' bits; when one of a
+    # group ends first the rest go on (the last one alone, with drafts)
+    for grp, base in ((('A', 'C'), 51), (('B', 'D'), 53), (('C', 'E', 'F'), 55), (('A', 'B', 'D'), 58)):
+        t0 = time.time()
+        rids = [start(n, base + i) for i, n in enumerate(grp)]
+        e.pump(lambda: e.finished(*rids))
+        for r in rids:
+            same('%s (%s)' % (e.recs[r]['name'], '+'.join(grp)), e.recs[r], ref[e.recs[r]['name']])
+        tok = sum(e.recs[r]['done']['completion'] - 1 for r in rids)
+        wall = max(e.recs[r]['done']['t'] for r in rids) - t0
+        print('    %s: %d tokens in %.2f s from the submit (%.1f tok/s in all)' % ('+'.join(grp), tok, wall, tok / wall))
+
+    print('8. a pause, a cancel and a stop id inside a drafted batch of two')
+    # E comes 50 tokens into A and C's batch (it pauses for E's prefill, then the three go on); then B and
+    # C together: B cancelled at its 40th token, C stopped by its stop id
+    r_a, r_c = start('A', 61), start('C', 62)
+    e.pump(lambda: e.ntok(r_a) >= 50)
+    r_e = start('E', 63)
+    e.pump(lambda: e.finished(r_a, r_c, r_e))
+    for r in (r_a, r_c, r_e):
+        same('%s (paused batch)' % e.recs[r]['name'], e.recs[r], ref[e.recs[r]['name']])
+    lag = ttft(e.recs[r_e]) - ttft(ref['E'])
+    check(lag < 1.0, "E's first token %.3f s after its submit, %.3f s later than alone" % (ttft(e.recs[r_e]), lag))
+    r_b = start('B', 64)
+    r_c = start('C', 65, stop=(sid,))
+    e.pump(lambda: e.ntok(r_b) >= 40)
+    e.cancel(r_b)
+    e.pump(lambda: e.finished(r_b, r_c))
+    db, dc = e.recs[r_b]['done'], e.recs[r_c]['done']
+    check(db['reason'] == 'cancelled' and e.recs[r_b]['ids'] == ref['B']['ids'][:e.ntok(r_b)],
+          'B %s after %d tokens, its tokens B\'s alone as far as they go' % (db['reason'], e.ntok(r_b)))
+    check(dc['reason'] == 'stop' and e.recs[r_c]['ids'] == cref[:k + 1],
+          'C stopped at its stop id %d: %d tokens (%s; alone it is at %d)' % (sid, e.ntok(r_c), dc['reason'], k))
 
     for s in sorted(set(used)):
         e.release(s)

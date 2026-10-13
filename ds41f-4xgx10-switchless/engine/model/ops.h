@@ -31,6 +31,8 @@ constexpr int kMaxSess = kMaxRows;  // sessions in a step, at most (docs/batchin
 // row_budget): a step of at most 8 rows runs the kernels and launches it ran.
 constexpr int kLowRows = 8;
 constexpr int row_budget(int R) { return R <= kLowRows ? kLowRows : kMaxRows; }
+constexpr int kSessTok = 1 + kDrafts;  // a session's rows in a spec step, at most: its bonus token and its drafts
+static_assert(kSessTok <= kMaxSessRows, "a session's spec rows fit its rows of a step");
 struct StepSamp {  // one session's sampling (model::Sampling)
   uint64_t seed;
   float temperature;  // 0: greedy
@@ -62,7 +64,17 @@ struct StepIn {
   float step_ms[kDrafts + 1];  // kGateRatio, kGateMarginal: the modelled ms of a step verifying n drafts
                                // (n + 1 rows), its draft pass included
   StepSamp samp[kMaxSess];     // each session's sampling
+  // Batch spec steps (spec.cu, docs/batching.md B3: drafts across sessions). Entry k (0 .. nsess - 1) is one
+  // session; its rows are consecutive (sess[r] = k), its bonus token then its drafts. Read only when
+  // sbatch = 1; the one-session path never reads them.
+  int32_t sbatch;               // 1: a batch spec step (k_spec_in_batch's layout, verdicts per entry)
+  int32_t sess_on[kMaxSess];    // entry k takes part in this step (the host writes it before every launch)
+  int32_t sess_slot[kMaxSess];  // entry k's session slot
+  int32_t scap[kMaxSess];       // entry k's drafts for the next step, at most (0..kDrafts)
+  int32_t spos_end[kMaxSess];   // entry k's rows stay below this position
+  float sthresh[kMaxSess];      // entry k's threshold (kGateThresh)
 };
+static_assert(sizeof(StepIn) % 4 == 0, "StepIn is copied word by word");
 // slot = *counter % kInSlots of ring -> dev, feedback tokens resolved from fb, ++*counter.
 void step_in(const StepIn* ring, uint32_t* counter, const int32_t* fb, StepIn* dev, cudaStream_t s);
 
@@ -96,6 +108,12 @@ struct SampleOut {
   int32_t drafts[kDrafts];
   float survival[kDrafts];
   uint32_t probe[kProbeWords];  // EXPERIMENT (Options::tree_probe): the draft pass's dspark::ProbeOut
+  // Batch spec steps (StepIn::sbatch): entry k's rows of this step and the device's choice for its next
+  int32_t sess_row0[kMaxSess], sess_step_rows[kMaxSess];  // its rows: row[sess_row0 .. sess_row0 + sess_step_rows)
+  int32_t sess_rows[kMaxSess];  // of them, the tokens it emits (accepted drafts, then the token after them)
+  int32_t sess_pos0[kMaxSess];  // its first row's position
+  int32_t next_srows[kMaxSess], next_spos0[kMaxSess];  // its rows of the next step (0: it was off this step)
+  int32_t next_stok[kMaxSess][kSessTok];
 };
 // The device's side of speculative steps (spec.cu), in device memory: what a spec step's sampling
 // decided, and the rows of the verify step after it.

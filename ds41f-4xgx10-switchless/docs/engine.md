@@ -634,6 +634,17 @@ the design, steps B1 and B2).
   request joins a run at its next token, the last one sent, at position prompt + sent − 1. The step
   queued behind a pause may have written that position's KV already; it is written again, with the same
   values.
+- **Drafts across sessions** (B3, [batching.md](batching.md); built 2026-10-13 on branch `runner-b3`,
+  not yet run). With drafts, a run of up to kMaxRows / 2 requests (four at kMaxRows 8) decodes with
+  drafts across them ([`spec_batch_loop`](../engine/server/cmd.cpp), `kCmdSpecBatch`): a batch spec
+  step holds each request's bonus token and its drafts, at most (kMaxRows − S) / S each for S requests
+  (3 for two, 1 for three or four), laid out on the device in request order. The verdicts are per
+  request and the draft passes run one per request in its own slot, so every request's tokens and
+  log-probabilities are its run's alone. Its end, stop ids, cancel (its slot's bit) and a pause act per
+  request as in the speculative loop; a request that ends keeps its rows in the step already queued
+  (their KV counts, their tokens do not); the last one decoding pauses to go on alone with its five
+  drafts. Larger runs take the plain batch loop. The batch log line adds `drafts: T tokens and R rows
+  per step, A of V drafts accepted; GPU ms by rows: …`.
 - **Turns.** While more requests decode than there are slots, a run is a turn of `--slice` tokens
   (64). A request whose turn is over goes to the back of the queue; paused ones go back to the front,
   in order. A request whose slot went to another resumes from the store when its turn comes: its prompt
