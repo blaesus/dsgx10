@@ -63,10 +63,10 @@ struct PrefillOut {
   std::vector<float> yr, ys;
 };
 static PrefillOut run_prefill(const TestLayer& L, const __nv_bfloat16* dx, const int* di, const float* dw, int T, void* ws,
-                              float* dyr, float* dys) {
+                              float* dyr, float* dys, const PrefillCfg& cfg = PrefillCfg()) {
   CUDA_CHECK(cudaMemset(dyr, 0xFF, (size_t)T * kH * 4));
   CUDA_CHECK(cudaMemset(dys, 0xFF, (size_t)T * kH * 4));
-  moe_prefill(L.layer(), dx, di, dw, T, ws, dyr, dys, 0);
+  moe_prefill(L.layer(), dx, di, dw, T, ws, dyr, dys, 0, cfg);
   CUDA_CHECK(cudaDeviceSynchronize());
   return PrefillOut{d2h(dyr, (size_t)T * kH), d2h(dys, (size_t)T * kH)};
 }
@@ -100,6 +100,8 @@ void test_prefill() {
   CUDA_CHECK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(di, idx.data(), idx.size() * 4, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(dw, w.data(), w.size() * 4, cudaMemcpyHostToDevice));
+  cudaStream_t side;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
 
   for (int T : {1, 37, 300, TB}) {
     const PrefillOut p = run_prefill(L, dx, di, dw, T, ws, dyr, dys);
@@ -155,6 +157,41 @@ void test_prefill() {
       check(name, !er.bad, "max |err|/sum|terms| %.2e over %zu", er.worst, er.n);
       snprintf(name, sizeof name, "prefill T=%d shared out vs double (from GPU h)", T);
       check(name, !es.bad, "max |err|/sum|terms| %.2e over %zu", es.worst, es.n);
+    }
+    // the default kernels (warp-specialised gate/up, chained down) against those of 2026-10-13 (k_pup, the
+    // per-pick buffer + combine): h and every output bit-identical; also with narrow passes (more tickets),
+    // passes claimed round-robin, and the shared expert on a side stream
+    {
+      PrefillCfg c0;
+      c0.down = 0;
+      c0.up = 0;
+      const PrefillOut r = run_prefill(L, dx, di, dw, T, ws, dyr, dys, c0);
+      // h by row and pick (bucket positions come from atomics and differ between calls)
+      const auto h0 = d2h(prefill_view(ws, T).h, (size_t)T * kTopK * kI);
+      const auto p0 = d2h(prefill_view(ws, T).rpos, (size_t)T * kTopK);
+      PrefillCfg c1;
+      c1.yr_kb = 1;  // 256-column passes, three claimed round-robin
+      c1.chain_q = 3;
+      c1.side = side;
+      c1.up = 2;  // and the gate/up kernel with 64 x 64 warp tiles
+      c1.down = 2;  // and the warp-specialised chained down
+      const PrefillOut q = run_prefill(L, dx, di, dw, T, ws, dyr, dys, c1);
+      const auto h1 = d2h(prefill_view(ws, T).h, (size_t)T * kTopK * kI);
+      const auto p1 = d2h(prefill_view(ws, T).rpos, (size_t)T * kTopK);
+      size_t hd = 0;
+      for (size_t i = 0; i < p0.size(); ++i)
+        for (int c = 0; c < kI; ++c) hd += bits(h0[(size_t)p0[i] * kI + c]) != bits(h1[(size_t)p1[i] * kI + c]);
+      snprintf(name, sizeof name, "prefill T=%d h: warp-specialised gate/up (64 x 64 warps) vs k_pup", T);
+      check(name, !hd, "%zu of %zu differ", hd, h0.size());
+      size_t bad = 0, bad1 = 0;
+      for (size_t i = 0; i < r.yr.size(); ++i) {
+        bad += fbits(p.yr[i]) != fbits(r.yr[i]) || fbits(p.ys[i]) != fbits(r.ys[i]);
+        bad1 += fbits(q.yr[i]) != fbits(r.yr[i]) || fbits(q.ys[i]) != fbits(r.ys[i]);
+      }
+      snprintf(name, sizeof name, "prefill T=%d default kernels vs those of 2026-10-13", T);
+      check(name, !bad, "%zu of %zu outputs differ", bad, 2 * r.yr.size());
+      snprintf(name, sizeof name, "prefill T=%d up 2, down 2 in 256-column passes, 3 round-robin, shared on a side stream", T);
+      check(name, !bad1, "%zu of %zu outputs differ", bad1, 2 * r.yr.size());
     }
     // every row against the decode step: identical but for the order of the K sums
     if (T <= 300) {
@@ -291,6 +328,7 @@ void test_prefill() {
     snprintf(msg, sizeof msg, "prefill fp4: routed out vs the bf16 path (info)");
     check(msg, true, "relative RMS difference %.3e (input scales %.3g, %.3g)", sqrt(se / sr), cfg.in_scale_gu, cfg.in_scale_dn);
   }
+  cudaStreamDestroy(side);
   cudaFree(ws), cudaFree(dws), cudaFree(dyr), cudaFree(dys), cudaFree(dyr2), cudaFree(dys2), cudaFree(di), cudaFree(dw), cudaFree(dx);
   L.free_dev();
 }

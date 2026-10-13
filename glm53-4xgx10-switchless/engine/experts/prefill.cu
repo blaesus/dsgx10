@@ -40,6 +40,12 @@ struct Ws {
   uint8_t *xq, *xs, *hq, *hs;  // FP4 path: NVFP4 activations (values, scales) of x [T] and of h [P]
   float* yp;
   int npass, cp;
+  // the chained down: per position the pick's rank in its row's expert-id order and its routing weight; the
+  // rows' tickets per 32 columns [kH / 32][kMaxChunk] (zero between calls: the last pick of a row
+  // resets them) and the task and exit counters (zero between calls), both at fixed offsets, so that calls
+  // of any T share them
+  int *prank, *tick, *dq;
+  float* pw;
   size_t bytes;
 };
 Ws ws_layout(void* base, int T) {
@@ -48,6 +54,8 @@ Ws ws_layout(void* base, int T) {
   size_t o = 0;
   auto take = [&](size_t b) { uint8_t* r = p ? p + o : nullptr; o += (b + 255) / 256 * 256; return r; };
   const size_t P = (size_t)T * kTopK;
+  w.tick = (int*)take((size_t)(kH / 32) * kMaxChunk * 4);
+  w.dq = (int*)take(2 * 4);
   w.cnt = (int*)take(kE * 4);
   w.cur = (int*)take(kE * 4);
   w.off = (int*)take((kE + 1) * 4);
@@ -68,6 +76,8 @@ Ws ws_layout(void* base, int T) {
   while (P * (kH / np) * 4 > (size_t)420 << 20 || kH % np || (kH / np) % 128) ++np;
   w.npass = np, w.cp = kH / np;
   w.yp = (float*)take(P * w.cp * 4);
+  w.prank = (int*)take(P * 4);
+  w.pw = (float*)take(P * 4);
   w.bytes = o;
   return w;
 }
@@ -81,6 +91,7 @@ struct PArgs {
   int c0;  // down: the pass's first column
   bool fp4;
   float in_gu, in_dn;
+  int cpc, npc, cq;  // the chained down: columns a pass, passes, passes in flight together
 };
 
 // ---- bucketing ----------------------------------------------------------------------------------------------------
@@ -135,7 +146,10 @@ __global__ void k_scatter(const int* __restrict__ idx, const float* __restrict__
         const float b = v[j]; v[j] = v[j - 1]; v[j - 1] = b;
       }
 #pragma unroll
-  for (int k = 0; k < kTopK; ++k) w.re[t * kTopK + k] = e[k], w.rpos[t * kTopK + k] = p[k], w.rw[t * kTopK + k] = v[k];
+  for (int k = 0; k < kTopK; ++k) {
+    w.re[t * kTopK + k] = e[k], w.rpos[t * kTopK + k] = p[k], w.rw[t * kTopK + k] = v[k];
+    w.prank[p[k]] = k, w.pw[p[k]] = v[k];
+  }
 }
 
 // ---- GEMM pieces ----------------------------------------------------------------------------------------------------
@@ -159,6 +173,18 @@ __device__ __forceinline__ void load_a(uint8_t* sa, const __nv_bfloat16* src, in
   for (int j = 0; j < 4; ++j) {
     const int c = 4 * h + j;
     cp_async16a(d + 16 * (c ^ (r & 7)), src + 8 * c);
+  }
+}
+// The same stage, loaded coalesced: thread tid copies chunk tid & 7 of rows (tid >> 3) + (NT / 8) j, j < R (eight
+// threads a row: a warp instruction covers 4 whole lines, against 16 part-lines for load_a). ri[j]: the row's
+// index into base (row stride LD elements).
+template <int R, int NT, int LD>
+__device__ __forceinline__ void load_a_co(uint8_t* sa, const __nv_bfloat16* base, const uint32_t (&ri)[R], int k0, int tid) {
+  const int c = tid & 7;
+#pragma unroll
+  for (int j = 0; j < R; ++j) {
+    const int r = (tid >> 3) + (NT / 8) * j;
+    cp_async16a(sa + r * 128 + 16 * (c ^ (r & 7)), base + (size_t)ri[j] * LD + k0 + 8 * c);
   }
 }
 // B stage: strip s, k16 m, lane l: words (o[2m], o[2m+1]) at byte ((s * 4 + m) * 32 + l) * 8
@@ -358,6 +384,322 @@ __global__ void __launch_bounds__(256, 1) k_pup(PArgs a) {
       }
 }
 
+// ---- gate/up, warp-specialised (PrefillCfg::up = 1) ---------------------------------------------------------------
+// The tile and the arithmetic of k_pup<false, 4> (the same MMAs on the same fragments in the same order, so the
+// same h bits), with the work split by role: 8 consumer warps (2 rows x 4 columns, as k_pup's) only run the
+// MMAs; 8 producer warps load the A rows by cp.async (kWsS - 1 k-steps ahead) and decode the B strips (each
+// two, as k_pup's warps do, from raw blocks in registers loaded two blocks ahead). A ring of kWsS stages (A + B)
+// handed over with named barriers: full[s] (producers arrive, consumers wait), empty[s] (the reverse).
+constexpr int kWsS = 3;
+// registers a thread by role (setmaxnreg; 256 x P + 256 x C = 64K), 0: both 128 (the default). 120 / 136 was
+// measured (docs/experts.md, 2026-10-14): the MMA warps already fit in 120, the producers need 128.
+constexpr int kWsRegP = 0, kWsRegC = 0;
+constexpr int kWsSmem = kWsS * (kStageA + kStageB);  // 96 KB
+constexpr int kWsSSh = 4;  // the shared expert's: 64-row A stages
+constexpr int kWsSmemSh = kWsSSh * (kStageA / 2 + kStageB);  // 96 KB
+__device__ __forceinline__ void bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory"); }
+__device__ __forceinline__ void bar_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(n) : "memory"); }
+// SH: the shared expert (rows of the chunk, FP8 with a scale per 128 x 128 block: each 128-k unit summed apart
+// and added scaled, as k_pup<true, 2>); 64-row tiles there (MT = 2), as its per-unit sums double the
+// consumers' accumulators.
+template <bool SH, int DG = 0>
+__global__ void __launch_bounds__(512, 1) k_pup_ws(PArgs a) {
+  extern __shared__ __align__(16) uint8_t smem[];
+  constexpr int MT = SH ? 2 : 4, RT = 32 * MT;
+  constexpr int SA = RT * 128;  // A bytes a stage
+  constexpr int NS = SH ? kWsSSh : kWsS;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  const int tile = blockIdx.x / kUpNB, nb = blockIdx.x % kUpNB;
+  int e = 0, pos0, n;
+  if (SH) {
+    pos0 = tile * RT;
+    n = min(RT, a.T - pos0);
+    if (n <= 0) return;
+  } else {
+    if (tile >= *a.w.ntile) return;
+    const PTile tt = a.w.tiles[tile];
+    e = tt.e, pos0 = tt.pos0, n = tt.n;
+  }
+  const MatDesc* d = a.L.desc + e * 3;
+  constexpr int NK = kH / 64;  // 96 k-steps
+  auto sA = [&](int s) { return smem + s * (SA + kStageB); };
+  auto sB = [&](int s) { return smem + s * (SA + kStageB) + SA; };
+  // barriers: full[s] = 1 + s, empty[s] = 1 + NS + s, each over all 512 threads
+  if (warp >= 8) {
+    if (kWsRegP) asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(kWsRegP));
+    // ---- producer: A rows and B strips 2 pw, 2 pw + 1 (0-7 gate, 8-15 up), as k_pup's warp pw
+    const int ptid = tid - 256, pw = warp - 8;
+    constexpr int AR = RT / 32;  // rows a producer thread loads
+    uint32_t ri[AR];
+#pragma unroll
+    for (int j = 0; j < AR; ++j) {
+      const int r = min((ptid >> 3) + 32 * j, n - 1);
+      ri[j] = SH ? pos0 + r : a.w.perm[pos0 + r];
+    }
+    const int mat = pw >= 4;
+    const int n80 = nb * 8 + (2 * pw) % 8;
+    uint32_t fmt = 0, tab[8] = {};
+    int bs = 0;
+    const uint8_t* wb;
+    if (!SH) {
+      fmt = d[mat].fmt;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) tab[j] = d[mat].tab[j];
+      bs = fmt == kNVFP4 ? kQ4Blk : kS3Blk;
+      wb = a.L.pool + d[mat].off + (size_t)n80 * (kH / kBlkK) * bs;
+    } else {
+      wb = (mat ? a.L.sh.u : a.L.sh.g) + (size_t)n80 * (kH / 128) * 1024;
+    }
+    Raw rb[SH ? 1 : 2][2];
+    Raw8 r8[SH ? 2 : 1][2];
+    auto load_raw = [&](int b, int buf) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) load_blk(rb[buf % (SH ? 1 : 2)][i], wb + ((size_t)i * (kH / kBlkK) + b) * bs, fmt, lane);
+    };
+    auto load_r8 = [&](int u, int buf) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const uint8_t* q = wb + ((size_t)i * (kH / 128) + u) * 1024 + 32 * lane;
+        r8[buf % (SH ? 2 : 1)][i].q0 = ldg_stream128(q);
+        r8[buf % (SH ? 2 : 1)][i].q1 = ldg_stream128(q + 16);
+      }
+    };
+    if (!(DG & 1)) {
+      if (SH) load_r8(0, 0), load_r8(1, 1);
+      else load_raw(0, 0), load_raw(1, 1);
+    }
+    // A of the first NS - 1 k-steps (their stages are free)
+#pragma unroll
+    for (int j = 0; j < NS - 1; ++j) {
+      if (!(DG & 4)) load_a_co<AR, 256, kH>(sA(j), a.x, ri, 64 * j, ptid);
+      cp_commit();
+    }
+    int s_cur = 0;  // the stage of k-step i
+#pragma unroll 1
+    for (int i0 = 0; i0 < NK; i0 += 16)
+#pragma unroll
+      for (int ii = 0; ii < 16; ++ii) {
+        const int i = i0 + ii;
+        // B of k-step i first (its stage's last user, k-step i - NS, was waited for at iteration i - NS + 1),
+        // while the consumers still run k-step i - 1
+        if (!(DG & 1)) {
+#pragma unroll
+          for (int x = 0; x < 2; ++x) {
+            uint32_t o[8];
+            if (SH) dec8((ii & 1) ? r8[(ii >> 1) & 1][x].q1 : r8[(ii >> 1) & 1][x].q0, o);
+            else dec_group(rb[(ii >> 3) & 1][x], (ii >> 1) & 3, ii & 1, fmt, tab, o);
+            store_b(sB(s_cur), 2 * pw + x, lane, o);
+          }
+          if (SH) {
+            if ((ii & 1) && (i >> 1) + 2 < NK / 2) load_r8((i >> 1) + 2, (ii >> 1) & 1);
+          } else {
+            if ((ii & 7) == 7 && (i >> 3) + 2 < NK / 8) load_raw((i >> 3) + 2, (ii >> 3) & 1);
+          }
+        }
+        cp_wait<NS - 2>();  // k-step i's A group is in (groups: one a k-step)
+        bar_arrive(1 + s_cur, 512);
+        // then A of k-step i + NS - 1 into the stage k-step i - 1 used, once the consumers have left it
+        const int s_ld = s_cur == 0 ? NS - 1 : s_cur - 1;
+        if (i + NS - 1 < NK) {
+          if (i >= 1) bar_sync(1 + NS + s_ld, 512);
+          if (!(DG & 4)) load_a_co<AR, 256, kH>(sA(s_ld), a.x, ri, 64 * (i + NS - 1), ptid);
+        }
+        cp_commit();
+        s_cur = s_cur == NS - 1 ? 0 : s_cur + 1;
+      }
+    cp_wait0();
+    return;
+  }
+  // ---- consumer: MMAs and the epilogue (k_pup's)
+  if (kWsRegC) asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(kWsRegC));
+  const int wm = warp >> 2, wn = warp & 3;
+  float kg = 1.f, ku = 1.f;
+  if (!SH) kg = d[0].s2 * (d[0].fmt == kNVFP4 ? 0x1p30f : 1.f), ku = d[1].s2 * (d[1].fmt == kNVFP4 ? 0x1p30f : 1.f);
+  const float* gsc = SH ? a.L.sh.gs + (nb / 2) * (kH / 128) : nullptr;  // the strips' 128-row scale block
+  const float* usc = SH ? a.L.sh.us + (nb / 2) * (kH / 128) : nullptr;
+  const int sj[4] = {2 * wn, 2 * wn + 1, 8 + 2 * wn, 9 + 2 * wn};
+  float acc[MT][4][4], cu[SH ? MT : 1][4][4];
+#pragma unroll
+  for (int i = 0; i < MT; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+  int s_cur = 0;
+#pragma unroll 1
+  for (int i = 0; i < NK; ++i) {
+    bar_sync(1 + s_cur, 512);
+    if (SH) {
+      if (!(i & 1))
+#pragma unroll
+        for (int x = 0; x < MT; ++x)
+#pragma unroll
+          for (int j = 0; j < 4; ++j) cu[x][j][0] = cu[x][j][1] = cu[x][j][2] = cu[x][j][3] = 0.f;
+      if (!(DG & 2)) mma_step<MT>(*reinterpret_cast<float(*)[MT][4][4]>(&cu), sA(s_cur), sB(s_cur), wm, sj, n, lane);
+    } else if (!(DG & 2)) {
+      mma_step<MT>(acc, sA(s_cur), sB(s_cur), wm, sj, n, lane);
+    }
+    // the stage is reloaded (A of k-step i + NS) only if that k-step exists: the producers wait just then
+    if (i + NS < NK) bar_arrive(1 + NS + s_cur, 512);
+    s_cur = s_cur == NS - 1 ? 0 : s_cur + 1;
+    if (SH && (i & 1)) {
+      const float sg = __ldg(gsc + (i >> 1)), su = __ldg(usc + (i >> 1));
+#pragma unroll
+      for (int x = 0; x < MT; ++x)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+          for (int c = 0; c < 4; ++c) acc[x][j][c] = fmaf(j < 2 ? sg : su, cu[x][j][c], acc[x][j][c]);
+    }
+  }
+  __nv_bfloat16* hout = SH ? a.w.hsh : a.w.h;
+#pragma unroll
+  for (int x = 0; x < MT; ++x)
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        const int r = 16 * (MT * wm + x) + g + 8 * hh;
+        if (r >= n) continue;
+        float hv[2];
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+          const float gt = __bfloat162float(__float2bfloat16_rn(acc[x][j][2 * hh + c] * kg));
+          const float ut = __bfloat162float(__float2bfloat16_rn(acc[x][j + 2][2 * hh + c] * ku));
+          hv[c] = silu_mul(gt, ut);
+        }
+        const int ch = 8 * (nb * 8 + 2 * wn + j) + 2 * t;
+        *reinterpret_cast<__nv_bfloat162*>(hout + (size_t)(pos0 + r) * kI + ch) = __floats2bfloat162_rn(hv[0], hv[1]);
+      }
+}
+
+// ---- gate/up, warp-specialised with 64 x 64 warp tiles (PrefillCfg::up = 2) ------------------------------------
+// The tile and the arithmetic of k_pup<false, 4> again, now with 4 consumer warps of 64 rows x 64 columns
+// (2 x 2; gate strips 4 wn .. 4 wn + 3 with up strips 8 + 4 wn ..) and 4 producer warps (A rows, a row a
+// thread; B: four strips a warp, raw blocks two ahead in registers). Each accumulator still takes the k-step's
+// four MMAs in the order m = 0..3 on the same fragments, so the same h bits. Half the shared-memory reads
+// per MMA of k_pup_ws, one MMA warp a scheduler.
+template <int DG = 0>
+__global__ void __launch_bounds__(256, 1) k_pup_w2(PArgs a) {
+  extern __shared__ __align__(16) uint8_t smem[];
+  constexpr int NS = kWsS;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  const int tile = blockIdx.x / kUpNB, nb = blockIdx.x % kUpNB;
+  if (tile >= *a.w.ntile) return;
+  const PTile tt = a.w.tiles[tile];
+  const int e = tt.e, pos0 = tt.pos0, n = tt.n;
+  const MatDesc* d = a.L.desc + e * 3;
+  constexpr int NK = kH / 64;
+  auto sA = [&](int s) { return smem + s * (kStageA + kStageB); };
+  auto sB = [&](int s) { return smem + s * (kStageA + kStageB) + kStageA; };
+  if (warp >= 4) {
+    const int ptid = tid - 128, pw = warp - 4;
+    uint32_t ri[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) ri[j] = a.w.perm[pos0 + min((ptid >> 3) + 16 * j, n - 1)];
+    const int mat = pw >= 2;
+    const int n80 = nb * 8 + (4 * pw) % 8;
+    const uint32_t fmt = d[mat].fmt;
+    uint32_t tab[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) tab[j] = d[mat].tab[j];
+    const int bs = fmt == kNVFP4 ? kQ4Blk : kS3Blk;
+    const uint8_t* wb = a.L.pool + d[mat].off + (size_t)n80 * (kH / kBlkK) * bs;
+    Raw rb[2][4];
+    auto load_raw = [&](int b, int buf) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) load_blk(rb[buf][i], wb + ((size_t)i * (kH / kBlkK) + b) * bs, fmt, lane);
+    };
+    if (!(DG & 1)) load_raw(0, 0), load_raw(1, 1);
+#pragma unroll
+    for (int j = 0; j < NS - 1; ++j) {
+      if (!(DG & 4)) load_a_co<8, 128, kH>(sA(j), a.x, ri, 64 * j, ptid);
+      cp_commit();
+    }
+    int s_cur = 0;
+#pragma unroll 1
+    for (int i0 = 0; i0 < NK; i0 += 16)
+#pragma unroll
+      for (int ii = 0; ii < 16; ++ii) {
+        const int i = i0 + ii;
+        if (!(DG & 1)) {
+#pragma unroll
+          for (int x = 0; x < 4; ++x) {
+            uint32_t o[8];
+            dec_group(rb[(ii >> 3) & 1][x], (ii >> 1) & 3, ii & 1, fmt, tab, o);
+            store_b(sB(s_cur), 4 * pw + x, lane, o);
+          }
+          if ((ii & 7) == 7 && (i >> 3) + 2 < NK / 8) load_raw((i >> 3) + 2, (ii >> 3) & 1);
+        }
+        cp_wait<NS - 2>();
+        bar_arrive(1 + s_cur, 256);
+        const int s_ld = s_cur == 0 ? NS - 1 : s_cur - 1;
+        if (i + NS - 1 < NK) {
+          if (i >= 1) bar_sync(1 + NS + s_ld, 256);
+          if (!(DG & 4)) load_a_co<8, 128, kH>(sA(s_ld), a.x, ri, 64 * (i + NS - 1), ptid);
+        }
+        cp_commit();
+        s_cur = s_cur == NS - 1 ? 0 : s_cur + 1;
+      }
+    cp_wait0();
+    return;
+  }
+  const int wm = warp >> 1, wn = warp & 1;
+  const float kg = d[0].s2 * (d[0].fmt == kNVFP4 ? 0x1p30f : 1.f), ku = d[1].s2 * (d[1].fmt == kNVFP4 ? 0x1p30f : 1.f);
+  float acc[4][8][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+  const bool live = 64 * wm < n;
+  int s_cur = 0;
+#pragma unroll 1
+  for (int i = 0; i < NK; ++i) {
+    bar_sync(1 + s_cur, 256);
+    if (!(DG & 2) && live) {
+      const uint8_t* sa = sA(s_cur);
+      const uint8_t* sb = sB(s_cur);
+#pragma unroll
+      for (int m = 0; m < 4; ++m) {
+        uint2 b[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int strip = j < 4 ? 4 * wn + j : 8 + 4 * wn + (j - 4);
+          b[j] = *reinterpret_cast<const uint2*>(sb + ((strip * 4 + m) * 32 + lane) * 8);
+        }
+#pragma unroll
+        for (int ti = 0; ti < 4; ++ti) {
+          const int r0 = 16 * (4 * wm + ti) + g;
+          // k-group m of lane t: chunk 2 t + (m >> 1), its half m & 1
+          const int ch = (2 * t + (m >> 1)) ^ g;
+          const uint2 a0 = *reinterpret_cast<const uint2*>(sa + r0 * 128 + 16 * ch + 8 * (m & 1));
+          const uint2 a1 = *reinterpret_cast<const uint2*>(sa + (r0 + 8) * 128 + 16 * ch + 8 * (m & 1));
+#pragma unroll
+          for (int j = 0; j < 8; ++j) mma_bf16(acc[ti][j], a0.x, a1.x, a0.y, a1.y, b[j].x, b[j].y);
+        }
+      }
+    }
+    if (i + NS < NK) bar_arrive(1 + NS + s_cur, 256);
+    s_cur = s_cur == NS - 1 ? 0 : s_cur + 1;
+  }
+#pragma unroll
+  for (int x = 0; x < 4; ++x)
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        const int r = 16 * (4 * wm + x) + g + 8 * hh;
+        if (r >= n) continue;
+        float hv[2];
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+          const float gt = __bfloat162float(__float2bfloat16_rn(acc[x][j][2 * hh + c] * kg));
+          const float ut = __bfloat162float(__float2bfloat16_rn(acc[x][j + 4][2 * hh + c] * ku));
+          hv[c] = silu_mul(gt, ut);
+        }
+        const int chn = 8 * (nb * 8 + 4 * wn + j) + 2 * t;
+        *reinterpret_cast<__nv_bfloat162*>(a.w.h + (size_t)(pos0 + r) * kI + chn) = __floats2bfloat162_rn(hv[0], hv[1]);
+      }
+}
+
 // ---- routed down ---------------------------------------------------------------------------------------------------
 // CTA: one tile x kDnCB column blocks of 128 outputs of the pass, one after another as one pipeline of
 // kDnCB x 8 k-steps (K = 512 a block): the A ring runs on across the blocks (the same h rows), the next blocks'
@@ -448,6 +790,388 @@ __global__ void __launch_bounds__(256, 1) k_pdown_r(PArgs a) {
       cp_wait<kNA - 2>();
       __syncthreads();
     }
+}
+
+// ---- the chained down (PrefillCfg::down = 1) -------------------------------------------------------------------
+// The same sums as k_pdown_r (each pick's c over K = 512 in the same MMA order), added into yr at once in the
+// combine's arithmetic, acc = fmaf(s2 fmt_k w, c, acc) over the row's picks in expert-id order, with acc read
+// back from yr: so the same bits as k_pdown_r + k_combine, without the per-pick f32 buffer (1.6 GB written and
+// read back at 8k rows).
+// The order: a row's ticket (one per 32 columns, a warp's share of a column block) counts its picks already
+// added there; each warp waits for and releases its own rows, so a wait holds only the rows that need it. Tasks (pass,
+// tile) are claimed from a counter in the order pass-major, then the tiles' order (expert id), so a tile waits
+// only on lower tasks, each held by a running CTA (no deadlock however many CTAs are resident). For each
+// 32 columns, a pick of rank k waits for ticket k, adds, and releases k + 1 (the row's last pick: 0, so the
+// tickets are clear for the next call).
+// The passes keep a slice of yr (T x cpc f32, the L2 budget) hot while every tile adds into it.
+__device__ __forceinline__ int ld_relaxed(const int* p) {
+  int v;
+  asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ void st_relaxed(int* p, int v) {
+  asm volatile("st.relaxed.gpu.global.b32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ uint64_t l2_last() {
+  uint64_t p;
+  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
+  return p;
+}
+__device__ __forceinline__ float2 ld_yr(const float* p, uint64_t pol) {
+  float2 v;
+  asm volatile("ld.global.cg.L2::cache_hint.v2.f32 {%0,%1}, [%2], %3;" : "=f"(v.x), "=f"(v.y) : "l"(p), "l"(pol) : "memory");
+  return v;
+}
+__device__ __forceinline__ void st_yr(float* p, float2 v, uint64_t pol) {
+  asm volatile("st.global.L2::cache_hint.v2.f32 [%0], {%1,%2}, %3;" ::"l"(p), "f"(v.x), "f"(v.y), "l"(pol) : "memory");
+}
+template <int MT>
+__global__ void __launch_bounds__(256, 1) k_pdown_c(PArgs a) {
+  extern __shared__ __align__(16) uint8_t smem[];
+  __shared__ int s_task, s_row[kTM], s_rank[kTM];
+  __shared__ float s_k0[kTM];
+  constexpr int RT = 32 * MT;
+  static_assert(RT == kTM);
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  const int wm = warp >> 2, wn = warp & 3;
+  const int ntile = *a.w.ntile, total = ntile * a.npc;
+  const int NK = a.cpc / 16;  // 8 k-steps a column block of 128, an even number of blocks
+  const uint64_t pol = l2_last();
+  const int sj[4] = {4 * wn, 4 * wn + 1, 4 * wn + 2, 4 * wn + 3};
+  uint8_t* sA = smem;
+  uint8_t* sB = smem + kNA * kStageA;
+#pragma unroll 1
+  for (;;) {
+    if (tid == 0) s_task = atomicAdd(a.w.dq, 1);
+    __syncthreads();
+    const int task = s_task;
+    if (task >= total) break;
+    // Q passes claimed round-robin (each pass's tiles still in order)
+    const int grp = task / (a.cq * ntile), rem = task - grp * a.cq * ntile;
+    const int pass = grp * a.cq + rem % a.cq, tile = rem / a.cq;
+    const PTile tt = a.w.tiles[tile];
+    const int e = tt.e, pos0 = tt.pos0, n = tt.n, c0 = pass * a.cpc;
+    const MatDesc& d = a.L.desc[e * 3 + 2];
+    const uint32_t fmt = d.fmt;
+    if (tid < n) {
+      const float kk = __ldg(&d.s2) * (fmt == kNVFP4 ? 0x1p30f : 1.f);  // as k_combine
+      s_row[tid] = a.w.perm[pos0 + tid];
+      s_rank[tid] = a.w.prank[pos0 + tid];
+      s_k0[tid] = kk * a.w.pw[pos0 + tid];
+    }
+    uint32_t ri[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) ri[j] = pos0 + min((tid >> 3) + 32 * j, n - 1);
+    uint32_t tab[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) tab[j] = d.tab[j];
+    const int bs = fmt == kNVFP4 ? kQ4Blk : kS3Blk;
+    const uint8_t* wb = a.L.pool + d.off + (size_t)(c0 / 8 + 2 * warp) * bs;
+    const int ncb = a.cpc / 128;
+    Raw rb[2][2];  // [column block & 1][strip]
+    auto load_raw = [&](int c, int buf) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) load_blk(rb[buf][i], wb + (size_t)(16 * c + i) * bs, fmt, lane);
+    };
+    auto decode = [&](uint8_t* sb, int step, int ph) {  // ph = step % 16, compile-time
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        uint32_t o[8];
+        dec_group(rb[ph >> 3][i], (ph & 7) >> 1, ph & 1, fmt, tab, o);
+        store_b(sb, 2 * warp + i, lane, o);
+      }
+      if ((ph & 7) == 7 && (step >> 3) + 2 < ncb) load_raw((step >> 3) + 2, ph >> 3);
+    };
+    float acc[MT][4][4];
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+    load_raw(0, 0);
+    load_raw(1, 1);
+#pragma unroll
+    for (int j = 0; j < kNA - 1; ++j) {
+      load_a_co<4, 256, kI>(sA + j * kStageA, a.w.h, ri, 64 * j, tid);
+      cp_commit();
+    }
+    decode(sB, 0, 0);
+    cp_wait<kNA - 2>();
+    __syncthreads();
+    int sa_cur = 0;
+#pragma unroll 1
+    for (int i0 = 0; i0 < NK; i0 += 16)
+#pragma unroll
+      for (int ii = 0; ii < 16; ++ii) {
+        const int i = i0 + ii, s = ii & 1;
+        const int sa_ld = sa_cur == 0 ? kNA - 1 : sa_cur - 1;
+        if (i + kNA - 1 < NK) load_a_co<4, 256, kI>(sA + sa_ld * kStageA, a.w.h, ri, 64 * ((i + kNA - 1) & 7), tid);
+        cp_commit();
+        if (i + 1 < NK) decode(sB + (s ^ 1) * kStageB, i + 1, (ii + 1) & 15);
+        mma_step<MT>(acc, sA + sa_cur * kStageA, sB + s * kStageB, wm, sj, n, lane);
+        sa_cur = sa_cur == kNA - 1 ? 0 : sa_cur + 1;
+        if ((ii & 7) == 7) {  // column block i >> 3 done: each warp adds its 64 rows x 32 columns into yr
+          const int cb = i >> 3, r0 = 64 * wm;
+          if (r0 < n) {
+            int* tick = a.w.tick + (size_t)((c0 + 128 * cb) / 32 + wn) * kMaxChunk;
+            // wait until the rows' lower picks are in (lane l polls rows r0 + l, r0 + l + 32; relaxed loads,
+            // then a fence)
+            uint32_t pend = 0;
+#pragma unroll
+            for (int m = 0; m < 2; ++m)
+              if (r0 + lane + 32 * m < n && s_rank[r0 + lane + 32 * m] > 0) pend |= 1u << m;
+            if (__any_sync(0xffffffffu, pend)) {
+              uint32_t ns = 64;
+              for (uint32_t spin = 0;; ++spin) {
+#pragma unroll
+                for (int m = 0; m < 2; ++m) {
+                  const int r = r0 + lane + 32 * m;
+                  if ((pend >> m & 1) && ld_relaxed(tick + s_row[r]) == s_rank[r]) pend &= ~(1u << m);
+                }
+                if (!__any_sync(0xffffffffu, pend)) break;
+                __nanosleep(ns);
+                ns = min(ns * 2, 1024u);
+                if (spin == (1u << 25)) __trap();  // ~30 s: a ticket left set (the workspace not zeroed)
+              }
+              __threadfence();
+              __syncwarp();
+            }
+            // per m16 tile, its two rows' eight loads in flight together, then the adds and stores
+#pragma unroll
+            for (int x = 0; x < MT; ++x) {
+              float2 v[2][4];
+              float* yrow[2];
+              bool live[2];
+#pragma unroll
+              for (int hh = 0; hh < 2; ++hh) {
+                const int r = 16 * (MT * wm + x) + g + 8 * hh;
+                live[hh] = r < n;
+                yrow[hh] = a.yr + (size_t)s_row[live[hh] ? r : 0] * kH + c0 + 128 * cb + 2 * t;
+                const bool rd = live[hh] && s_rank[live[hh] ? r : 0] > 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) v[hh][j] = rd ? ld_yr(yrow[hh] + 8 * sj[j], pol) : make_float2(0.f, 0.f);
+              }
+#pragma unroll
+              for (int hh = 0; hh < 2; ++hh)
+                if (live[hh]) {
+                  const float k0 = s_k0[16 * (MT * wm + x) + g + 8 * hh];
+#pragma unroll
+                  for (int j = 0; j < 4; ++j)
+                    st_yr(yrow[hh] + 8 * sj[j],
+                          make_float2(fmaf(k0, acc[x][j][2 * hh], v[hh][j].x), fmaf(k0, acc[x][j][2 * hh + 1], v[hh][j].y)), pol);
+                }
+            }
+            // the adds are out: release the rows (each lane's fence, the warp barrier, relaxed stores)
+            __threadfence();
+            __syncwarp();
+#pragma unroll
+            for (int m = 0; m < 2; ++m) {
+              const int r = r0 + lane + 32 * m;
+              if (r < n) st_relaxed(tick + s_row[r], s_rank[r] == kTopK - 1 ? 0 : s_rank[r] + 1);
+            }
+          }
+#pragma unroll
+          for (int x = 0; x < MT; ++x)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) acc[x][j][0] = acc[x][j][1] = acc[x][j][2] = acc[x][j][3] = 0.f;
+        }
+        cp_wait<kNA - 2>();
+        __syncthreads();
+      }
+  }
+  if (tid == 0 && atomicAdd(a.w.dq + 1, 1) == (int)gridDim.x - 1) a.w.dq[0] = 0, a.w.dq[1] = 0;
+}
+
+// The chained down, warp-specialised (PrefillCfg::down = 2): k_pdown_c's tasks, order, sums and adds, with
+// k_pup_ws's split: 8 producer warps load the h rows (coalesced) and decode the weights (two strips a warp,
+// raw blocks two column blocks ahead), 8 consumer warps run the MMAs and, after each column block, wait for
+// their rows' tickets and add into yr. A ring of kWsS stages per task; the CTA meets at each task's end.
+__global__ void __launch_bounds__(512, 1) k_pdown_cw(PArgs a) {
+  extern __shared__ __align__(16) uint8_t smem[];
+  __shared__ int s_task, s_row[kTM], s_rank[kTM];
+  __shared__ float s_k0[kTM];
+  constexpr int MT = 4, NS = kWsS;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  const int ntile = *a.w.ntile, total = ntile * a.npc;
+  const int NK = a.cpc / 16;  // 8 k-steps a column block of 128, an even number of blocks
+  const int ncb = a.cpc / 128;
+  const uint64_t pol = l2_last();
+  auto sA = [&](int s) { return smem + s * (kStageA + kStageB); };
+  auto sB = [&](int s) { return smem + s * (kStageA + kStageB) + kStageA; };
+  // the roles split before the task loop, so each loop runs under its own register budget (setmaxnreg)
+  if (warp >= 8) {
+    if (kWsRegP) asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(kWsRegP));
+#pragma unroll 1
+    for (;;) {
+      if (tid == 0) s_task = atomicAdd(a.w.dq, 1);
+      __syncthreads();
+      const int task = s_task;
+      if (task >= total) break;
+      const int grp = task / (a.cq * ntile), rem = task - grp * a.cq * ntile;
+      const int pass = grp * a.cq + rem % a.cq, tile = rem / a.cq;
+      const PTile tt = a.w.tiles[tile];
+      const int e = tt.e, pos0 = tt.pos0, n = tt.n, c0 = pass * a.cpc;
+      const MatDesc& d = a.L.desc[e * 3 + 2];
+      const uint32_t fmt = d.fmt;
+      if (tid < n) {
+        const float kk = __ldg(&d.s2) * (fmt == kNVFP4 ? 0x1p30f : 1.f);  // as k_combine
+        s_row[tid] = a.w.perm[pos0 + tid];
+        s_rank[tid] = a.w.prank[pos0 + tid];
+        s_k0[tid] = kk * a.w.pw[pos0 + tid];
+      }
+      __syncthreads();
+      // ---- producer
+      const int ptid = tid - 256, pw = warp - 8;
+      uint32_t ri[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) ri[j] = pos0 + min((ptid >> 3) + 32 * j, n - 1);
+      uint32_t tab[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) tab[j] = d.tab[j];
+      const int bs = fmt == kNVFP4 ? kQ4Blk : kS3Blk;
+      const uint8_t* wb = a.L.pool + d.off + (size_t)(c0 / 8 + 2 * pw) * bs;
+      Raw rb[2][2];  // [column block & 1][strip]
+      auto load_raw = [&](int c, int buf) {
+#pragma unroll
+        for (int x = 0; x < 2; ++x) load_blk(rb[buf][x], wb + (size_t)(16 * c + x) * bs, fmt, lane);
+      };
+      load_raw(0, 0);
+      load_raw(1, 1);
+#pragma unroll
+      for (int j = 0; j < NS - 1; ++j) {
+        load_a_co<4, 256, kI>(sA(j), a.w.h, ri, 64 * j, ptid);
+        cp_commit();
+      }
+      int s_cur = 0;
+#pragma unroll 1
+      for (int i0 = 0; i0 < NK; i0 += 16)
+#pragma unroll
+        for (int ii = 0; ii < 16; ++ii) {
+          const int i = i0 + ii;
+#pragma unroll
+          for (int x = 0; x < 2; ++x) {
+            uint32_t o[8];
+            dec_group(rb[ii >> 3][x], (ii & 7) >> 1, ii & 1, fmt, tab, o);
+            store_b(sB(s_cur), 2 * pw + x, lane, o);
+          }
+          if ((ii & 7) == 7 && (i >> 3) + 2 < ncb) load_raw((i >> 3) + 2, ii >> 3);
+          cp_wait<NS - 2>();
+          bar_arrive(1 + s_cur, 512);
+          const int s_ld = s_cur == 0 ? NS - 1 : s_cur - 1;
+          if (i + NS - 1 < NK) {
+            if (i >= 1) bar_sync(1 + NS + s_ld, 512);
+            load_a_co<4, 256, kI>(sA(s_ld), a.w.h, ri, 64 * ((i + NS - 1) & 7), ptid);
+          }
+          cp_commit();
+          s_cur = s_cur == NS - 1 ? 0 : s_cur + 1;
+        }
+      cp_wait0();
+      __syncthreads();  // the task's stages and row tables are free
+    }
+  } else {
+    if (kWsRegC) asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(kWsRegC));
+#pragma unroll 1
+    for (;;) {
+      if (tid == 0) s_task = atomicAdd(a.w.dq, 1);
+      __syncthreads();
+      const int task = s_task;
+      if (task >= total) break;
+      const int grp = task / (a.cq * ntile), rem = task - grp * a.cq * ntile;
+      const int pass = grp * a.cq + rem % a.cq, tile = rem / a.cq;
+      const PTile tt = a.w.tiles[tile];
+      const int e = tt.e, pos0 = tt.pos0, n = tt.n, c0 = pass * a.cpc;
+      const MatDesc& d = a.L.desc[e * 3 + 2];
+      const uint32_t fmt = d.fmt;
+      if (tid < n) {
+        const float kk = __ldg(&d.s2) * (fmt == kNVFP4 ? 0x1p30f : 1.f);  // as k_combine
+        s_row[tid] = a.w.perm[pos0 + tid];
+        s_rank[tid] = a.w.prank[pos0 + tid];
+        s_k0[tid] = kk * a.w.pw[pos0 + tid];
+      }
+      __syncthreads();
+      const int wm = warp >> 2, wn = warp & 3;
+      const int sj[4] = {4 * wn, 4 * wn + 1, 4 * wn + 2, 4 * wn + 3};
+      float acc[MT][4][4];
+#pragma unroll
+      for (int x = 0; x < MT; ++x)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[x][j][0] = acc[x][j][1] = acc[x][j][2] = acc[x][j][3] = 0.f;
+      int s_cur = 0;
+#pragma unroll 1
+      for (int i = 0; i < NK; ++i) {
+        bar_sync(1 + s_cur, 512);
+        mma_step<MT>(acc, sA(s_cur), sB(s_cur), wm, sj, n, lane);
+        if (i + NS < NK) bar_arrive(1 + NS + s_cur, 512);
+        s_cur = s_cur == NS - 1 ? 0 : s_cur + 1;
+    if ((i & 7) == 7) {  // column block i >> 3 done: each warp adds its 64 rows x 32 columns into yr
+      const int cb = i >> 3, r0 = 64 * wm;
+      if (r0 < n) {
+        int* tick = a.w.tick + (size_t)((c0 + 128 * cb) / 32 + wn) * kMaxChunk;
+        // wait until the rows' lower picks are in (lane l polls rows r0 + l, r0 + l + 32; relaxed loads,
+        // then a fence)
+        uint32_t pend = 0;
+#pragma unroll
+        for (int m = 0; m < 2; ++m)
+          if (r0 + lane + 32 * m < n && s_rank[r0 + lane + 32 * m] > 0) pend |= 1u << m;
+        if (__any_sync(0xffffffffu, pend)) {
+          uint32_t ns = 64;
+          for (uint32_t spin = 0;; ++spin) {
+#pragma unroll
+            for (int m = 0; m < 2; ++m) {
+              const int r = r0 + lane + 32 * m;
+              if ((pend >> m & 1) && ld_relaxed(tick + s_row[r]) == s_rank[r]) pend &= ~(1u << m);
+            }
+            if (!__any_sync(0xffffffffu, pend)) break;
+            __nanosleep(ns);
+            ns = min(ns * 2, 1024u);
+            if (spin == (1u << 25)) __trap();  // ~30 s: a ticket left set (the workspace not zeroed)
+          }
+          __threadfence();
+          __syncwarp();
+        }
+        // per m16 tile, its two rows' eight loads in flight together, then the adds and stores
+#pragma unroll
+        for (int x = 0; x < MT; ++x) {
+          float2 v[2][4];
+          float* yrow[2];
+          bool live[2];
+#pragma unroll
+          for (int hh = 0; hh < 2; ++hh) {
+            const int r = 16 * (MT * wm + x) + g + 8 * hh;
+            live[hh] = r < n;
+            yrow[hh] = a.yr + (size_t)s_row[live[hh] ? r : 0] * kH + c0 + 128 * cb + 2 * t;
+            const bool rd = live[hh] && s_rank[live[hh] ? r : 0] > 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[hh][j] = rd ? ld_yr(yrow[hh] + 8 * sj[j], pol) : make_float2(0.f, 0.f);
+          }
+#pragma unroll
+          for (int hh = 0; hh < 2; ++hh)
+            if (live[hh]) {
+              const float k0 = s_k0[16 * (MT * wm + x) + g + 8 * hh];
+#pragma unroll
+              for (int j = 0; j < 4; ++j)
+                st_yr(yrow[hh] + 8 * sj[j],
+                      make_float2(fmaf(k0, acc[x][j][2 * hh], v[hh][j].x), fmaf(k0, acc[x][j][2 * hh + 1], v[hh][j].y)), pol);
+            }
+        }
+        // the adds are out: release the rows (each lane's fence, the warp barrier, relaxed stores)
+        __threadfence();
+        __syncwarp();
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+          const int r = r0 + lane + 32 * m;
+          if (r < n) st_relaxed(tick + s_row[r], s_rank[r] == kTopK - 1 ? 0 : s_rank[r] + 1);
+        }
+      }
+#pragma unroll
+      for (int x = 0; x < MT; ++x)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[x][j][0] = acc[x][j][1] = acc[x][j][2] = acc[x][j][3] = 0.f;
+    }
+      }
+      __syncthreads();  // the task's stages and row tables are free
+    }
+  }
+  if (tid == 0 && atomicAdd(a.w.dq + 1, 1) == (int)gridDim.x - 1) a.w.dq[0] = 0, a.w.dq[1] = 0;
 }
 
 // ---- down ----------------------------------------------------------------------------------------------------------
@@ -888,10 +1612,22 @@ PrefillView prefill_view(void* ws, int T) {
   return PrefillView{w.rpos, w.re, w.h, w.hsh, w.xq, w.xs, w.hq, w.hs};
 }
 
+// The chained down's pass: the widest multiple of 256 columns dividing kH whose yr slice (T x cpc f32) fits
+// the L2 budget.
+constexpr int kDefYrKB = 16 << 10;
+static int chain_cols(int T, int yr_kb) {
+  const size_t budget = (size_t)(yr_kb > 0 ? yr_kb : kDefYrKB) << 10;
+  for (int m : {24, 12, 8, 6, 4, 3, 2})
+    if ((size_t)T * 256 * m * 4 <= budget) return 256 * m;
+  return 256;
+}
+
 void moe_prefill_phases(const LayerW& L, const __nv_bfloat16* x, const int* idx, const float* w, int T, void* ws,
                         float* yr, float* ys, cudaStream_t st, const PrefillCfg& cfg, int ph) {
   if (T < 1 || T > kMaxChunk) die("moe_prefill: T=%d", T);
   static bool init = false;
+  static int nsm = 0;
+  static thread_local cudaEvent_t ev[2] = {nullptr, nullptr};
   if (!init) {
     set_smem(k_pup<false, 4>, kSmem);
     set_smem(k_pup<false, 4, 1>, kSmem);
@@ -902,24 +1638,93 @@ void moe_prefill_phases(const LayerW& L, const __nv_bfloat16* x, const int* idx,
     set_smem(k_pup<false, 4, 6>, kSmem);
     set_smem(k_pup<true, 2>, kSmem);
     set_smem(k_pdown_r<4>, kSmem);
+    set_smem(k_pdown_c<4>, kSmem);
+    set_smem(k_pdown_cw, kWsSmem);
+    set_smem(k_pup_ws<false, 0>, kWsSmem);
+    set_smem(k_pup_ws<true>, kWsSmemSh);
+    set_smem(k_pup_w2<0>, kWsSmem);
+    set_smem(k_pup_w2<1>, kWsSmem);
+    set_smem(k_pup_w2<2>, kWsSmem);
+    set_smem(k_pup_w2<3>, kWsSmem);
+    set_smem(k_pup_w2<4>, kWsSmem);
+    set_smem(k_pup_w2<5>, kWsSmem);
+    set_smem(k_pup_w2<6>, kWsSmem);
+    set_smem(k_pup_ws<false, 1>, kWsSmem);
+    set_smem(k_pup_ws<false, 2>, kWsSmem);
+    set_smem(k_pup_ws<false, 3>, kWsSmem);
+    set_smem(k_pup_ws<false, 4>, kWsSmem);
+    set_smem(k_pup_ws<false, 5>, kWsSmem);
+    set_smem(k_pup_ws<false, 6>, kWsSmem);
     set_smem(k_pdown<true, 2>, kSmem);
     set_smem(k_pup_f4<4>, kF4Smem);
     set_smem(k_pdown_f4<4>, kF4Smem);
+    int dev;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
     init = true;
   }
-  PArgs a{L, x, T, ws_layout(ws, T), yr, ys, 0, cfg.fp4, cfg.in_scale_gu, cfg.in_scale_dn};
+  const bool chain = !cfg.fp4 && cfg.down >= 1;
+  PArgs a{L, x, T, ws_layout(ws, T), yr, ys, 0, cfg.fp4, cfg.in_scale_gu, cfg.in_scale_dn, 0, 0, 1};
+  a.cq = std::max(1, cfg.chain_q);
+  a.cpc = chain_cols(T, (cfg.yr_kb > 0 ? cfg.yr_kb : kDefYrKB) / a.cq);
+  a.npc = kH / a.cpc;
+  while (a.npc % a.cq) --a.cq;
   const int P = T * kTopK;
+  const int maxt = std::min(kMaxRTiles, P / kTM + kE);
+  // the shared expert: needs only x, so it may run beside the routed experts on cfg.side
+  const bool sh = cfg.shared && (ph & kPhShared);
+  const bool fork = sh && cfg.side;
+  if (fork) {
+    if (!ev[0])
+      for (auto& e : ev) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(ev[0], st));
+    CUDA_CHECK(cudaStreamWaitEvent(cfg.side, ev[0], 0));
+  }
+  if (sh) {
+    const cudaStream_t ss = fork ? cfg.side : st;
+    PArgs b = a;
+    if (cfg.up == 1) k_pup_ws<true><<<(T + 63) / 64 * kUpNB, 512, kWsSmemSh, ss>>>(b);
+    else k_pup<true, 2><<<(T + 63) / 64 * kUpNB, 256, kSmem, ss>>>(b);
+    for (int p = 0; p < b.w.npass; ++p) {
+      b.c0 = p * b.w.cp;
+      k_pdown<true, 2><<<(T + 63) / 64 * (b.w.cp / 128), 256, kSmem, ss>>>(b);
+    }
+    if (fork) CUDA_CHECK(cudaEventRecord(ev[1], cfg.side));
+  }
   if (ph & kPhBucket) {
     k_count<<<(P + 1023) / 1024, 1024, 0, st>>>(idx, P, a.w.cnt);
     k_scan<<<1, 256, 0, st>>>(a.w);
     k_scatter<<<(T + 127) / 128, 128, 0, st>>>(idx, w, T, a.w);
   }
-  const int maxt = std::min(kMaxRTiles, P / kTM + kE);
   if (ph & kPhUp) {
     if (cfg.fp4) {
       k_quant<kH><<<(T * (kH / 16) + 255) / 256, 256, 0, st>>>(x, T, cfg.in_scale_gu, a.w.xq, a.w.xs);
       k_pup_f4<4><<<maxt * kUpNB, 256, kF4Smem, st>>>(a);
       k_quant<kI><<<(P * (kI / 16) + 255) / 256, 256, 0, st>>>(a.w.h, P, cfg.in_scale_dn, a.w.hq, a.w.hs);
+    } else if (cfg.up == 2) {
+      const int gu = maxt * kUpNB;
+      switch (cfg.diag) {
+        case 0: k_pup_w2<0><<<gu, 256, kWsSmem, st>>>(a); break;
+        case 1: k_pup_w2<1><<<gu, 256, kWsSmem, st>>>(a); break;
+        case 2: k_pup_w2<2><<<gu, 256, kWsSmem, st>>>(a); break;
+        case 3: k_pup_w2<3><<<gu, 256, kWsSmem, st>>>(a); break;
+        case 4: k_pup_w2<4><<<gu, 256, kWsSmem, st>>>(a); break;
+        case 5: k_pup_w2<5><<<gu, 256, kWsSmem, st>>>(a); break;
+        case 6: k_pup_w2<6><<<gu, 256, kWsSmem, st>>>(a); break;
+        default: die("moe_prefill: diag %d", cfg.diag);
+      }
+    } else if (cfg.up == 1) {
+      const int gu = maxt * kUpNB;
+      switch (cfg.diag) {
+        case 0: k_pup_ws<false, 0><<<gu, 512, kWsSmem, st>>>(a); break;
+        case 1: k_pup_ws<false, 1><<<gu, 512, kWsSmem, st>>>(a); break;
+        case 2: k_pup_ws<false, 2><<<gu, 512, kWsSmem, st>>>(a); break;
+        case 3: k_pup_ws<false, 3><<<gu, 512, kWsSmem, st>>>(a); break;
+        case 4: k_pup_ws<false, 4><<<gu, 512, kWsSmem, st>>>(a); break;
+        case 5: k_pup_ws<false, 5><<<gu, 512, kWsSmem, st>>>(a); break;
+        case 6: k_pup_ws<false, 6><<<gu, 512, kWsSmem, st>>>(a); break;
+        default: die("moe_prefill: diag %d", cfg.diag);
+      }
     } else {
       switch (cfg.diag) {
         case 0: k_pup<false, 4><<<maxt * kUpNB, 256, kSmem, st>>>(a); break;
@@ -933,16 +1738,22 @@ void moe_prefill_phases(const LayerW& L, const __nv_bfloat16* x, const int* idx,
       }
     }
   }
-  if (cfg.shared && (ph & kPhShared)) k_pup<true, 2><<<(T + 63) / 64 * kUpNB, 256, kSmem, st>>>(a);
-  for (int p = 0; p < a.w.npass; ++p) {
-    a.c0 = p * a.w.cp;
+  if (chain) {
     if (ph & kPhDown) {
-      if (cfg.fp4) k_pdown_f4<4><<<maxt * (a.w.cp / 128), 256, kF4Smem, st>>>(a);
-      else k_pdown_r<4><<<maxt * (a.w.cp / 128 / kDnCB), 256, kSmem, st>>>(a);
+      if (cfg.down == 2) k_pdown_cw<<<std::min(nsm, maxt * a.npc), 512, kWsSmem, st>>>(a);
+      else k_pdown_c<4><<<std::min(nsm, maxt * a.npc), 256, kSmem, st>>>(a);
     }
-    if (cfg.shared && (ph & kPhShared)) k_pdown<true, 2><<<(T + 63) / 64 * (a.w.cp / 128), 256, kSmem, st>>>(a);
-    if (ph & kPhCombine) k_combine<<<(T * (a.w.cp / 4) + 255) / 256, 256, 0, st>>>(a);
+  } else {
+    for (int p = 0; p < a.w.npass; ++p) {
+      a.c0 = p * a.w.cp;
+      if (ph & kPhDown) {
+        if (cfg.fp4) k_pdown_f4<4><<<maxt * (a.w.cp / 128), 256, kF4Smem, st>>>(a);
+        else k_pdown_r<4><<<maxt * (a.w.cp / 128 / kDnCB), 256, kSmem, st>>>(a);
+      }
+      if (ph & kPhCombine) k_combine<<<(T * (a.w.cp / 4) + 255) / 256, 256, 0, st>>>(a);
+    }
   }
+  if (fork) CUDA_CHECK(cudaStreamWaitEvent(st, ev[1], 0));
   CUDA_CHECK(cudaGetLastError());
 }
 

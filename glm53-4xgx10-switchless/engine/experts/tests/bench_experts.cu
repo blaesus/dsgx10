@@ -1,7 +1,9 @@
 // Benchmarks of the routed-expert kernels on one GB10 (GPU: only through ring.sh).
 //   bench_experts --bw                                   the window's streaming read
 //   bench_experts --decode q4|s3|mix [--rows 1,2,4,6,8,16,6c] [--sweep] [--out f.tsv]
-//   bench_experts --prefill q4|s3|mix [--chunks 1024,4096,8192] [--fp4] [--out f.tsv]
+//   bench_experts --prefill q4|s3|mix [--chunks 1024,4096,8192] [--fp4] [--down 0,1] [--yrkb 0] [--side 0] [--cq 4] [--up 0,1] [--diag]
+//                 [--out f.tsv]   (down: PrefillCfg::down variants; yrkb: chained-down L2 budgets, KB; side: the
+//                 shared expert on a second stream; cq: chained-down passes in flight; up: PrefillCfg::up variants; diag: the gate/up kernel with parts switched off)
 // Decode: a pool of >= 2.2 GB of experts in the format (random bits, valid scales) is cycled so L2 holds no
 // step's weights; each step routes its rows (logits that pick a chosen set) and runs the expert step; a CUDA
 // graph of whole steps, the median of 7 replays. Bytes = the union's weights and scales + the shared expert's.
@@ -321,11 +323,16 @@ static void bench_decode(const std::string& fname, const std::string& rows_s, bo
   cudaFree(ws), cudaFree(shw), cudaFree(shs), cudaFree(P.d);
 }
 
-void bench_prefill(const std::string& fname, const std::string& chunks, bool fp4);  // bench_prefill.inc
+struct PfOpts {
+  std::string down = "0,1", yrkb = "0", side = "0", cq = "4", up = "0,1";
+  bool diag = false;
+};
+void bench_prefill(const std::string& fname, const std::string& chunks, bool fp4, const PfOpts& o);  // bench_prefill.inc
 
 int main(int argc, char** argv) {
   std::string mode, fmt, rows = "1,2,4,6,8,16,6c", chunks = "1024,4096,8192";
   bool sweep = false, fp4 = false;
+  PfOpts po;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--bw") mode = "bw";
@@ -335,6 +342,12 @@ int main(int argc, char** argv) {
     else if (a == "--chunks" && i + 1 < argc) chunks = argv[++i];
     else if (a == "--sweep") sweep = true;
     else if (a == "--fp4") fp4 = true;
+    else if (a == "--down" && i + 1 < argc) po.down = argv[++i];
+    else if (a == "--yrkb" && i + 1 < argc) po.yrkb = argv[++i];
+    else if (a == "--side" && i + 1 < argc) po.side = argv[++i];
+    else if (a == "--cq" && i + 1 < argc) po.cq = argv[++i];
+    else if (a == "--up" && i + 1 < argc) po.up = argv[++i];
+    else if (a == "--diag") po.diag = true;
     else if (a == "--out" && i + 1 < argc) g_out = fopen(argv[++i], "a");
     else {
       fprintf(stderr, "usage: see the header of bench_experts.cu\n");
@@ -343,7 +356,7 @@ int main(int argc, char** argv) {
   }
   bench_bw();
   if (mode == "decode") bench_decode(fmt, rows, sweep);
-  else if (mode == "prefill") bench_prefill(fmt, chunks, fp4);
+  else if (mode == "prefill") bench_prefill(fmt, chunks, fp4, po);
   return 0;
 }
 

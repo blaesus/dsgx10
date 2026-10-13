@@ -1,12 +1,12 @@
 #!/bin/bash
 # Build the experts' binaries (CPU only, -j4) and install them with the sources' hash for run.sh.
-#   install.sh [bin dir]     (default ~/dsgb10-data/glm53-experts/bin)
+#   install.sh [bin dir]     (default $TOP/bin; TOP, the build area, default ~/dsgb10-data/glm53-experts)
 # Builds through an out-of-tree wrapper project holding the engine's top-level flags and experts/ only, so a
 # half-written sibling directory cannot stop the build.
 set -eu
 cd "$(dirname "$0")"
 ENGINE=$(cd .. && pwd)
-TOP=$HOME/dsgb10-data/glm53-experts
+TOP=${TOP:-$HOME/dsgb10-data/glm53-experts}
 BIN=${1:-$TOP/bin}
 mkdir -p "$TOP/wrap" "$BIN"
 sed -n '/^set(CMAKE_CUDA_FLAGS/p' "$ENGINE/CMakeLists.txt" > "$TOP/wrap/flags.cmake"
