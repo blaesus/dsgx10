@@ -44,7 +44,7 @@ cost as many decode bytes as the experts (13.1B attention parameters are read ev
 | KV a token | 52.7 KiB (FP8: 656 B latent + 132 B indexer key on 21 layers), 93 KiB (BF16); 13.4 GiB for 256k in FP8 |
 | Bytes a decode token a rank | routed experts 2.65 GB at 3.75 bpw (3.19 at NVFP4); attention 3.22 GB at FP8 (6.44 at BF16); shared experts, head, dense, routers ~1.65 GB; **7.53 GB → 32.0 ms a token** at 235 GB/s, ~31 tok/s before drafting (51 ms with BF16 attention and NVFP4 experts) |
 | Prefill | all 78 layers run over every token (no compressed-encoder trick as DeepSeek's CED): ~5× the FLOPs a token of the DeepSeek engine; tensor cores: `mxf4nvf4` block-scaled MMA ~214 TFLOPS measured on DeepSeek's formats, bf16 ~107 |
-| Collectives | 3 a layer × 78 at ~12 µs on the DeepSeek ring code: ~2.9 ms a step |
+| Collectives | 256 a step (3 a layer × 78, 21 indexer-query gathers, the head's top-K exchange): **4.40 ms at 1 row**, 8.9 at 6, 17.6 at 16, measured on the ported ring ([ring.md](docs/ring.md)); the estimate before measuring was 2.9 |
 | Published bar | the fastest four-GB10 engine found: code 49.3 / prose 30.0 tok/s, cold prefill 1,374 tok/s at 8k (kindlingai/gr8, 3.25 bpw trellis, 2026-10-13); the best vLLM fork on sparkDash: prose 40.2 / code 46.6 |
 
 ## Decisions
@@ -94,7 +94,18 @@ cost as many decode bytes as the experts (13.1B attention parameters are read ev
    not retrofitted). The DeepSeek engine's ring, weight container, graph and PDL step machinery, verify loop,
    batching, session store, server, front-end core, scripts and bench tools carry over; its kernels keep only
    their structure ([reuse § 1](docs/reuse.md#1-component-table)).
-8. **Production on the ring keeps serving DeepSeek.** Every GPU job here is a ring job: build and check on the
+8. **The numerics contract's reduction order is the engine's, not transformers'** (decided 2026-10-14 from
+   experiments 2 and G4): the weighted outputs of a row's eight routed experts and the shared expert are
+   summed in f32 across experts and ranks and rounded to bf16 once, when added to the residual; o_proj and the
+   MLP downs likewise produce f32 partials rounded once after the all-reduce. transformers rounds each expert's
+   output to bf16 first; the two orders agree on the argmax at 94.2 % of positions on the short sequence (mean
+   KL 0.047), because the router picks its eighth expert by a margin under 1e-3 in about a quarter of the
+   cases. So the order is part of the contract, the golden data is made in it, and no bit allocation by expert
+   usage is attempted: experiment 2 found no hot set that carries across text types (99 % of the routing mass
+   needs 235–251 of 256 experts a layer).
+9. **Batch invariance is kept**: a row's result does not depend on how many rows share its step. The sparse
+   attention's split-K is therefore fixed (not chosen per row count), at the cost G4 measured.
+10. **Production on the ring keeps serving DeepSeek.** Every GPU job here is a ring job: build and check on the
    CPU first, then short (< 15 min) preemptible windows; the reference and the quantiser run on the CPU, on
    rank 2 (the box with the disk).
 
@@ -111,6 +122,9 @@ cost as many decode bytes as the experts (13.1B attention parameters are read ev
 - KL on this model has a high floor (two exact BF16 runs differing in batching: 0.11 mean on long text):
   only paired, same-harness comparisons count, and the reference's own variance sets the engine's bar.
 - MTP acceptance at quantised precision is unstudied anywhere.
+- Measured on 2026-10-14 (G4, synthetic weights): the step is 46.4 ms at 1 row, 1.35× the floor (MoE 21.1 ms
+  against 15.2 for the kernels alone, o_proj 9.0, collectives 9.7 with rank skew, attention 4.1, head 2.6), and
+  97.2 ms at 6 rows (1.01×); a tuning pass works on the 1-row gap.
 - The decode floor is ~32 ms a token before drafting: a third of the DeepSeek engine's per-token speed is
   the physics of 7.5 GB a token; the published bar is low (30–49 tok/s) because every published engine reads
   more bytes or runs slower kernels, so the target is the floor plus drafts, not a multiple of the bar.
