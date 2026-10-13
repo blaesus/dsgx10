@@ -32,13 +32,18 @@ struct Spec {
   size_t nodes = 0;    // in the last graph's bodies
   // B3 (docs/batching.md): the batch spec step per context bucket, drafts across sessions: spec_in_batch
   // (the entries' rows laid out on the device), the same switch, the sampling with verdicts per entry,
-  // then per entry an if node (on when the entry takes part) with its accept, draft and gate in its own
-  // slot, and the publication. The one-session graphs above never run any of it.
+  // then per entry an if node (on when the entry takes part) with its accept in its own slot, a switch
+  // over the entries on whose body runs one draft pass over them all (phase 2a, passes of at most
+  // dspark::kBatchEnts), one gate kernel over the entries, and the publication. The one-session graphs
+  // above never run any of it.
   std::map<int, cudaGraphExec_t> bgraphs;
   int bents = 0;         // entries a batch step takes at most: min(kMaxSess, Options::slots)
   size_t bnodes = 0;     // in the last batch graph's bodies (the switch's and the ifs')
   int* row0 = nullptr;   // device [kMaxSess]: entry k's first row of the step
   int* stab = nullptr;   // device [kMaxSess][dspark::kMaxAcc]: entry k's slot table (every entry its slot)
+  int* bent = nullptr;   // device [kMaxSess]: the entries on, in order (spec_batch_passes)
+  int* pstab = nullptr;  // device [kMaxSess][ops::kDrafts]: the passes' slot tables, by the entries on
+  unsigned* mism = nullptr;  // device: --bgraph-check's count of words a pass's drafts differ from draft()'s
   // prefill: main_hidden of the chunk's rows that enter the windows. Each rank computes the rows it owns
   // into its block of pf_mh ([4][C][15360] for C rows a rank at most), one all-gather shares them, then
   // accept() takes them kMaxAcc at a time.

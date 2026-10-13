@@ -82,6 +82,22 @@ int main() {
     for (int r = R; r < kMaxRows; ++r)
       check(d.tokens[r] == 0 && d.pos[r] == d.pos[R - 1] && d.slot[r] == d.slot[R - 1] && d.sess[r] == d.sess[R - 1],
             "layout: the entries past R repeat the last row's", it);
+    // B3 phase 2a: the draft passes' compact list and slot tables (k_spec_in_batch, the switch over the entries on)
+    int bent[kMaxSess], pstab[kMaxSess * kDrafts];
+    const int Sp = spec_batch_passes(d, bent, pstab);
+    check(Sp == S, "passes: the count is the entries on", it);
+    int c = 0;
+    for (int k = 0; k < ns; ++k) {
+      if (!d.sess_on[k]) continue;
+      check(c < Sp && bent[c] == k, "passes: the compact list is the entries on, in order", it);
+      for (int j = 0; j < kDrafts; ++j)
+        check(pstab[c * kDrafts + j] == d.sess_slot[k], "passes: an entry's rows take its slot", it);
+      ++c;
+    }
+    for (; c < kMaxSess; ++c) {
+      check(bent[c] == 0, "passes: the list past the entries on is 0", it);
+      for (int j = 0; j < kDrafts; ++j) check(pstab[c * kDrafts + j] == 0, "passes: the tables past the entries on are 0", it);
+    }
     // the verdicts: samples with matches planted (row r's sample is row r + 1's token, two times in three)
     int32_t fb[kMaxRows];
     for (int r = 0; r < kMaxRows; ++r)

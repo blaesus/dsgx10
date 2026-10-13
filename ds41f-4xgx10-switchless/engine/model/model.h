@@ -129,7 +129,10 @@ struct Options {
                             // window rings, compressed caches, index keys, carries and draft windows), up to
                             // kMaxSlots; ~240 MB a slot at 262,144 positions
   int bgraph_bodies = 0;    // DIAGNOSTICS (spec.cu, 2026-10-13): the batch spec graph's switch bodies (0: kMaxRows)
-  bool bgraph_noif = false; // DIAGNOSTICS: the entries' draft passes at the top level, without if nodes
+  bool bgraph_noif = false; // DIAGNOSTICS: the entries' accepts at the top level, without if nodes
+  bool bgraph_check = false;  // DIAGNOSTICS (B3 phase 2a): after the batch step's draft pass over the entries, every
+                              // entry's one-session draft too, and a count of the words of its drafts and
+                              // confidence that differ (spec_batch_mismatches(); the pass's bit check)
   bool l2pf = true;         // the decode step's paced L2 prefetch in its windows (kernels/l2pf.cu, docs/engine.md
                             // "A paced L2 prefetch"): a side stream, the same bits
   // EXPERIMENT, bench only (docs/engine.md, "Draft trees"): every spec step's draft pass also runs the
@@ -197,13 +200,16 @@ class Model {
   // B3 (docs/batching.md): drafts across sessions, a spec step of several sessions' rows (SpecBatch;
   // Options::slots > 1). launch_spec_batch: a given step, one row per entry on; launch_verify_batch: the
   // rows the step before chose for each entry on (queued before it ends). The step samples its rows with
-  // the verdicts per entry and runs each entry's draft pass in its own slot; every row computes what it
-  // would in a step of its session alone, bit for bit. SampleOut: sess_* per entry (its rows, the tokens
-  // it emits), next_s* for the step after (0 rows: the entry was off). spec_batch_entries(): entries a
-  // batch step takes at most (0 without DSpark or slots).
+  // the verdicts per entry, runs each entry's accept in its own slot and one draft pass over the entries
+  // (phase 2a); every row computes what it would in a step of its session alone, bit for bit. SampleOut:
+  // sess_* per entry (its rows, the tokens it emits), next_s* for the step after (0 rows: the entry was
+  // off). spec_batch_entries(): entries a batch step takes at most (0 without DSpark or slots).
+  // spec_batch_mismatches() (Options::bgraph_check): the words of the passes' drafts and confidence that
+  // differed from the entries' one-session drafts so far (synchronises).
   int spec_batch_entries() const;
   uint64_t launch_spec_batch(const SpecBatch& b);
   uint64_t launch_verify_batch(const SpecBatch& b);
+  unsigned spec_batch_mismatches() const;
   // engram_late() of a batch verify step: its rows as the device laid them out (the entries on in entry
   // order, each its next_s* of the step before): their tokens, positions and slots.
   void engram_late_rows(int R, const int32_t* tokens, const int32_t* pos, const int32_t* slot);

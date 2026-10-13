@@ -128,13 +128,16 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
 // entry order, each its rows (a verify step: the rows the step before chose for it, its bonus token then
 // its drafts; a given step: the host's one row per entry), with its slot in slot[] and its entry index
 // in sess[]; row0[k] entry k's first row; stab the entries' slot tables (every entry of entry k's its
-// slot); then the switch's value (the row count - 1) and each entry's if (on or not).
+// slot); bent and pstab the draft passes' compact list and slot tables (spec_batch_passes); then the
+// switch's value (the row count - 1), each entry's if (on or not), the passes' switch (the entries on - 1)
+// and the check ifs' (--bgraph-check; as the entries').
 struct IfHandles {
   cudaGraphConditionalHandle h[ops::kMaxSess];
   int n;  // entries with an if node (the batch graph's bents); the others' handles do not exist
 };
 __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, const ops::SpecState* ss, ops::StepIn* d,
-                                int* row0, int* stab, cudaGraphConditionalHandle hsw, IfHandles hif) {
+                                int* row0, int* stab, int* bent, int* pstab, cudaGraphConditionalHandle hsw,
+                                IfHandles hif, cudaGraphConditionalHandle hpass, IfHandles hchk) {
   constexpr int n = sizeof(ops::StepIn) / 4;
   const uint32_t slot = *counter % ops::kInSlots;
   for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -145,18 +148,27 @@ __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, cons
     else ops::spec_batch_row0(*d, row0);  // a given step: the host's layout, one row per entry on
     for (int k = 0; k < ops::kMaxSess; ++k)
       for (int j = 0; j < dspark::kMaxAcc; ++j) stab[k * dspark::kMaxAcc + j] = d->sess_slot[k];
+    const int S = ops::spec_batch_passes(*d, bent, pstab);
     *counter += 1;
     cudaGraphSetConditional(hsw, (unsigned)(d->rows - 1));
     for (int k = 0; k < hif.n; ++k) cudaGraphSetConditional(hif.h[k], d->sess_on[k] ? 1u : 0u);
+    cudaGraphSetConditional(hpass, (unsigned)(S - 1));
+    for (int k = 0; k < hchk.n; ++k) cudaGraphSetConditional(hchk.h[k], d->sess_on[k] ? 1u : 0u);
   }
 }
 
-// After entry k's draft pass: the drafts its rows of the next step verify, by the gate (ops.h) under its
-// own cap (scap[k]), position bound (spos_end[k]) and threshold (sthresh[k]): k_spec_next's choice, for
-// its rows alone. Into its spec state (the next step's layout) and the step's SampleOut (next_s*[k]).
-__global__ void k_spec_gate_batch(const ops::StepIn* in, ops::SpecState* ss, int k, const int* drafts,
-                                  const float* surv, ops::SampleOut* outs) {
-  if (threadIdx.x != 0) return;
+// After the draft pass over the entries: each entry k on, the drafts its rows of the next step verify,
+// by the gate (ops.h) under its own cap (scap[k]), position bound (spos_end[k]) and threshold
+// (sthresh[k]): k_spec_next's choice, for its rows alone. Into its spec state (the next step's layout)
+// and the step's SampleOut (next_s*[k]). A thread per entry; an entry off keeps its state (the host
+// ignores it). tok0 / surv0: entry 0's drafts and survival in the draft module's batch results, entry
+// k's a stride on.
+__global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss, const int* tok0, int tok_stride,
+                                      const float* surv0, int surv_stride, ops::SampleOut* outs) {
+  const int k = threadIdx.x;
+  if (k >= ops::kMaxSess || k >= in->nsess || !in->sess_on[k]) return;
+  const int* drafts = tok0 + k * tok_stride;
+  const float* surv = surv0 + k * surv_stride;
   ops::SampleOut& o = outs[in->step % ops::kOutSlots];
   ops::SpecState& s = ss[k];
   const int P = s.pos0 + s.count;
@@ -183,6 +195,18 @@ __global__ void k_spec_gate_batch(const ops::StepIn* in, ops::SpecState* ss, int
   o.next_spos0[k] = P;
   for (int j = 0; j < ops::kSessTok; ++j) o.next_stok[k][j] = s.next_tok[j];
   __threadfence_system();
+}
+
+// DIAGNOSTICS (Options::bgraph_check): one entry's drafts from the one-session draft() (a: ids [6], conf [5]
+// and survival [5]) against the pass's (b), word by word; mism counts the words that differ.
+__global__ void k_spec_draft_check(const int* a_ids, const float* a_conf, const int* b_ids, const float* b_conf,
+                                   unsigned* mism) {
+  const int t = threadIdx.x;
+  bool bad = false;
+  if (t < 6) bad = a_ids[t] != b_ids[t];
+  else if (t < 11) bad = __float_as_int(a_conf[t - 6]) != __float_as_int(b_conf[t - 6]);
+  else if (t < 16) bad = __float_as_int(a_conf[8 + t - 11]) != __float_as_int(b_conf[8 + t - 11]);
+  if (bad) atomicAdd(mism, 1u);
 }
 
 // The batch step's publication, after every entry's draft pass.
@@ -324,7 +348,7 @@ class RingComm final : public dspark::Comm {
   explicit RingComm(const comm::DevChannel& ch) : ch_(ch) {
     send_ = dalloc<uint32_t>(kBlock / 4);
     recv_ = dalloc<uint32_t>(kRanks * kBlock / 4);
-    f32_ = dalloc<float>((size_t)dspark::kDraft * dspark::kDim);
+    f32_ = dalloc<float>((size_t)dspark::kBatchRows * dspark::kDim);  // a batch pass's rows at most
   }
   ~RingComm() override {
     cudaFree(send_);
@@ -353,7 +377,7 @@ class RingComm final : public dspark::Comm {
     k_gather_unpack<<<std::min(64, 4 * blocks), 256, 0, s>>>(a, recv_);
   }
   void all_reduce(const void* src, bool f32, uint16_t* dst, size_t n, cudaStream_t s) override {
-    if (n > (size_t)dspark::kDraft * dspark::kDim) die("spec: all_reduce of %zu", n);
+    if (n > (size_t)dspark::kBatchRows * dspark::kDim) die("spec: all_reduce of %zu", n);
     if (!f32) {
       comm::allreduce_bf16(ch_, static_cast<const bf16*>(src), reinterpret_cast<bf16*>(dst), n, s);
     } else {
@@ -366,6 +390,11 @@ class RingComm final : public dspark::Comm {
   void argmax(const dspark::Cand* src, dspark::Cand* dst, cudaStream_t s) override {
     static_assert(sizeof(dspark::Cand) == sizeof(comm::ArgMax), "Cand");
     comm::argmax_rows(ch_, reinterpret_cast<const comm::ArgMax*>(src), reinterpret_cast<comm::ArgMax*>(dst), 2, s);
+  }
+  // a batch pass's entries' candidates in one collective (an even count: argmax_rows's 16-byte posts)
+  void argmax_rows(const dspark::Cand* src, dspark::Cand* dst, int rows, cudaStream_t s) override {
+    if (rows < 1 || rows % 2) die("spec: argmax_rows of %d candidates", rows);
+    comm::argmax_rows(ch_, reinterpret_cast<const comm::ArgMax*>(src), reinterpret_cast<comm::ArgMax*>(dst), rows, s);
   }
 
  private:
@@ -384,6 +413,9 @@ Spec::~Spec() {
   cudaFree(ss);
   cudaFree(row0);
   cudaFree(stab);
+  cudaFree(bent);
+  cudaFree(pstab);
+  cudaFree(mism);
   cudaFree(pf_mh);
   cudaFree(pf_acc);
   cudaFreeHost(pf_acc_h);
@@ -522,6 +554,14 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
   sp.bents = std::min(ops::kMaxSess, nslots);
   sp.row0 = dalloc<int>(ops::kMaxSess);
   sp.stab = dalloc<int>((size_t)ops::kMaxSess * dspark::kMaxAcc);
+  // B3 phase 2a: the draft passes over the entries (spec_batch_passes' list and tables, the draft module's
+  // batch buffers), with session slots only
+  static_assert(ops::kMaxSess <= dspark::kMaxEnts, "every batch entry keeps an anchor and results in the draft module");
+  static_assert(ops::kDrafts == dspark::kDraft, "a pass's rows per entry are the drafter's");
+  sp.bent = dalloc<int>(ops::kMaxSess);
+  sp.pstab = dalloc<int>((size_t)ops::kMaxSess * ops::kDrafts);
+  sp.mism = dalloc<unsigned>(1);
+  if (sp.bents >= 2) sp.draft->enable_batch();
   // the prefill's seed rows, sized for a 4096-row chunk with snapshots every 1024 (768 rows in 96
   // groups, 384 on the last rank), so that a prefill rarely has to grow them (which synchronises)
   sp.pf_rows = kSpecPfRows + 2 * kSnapRows, sp.pf_groups = 128;
@@ -669,11 +709,14 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
 }
 
 // B3 (docs/batching.md): the batch spec step of a context bucket, drafts across sessions. The one-session
-// step's shape, with the rows laid out on the device (k_spec_in_batch), the verdicts per entry (k_sample),
-// and the draft passes under if nodes, one per entry: accept from its rows (row0) into its slot's windows
-// (its slot table), draft from its bonus token, its gate; then the publication. The passes run one after
-// the other (they share the draft module's buffers, and the ring's collectives run in one order on every
-// rank). Captured only with Options::slots > 1; the one-session graph above is not touched.
+// step's shape, with the rows laid out on the device (k_spec_in_batch), the verdicts per entry (k_sample);
+// then the accepts under if nodes, one per entry (from its rows (row0) into its slot's windows (its slot
+// table), its anchor into the draft module's batch_start()[k]); then one draft pass over the entries on
+// (phase 2a: a switch over their number S, body S - 1 running passes of at most dspark::kBatchEnts entries
+// over the compact list, each pass draft_batch with the weights read once); then one gate kernel over the
+// entries and the publication. The passes run one after the other (they share the draft module's batch
+// buffers, and the ring's collectives run in one order on every rank). Captured only with Options::slots
+// > 1; the one-session graph above is not touched.
 cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   Spec& sp = *spec;
   const auto it = sp.bgraphs.find(ctx);
@@ -685,19 +728,24 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   const auto mode = cudaStreamCaptureModeThreadLocal;
   cudaGraph_t g, cap;
   CUDA_CHECK(cudaGraphCreate(&g, 0));
-  cudaGraphConditionalHandle hsw;
+  cudaGraphConditionalHandle hsw, hpass;
   CUDA_CHECK(cudaGraphConditionalHandleCreate(&hsw, g, 0, 0));
+  CUDA_CHECK(cudaGraphConditionalHandleCreate(&hpass, g, 0, 0));
   // DIAGNOSTICS (the batch graph's first instantiation failed on the ring, 2026-10-13): --bgraph-bodies N
-  // captures N switch bodies only; --bgraph-noif runs the entries' draft passes without if nodes (every
-  // entry's, on or not: a check of the graph's structure, not of the outputs)
+  // captures N switch bodies only; --bgraph-noif runs the entries' accepts without if nodes (every entry's,
+  // on or not: a check of the graph's structure, not of the outputs); --bgraph-check runs every entry's
+  // one-session draft after the pass and counts the words that differ (k_spec_draft_check)
   const int bodies = opt.bgraph_bodies > 0 ? std::min(kMaxRows, opt.bgraph_bodies) : kMaxRows;
-  const bool noif = opt.bgraph_noif;
-  IfHandles hif{};
+  const bool noif = opt.bgraph_noif, check = opt.bgraph_check;
+  IfHandles hif{}, hchk{};
   hif.n = noif ? 0 : sp.bents;  // a handle per if node, no more: a handle no node uses is an error at instantiate
   for (int k = 0; k < hif.n; ++k) CUDA_CHECK(cudaGraphConditionalHandleCreate(&hif.h[k], g, 0, 0));
-  // the step's rows, the switch's value and the ifs'
+  hchk.n = check ? sp.bents : 0;
+  for (int k = 0; k < hchk.n; ++k) CUDA_CHECK(cudaGraphConditionalHandleCreate(&hchk.h[k], g, 0, 0));
+  // the step's rows, the switch's value, the ifs' and the passes' switch's
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, nullptr, nullptr, 0, mode));
-  k_spec_in_batch<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, sp.row0, sp.stab, hsw, hif);
+  k_spec_in_batch<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, sp.row0, sp.stab, sp.bent, sp.pstab, hsw, hif, hpass,
+                                     hchk);
   CUDA_CHECK(cudaGetLastError());
   cudaStreamCaptureStatus cs;
   const cudaGraphNode_t* deps = nullptr;
@@ -732,7 +780,8 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &deps, nullptr, &nd));
   std::vector<cudaGraphNode_t> tail(deps, deps + nd);
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
-  // the entries' draft passes, each under its if
+  // the entries' accepts, each under its if: entry k's final rows from its row0 into its slot's windows,
+  // its anchor into the draft module's batch_start()[k] (what the pass reads)
   std::vector<cudaGraph_t> ifbody;
   for (int k = 0; k < sp.bents; ++k) {
     cudaGraph_t body = nullptr;
@@ -750,10 +799,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
       CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, tail.data(), nullptr, tail.size(), mode));
     }
     const int* slot = sp.stab + (size_t)k * dspark::kMaxAcc;
-    sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k);
-    sp.draft->draft(&sp.ss[k].bonus, st, slot);
-    k_spec_gate_batch<<<1, 32, 0, st>>>(in_d, sp.ss, k, sp.draft->tokens(), sp.draft->survival(), out_h);
-    CUDA_CHECK(cudaGetLastError());
+    sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k, sp.draft->batch_start() + k);
     if (!noif) {
       CUDA_CHECK(cudaStreamEndCapture(st, &cap));
       size_t kn = 0;
@@ -767,9 +813,68 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
       CUDA_CHECK(cudaStreamEndCapture(st, &cap));
     }
   }
+  // the draft passes over the entries on, after the last accept: a switch over their number S (the
+  // device's: k_spec_in_batch sets S - 1), body S - 1 running passes of at most kBatchEnts entries over
+  // the compact list (bent, pstab), each entry's token its bonus in its SpecState
+  {
+    cudaGraphNodeParams pp{};
+    pp.type = cudaGraphNodeTypeConditional;
+    pp.conditional.handle = hpass;
+    pp.conditional.type = cudaGraphCondTypeSwitch;
+    pp.conditional.size = sp.bents;
+    cudaGraphNode_t psw;
+    CUDA_CHECK(cudaGraphAddNode(&psw, g, tail.data(), nullptr, tail.size(), &pp));
+    for (int S = 1; S <= sp.bents; ++S) {
+      cudaGraph_t body = pp.conditional.phGraph_out[S - 1];
+      CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, body, nullptr, nullptr, 0, mode));
+      for (int c0 = 0; c0 < S; c0 += dspark::kBatchEnts) {
+        dspark::Draft::BatchPass bp{};
+        bp.ent = sp.bent + c0;
+        bp.n = std::min(dspark::kBatchEnts, S - c0);
+        bp.tok = &sp.ss[0].bonus;
+        bp.tok_stride = (int)(sizeof(ops::SpecState) / sizeof(int32_t));
+        bp.slot = sp.pstab + (size_t)c0 * ops::kDrafts;
+        sp.draft->draft_batch(bp, st);
+      }
+      CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+      size_t kn = 0;
+      CUDA_CHECK(cudaGraphGetNodes(body, nullptr, &kn));
+      nodes += kn;
+    }
+    tail.assign(1, psw);
+  }
+  // DIAGNOSTICS (--bgraph-check): every entry's one-session draft after the pass, under its own if (its
+  // accept once more, so that its anchor is in draft()'s buffer; the windows get the same values again),
+  // and the words of its drafts and confidence that differ from the pass's, counted in sp.mism
+  for (int k = 0; k < hchk.n; ++k) {
+    cudaGraphNodeParams ip{};
+    ip.type = cudaGraphNodeTypeConditional;
+    ip.conditional.handle = hchk.h[k];
+    ip.conditional.type = cudaGraphCondTypeIf;
+    ip.conditional.size = 1;
+    cudaGraphNode_t node = nullptr;
+    CUDA_CHECK(cudaGraphAddNode(&node, g, tail.data(), nullptr, tail.size(), &ip));
+    cudaGraph_t body = ip.conditional.phGraph_out[0];
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, body, nullptr, nullptr, 0, mode));
+    const int* slot = sp.stab + (size_t)k * dspark::kMaxAcc;
+    sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k);
+    sp.draft->draft(&sp.ss[k].bonus, st, slot);
+    k_spec_draft_check<<<1, 32, 0, st>>>(sp.draft->ids(), sp.draft->confidence(), sp.draft->batch_ids(k),
+                                         sp.draft->batch_confidence(k), sp.mism);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    size_t kn = 0;
+    CUDA_CHECK(cudaGraphGetNodes(body, nullptr, &kn));
+    nodes += kn;
+    ifbody.push_back(body);
+    tail.assign(1, node);
+  }
   sp.bnodes = nodes;
-  // the publication
+  // the gates, one kernel over the entries on, then the publication
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, tail.data(), nullptr, tail.size(), mode));
+  static_assert(ops::kMaxSess <= 32, "k_spec_gate_batch_all: a thread per entry");
+  k_spec_gate_batch_all<<<1, 32, 0, st>>>(in_d, sp.ss, sp.draft->batch_tokens(0), 8, sp.draft->batch_survival(0), 16,
+                                          out_h);
   k_spec_publish_batch<<<1, 32, 0, st>>>(in_d, out_h);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
@@ -1025,6 +1130,12 @@ uint64_t Model::Impl::launch_verify_batch(const SpecBatch& b) {
 
 void Model::bind_spec(dsw::WeightFile& wf) { d_->bind_spec(wf); }
 int Model::spec_batch_entries() const { return d_->spec ? d_->spec->bents : 0; }
+unsigned Model::spec_batch_mismatches() const {
+  if (!d_->spec || !d_->spec->mism) return 0;
+  unsigned n = 0;
+  CUDA_CHECK(cudaMemcpy(&n, d_->spec->mism, sizeof n, cudaMemcpyDeviceToHost));
+  return n;
+}
 uint64_t Model::launch_spec_batch(const SpecBatch& b) { return d_->launch_spec_batch(b); }
 uint64_t Model::launch_verify_batch(const SpecBatch& b) { return d_->launch_verify_batch(b); }
 void Model::spec_graphs() { d_->spec_graphs(); }
