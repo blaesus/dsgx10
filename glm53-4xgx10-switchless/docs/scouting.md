@@ -100,7 +100,7 @@ vLLM ([recipe](https://recipes.vllm.ai/zai-org/GLM-5.3), updated 2026-10-03), To
 B200/B300; full 1M context on 8× B200 with FP8 KV. Nothing in either recipe covers GB10 / DGX Spark (the SGLang
 cookbook has a `dgx-spark` hardware id only in its multi-node Docker flags).
 
-**Sampling and thinking.** `generation_config.json`: temperature 1.0, top-p 0.95; EOS ids 154820, 154827, 154829.
+**Sampling and thinking.** `generation_config.json` holds only the EOS ids 154820, 154827, 154829 (no sampling fields, checked 2026-10-13); the model card gives temperature 1.0, top-p 0.95.
 Thinking is always on: `reasoning_effort` takes `low`, `high`, `max` and **defaults to `max`**; the chat template has
 `clear_thinking` defaulting to false (pass true for chat). `enable_thinking=false` is not supported
 ([discussion #21](https://huggingface.co/zai-org/GLM-5.3/discussions/21), closed 2026-09-08). The chat template was
