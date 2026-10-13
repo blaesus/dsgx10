@@ -1,7 +1,18 @@
 // The prefill bench (included at the end of bench_experts.cu): one layer of 256 experts in the format, chunks of
 // T rows with 8 distinct uniformly random experts a row (balanced buckets), the whole call and each phase.
 // TFLOPS count the useful MACs: T x 8 x 3 x 512 x 6144 routed, T x 3 x 512 x 6144 shared, 2 FLOPs each.
-void bench_prefill(const std::string& fname, const std::string& chunks_s, bool fp4) {
+static std::vector<int> int_list(const std::string& s) {
+  std::vector<int> v;
+  size_t i = 0;
+  while (i < s.size()) {
+    size_t j = s.find(',', i);
+    if (j == std::string::npos) j = s.size();
+    v.push_back(atoi(s.substr(i, j - i).c_str()));
+    i = j + 1;
+  }
+  return v;
+}
+void bench_prefill(const std::string& fname, const std::string& chunks_s, bool fp4, const PfOpts& o) {
   const int pi = fname == "q4" ? 0 : fname == "s3" ? 2 : 3;
   const Pattern& pat = kPatterns[pi];
   size_t per = 0;  // 256 distinct experts: a real layer's bytes
@@ -58,34 +69,50 @@ void bench_prefill(const std::string& fname, const std::string& chunks_s, bool f
   }
   PrefillCfg cfg;
   cfg.fp4 = fp4;
-  for (size_t ci = 0; ci < chunks.size(); ++ci) {
-    const int T = chunks[ci];
-    const double mac = (double)T * kI * kH * 3, fl_r = 2 * mac * kTopK, fl_s = 2 * mac;
-    auto run = [&](int ph) {
-      return time_graph(3, [&](int, cudaStream_t st) { moe_prefill_phases(L, dx, di, dw, T, ws, dyr, dys, st, cfg, ph); }, 5);
-    };
-    const double all = run(kPhAll);
-    const double bucket = run(kPhBucket);
-    // the GEMM phases read the bucketing left in the workspace by the call before
-    const double up = run(kPhUp), down = run(kPhDown), comb = run(kPhCombine), sh = run(kPhShared);
-    result("PREFILL\t%s%s\tT %d\tall us %.0f\tTFLOPS %.1f\t%% of 107 %.1f\t75 layers ms %.1f\tms/1k rows %.2f", fname.c_str(),
-           fp4 ? " fp4" : "", T, all, (fl_r + fl_s) / all / 1e6, 100 * (fl_r + fl_s) / all / 1e6 / 107, 75 * all / 1e3,
-           all / 1e3 * 1024 / T);
-    result("PREFILL\t%s%s\tT %d\tphases us: bucket %.0f, up %.0f (%.1f TFLOPS), down %.0f (%.1f TFLOPS), combine %.0f, shared %.0f (%.1f TFLOPS)",
-           fname.c_str(), fp4 ? " fp4" : "", T, bucket, up, fl_r * 2 / 3 / up / 1e6, down, fl_r / 3 / down / 1e6, comb, sh,
-           fl_s / sh / 1e6);
-  }
+  cudaStream_t side;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
+  const std::vector<int> downs = fp4 ? std::vector<int>{0} : int_list(o.down), yrkbs = int_list(o.yrkb), sides = int_list(o.side),
+                         cqs = int_list(o.cq), ups = fp4 ? std::vector<int>{0} : int_list(o.up);
+  for (size_t ci = 0; ci < chunks.size(); ++ci)
+    for (int uv : ups)
+    for (int dn : downs)
+      for (int yk : yrkbs)
+        for (int q : cqs)
+        for (int sd : sides) {
+          if (dn == 0 && (yk != yrkbs[0] || q != cqs[0])) continue;  // budget and cq apply to the chained down only
+          const int T = chunks[ci];
+          cfg.up = uv, cfg.down = dn, cfg.yr_kb = yk, cfg.chain_q = q, cfg.side = sd ? side : nullptr;
+          char tag[128];
+          snprintf(tag, sizeof tag, "%s%s\tT %d\tup %d down %d yrkb %d cq %d side %d", fname.c_str(), fp4 ? " fp4" : "", T, uv, dn, yk,
+                   q, sd);
+          const double mac = (double)T * kI * kH * 3, fl_r = 2 * mac * kTopK, fl_s = 2 * mac;
+          auto run = [&](int ph) {
+            return time_graph(3, [&](int, cudaStream_t st) { moe_prefill_phases(L, dx, di, dw, T, ws, dyr, dys, st, cfg, ph); }, 5);
+          };
+          const double all = run(kPhAll);
+          const double bucket = run(kPhBucket);
+          // the GEMM phases read the bucketing left in the workspace by the call before
+          const double up = run(kPhUp), down = run(kPhDown), comb = dn ? 0 : run(kPhCombine), sh = run(kPhShared);
+          result("PREFILL\t%s\tall us %.0f\tTFLOPS %.1f\t%% of 107 %.1f\t75 layers ms %.1f\tms/1k rows %.2f", tag, all,
+                 (fl_r + fl_s) / all / 1e6, 100 * (fl_r + fl_s) / all / 1e6 / 107, 75 * all / 1e3, all / 1e3 * 1024 / T);
+          result("PREFILL\t%s\tphases us: bucket %.0f, up %.0f (%.1f TFLOPS), down %.0f (%.1f TFLOPS), combine %.0f, shared %.0f (%.1f TFLOPS)",
+                 tag, bucket, up, fl_r * 2 / 3 / up / 1e6, down, fl_r / 3 / down / 1e6, comb, sh, fl_s / sh / 1e6);
+        }
+  cfg.side = nullptr;
   // where the gate/up kernel's time goes (bf16 path, the largest chunk): parts switched off
-  if (!fp4) {
+  if (!fp4 && o.diag) {
     const int T = TM;
+    for (int uv : int_list(o.up))
     for (int dg : {0, 1, 2, 4, 3, 5, 6}) {
       PrefillCfg c = cfg;
       c.diag = dg;
+      c.up = uv;
       const double us = time_graph(3, [&](int, cudaStream_t st) { moe_prefill_phases(L, dx, di, dw, T, ws, dyr, dys, st, c, kPhUp); }, 5);
-      result("PREFILL\t%s\tT %d\tup kernel diag %d (%s%s%s)\tus %.0f", fname.c_str(), T, dg, dg & 1 ? "no weights " : "",
+      result("PREFILL\t%s\tT %d\tup %d kernel diag %d (%s%s%s)\tus %.0f", fname.c_str(), T, uv, dg, dg & 1 ? "no weights " : "",
              dg & 2 ? "no MMAs " : "", dg & 4 ? "no A loads" : "", us);
     }
   }
+  cudaStreamDestroy(side);
   cudaFree(dyr), cudaFree(dys), cudaFree(di), cudaFree(dw), cudaFree(dx), cudaFree(ws), cudaFree(shw), cudaFree(shs),
       cudaFree(ddesc), cudaFree(P.d);
 }
