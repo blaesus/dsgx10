@@ -31,6 +31,12 @@ constexpr int kShSlot = kMaxUnion;           // the shared expert's slot in the 
 enum Fmt : uint32_t { kNVFP4 = 0, kS3 = 1 };
 constexpr int kBlkK = 512;
 constexpr int kQ4Blk = 2304, kS3Blk = 1792;
+// S3x2, the quantiser's chosen 3-bit expert format (docs/quantiser.md Q1, quant/formats.py levelset3 with two
+// subsets; docs/experts.md section 13): kS3 with these two subsets of E2M1 magnitudes, subset A where a group's
+// scale byte has bit 7 clear, B where it is set. The main track stores gate and up in S3x2 and down in NVFP4;
+// the bracket stores all three in S3x2. Any pair decodes through the same tables (MatDesc::tab); this one is
+// what the converter writes (engine/weights/s3x2_pack.py) and what the loader expects (glw_kcheck).
+constexpr float kS3x2Mags[2][4] = {{0.5f, 2.f, 4.f, 6.f}, {0.5f, 1.5f, 3.f, 6.f}};
 constexpr size_t mat_bytes(uint32_t fmt, int N, int K) {
   return (size_t)(N / 8) * (K / kBlkK) * (fmt == kNVFP4 ? kQ4Blk : kS3Blk);
 }
@@ -75,7 +81,10 @@ void route(const float* logits, const float* bias, int M, int* idx, float* w, cu
 // Writes yr = sum over the rows' experts in expert-id order of w * down(h) and ys = the shared expert's
 // output, both f32 [M][6144] partial sums of this rank (the ring all-reduces them), and h's in ws.
 struct DecodeCfg {
-  int up = 0;     // up-kernel variant (decode.cu, kUpCfgs)
+  // up-kernel variant (decode.cu, kUp). 0 (the default) splits K over 6 warps; kUpPrefillOrder and the other
+  // "wk1" variants sum each strip's K in one warp, in prefill's order: their h, yr and ys equal moe_prefill's bit
+  // for bit (tested; docs/experts.md section 13).
+  int up = 0;
   int down = 0;   // down-kernel variant
   int up_ctas_per_sm = 0;  // 0: as many as fit
   bool pdl = true;
@@ -91,6 +100,7 @@ struct DecodeCfg {
   // producer half of comm::glm::allreduce2_add_norm (its consumer half: allreduce2_add_norm_posted). The same bits.
   const comm::DevChannel* post = nullptr;
 };
+constexpr int kUpPrefillOrder = 6;  // DecodeCfg::up: "nt1 wk1 p2", decode = prefill bit for bit
 size_t decode_ws_bytes();
 void moe_decode(const LayerW& L, const __nv_bfloat16* x, const int* idx, const float* w, int M, void* ws, float* yr,
                 float* ys, cudaStream_t st, const DecodeCfg& cfg = DecodeCfg());

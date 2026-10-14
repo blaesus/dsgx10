@@ -16,6 +16,11 @@ namespace gx {
 // S3 (quant/formats.py levelset3): codes [N][K/16][6] (each group of 16 a little-endian 48-bit word, value j
 // at bits 3j..3j+2), s [N][K/16] (bit 7: the group's subset, bits 6:0 its e4m3 scale), s2 f32, subsets
 // [1 or 2][4] ascending magnitudes.  W(n, k) = (-1)^(c >> 2) * mags[s >> 7][c & 3] * e4m3(s & 0x7f) * s2
+// S3x2 (the quantiser's format, docs/quantiser.md Q1; docs/experts.md section 13) is S3 with mags =
+// kS3x2Mags = {0.5, 2, 4, 6}, {0.5, 1.5, 3, 6}: per group of 16 the quantiser picks the subset and the scale
+// (bit 7 and bits 6:0 of the group's byte) by least squared error; s2 = f32(amax) / f32(2688) over the tensor.
+// The canonical tensors are levelset3's output as is; engine/weights/s3x2_pack.py is the converter's port of
+// pack_s3 and make_desc_s3x2 (tested byte for byte against these, tests/test_experts.cu "real").
 inline int q4_nibble(const uint8_t* w, int K, int n, int k) { return (w[(size_t)n * (K / 2) + k / 2] >> (4 * (k & 1))) & 15; }
 inline int s3_code(const uint8_t* c6, int K, int n, int k) {
   const uint8_t* p = c6 + ((size_t)n * (K / 16) + k / 16) * 6;
@@ -137,6 +142,46 @@ inline MatDesc make_desc(uint64_t off, float s2, uint32_t fmt, int nsub = 0, con
       d.nib[s] = s3_nibble_table(mags[s < nsub ? s : 0]);
     }
   return d;
+}
+// S3x2 (experts.h kS3x2Mags): the quantiser's two subsets, A for scale bytes with bit 7 clear, B with it set.
+inline MatDesc make_desc_s3x2(uint64_t off, float s2) { return make_desc(off, s2, kS3, 2, kS3x2Mags); }
+
+// The loader's check of an S3 descriptor (glw_kcheck): reads the two subsets back from the prmt tables and
+// accepts the descriptor only if each is four ascending E2M1 magnitudes and tab and nib are exactly what
+// make_desc builds from them (so the bf16 path and the FP4 path decode the same values). Returns the
+// subsets in mags; *pair_is_s3x2 tells whether they are kS3x2Mags.
+inline bool s3_desc_check(const MatDesc& d, float mags[2][4], bool* pair_is_s3x2 = nullptr) {
+  if (d.fmt != kS3) return false;
+  static const float grid[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+  for (int s = 0; s < 2; ++s)
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t lo = (d.tab[4 * s] >> 8 * j) & 0xFF, hi = (d.tab[4 * s + 2] >> 8 * j) & 0xFF;
+      mags[s][j] = bf16_bits_to_f((uint16_t)(hi << 8 | lo));
+      bool on_grid = false;
+      for (float g : grid) on_grid |= mags[s][j] == g;
+      if (!on_grid || (j && !(mags[s][j] > mags[s][j - 1]))) return false;
+    }
+  const MatDesc r = make_desc(d.off, d.s2, kS3, 2, mags);
+  if (memcmp(r.tab, d.tab, sizeof d.tab) || memcmp(r.nib, d.nib, sizeof d.nib)) return false;
+  if (pair_is_s3x2) *pair_is_s3x2 = !memcmp(mags, kS3x2Mags, sizeof(float) * 8);
+  return true;
+}
+// A matrix's scale bytes as stored in its blocks (blocks of size bs, scales from byte so): none may be the e4m3
+// NaN (low 7 bits 0x7F). NVFP4's must be positive (the FP4 tensor-core path reads them as ue4m3); in S3, bit 7
+// is the subset, so a matrix with one subset (tab halves equal) may still set it. Returns the number of bad bytes,
+// and counts the groups of subset B in *nb (S3).
+inline size_t scale_bytes_check(const uint8_t* m, uint32_t fmt, int N, int K, size_t* nb = nullptr) {
+  const int bs = fmt == kNVFP4 ? kQ4Blk : kS3Blk, so = fmt == kNVFP4 ? 2048 : 1536;
+  const size_t blocks = (size_t)(N / 8) * (K / kBlkK);
+  size_t bad = 0, b = 0;
+  for (size_t i = 0; i < blocks; ++i)
+    for (int j = 0; j < 256; ++j) {
+      const uint8_t s = m[i * bs + so + j];
+      bad += (s & 0x7F) == 0x7F || (fmt == kNVFP4 && (s & 0x80));
+      b += s >> 7;
+    }
+  if (nb) *nb = fmt == kS3 ? b : 0;
+  return bad;
 }
 
 }  // namespace gx

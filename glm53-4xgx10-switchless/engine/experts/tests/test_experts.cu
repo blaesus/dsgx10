@@ -19,12 +19,15 @@ using namespace gx;
 
 static int g_fail = 0;
 static FILE* g_out = nullptr;
-static void check(const char* name, bool ok, const char* fmt, ...) {
+static std::string g_tag;  // prefixed to every check's name (the real-expert runs: "real l3r1: ")
+static void check(const char* name0, bool ok, const char* fmt, ...) {
   char buf[512];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof buf, fmt, ap);
   va_end(ap);
+  const std::string nm = g_tag + name0;
+  const char* name = nm.c_str();
   printf("CHECK %-44s %s  %s\n", name, ok ? "ok  " : "FAIL", buf);
   fflush(stdout);
   if (g_out) fprintf(g_out, "CHECK\t%s\t%s\t%s\n", name, ok ? "ok" : "FAIL", buf), fflush(g_out);
@@ -68,8 +71,8 @@ static void cpu_checks() {
   }
   {  // S3: pack a lane, decode through selectors + prmt, both subsets
     int bad = 0;
-    for (int sub = 0; sub < 2; ++sub) {
-      const float* mg = sub ? kSubB : kSubA;
+    for (int sub = 0; sub < 3; ++sub) {
+      const float* mg = sub == 2 ? kSubC : sub ? kSubB : kSubA;
       const S3Tab T = s3_table(mg);
       for (int r = 0; r < 2048; ++r) {
         uint8_t v[32];
@@ -88,7 +91,7 @@ static void cpu_checks() {
         }
       }
     }
-    check("cpu s3 pack + prmt decode (2 subsets)", !bad, "%d mismatches", bad);
+    check("cpu s3 pack + prmt decode (subsets A, B, C)", !bad, "%d mismatches", bad);
   }
   {  // FP8 widen, every non-NaN byte
     int bad = 0;
@@ -103,8 +106,8 @@ static void cpu_checks() {
   }
   {  // the S3 nibble table (FP4 path): the nibble's e2m1 value equals the code's value
     int bad = 0;
-    for (int sub = 0; sub < 2; ++sub) {
-      const float* mg = sub ? kSubB : kSubA;
+    for (int sub = 0; sub < 3; ++sub) {
+      const float* mg = sub == 2 ? kSubC : sub ? kSubB : kSubA;
       const uint32_t t = s3_nibble_table(mg);
       for (int c = 0; c < 8; ++c) {
         const float want = (c & 4 ? -1.f : 1.f) * mg[c & 3];
@@ -112,6 +115,26 @@ static void cpu_checks() {
       }
     }
     check("cpu s3 code -> e2m1 nibble table", !bad, "%d mismatches", bad);
+  }
+  {  // the loader's descriptor check (glw_kcheck): S3x2 accepted as the pair, another pair accepted as not the pair,
+     // a damaged table or nibble word, a non-E2M1 or descending subset refused
+    int bad = 0;
+    float mg[2][4];
+    bool pair = false;
+    const MatDesc a = make_desc_s3x2(4096, 0.01f);
+    bad += !s3_desc_check(a, mg, &pair) || !pair || memcmp(mg, kS3x2Mags, sizeof mg);
+    const float ac[2][4] = {{kSubA[0], kSubA[1], kSubA[2], kSubA[3]}, {kSubC[0], kSubC[1], kSubC[2], kSubC[3]}};
+    bad += !s3_desc_check(make_desc(0, 1.f, kS3, 2, ac), mg, &pair) || pair;
+    MatDesc d = a;
+    d.tab[5] ^= 0x100;  // a low byte of subset B
+    bad += s3_desc_check(d, mg);
+    d = a;
+    d.nib[1] ^= 1;
+    bad += s3_desc_check(d, mg);
+    const float desc_[2][4] = {{0.5f, 4.f, 2.f, 6.f}, {0.5f, 1.5f, 3.f, 6.f}}, offg[2][4] = {{0.5f, 2.f, 4.f, 5.f}, {0.5f, 1.5f, 3.f, 6.f}};
+    bad += s3_desc_check(make_desc(0, 1.f, kS3, 2, desc_), mg) + s3_desc_check(make_desc(0, 1.f, kS3, 2, offg), mg);
+    bad += s3_desc_check(make_desc(0, 1.f, kNVFP4), mg);
+    check("cpu s3 descriptor check (loader)", !bad, "%d wrong verdicts of 7", bad);
   }
   {  // packers against the canonical decode, through the layout readers
     int bad = 0;
@@ -339,10 +362,10 @@ static DecodeRun run_decode(const TestLayer& L, const __nv_bfloat16* dx, const i
   return r;
 }
 
-static void test_decode() {
-  TestLayer L;
-  L.build(10, 1);
-  L.upload();
+static void test_decode(TestLayer* ext = nullptr) {  // ext: an uploaded layer (the real experts), else synthetic
+  TestLayer syn;
+  if (!ext) syn.build(10, 1), syn.upload();
+  TestLayer& L = ext ? *ext : syn;
   Ref R(L);
   void* ws;
   CUDA_CHECK(cudaMalloc(&ws, decode_ws_bytes()));
@@ -375,7 +398,7 @@ static void test_decode() {
   // full check against the CPU at several row counts
   std::map<int, DecodeRun> runs;
   std::map<int, HRef> refs;
-  for (int M : {1, 3, 5, 8, 9, 16}) {
+  for (int M : {1, 3, 5, 6, 8, 9, 16}) {
     DecodeRun r = run_decode(L, dx, di, dw, M, idx, ws, dyr, dys, DecodeCfg());
     const int U = (int)r.uni.size();
     HRef& hr = refs[M];
@@ -459,20 +482,111 @@ static void test_decode() {
                    b.h.size(), hfar);
       }
   cudaFree(ws), cudaFree(dyr), cudaFree(dys), cudaFree(dl), cudaFree(db), cudaFree(di), cudaFree(dw), cudaFree(dx);
-  L.free_dev();
+  if (!ext) L.free_dev();
 }
 
-void test_prefill();  // test_prefill.inc
+void test_prefill(TestLayer* ext = nullptr, bool light = false);  // test_prefill.inc
+
+// ------------------------------------------------------------------------------------------------------------------
+// S3x2 and the mixed expert on the quantiser's own bytes (engine/weights/s3x2_pack.py dump: real BF16 experts of
+// layers 3 and 40 cut to a rank; dump-random: random canonical bits). Host: the Python packer's blocks and
+// descriptors equal layout.h's byte for byte; every value of the torch model of the format (levelset3_dequant /
+// nvfp4_dequant without s2) equals layout.h's canonical reader and its reader of the Python-packed blocks; the
+// loader's checks pass. GPU: the kernels' decode of every value equals the torch model's; then the decode and
+// prefill tests on a layer of these experts.
+static void real_host(const TestLayer& L, const std::vector<RealMat>& rm) {
+  size_t pb = 0, db = 0, vb = 0, rb = 0, sb = 0, nv = 0, nb = 0, nsc = 0, nds = 0;
+  int s3 = 0, q4 = 0;
+  for (size_t i = 0; i < L.m.size(); ++i) {
+    const HostMat& m = L.m[i];
+    const RealMat& r = rm[i];
+    std::vector<uint8_t> pk(m.packed.size());
+    if (m.fmt == kS3) pack_s3(m.w.data(), m.s.data(), m.N, m.K, pk.data()), ++s3;
+    else pack_nvfp4(m.w.data(), m.s.data(), m.N, m.K, pk.data()), ++q4;
+    for (size_t j = 0; j < pk.size(); ++j) pb += pk[j] != m.packed[j];
+    const MatDesc d = m.fmt == kS3 ? make_desc_s3x2(0, m.s2) : make_desc(0, m.s2, kNVFP4);
+    db += memcmp(&d, r.desc.data(), sizeof d) != 0;
+    MatDesc rd;
+    memcpy(&rd, r.desc.data(), sizeof rd);
+    float mg[2][4];
+    bool pair = false;
+    if (m.fmt == kS3) nds += !s3_desc_check(rd, mg, &pair) || !pair;
+    size_t nbm = 0;
+    sb += scale_bytes_check(m.packed.data(), m.fmt, m.N, m.K, &nbm);
+    nb += nbm, nsc += m.fmt == kS3 ? (size_t)m.N * m.K / 16 : 0;
+    size_t v1 = 0, v2 = 0;
+#pragma omp parallel for reduction(+ : v1, v2)
+    for (int n = 0; n < m.N; ++n)
+      for (int k = 0; k < m.K; ++k) {
+        const float want = bf16_bits_to_f(r.val[(size_t)n * m.K + k]);
+        const float c = m.value(n, k);
+        const float g = m.fmt == kS3 ? read_s3(m.packed.data(), m.mags, m.K, n, k) : read_q4(m.packed.data(), m.K, n, k);
+        v1 += fbits(c) != fbits(want);
+        v2 += fbits(g) != fbits(want);
+      }
+    vb += v1, rb += v2, nv += (size_t)m.N * m.K;
+  }
+  check("real: python packer = layout.h packer", !pb, "%zu bytes differ (%d S3x2, %d NVFP4 matrices)", pb, s3, q4);
+  check("real: python MatDesc = make_desc", !db && !nds, "%zu of %zu descriptors differ; %zu S3 not the S3x2 pair", db, L.m.size(), nds);
+  check("real: torch model = canonical reader", !vb, "%zu of %zu values differ (bits, without s2)", vb, nv);
+  check("real: torch model = reader of the packed blocks", !rb, "%zu of %zu values differ", rb, nv);
+  check("real: scale bytes (loader check)", !sb, "%zu bad; subset B in %.1f %% of S3 groups", sb, nsc ? 100.0 * nb / nsc : 0.0);
+}
+static void real_deq(const TestLayer& L, const std::vector<RealMat>& rm) {
+  size_t bad = 0, n = 0;
+  for (size_t i = 0; i < L.m.size(); ++i) {
+    const HostMat& m = L.m[i];
+    const MatDesc d = m.fmt == kS3 ? make_desc_s3x2(0, m.s2) : make_desc(0, m.s2, kNVFP4);
+    uint8_t* dm = h2d(m.packed);
+    uint16_t* dout;
+    CUDA_CHECK(cudaMalloc(&dout, (size_t)m.N * m.K * 2));
+    const int warps = m.N / 8 * (m.K / kBlkK);
+    k_deq<<<(warps + 7) / 8, 256>>>(dm, d, m.N, m.K, dout);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const auto got = d2h(dout, (size_t)m.N * m.K);
+    for (size_t j = 0; j < got.size(); ++j) {
+      const float v = bf16_bits_to_f(rm[i].val[j]);
+      const uint16_t want = m.fmt == kS3 ? rm[i].val[j] : f_to_bf16_bits(v * 0x1p-30f);
+      bad += got[j] != want && !(v == 0 && (got[j] & 0x7FFF) == 0);
+    }
+    n += got.size();
+    CUDA_CHECK(cudaFree(dm));
+    CUDA_CHECK(cudaFree(dout));
+  }
+  check("real: GPU decode = torch model", !bad, "%zu of %zu values differ (bf16 bits; NVFP4 x 2^-30)", bad, n);
+}
+static void test_real(const std::string& dir, bool gpu) {
+  const std::string tag = dir.substr(dir.find_last_of('/') + 1);
+  g_tag = "[" + tag + "] ";
+  TestLayer L;
+  std::vector<RealMat> rm;
+  load_real(L, rm, dir, 5);
+  printf("== %s: %d stored experts (%zu matrices)\n", dir.c_str(), L.NS, L.m.size());
+  real_host(L, rm);
+  if (gpu) {
+    real_deq(L, rm);
+    L.upload();
+    test_decode(&L);
+    test_prefill(&L, true);
+    L.free_dev();
+  }
+  g_tag.clear();
+}
 
 int main(int argc, char** argv) {
   std::set<std::string> what;
+  std::vector<std::string> real;
   bool cpu = false;
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--cpu")) cpu = true;
     else if (!strcmp(argv[i], "--out") && i + 1 < argc) g_out = fopen(argv[++i], "a");
+    else if (!strcmp(argv[i], "--real") && i + 1 < argc) real.push_back(argv[++i]);
     else what.insert(argv[i]);
   }
-  if (cpu) {
+  if (!real.empty()) {  // --real DIR ...: those layers only (with --cpu, their host checks only)
+    if (cpu) cpu_checks();
+    for (const auto& d : real) test_real(d, !cpu);
+  } else if (cpu) {
     cpu_checks();
   } else {
     auto want = [&](const char* w) { return what.empty() || what.count(w); };

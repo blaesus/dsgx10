@@ -241,10 +241,12 @@ __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
     pre = false;
 
     // partials -> shared memory; warp i % WK finishes strip pair i (gate tile i, up tile NT + i)
+    if (WK > 1) {
 #pragma unroll
-    for (int i = 0; i < NTL; ++i)
-      *reinterpret_cast<float4*>(&red[warp][i][lane][0]) = make_float4(c[i][0], c[i][1], c[i][2], c[i][3]);
-    __syncthreads();
+      for (int i = 0; i < NTL; ++i)
+        *reinterpret_cast<float4*>(&red[warp][i][lane][0]) = make_float4(c[i][0], c[i][1], c[i][2], c[i][3]);
+      __syncthreads();
+    }
     float kg = 1.f, ku = 1.f;
     if (!sh) {
       const MatDesc* dg = a.L.desc + U.id[slot] * 3;
@@ -255,12 +257,18 @@ __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
     for (int i = 0; i < NT; ++i) {
       if (i % WK != warp) continue;
       float gs[4], us[4];
+      if (WK == 1) {  // one warp summed all of K, in prefill's order: its sums as they are (no 0 + c, which
+                      // would turn a -0 into +0), so h equals moe_prefill's bit for bit
 #pragma unroll
-      for (int e = 0; e < 4; ++e) gs[e] = us[e] = 0.f;
+        for (int e = 0; e < 4; ++e) gs[e] = c[i][e], us[e] = c[NT + i][e];
+      } else {
 #pragma unroll
-      for (int w = 0; w < WK; ++w)
+        for (int e = 0; e < 4; ++e) gs[e] = us[e] = 0.f;
 #pragma unroll
-        for (int e = 0; e < 4; ++e) gs[e] += red[w][i][lane][e], us[e] += red[w][NT + i][lane][e];
+        for (int w = 0; w < WK; ++w)
+#pragma unroll
+          for (int e = 0; e < 4; ++e) gs[e] += red[w][i][lane][e], us[e] += red[w][NT + i][lane][e];
+      }
       float hv[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
@@ -451,6 +459,8 @@ struct UpV { int nt, wk, p; const char* name; };
 constexpr UpV kUp[] = {
     {1, 6, 2, "nt1 wk6 p2"}, {1, 4, 2, "nt1 wk4 p2"}, {1, 4, 1, "nt1 wk4 p1"},
     {2, 4, 1, "nt2 wk4 p1"}, {1, 2, 2, "nt1 wk2 p2"}, {2, 2, 1, "nt2 wk2 p1"},
+    // one warp a task, K in prefill's order (kUpPrefillOrder = 6): decode = prefill bit for bit
+    {1, 1, 2, "nt1 wk1 p2"}, {1, 1, 4, "nt1 wk1 p4"}, {2, 1, 2, "nt2 wk1 p2"},
 };
 struct DownV { int nt, p; const char* name; };
 constexpr DownV kDown[] = {{2, 1, "nt2 p1"}, {1, 2, "nt1 p2"}, {1, 3, "nt1 p3"}, {2, 2, "nt2 p2"}, {1, 4, "nt1 p4"}};
@@ -501,6 +511,9 @@ void moe_decode(const LayerW& L, const __nv_bfloat16* x, const int* idx, const f
     case 3: up_launch<2, 4, 1>(p, cps, st, cfg.pdl); break;
     case 4: up_launch<1, 2, 2>(p, cps, st, cfg.pdl); break;
     case 5: up_launch<2, 2, 1>(p, cps, st, cfg.pdl); break;
+    case 6: up_launch<1, 1, 2>(p, cps, st, cfg.pdl); break;
+    case 7: up_launch<1, 1, 4>(p, cps, st, cfg.pdl); break;
+    case 8: up_launch<2, 1, 2>(p, cps, st, cfg.pdl); break;
     default: die("moe_decode: up variant %d", cfg.up);
   }
   if (cfg.parts & 2) switch (cfg.down) {
