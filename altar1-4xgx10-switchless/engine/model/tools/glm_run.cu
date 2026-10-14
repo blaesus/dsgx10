@@ -472,9 +472,13 @@ void check_state(Model& m, comm::Ring& ring) {
   while (lead < kLayers && h2[lead] == h0[lead]) ++lead;
   same = 0;
   for (int l = 0; l < kCacheLayers; ++l) same += h2[l] == h0[l];
-  check(rk, lead >= kDenseLayers + 1, "decode steps (16 rows) = prefill: the caches of layers 0-%d identical (the first "
-        "MoE output feeds layer 4: routed sums in another order from there; %d of %d layers identical)", lead - 1, same,
-        kCacheLayers);
+  if (o.moe_up == gx::kUpPrefillOrder)  // decode's routed experts in prefill's K order: every layer the same bits
+    check(rk, same == kCacheLayers, "decode steps (16 rows, experts in prefill's K order, --moe-up %d) = prefill: %d of "
+          "%d layers' caches identical", o.moe_up, same, kCacheLayers);
+  else
+    check(rk, lead >= kDenseLayers + 1, "decode steps (16 rows) = prefill: the caches of layers 0-%d identical (the first "
+          "MoE output feeds layer 4: routed sums in another order from there; %d of %d layers identical)", lead - 1, same,
+          kCacheLayers);
   // (3) batch invariance and determinism: 16 rows in one step (eager, then graph) vs 16 steps of one row, after the
   // same prefix
   m.prefill(3, 0, P, tok.data());
@@ -1353,6 +1357,7 @@ int main(int argc, char** argv) {
     else if (a == "--pf-blocks") A.mo.prefill_comm_blocks = std::stoi(nx());
     else if (a == "--pf-min-piece") A.mo.prefill_min_piece = std::stoi(nx());
     else if (a == "--splits") A.mo.attn_splits = std::stoi(nx());
+    else if (a == "--moe-up") A.mo.moe_up = std::stoi(nx());
     else if (a == "--rows") A.rows = parse_list(nx());
     else if (a == "--tune") A.mo.tune = (uint32_t)std::stoul(nx(), nullptr, 16);
     else if (a == "--ab") A.ab = (uint32_t)std::stoul(nx(), nullptr, 16);

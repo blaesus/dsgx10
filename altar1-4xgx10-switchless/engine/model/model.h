@@ -139,6 +139,9 @@ struct Options {
   int prefill_pieces = 2;   // kTunePfOverlap: pieces a chunk (1-8), each of a multiple of 64 rows (2: measured best)
   int prefill_min_piece = 512;  // kTunePfOverlap: rows of a piece at least (chunks of fewer than twice that: one piece)
   int prefill_comm_blocks = 4;  // kTunePfOverlap: blocks of the overlapped reduce-scatters and all-gathers (1-16; T6: 4)
+  // the decode expert kernels' up variant (gx::DecodeCfg::up): 0, the default (glm53 decision 11's K order), or
+  // gx::kUpPrefillOrder (6): decode = prefill bit for bit (glm_run check's strong form; experts.md § 8.1)
+  int moe_up = 0;
   int attn_splits = 0;   // sparse attention's split-K at decode (0: 16 up to 2 rows, 8 above)
   size_t index_scratch = 512ull << 20;  // the prefill indexer's score scratch, bytes
 };

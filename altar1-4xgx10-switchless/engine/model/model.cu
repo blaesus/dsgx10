@@ -322,6 +322,7 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     mark(kKShared, l);
     gx::DecodeCfg dc;
     dc.pdl = P;
+    dc.up = opt.moe_up;
     if (tune(kTuneRoute)) dc.logits = gl, dc.bias = w.router_bias;
     else gx::route(gl, w.router_bias, R, ridx, rw, st, P);
     const bool post = tune(kTunePost);

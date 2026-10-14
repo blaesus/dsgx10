@@ -3,7 +3,8 @@
 # runs, so a preempted job (ring.sh exit 76) is resumed by starting it again. One job, through the DeepSeek engine's
 # ring.sh, from the repo root:
 #   OWNER=altar1-model ds41f-4xgx10-switchless/engine/server/ring.sh altar1-4xgx10-switchless/engine/model/run.sh [step...]
-# Steps (synthetic weights in the real layouts): check, bench, mtp (bench with one draft), l2pf, prefill, refhash,
+# Steps (synthetic weights in the real layouts): check, check6 (the same with the decode experts in prefill's K order:
+# decode = prefill in every layer), bench, mtp (bench with one draft), l2pf, prefill, refhash,
 # ab (the speed levers ABBASE, default none, against AB, default all, A/B/B/A at ABROWS: time and output bits),
 # trace (graph steps at TROWS, default 1,6, under nsys on every rank: run/nsys/glm_run.<rank>.nsys-rep),
 # pfab (prefill A B B A of the lever sets PFA, default f7: the collectives overlapped, attention by k_attn, against
@@ -69,6 +70,7 @@ for s in "${steps[@]}"; do
   T="--tag $s.$(date '+%FT%T')"
   case $s in
     check) cmd=($G $T --slots 6 --max-ctx 8192 --chunk 2048 --splits 1 $EXTRA check) ;;
+    check6) cmd=($G $T --slots 6 --max-ctx 8192 --chunk 2048 --splits 1 --moe-up 6 $EXTRA check) ;;  # decode = prefill, every layer
     bench) cmd=($G $T --max-ctx 8192 --ctx 4096 $EXTRA bench) ;;
     mtp) cmd=($G $T --max-ctx 8192 --ctx 4096 --drafts 1 --rows 1,2,4 $EXTRA bench) ;;
     l2pf) cmd=($G $T --max-ctx 8192 --ctx 4096 --rows 1,6,16 $EXTRA l2pf) ;;
