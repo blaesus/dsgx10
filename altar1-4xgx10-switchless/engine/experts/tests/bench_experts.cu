@@ -1,14 +1,17 @@
 // Benchmarks of the routed-expert kernels on one GB10 (GPU: only through ring.sh).
 //   bench_experts --bw                                   the window's streaming read
-//   bench_experts --decode q4|s3|mix [--rows 1,2,4,6,8,16,6c] [--sweep | --ups 0,6,6,0] [--out f.tsv]
-//                 (s3: S3x2 on every projection, the bracket; mix: S3x2 gate/up + NVFP4 down, the main track; --ups:
-//                 those up variants in that order, e.g. the default against the prefill-order wk1, A B B A)
-//   bench_experts --prefill q4|s3|mix [--chunks 1024,4096,8192] [--fp4] [--down 0,1] [--yrkb 0] [--side 0] [--cq 4] [--up 0,1] [--sh 128] [--diag]
-//                 [--out f.tsv]   (down: PrefillCfg::down variants; yrkb: chained-down L2 budgets, KB; side: the
-//                 shared expert on a second stream; cq: chained-down passes in flight; up: PrefillCfg::up variants; diag: the gate/up kernel and the chained down with parts switched off; sh: the shared down's rows a CTA)
+//   bench_experts --decode i4|b16|q4 [--rows 1,6,16] [--sweep | --ups 0,6,6,0] [--out f.tsv]
+//                 (a layer of the format; --ups: those up variants in that order, e.g. the default against the
+//                 prefill-order wk1, A B B A)
+//   bench_experts --prefill i4|b16|q4 [--chunks 1024,4096,8192] [--down 0,1] [--yrkb 0] [--cq 4] [--up 0,1] [--diag]
+//                 [--out f.tsv]   (down / up: PrefillCfg variants; yrkb: chained-down L2 budgets, KB; cq: chained-down
+//                 passes in flight; diag: the gate/up kernel and the chained down with parts switched off)
+//   bench_experts --shared [--rows 1,6,16]   altar-1's BF16 shared expert through attn's BF16 GEMV (gate/up
+//                 interleaved, SwiGLU epilogue; down to f32 partials), every split-K
 // Decode: a pool of >= 2.2 GB of experts in the format (random bits, valid scales) is cycled so L2 holds no
 // step's weights; each step routes its rows (logits that pick a chosen set) and runs the expert step; a CUDA
-// graph of whole steps, the median of 7 replays. Bytes = the union's weights and scales + the shared expert's.
+// graph of whole steps, the median of 7 replays. Bytes = the union's routed blocks (values, scales, zero points).
+// No fused shared expert (altar-1's is BF16 and runs outside: --shared).
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -17,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "attn/attn.h"
 #include "experts/formats.cuh"
 #include "experts/tests/testdata.h"
 
@@ -71,27 +75,26 @@ static double time_graph(int steps, F launch, int reps = 7) {
 }
 
 // ---- data on the GPU ----------------------------------------------------------------------------------------
-// a matrix region of `blocks` blocks of size bs whose bytes from so on are scales: random bits, valid scales
-__global__ void k_fill_mat(uint8_t* p, size_t blocks, int bs, int so, uint64_t seed, int sub2) {
+// `blocks` blocks of format fmt: random values, valid scales (testdata.h's generators)
+__global__ void k_fill_mat(uint8_t* p, size_t blocks, uint32_t fmt, uint64_t seed) {
+  const int bs = fmt == kNVFP4 ? kQ4Blk : fmt == kINT4 ? kI4Blk : kB16Blk;
   const size_t n = blocks * bs / 4;
   for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
     const uint64_t h = mix64(seed ^ (i * 0x9E3779B97F4A7C15ull));
+    const int o = (int)((i * 4) % bs);
     uint32_t v = (uint32_t)h;
-    if ((int)((i * 4) % bs) >= so) {
+    if (fmt == kBF16) v = rnd_b16(h) | (uint32_t)rnd_b16(h >> 21) << 16;
+    else if (fmt == kINT4 && o >= 2048 && o < 2304) v = rnd_i4_scale(h) | (uint32_t)rnd_i4_scale(h >> 24) << 16;
+    else if (fmt == kNVFP4 && o >= 2048) {
       v = 0;
-      for (int b = 0; b < 4; ++b) v |= (uint32_t)(rnd_scale(h >> (8 * b)) | (sub2 && (h >> (32 + b)) & 1 ? 0x80 : 0)) << (8 * b);
+      for (int b = 0; b < 4; ++b) v |= (uint32_t)rnd_scale(h >> (8 * b)) << (8 * b);
     }
     reinterpret_cast<uint32_t*>(p)[i] = v;
   }
 }
-__global__ void k_fill_fp8(uint8_t* p, size_t n, uint64_t seed) {
-  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n / 4; i += (size_t)gridDim.x * blockDim.x) {
-    uint32_t v = (uint32_t)mix64(seed ^ (i * 0x9E3779B97F4A7C15ull)) & 0xC7C7C7C7u;  // small exponents, no NaN
-    reinterpret_cast<uint32_t*>(p)[i] = v | 0x30303030u;
-  }
-}
-__global__ void k_fill_f32(float* p, size_t n, float v) {
-  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) p[i] = v;
+__global__ void k_fill_b16(uint16_t* p, size_t n, uint64_t seed) {
+  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+    p[i] = rnd_b16(mix64(seed ^ (i * 0x9E3779B97F4A7C15ull)));
 }
 __global__ void k_read(const int4* __restrict__ p, size_t n, int* out) {
   int4 acc = make_int4(0, 0, 0, 0);
@@ -125,39 +128,30 @@ static double bench_bw() {
 
 // ---- the decode bench ---------------------------------------------------------------------------------------------
 struct Pool {
+  uint32_t fmt = kINT4;
   int NP = 0;
-  std::vector<uint32_t> fmt;  // [NP * 3]
-  std::vector<uint64_t> off;
-  std::vector<size_t> bytes;  // a stored expert's routed bytes
+  std::vector<uint64_t> off;  // [NP * 3]
+  size_t per = 0;             // a stored expert's routed bytes
   uint8_t* d = nullptr;
   size_t total = 0;
 };
-static Pool make_pool(const Pattern& pat, double target) {
+static Pool make_pool(uint32_t fmt, double target) {
   Pool P;
-  size_t per = 0;
-  for (int j = 0; j < 3; ++j) per += mat_bytes(pat.f[j], j < 2 ? kI : kH, j < 2 ? kH : kI);
-  P.NP = (int)(target / per) + 1;
-  for (int e = 0; e < P.NP; ++e) {
-    size_t b = 0;
-    for (int j = 0; j < 3; ++j) {
-      P.fmt.push_back(pat.f[j]);
-      P.off.push_back(P.total);
-      const size_t mb = mat_bytes(pat.f[j], j < 2 ? kI : kH, j < 2 ? kH : kI);
-      P.total += mb;
-      b += mb;
-    }
-    P.bytes.push_back(b);
-  }
-  CUDA_CHECK(cudaMalloc(&P.d, P.total));
+  P.fmt = fmt;
+  for (int j = 0; j < 3; ++j) P.per += mat_bytes(fmt, j < 2 ? kI : kH, j < 2 ? kH : kI);
+  P.NP = (int)(target / P.per) + 1;
   for (int e = 0; e < P.NP; ++e)
     for (int j = 0; j < 3; ++j) {
-      const uint32_t f = pat.f[j];
-      const int bs = f == kNVFP4 ? kQ4Blk : kS3Blk, so = f == kNVFP4 ? 2048 : 1536;
-      const size_t blocks = mat_bytes(f, j < 2 ? kI : kH, j < 2 ? kH : kI) / bs;
-      k_fill_mat<<<192, 256>>>(P.d + P.off[e * 3 + j], blocks, bs, so, e * 3 + j + 1, f == kS3 && pat.nsub[j] > 1);
+      P.off.push_back(P.total);
+      P.total += mat_bytes(fmt, j < 2 ? kI : kH, j < 2 ? kH : kI);
     }
+  CUDA_CHECK(cudaMalloc(&P.d, P.total));
+  k_fill_mat<<<384, 256>>>(P.d, P.total / blk_bytes(fmt), fmt, 12345 + fmt);
   CUDA_CHECK(cudaDeviceSynchronize());
   return P;
+}
+static MatDesc pool_desc(const Pool& P, int x, int j) {
+  return make_desc(P.off[x * 3 + j], P.fmt == kNVFP4 ? (j < 2 ? kS2Up : kS2Down) : 1.f, P.fmt);
 }
 
 static std::vector<int> parse_rows(const std::string& s, std::vector<std::string>& names) {
@@ -175,21 +169,9 @@ static std::vector<int> parse_rows(const std::string& s, std::vector<std::string
 }
 
 static void bench_decode(const std::string& fname, const std::string& rows_s, bool sweep) {
-  const int pi = fname == "q4" ? 0 : fname == "s3" ? 2 : 3;
-  const Pattern& pat = kPatterns[pi];
-  Pool P = make_pool(pat, 2.2e9);
-  // shared experts: 8 copies (each 9.4 MB, so L2 holds none across steps)
-  constexpr int NSH = 8;
-  const size_t shm = (size_t)kI * kH;
-  uint8_t* shw;
-  float* shs;
-  CUDA_CHECK(cudaMalloc(&shw, NSH * 3 * shm));
-  CUDA_CHECK(cudaMalloc(&shs, NSH * 3 * 4 * 48 * 4));
-  k_fill_fp8<<<192, 256>>>(shw, NSH * 3 * shm, 77);
-  k_fill_f32<<<16, 256>>>(shs, NSH * 3 * 4 * 48, 1.f / 512);
-  const double sh_bytes = 3.0 * shm + 3 * 4 * 48 * 4;
-  printf("== decode %s: %d experts in the pool (%.2f GB), %.3f MB an expert\n", fname.c_str(), P.NP, P.total / 1e9,
-         P.bytes[0] / 1e6);
+  const uint32_t fmt = fmt_of(fname);
+  Pool P = make_pool(fmt, 2.2e9);
+  printf("== decode %s: %d experts in the pool (%.2f GB), %.3f MB an expert\n", fname.c_str(), P.NP, P.total / 1e9, P.per / 1e6);
   std::vector<std::string> names;
   const std::vector<int> rows = parse_rows(rows_s, names);
   constexpr int NS = 64;  // steps a graph
@@ -213,58 +195,38 @@ static void bench_decode(const std::string& fname, const std::string& rows_s, bo
   std::vector<__nv_bfloat16> hx;
   rnd_x(hx, (size_t)kMaxRows * kH, 5);
   CUDA_CHECK(cudaMemcpy(dx, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
-  // per-step descriptors: id e of step s -> stored expert (s * 211 + e * 7) % NP, cycling the pool
+  // per-step descriptors: id e of step s -> stored expert (s * kE + e) % NP, cycling the pool
   {
     std::vector<MatDesc> d((size_t)NS * kE * 3);
     for (int s = 0; s < NS; ++s)
-      for (int e = 0; e < kE; ++e) {
-        const int x = (int)(((size_t)s * kE + e) % P.NP);
-        for (int j = 0; j < 3; ++j) {
-          const float mags[2][4] = {{kSubA[0], kSubA[1], kSubA[2], kSubA[3]}, {kSubB[0], kSubB[1], kSubB[2], kSubB[3]}};
-          d[((size_t)s * kE + e) * 3 + j] = make_desc(P.off[x * 3 + j], j < 2 ? kS2Up : kS2Down, P.fmt[x * 3 + j], pat.nsub[j], mags);
-        }
-      }
+      for (int e = 0; e < kE; ++e)
+        for (int j = 0; j < 3; ++j) d[((size_t)s * kE + e) * 3 + j] = pool_desc(P, (int)(((size_t)s * kE + e) % P.NP), j);
     CUDA_CHECK(cudaMemcpy(ddesc, d.data(), d.size() * sizeof(MatDesc), cudaMemcpyHostToDevice));
   }
   for (size_t ri = 0; ri < rows.size(); ++ri) {
     const int M = rows[ri];
-    const bool corr = names[ri].find('c') != std::string::npos;  // "6c": 6 rows over 28 experts (experiment 1's case)
-    // each step's picks; logits that make route() pick exactly them
+    // each step's picks (8 distinct uniformly random experts a row); logits that make route() pick exactly them
     std::vector<float> lg((size_t)NS * kMaxRows * kE, -8.f);
     double bytes = 0, uavg = 0;
     for (int s = 0; s < NS; ++s) {
-      std::vector<int> pool;
-      if (corr) {
-        std::set<int> c;
-        uint64_t h = mix64(s * 31 + 7);
-        while ((int)c.size() < 28) c.insert((int)((h = mix64(h)) % kE));
-        pool.assign(c.begin(), c.end());
-      }
       std::set<int> uni;
       for (int m = 0; m < M; ++m) {
         std::set<int> row;
         uint64_t h = mix64((uint64_t)s * 1000 + m * 17 + M);
-        int k = 0;
-        while ((int)row.size() < kTopK) {
-          h = mix64(h);
-          int e = corr ? pool[(m * kTopK + k++) % 28] : (int)(h % kE);
-          if (corr && row.count(e)) e = pool[h % 28];
-          row.insert(e);
-        }
+        while ((int)row.size() < kTopK) row.insert((int)((h = mix64(h)) % kE));
         int r = 0;
         for (int e : row) lg[((size_t)s * kMaxRows + m) * kE + e] = 8.f + 0.01f * r++, uni.insert(e);
       }
-      for (int e : uni) bytes += P.bytes[((size_t)s * kE + e) % P.NP];
+      bytes += (double)P.per * uni.size();
       uavg += uni.size();
     }
-    bytes = bytes / NS + sh_bytes;
+    bytes /= NS;
     uavg /= NS;
     CUDA_CHECK(cudaMemcpy(dl, lg.data(), lg.size() * 4, cudaMemcpyHostToDevice));
     auto layer = [&](int s) {
-      const int c = s % NSH;
-      return LayerW{P.d, ddesc + (size_t)s * kE * 3,
-                    SharedW{shw + (3 * c) * shm, shw + (3 * c + 1) * shm, shw + (3 * c + 2) * shm, shs + (3 * c) * 192,
-                            shs + (3 * c + 1) * 192, shs + (3 * c + 2) * 192}};
+      LayerW L;
+      L.pool = P.d, L.desc = ddesc + (size_t)s * kE * 3, L.fmt = fmt;
+      return L;
     };
     auto rt = [&](int s, cudaStream_t st) {
       route(dl + (size_t)s * kMaxRows * kE, db, M, di + s * kMaxRows * kTopK, dw + s * kMaxRows * kTopK, st);
@@ -273,10 +235,10 @@ static void bench_decode(const std::string& fname, const std::string& rows_s, bo
     for (int s = 0; s < NS; ++s) rt(s, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
     auto line = [&](const char* what, const DecodeCfg& c, double t, double tr) {
-      result("DECODE\t%s\trows %s\tU %.1f\t%s\tup %s%s\tdown %s%s\tMB %.2f\tus %.1f\t(route %.1f)\tGB/s %.1f\t%% of 235 %.1f\t%% of window %.1f\t75 layers ms %.2f",
+      result("DECODE\t%s\trows %s\tU %.1f\t%s\tup %s%s\tdown %s%s\tMB %.2f\tus %.1f\t(route %.1f)\tGB/s %.1f\t%% of 235 %.1f\t%% of window %.1f\t73 layers ms %.2f",
              fname.c_str(), names[ri].c_str(), uavg, what, decode_up_name(c.up), c.dyn ? " dyn" : "", decode_down_name(c.down),
              c.pdl ? "" : " nopdl", bytes / 1e6, t, tr, bytes / t / 1e3, 100 * bytes / t / 1e3 / 235.0, 100 * bytes / t / 1e3 / g_bw,
-             75 * t / 1e3);
+             73 * t / 1e3);
     };
     auto time_cfg = [&](const DecodeCfg& c, bool with_route) {
       return time_graph(NS, [&](int s, cudaStream_t st) {
@@ -333,25 +295,74 @@ static void bench_decode(const std::string& fname, const std::string& rows_s, bo
     }
   }
   cudaFree(ddesc), cudaFree(dl), cudaFree(db), cudaFree(dyr), cudaFree(dys), cudaFree(di), cudaFree(dw), cudaFree(dx);
-  cudaFree(ws), cudaFree(shw), cudaFree(shs), cudaFree(P.d);
+  cudaFree(ws), cudaFree(P.d);
+}
+
+// ---- altar-1's BF16 shared expert through attn's BF16 GEMV ----------------------------------------------------------
+// A rank's slice: gate and up [512][6144] interleaved row by row (2i gate, 2i + 1 up: GemvOut::kSwiGLU's order),
+// down [6144][512]; 8 copies cycled so L2 (24 MB) holds none across steps. A step = the SwiGLU GEMV then the down
+// GEMV (f32 partials, as the ring all-reduces them). Bytes = the three matrices, 18.9 MB.
+static void bench_shared(const std::string& rows_s) {
+  constexpr int NC = 8;
+  const size_t gu = (size_t)2 * kI * kH, dn = (size_t)kH * kI;
+  uint16_t* w;
+  CUDA_CHECK(cudaMalloc(&w, NC * (gu + dn) * 2));
+  k_fill_b16<<<384, 256>>>(w, NC * (gu + dn), 99);
+  uint16_t* x;
+  __nv_bfloat16* hx;
+  float* y;
+  CUDA_CHECK(cudaMalloc(&x, (size_t)kMaxRows * kH * 2));
+  CUDA_CHECK(cudaMalloc(&hx, (size_t)kMaxRows * kI * 2));
+  CUDA_CHECK(cudaMalloc(&y, (size_t)kMaxRows * kH * 4));
+  {
+    std::vector<__nv_bfloat16> v;
+    rnd_x(v, (size_t)kMaxRows * kH, 7);
+    CUDA_CHECK(cudaMemcpy(x, v.data(), v.size() * 2, cudaMemcpyHostToDevice));
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+  const double bytes = (gu + dn) * 2.0;
+  std::vector<std::string> names;
+  for (int M : parse_rows(rows_s, names))
+    for (int sku : {1, 2, 4})
+      for (int skd : {1, 2, 4}) {
+        auto step = [&](int s, cudaStream_t st, int parts) {
+          const uint16_t* wg = w + (size_t)(s % NC) * (gu + dn);
+          if (parts & 1) {
+            glm::GemvSeg g;
+            g.w = wg, g.n = 2 * kI, g.y = hx, g.ldy = kI;
+            glm::gemv(false, x, kH, M, kH, &g, 1, glm::GemvOut::kSwiGLU, sku, st, true);
+          }
+          if (parts & 2) {
+            glm::GemvSeg d;
+            d.w = wg + gu, d.n = kH, d.y = y, d.ldy = kH;
+            glm::gemv(false, reinterpret_cast<const uint16_t*>(hx), kI, M, kI, &d, 1, glm::GemvOut::kF32, skd, st, true);
+          }
+        };
+        const double t = time_graph(64, [&](int s, cudaStream_t st) { step(s, st, 3); });
+        const double tu = time_graph(64, [&](int s, cudaStream_t st) { step(s, st, 1); });
+        const double td = time_graph(64, [&](int s, cudaStream_t st) { step(s, st, 2); });
+        result("SHARED\tbf16 gemv\trows %d\tsplitk up %d down %d\tMB %.2f\tus %.1f\t(up %.1f, down %.1f)\tGB/s %.1f\t%% of 235 %.1f\t%% of window %.1f\t76 layers ms %.2f",
+               M, sku, skd, bytes / 1e6, t, tu, td, bytes / t / 1e3, 100 * bytes / t / 1e3 / 235.0, 100 * bytes / t / 1e3 / g_bw, 76 * t / 1e3);
+      }
+  cudaFree(w), cudaFree(x), cudaFree(hx), cudaFree(y);
 }
 
 struct PfOpts {
-  std::string down = "0,1", yrkb = "0", side = "0", cq = "4", up = "0,1";
-  std::string sh = "128";  // the shared down's rows a CTA (PrefillCfg::sh_rows)
+  std::string down = "0,1", yrkb = "0", cq = "4", up = "0,1";
   bool diag = false;
 };
-void bench_prefill(const std::string& fname, const std::string& chunks, bool fp4, const PfOpts& o);  // bench_prefill.inc
+void bench_prefill(const std::string& fname, const std::string& chunks, const PfOpts& o);  // bench_prefill.inc
 
 int main(int argc, char** argv) {
-  std::string mode, fmt, rows = "1,2,4,6,8,16,6c", chunks = "1024,4096,8192";
-  bool sweep = false, fp4 = false;
+  std::string mode, fmt, rows = "1,6,16", chunks = "1024,4096,8192";
+  bool sweep = false;
   PfOpts po;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--bw") mode = "bw";
     else if (a == "--decode" && i + 1 < argc) mode = "decode", fmt = argv[++i];
     else if (a == "--prefill" && i + 1 < argc) mode = "prefill", fmt = argv[++i];
+    else if (a == "--shared") mode = "shared";
     else if (a == "--rows" && i + 1 < argc) rows = argv[++i];
     else if (a == "--chunks" && i + 1 < argc) chunks = argv[++i];
     else if (a == "--sweep") sweep = true;
@@ -359,11 +370,8 @@ int main(int argc, char** argv) {
       std::vector<std::string> nm;
       g_ups = parse_rows(argv[++i], nm);
     }
-    else if (a == "--fp4") fp4 = true;
     else if (a == "--down" && i + 1 < argc) po.down = argv[++i];
-    else if (a == "--sh" && i + 1 < argc) po.sh = argv[++i];
     else if (a == "--yrkb" && i + 1 < argc) po.yrkb = argv[++i];
-    else if (a == "--side" && i + 1 < argc) po.side = argv[++i];
     else if (a == "--cq" && i + 1 < argc) po.cq = argv[++i];
     else if (a == "--up" && i + 1 < argc) po.up = argv[++i];
     else if (a == "--diag") po.diag = true;
@@ -375,7 +383,8 @@ int main(int argc, char** argv) {
   }
   bench_bw();
   if (mode == "decode") bench_decode(fmt, rows, sweep);
-  else if (mode == "prefill") bench_prefill(fmt, chunks, fp4, po);
+  else if (mode == "prefill") bench_prefill(fmt, chunks, po);
+  else if (mode == "shared") bench_shared(rows);
   return 0;
 }
 

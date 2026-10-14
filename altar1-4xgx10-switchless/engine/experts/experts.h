@@ -134,9 +134,10 @@ void finalize(const float* R, const float* S, int M, __nv_bfloat16* out, cudaStr
 constexpr int kMaxChunk = 8192;
 struct PrefillCfg {
   bool shared = true;                          // run the fused shared expert (if the layer has one)
-  int diag = 0;  // bench diagnostics of the gate/up kernel (wrong results): 1 no weights, 2 no MMAs, 4 no A loads
-  // the same for the chained down (down 1): 1, 2, 4 as diag, 8 no adds into yr, 16 no waits, 32 no yr loads, 64 no
-  // yr stores (bench_experts --diag, docs/experts.md section 12)
+  // bench diagnostics, INT4 layers only (wrong results): the gate/up kernel (up 1) with 1 no weights, 2 no MMAs, 4 no
+  // A loads; the chained down (down 1) with 8 no adds into yr, 16 no waits (bench_experts --diag; glm53's other
+  // combinations are not built here)
+  int diag = 0;
   int ddiag = 0;
   // The routed down and combine: 1 (default) the chained down, which adds each pick's f32 sums into yr in the
   // row's expert-id order as its tile finishes (no per-pick buffer); 0 GLM-5.3's kernels of 2026-10-13

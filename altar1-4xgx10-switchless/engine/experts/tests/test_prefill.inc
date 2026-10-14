@@ -1,6 +1,8 @@
 // Prefill tests (included at the end of test_experts.cu): sampled rows against a double reference, every row
-// against the decode step (the same arithmetic up to the order of the K sums), determinism, and chunk
-// invariance (a row's bits do not depend on the other rows of its chunk).
+// against the decode step (the same arithmetic up to the order of the K sums) and against the decode step in
+// prefill's K order (bit for bit), the kernel variants against each other, determinism, and chunk invariance (a
+// row's bits do not depend on the other rows of its chunk). Then test_equiv: an INT4 layer against the BF16 layer
+// of its dequantised values, decode and prefill, every h and output bit for bit.
 
 // picks of T rows: 8 distinct experts a row, a few hot experts (so some have many tiles), random weights
 static void prefill_picks(int T, uint64_t seed, std::vector<int>& idx, std::vector<float>& w) {
@@ -31,7 +33,7 @@ static void prefill_picks(int T, uint64_t seed, std::vector<int>& idx, std::vect
   }
 }
 
-// one row's h for expert e (-1: the shared expert) with its range (ref_h's rule)
+// one row's h for expert e (-1: the fused shared expert) with its range (ref_h's rule)
 static void ref_h_one(Ref& R, const float* x, int e, HRef& out) {
   const bool sh = e < 0;
   const std::vector<float>& G = sh ? R.sg : R.mat(e, 0);
@@ -61,20 +63,44 @@ static void ref_h_one(Ref& R, const float* x, int e, HRef& out) {
 
 struct PrefillOut {
   std::vector<float> yr, ys;
+  std::vector<std::vector<uint16_t>> h;  // per row and pick in expert-id order: h bits [T * 8][kI] (+ fused shared [T][kI])
 };
 static PrefillOut run_prefill(const TestLayer& L, const __nv_bfloat16* dx, const int* di, const float* dw, int T, void* ws,
-                              float* dyr, float* dys, const PrefillCfg& cfg = PrefillCfg()) {
+                              float* dyr, float* dys, const PrefillCfg& cfg = PrefillCfg(), bool want_h = false) {
   CUDA_CHECK(cudaMemset(dyr, 0xFF, (size_t)T * kH * 4));
   CUDA_CHECK(cudaMemset(dys, 0xFF, (size_t)T * kH * 4));
   moe_prefill(L.layer(), dx, di, dw, T, ws, dyr, dys, 0, cfg);
   CUDA_CHECK(cudaDeviceSynchronize());
-  return PrefillOut{d2h(dyr, (size_t)T * kH), d2h(dys, (size_t)T * kH)};
+  PrefillOut o{d2h(dyr, (size_t)T * kH), d2h(dys, (size_t)T * kH), {}};
+  if (want_h) {  // h by row and pick (bucket positions come from atomics and differ between calls)
+    const PrefillView v = prefill_view(ws, T);
+    const auto hall = d2h(v.h, (size_t)T * kTopK * kI);
+    const auto rpos = d2h(v.rpos, (size_t)T * kTopK);
+    o.h.resize(2);
+    o.h[0].resize((size_t)T * kTopK * kI);
+    for (size_t i = 0; i < rpos.size(); ++i)
+      for (int c = 0; c < kI; ++c) o.h[0][i * kI + c] = bits(hall[(size_t)rpos[i] * kI + c]);
+    if (L.fused) {
+      const auto hsh = d2h(v.hsh, (size_t)T * kI);
+      o.h[1].resize(hsh.size());
+      for (size_t i = 0; i < hsh.size(); ++i) o.h[1][i] = bits(hsh[i]);
+    }
+  }
+  return o;
+}
+static size_t out_diff(const PrefillOut& a, const PrefillOut& b) {
+  size_t d = 0;
+  for (size_t i = 0; i < a.yr.size(); ++i) d += fbits(a.yr[i]) != fbits(b.yr[i]) || fbits(a.ys[i]) != fbits(b.ys[i]);
+  return d;
+}
+static size_t h_diff(const PrefillOut& a, const PrefillOut& b) {
+  size_t d = 0;
+  for (int j = 0; j < 2; ++j)
+    for (size_t i = 0; i < a.h[j].size(); ++i) d += a.h[j][i] != b.h[j][i];
+  return d;
 }
 
-void test_prefill(TestLayer* ext, bool light) {  // ext: an uploaded layer (the real experts); light: T <= 300 only
-  TestLayer syn;
-  if (!ext) syn.build(10, 3), syn.upload();
-  TestLayer& L = ext ? *ext : syn;
+void test_prefill(TestLayer& L, bool light) {  // light: T <= 300 only
   Ref R(L);
   const int TB = 2500;  // two down passes
   void *ws, *dws;
@@ -105,21 +131,21 @@ void test_prefill(TestLayer* ext, bool light) {  // ext: an uploaded layer (the 
 
   for (int T : light ? std::vector<int>{1, 37, 300} : std::vector<int>{1, 37, 300, TB}) {
     const PrefillOut p = run_prefill(L, dx, di, dw, T, ws, dyr, dys);
-    char name[96];
+    char name[128];
     // sampled rows: each pick's h (from the workspace) within the range of f32 sums of the double gate/up, and
     // the outputs against double from the GPU's h (as the decode test)
     {
       const PrefillView v = prefill_view(ws, T);
       const auto rpos = d2h(v.rpos, (size_t)T * kTopK), re = d2h(v.re, (size_t)T * kTopK);
       const auto hall = d2h(v.h, (size_t)T * kTopK * kI);
-      const auto hsh = d2h(v.hsh, (size_t)T * kI);
+      const auto hsh = L.fused ? d2h(v.hsh, (size_t)T * kI) : std::vector<__nv_bfloat16>();
       ErrStat er, es;
       size_t hfar = 0, hexact = 0, hn = 0;
       const int ns = std::min(T, 8);
       for (int si = 0; si < ns; ++si) {
         const int t = (int)((size_t)si * (T - 1) / std::max(1, ns - 1));
         std::vector<double> yr(kH, 0), yrm(kH, 0), ys(kH, 0), ysm(kH, 0);
-        for (int k = 0; k <= kTopK; ++k) {
+        for (int k = 0; k < kTopK + (L.fused ? 1 : 0); ++k) {
           const bool sh = k == kTopK;
           const int e = sh ? -1 : re[(size_t)t * kTopK + k];
           float wk = 0;
@@ -148,51 +174,45 @@ void test_prefill(TestLayer* ext, bool light) {  // ext: an uploaded layer (the 
             (sh ? ys : yr)[n] += s * kd, (sh ? ysm : yrm)[n] += sm * fabs(kd);
           }
         }
-        for (int n = 0; n < kH; ++n)
-          er.add(p.yr[(size_t)t * kH + n], yr[n], yrm[n], 1e-4), es.add(p.ys[(size_t)t * kH + n], ys[n], ysm[n], 1e-4);
+        for (int n = 0; n < kH; ++n) {
+          er.add(p.yr[(size_t)t * kH + n], yr[n], yrm[n], 1e-4);
+          if (L.fused) es.add(p.ys[(size_t)t * kH + n], ys[n], ysm[n], 1e-4);
+        }
       }
-      snprintf(name, sizeof name, "prefill T=%d h (%d rows, 8 picks + shared)", T, ns);
+      snprintf(name, sizeof name, "prefill T=%d h (%d rows, 8 picks%s)", T, ns, L.fused ? " + shared" : "");
       check(name, hfar == 0 && hexact >= hn * 0.995, "%zu of %zu bit-exact, %zu outside the range of f32 sums", hexact, hn, hfar);
       snprintf(name, sizeof name, "prefill T=%d routed out vs double (from GPU h)", T);
       check(name, !er.bad, "max |err|/sum|terms| %.2e over %zu", er.worst, er.n);
-      snprintf(name, sizeof name, "prefill T=%d shared out vs double (from GPU h)", T);
-      check(name, !es.bad, "max |err|/sum|terms| %.2e over %zu", es.worst, es.n);
+      if (L.fused) {
+        snprintf(name, sizeof name, "prefill T=%d shared out vs double (from GPU h)", T);
+        check(name, !es.bad, "max |err|/sum|terms| %.2e over %zu", es.worst, es.n);
+      } else {
+        const size_t t = ys_touched(p.ys);
+        snprintf(name, sizeof name, "prefill T=%d ys untouched (no fused shared expert)", T);
+        check(name, !t, "%zu of %zu written", t, p.ys.size());
+      }
     }
-    // the default kernels (warp-specialised gate/up, chained down) against those of 2026-10-13 (k_pup, the
-    // per-pick buffer + combine): h and every output bit-identical; also with narrow passes (more tickets),
-    // passes claimed round-robin, and the shared expert on a side stream
+    // the default kernels (warp-specialised gate/up, chained down) against glm53's kernels of 2026-10-13 (k_pup,
+    // the per-pick buffer + combine): h and every output bit-identical; also with narrow passes (more tickets),
+    // passes claimed round-robin, and a fused shared expert on a side stream
     {
       PrefillCfg c0;
       c0.down = 0;
       c0.up = 0;
-      c0.sh_rows = 64;  // and the shared down at 64-row tiles
-      const PrefillOut r = run_prefill(L, dx, di, dw, T, ws, dyr, dys, c0);
-      // h by row and pick (bucket positions come from atomics and differ between calls)
-      const auto h0 = d2h(prefill_view(ws, T).h, (size_t)T * kTopK * kI);
-      const auto p0 = d2h(prefill_view(ws, T).rpos, (size_t)T * kTopK);
+      c0.sh_rows = 64;  // and the fused shared down at 64-row tiles
+      const PrefillOut r = run_prefill(L, dx, di, dw, T, ws, dyr, dys, c0, true);
+      const PrefillOut d = run_prefill(L, dx, di, dw, T, ws, dyr, dys, PrefillCfg(), true);
       PrefillCfg c1;
       c1.yr_kb = 1;  // 256-column passes, three claimed round-robin
       c1.chain_q = 3;
       c1.side = side;
-      c1.up = 2;  // and the gate/up kernel with 64 x 64 warp tiles
-      c1.down = 2;  // and the warp-specialised chained down
-      const PrefillOut q = run_prefill(L, dx, di, dw, T, ws, dyr, dys, c1);
-      const auto h1 = d2h(prefill_view(ws, T).h, (size_t)T * kTopK * kI);
-      const auto p1 = d2h(prefill_view(ws, T).rpos, (size_t)T * kTopK);
-      size_t hd = 0;
-      for (size_t i = 0; i < p0.size(); ++i)
-        for (int c = 0; c < kI; ++c) hd += bits(h0[(size_t)p0[i] * kI + c]) != bits(h1[(size_t)p1[i] * kI + c]);
-      snprintf(name, sizeof name, "prefill T=%d h: warp-specialised gate/up (64 x 64 warps) vs k_pup", T);
-      check(name, !hd, "%zu of %zu differ", hd, h0.size());
-      size_t bad = 0, bad1 = 0;
-      for (size_t i = 0; i < r.yr.size(); ++i) {
-        bad += fbits(p.yr[i]) != fbits(r.yr[i]) || fbits(p.ys[i]) != fbits(r.ys[i]);
-        bad1 += fbits(q.yr[i]) != fbits(r.yr[i]) || fbits(q.ys[i]) != fbits(r.ys[i]);
-      }
+      const PrefillOut q = run_prefill(L, dx, di, dw, T, ws, dyr, dys, c1, true);
+      snprintf(name, sizeof name, "prefill T=%d h: warp-specialised gate/up vs k_pup", T);
+      check(name, !h_diff(d, r) && !h_diff(q, r), "%zu, %zu of %zu differ", h_diff(d, r), h_diff(q, r), r.h[0].size() + r.h[1].size());
       snprintf(name, sizeof name, "prefill T=%d default kernels vs those of 2026-10-13", T);
-      check(name, !bad, "%zu of %zu outputs differ", bad, 2 * r.yr.size());
-      snprintf(name, sizeof name, "prefill T=%d up 2, down 2 in 256-column passes, 3 round-robin, shared on a side stream", T);
-      check(name, !bad1, "%zu of %zu outputs differ", bad1, 2 * r.yr.size());
+      check(name, !out_diff(p, r), "%zu of %zu outputs differ", out_diff(p, r), 2 * r.yr.size());
+      snprintf(name, sizeof name, "prefill T=%d 256-column passes, 3 round-robin, side stream", T);
+      check(name, !out_diff(q, r), "%zu of %zu outputs differ", out_diff(q, r), 2 * r.yr.size());
     }
     // every row against the decode step: identical but for the order of the K sums
     if (T <= 300) {
@@ -200,6 +220,7 @@ void test_prefill(TestLayer* ext, bool light) {  // ext: an uploaded layer (the 
       double worst = 0;
       for (int t0 = 0; t0 < T; t0 += kMaxRows) {
         const int M = std::min(kMaxRows, T - t0);
+        CUDA_CHECK(cudaMemset(dys2, 0, (size_t)M * kH * 4));
         moe_decode(L.layer(), dx + (size_t)t0 * kH, di + t0 * kTopK, dw + t0 * kTopK, M, dws, dyr2, dys2, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
         const auto dr = d2h(dyr2, (size_t)M * kH), ds = d2h(dys2, (size_t)M * kH);
@@ -209,10 +230,13 @@ void test_prefill(TestLayer* ext, bool light) {  // ext: an uploaded layer (the 
           for (int c = 0; c < kH; ++c) {
             const size_t i = (size_t)(t0 + m) * kH + c;
             same += fbits(p.yr[i]) == fbits(dr[m * kH + c]);
-            same += fbits(p.ys[i]) == fbits(ds[m * kH + c]);
             worst = std::max(worst, fabs(p.yr[i] - dr[m * kH + c]) / mr);
-            worst = std::max(worst, fabs(p.ys[i] - ds[m * kH + c]) / ms);
-            n += 2;
+            ++n;
+            if (L.fused) {
+              same += fbits(p.ys[i]) == fbits(ds[m * kH + c]);
+              worst = std::max(worst, fabs(p.ys[i] - ds[m * kH + c]) / ms);
+              ++n;
+            }
           }
         }
       }
@@ -220,12 +244,13 @@ void test_prefill(TestLayer* ext, bool light) {  // ext: an uploaded layer (the 
       check(name, worst <= 2e-3, "%zu of %zu outputs bit-identical, max diff %.2e of the row's largest output", same, n, worst);
     }
     // decode in prefill's K order (DecodeCfg::up = kUpPrefillOrder and the other wk1 variants): every h (each
-    // pick's and the shared expert's) and every output bit for bit equal to the prefill's, 16-row steps
+    // pick's and a fused shared expert's) and every output bit for bit equal to the prefill's, 16-row steps
     if (T <= 300) {
       const PrefillView v = prefill_view(ws, T);
+      run_prefill(L, dx, di, dw, T, ws, dyr, dys);  // the default's workspace (the variants above changed it)
       const auto rpos = d2h(v.rpos, (size_t)T * kTopK), re = d2h(v.re, (size_t)T * kTopK);
       const auto hall = d2h(v.h, (size_t)T * kTopK * kI);
-      const auto hsh = d2h(v.hsh, (size_t)T * kI);
+      const auto hsh = L.fused ? d2h(v.hsh, (size_t)T * kI) : std::vector<__nv_bfloat16>();
       for (int uv = 0; uv < decode_up_variants(); ++uv) {
         if (!strstr(decode_up_name(uv), "wk1")) continue;
         size_t yd = 0, hd = 0, hn = 0;
@@ -233,6 +258,7 @@ void test_prefill(TestLayer* ext, bool light) {  // ext: an uploaded layer (the 
           const int M = std::min(kMaxRows, T - t0);
           DecodeCfg c;
           c.up = uv;
+          CUDA_CHECK(cudaMemset(dys2, 0xFF, (size_t)M * kH * 4));
           moe_decode(L.layer(), dx + (size_t)t0 * kH, di + t0 * kTopK, dw + t0 * kTopK, M, dws, dyr2, dys2, 0, c);
           CUDA_CHECK(cudaDeviceSynchronize());
           const auto dr = d2h(dyr2, (size_t)M * kH), ds = d2h(dys2, (size_t)M * kH);
@@ -247,7 +273,7 @@ void test_prefill(TestLayer* ext, bool light) {  // ext: an uploaded layer (the 
           const std::vector<int> uni(us.begin(), us.end());
           for (int m = 0; m < M; ++m) {
             const int t = t0 + m;
-            for (int k = 0; k <= kTopK; ++k) {
+            for (int k = 0; k < kTopK + (L.fused ? 1 : 0); ++k) {
               const bool sh = k == kTopK;
               const int slot = sh ? kShSlot : (int)(std::lower_bound(uni.begin(), uni.end(), re[(size_t)t * kTopK + k]) - uni.begin());
               const __nv_bfloat16* hp = sh ? &hsh[(size_t)t * kI] : &hall[(size_t)rpos[(size_t)t * kTopK + k] * kI];
@@ -271,105 +297,74 @@ void test_prefill(TestLayer* ext, bool light) {  // ext: an uploaded layer (the 
     check("prefill deterministic (T=2500 twice)", !bad, "%zu differ", bad);
     check("prefill chunk invariance (300 rows alone vs in 2500)", !bad2, "%zu differ", bad2);
   }
-  // the FP4-activation path, 300 rows: the activations' NVFP4 bits against the host quantiser, h within the
-  // range of f32 sums from the dequantised x, the outputs against double from the GPU's quantised h, the shared
-  // expert unchanged, deterministic; and how far its outputs move from the bf16 path's (informational)
-  {
-    const int T = 300;
-    const PrefillOut base = run_prefill(L, dx, di, dw, T, ws, dyr, dys);
-    float amx = 0, amh = 0;
-    for (size_t i = 0; i < (size_t)T * kH; ++i) amx = std::max(amx, fabsf(bf(x[i])));
-    {
-      const PrefillView v = prefill_view(ws, T);
-      const auto hb = d2h(v.h, (size_t)T * kTopK * kI);
-      for (auto hv : hb) amh = std::max(amh, fabsf(bf(hv)));
-    }
-    PrefillCfg cfg;
-    cfg.fp4 = true;
-    cfg.in_scale_gu = amx / (6.f * 448.f);
-    cfg.in_scale_dn = amh / (6.f * 448.f);
-    auto run4 = [&]() {
-      CUDA_CHECK(cudaMemset(dyr, 0xFF, (size_t)T * kH * 4));
-      CUDA_CHECK(cudaMemset(dys, 0xFF, (size_t)T * kH * 4));
-      moe_prefill(L.layer(), dx, di, dw, T, ws, dyr, dys, 0, cfg);
-      CUDA_CHECK(cudaDeviceSynchronize());
-      return PrefillOut{d2h(dyr, (size_t)T * kH), d2h(dys, (size_t)T * kH)};
-    };
-    const PrefillOut f = run4();
-    const PrefillView v = prefill_view(ws, T);
-    const auto xq = d2h(v.xq, (size_t)T * kH / 2), xs = d2h(v.xs, (size_t)T * kH / 16);
-    const auto hq = d2h(v.hq, (size_t)T * kTopK * kI / 2), hs = d2h(v.hs, (size_t)T * kTopK * kI / 16);
-    const auto hall = d2h(v.h, (size_t)T * kTopK * kI);
-    const auto rpos = d2h(v.rpos, (size_t)T * kTopK), re = d2h(v.re, (size_t)T * kTopK);
-    auto quant_check = [&](const char* nm, const std::vector<__nv_bfloat16>& src, size_t groups, const std::vector<uint8_t>& q,
-                           const std::vector<uint8_t>& sf, float S) {
-      size_t bad = 0;
-      for (size_t gi = 0; gi < groups; ++gi) {
-        float xv[16];
-        for (int i = 0; i < 16; ++i) xv[i] = bf(src[gi * 16 + i]);
-        uint8_t q8[8], sb;
-        nvfp4_quant16_host(xv, S, q8, sb);
-        bad += sb != sf[gi] || memcmp(q8, &q[gi * 8], 8) != 0;
-      }
-      check(nm, !bad, "%zu of %zu groups differ (values or scale)", bad, groups);
-    };
-    quant_check("prefill fp4: x quantised as NVFP4 (host bits)", x, (size_t)T * kH / 16, xq, xs, cfg.in_scale_gu);
-    quant_check("prefill fp4: h quantised as NVFP4 (host bits)", hall, (size_t)T * kTopK * kI / 16, hq, hs, cfg.in_scale_dn);
-    auto deq = [](const uint8_t* q, const uint8_t* sf, float S, int K, std::vector<float>& o) {
-      static const float g[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, -0.f, -.5f, -1, -1.5f, -2, -3, -4, -6};
-      o.resize(K);
-      for (int k = 0; k < K; ++k) o[k] = g[(q[k / 2] >> (4 * (k & 1))) & 15] * (e4m3_to_f(sf[k / 16]) * S);
-    };
-    ErrStat er;
-    size_t hfar = 0, hexact = 0, hn = 0;
-    for (int si = 0; si < 6; ++si) {
-      const int t = si * (T - 1) / 5;
-      std::vector<float> xf;
-      deq(&xq[(size_t)t * kH / 2], &xs[(size_t)t * kH / 16], cfg.in_scale_gu, kH, xf);
-      std::vector<double> yr(kH, 0), yrm(kH, 0);
-      for (int k = 0; k < kTopK; ++k) {
-        const int e = re[(size_t)t * kTopK + k], pos = rpos[(size_t)t * kTopK + k];
-        float wk = 0;
-        for (int j = 0; j < kTopK; ++j)
-          if (idx[(size_t)t * kTopK + j] == e) wk = w[(size_t)t * kTopK + j];
-        HRef hr;
-        ref_h_one(R, xf.data(), e, hr);
-        for (int c = 0; c < kI; ++c) {
-          const float gv = bf(hall[(size_t)pos * kI + c]);
-          hexact += fbits(gv) == fbits(hr.h[c]) || (gv == 0 && hr.h[c] == 0);
-          hfar += !hr.ok(c, gv);
-          ++hn;
-        }
-        std::vector<float> hf;
-        deq(&hq[(size_t)pos * kI / 2], &hs[(size_t)pos * kI / 16], cfg.in_scale_dn, kI, hf);
-        const std::vector<float>& D = R.mat(e, 2);
-        const double kd = R.s2(e, 2) * (double)wk;
-#pragma omp parallel for
-        for (int n = 0; n < kH; ++n) {
-          double s = 0, sm = 0;
-          for (int c = 0; c < kI; ++c) s += (double)hf[c] * D[(size_t)n * kI + c], sm += fabs((double)hf[c] * D[(size_t)n * kI + c]);
-          yr[n] += s * kd, yrm[n] += sm * fabs(kd);
-        }
-      }
-      for (int n = 0; n < kH; ++n) er.add(f.yr[(size_t)t * kH + n], yr[n], yrm[n], 1e-4);
-    }
-    check("prefill fp4: h (6 rows) from the quantised x", hfar == 0 && hexact >= hn * 0.995, "%zu of %zu bit-exact, %zu outside the range of f32 sums",
-          hexact, hn, hfar);
-    check("prefill fp4: routed out vs double (from the GPU's quantised h)", !er.bad, "max |err|/sum|terms| %.2e over %zu", er.worst, er.n);
-    size_t shd = 0;
-    for (size_t i = 0; i < f.ys.size(); ++i) shd += fbits(f.ys[i]) != fbits(base.ys[i]);
-    check("prefill fp4: shared expert as the bf16 path", !shd, "%zu differ", shd);
-    const PrefillOut f2 = run4();
-    size_t nd = 0;
-    for (size_t i = 0; i < f.yr.size(); ++i) nd += fbits(f.yr[i]) != fbits(f2.yr[i]);
-    check("prefill fp4: deterministic", !nd, "%zu differ", nd);
-    double se = 0, sr = 0;
-    for (size_t i = 0; i < f.yr.size(); ++i) se += (f.yr[i] - base.yr[i]) * (double)(f.yr[i] - base.yr[i]), sr += (double)base.yr[i] * base.yr[i];
-    char msg[160];
-    snprintf(msg, sizeof msg, "prefill fp4: routed out vs the bf16 path (info)");
-    check(msg, true, "relative RMS difference %.3e (input scales %.3g, %.3g)", sqrt(se / sr), cfg.in_scale_gu, cfg.in_scale_dn);
-  }
   cudaStreamDestroy(side);
   cudaFree(ws), cudaFree(dws), cudaFree(dyr), cudaFree(dys), cudaFree(dyr2), cudaFree(dys2), cudaFree(di), cudaFree(dw), cudaFree(dx);
-  if (!ext) L.free_dev();
+}
+
+// An INT4 layer A against B, the BF16 layer of A's contract values (the same experts, the same map): the INT4
+// kernels' only difference is the decode, so every h and output must be B's bit for bit, at every decode row count
+// and variant and every prefill chunk and variant.
+void test_equiv(TestLayer& A, bool light) {
+  if (A.fmt != kINT4) die("test_equiv: an INT4 layer");
+  TestLayer B = A.dequantised();
+  B.upload();
+  char name[128];
+  {  // decode
+    void* ws;
+    CUDA_CHECK(cudaMalloc(&ws, decode_ws_bytes()));
+    CUDA_CHECK(cudaMemset(ws, 0, decode_ws_bytes()));
+    float *dyr, *dys;
+    CUDA_CHECK(cudaMalloc(&dyr, (size_t)kMaxRows * kH * 4));
+    CUDA_CHECK(cudaMalloc(&dys, (size_t)kMaxRows * kH * 4));
+    Rows rw;
+    rw.make(kMaxRows, 41);
+    for (int M : {1, 2, 6, 9, 16}) {
+      size_t hd = 0, yd = 0, hn = 0, n = 0;
+      for (int uv = 0; uv < decode_up_variants(); ++uv)
+        for (int dv = 0; dv < decode_down_variants(); ++dv) {
+          if (uv && dv) continue;
+          DecodeCfg c;
+          c.up = uv, c.down = dv;
+          const DecodeRun a = run_decode(A, rw.dx, rw.di, rw.dw, M, rw.idx, ws, dyr, dys, c);
+          const DecodeRun b = run_decode(B, rw.dx, rw.di, rw.dw, M, rw.idx, ws, dyr, dys, c);
+          for (size_t i = 0; i < a.h.size(); ++i) hd += bits(a.h[i]) != bits(b.h[i]);
+          for (size_t i = 0; i < a.yr.size(); ++i) yd += fbits(a.yr[i]) != fbits(b.yr[i]) || fbits(a.ys[i]) != fbits(b.ys[i]);
+          hn += a.h.size(), n += a.yr.size();
+        }
+      snprintf(name, sizeof name, "equiv decode M=%d, %d variants: INT4 = BF16(dequantised)", M,
+               decode_up_variants() + decode_down_variants() - 1);
+      check(name, !hd && !yd, "h %zu of %zu, outputs %zu of %zu differ", hd, hn, yd, n);
+    }
+    cudaFree(ws), cudaFree(dyr), cudaFree(dys);
+    rw.free_dev();
+  }
+  {  // prefill
+    const int TB = light ? 300 : 2500;
+    void* ws;
+    CUDA_CHECK(cudaMalloc(&ws, prefill_ws_bytes(TB)));
+    CUDA_CHECK(cudaMemset(ws, 0, prefill_ws_bytes(TB)));
+    float *dyr, *dys, *dw;
+    int* di;
+    __nv_bfloat16* dx;
+    CUDA_CHECK(cudaMalloc(&dyr, (size_t)TB * kH * 4));
+    CUDA_CHECK(cudaMalloc(&dys, (size_t)TB * kH * 4));
+    std::vector<__nv_bfloat16> x;
+    rnd_x(x, (size_t)TB * kH, 43);
+    std::vector<int> idx;
+    std::vector<float> w;
+    prefill_picks(TB, 44, idx, w);
+    dx = h2d(x), di = h2d(idx), dw = h2d(w);
+    for (int T : light ? std::vector<int>{1, 37, 300} : std::vector<int>{1, 37, 300, TB})
+      for (int v = 0; v < 2; ++v) {
+        PrefillCfg c;
+        if (v) c.up = 0, c.down = 0;
+        const PrefillOut a = run_prefill(A, dx, di, dw, T, ws, dyr, dys, c, true);
+        const PrefillOut b = run_prefill(B, dx, di, dw, T, ws, dyr, dys, c, true);
+        snprintf(name, sizeof name, "equiv prefill T=%d %s: INT4 = BF16(dequantised)", T, v ? "up 0 down 0" : "default");
+        check(name, !h_diff(a, b) && !out_diff(a, b), "h %zu of %zu, outputs %zu of %zu differ", h_diff(a, b), a.h[0].size(),
+              out_diff(a, b), a.yr.size());
+      }
+    cudaFree(ws), cudaFree(dyr), cudaFree(dys), cudaFree(dw), cudaFree(di), cudaFree(dx);
+  }
+  B.free_dev();
 }
