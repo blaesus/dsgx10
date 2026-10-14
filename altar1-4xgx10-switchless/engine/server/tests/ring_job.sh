@@ -131,4 +131,7 @@ echo "--- rank 0 log (serve lines)"
 grep -E "^serve: (req|run|session|pool|kept)" "$LRD/logs/$NAME.0.log" | tail -n 60
 ranks_tails 3
 cp "$LRD/logs/$NAME.0.log" "$DATA/rank0.$(date +%Y%m%d-%H%M%S).log" 2> /dev/null  # the whole job's rank 0 log
+# rank 0's data disk has little room (DESIGN, rank 0's disk): the test tier's files go once the job is over
+S0=$(fleet_local "$(fleet_rank "$(fleet_get RANK0_SPILL)" 0)")
+[ -n "$S0" ] && rm -f "$S0"/rank0.test.spill "$S0"/rank0.test.index "$S0"/server.test.index
 exit $RC
