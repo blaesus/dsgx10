@@ -1,5 +1,5 @@
-// glw_expert_fill_test: a filled routed-expert pool against the canonical NVFP4 tensors it came from, with the
-// expert kernels' own host readers (engine/experts/layout.h: read_q4 on the packed blocks, canon_q4 on the
+// glw_expert_fill_test: a filled routed-expert pool against the canonical NVFP4 or S3 (S3x2) tensors it came from, with the
+// expert kernels' own host readers (engine/experts/layout.h: read_q4 / read_s3 on the packed blocks, canon_q4 / canon_s3 on the
 // canonical tensors). Host only, no device.
 //
 //   glw_expert_fill_test FILE RANK DUMP_DIR LAYER E [E ...]
@@ -49,15 +49,21 @@ int main(int argc, char** argv) {
       const std::string base = dir + "/L" + std::to_string(L) + ".r" + std::to_string(rank) + ".e" + std::to_string(e) + "." + proj[m];
       const std::vector<uint8_t> w = slurp(base + ".w"), s = slurp(base + ".s");
       const gx::MatDesc& d = desc[3 * e + m];
-      if (w.size() != size_t(N) * K / 2 || s.size() != size_t(N) * K / 16) die("%s: canonical sizes", base.c_str());
-      if (d.fmt != gx::kNVFP4 || expert_matrix_fmt(et->fmt, m) != gx::kNVFP4 || d.off % 256 || d.off < eoff ||
-          d.off - eoff + gx::mat_bytes(gx::kNVFP4, N, K) > ent.size() ||
-          !(d.s2 > 0) || !std::isfinite(d.s2))
+      // NVFP4: w [N][K/2] nibbles; S3 (S3x2, s3x2_pack.py): w the codes [N][K/16][6], the subsets from the descriptor
+      const bool s3 = d.fmt == gx::kS3;
+      float mags[2][4];
+      if (w.size() != (s3 ? size_t(N) * K / 16 * 6 : size_t(N) * K / 2) || s.size() != size_t(N) * K / 16)
+        die("%s: canonical sizes", base.c_str());
+      if ((d.fmt != gx::kNVFP4 && !s3) || expert_matrix_fmt(et->fmt, m) != d.fmt || d.off % 256 || d.off < eoff ||
+          d.off - eoff + gx::mat_bytes(d.fmt, N, K) > ent.size() || !(d.s2 > 0) || !std::isfinite(d.s2) ||
+          (s3 && !gx::s3_desc_check(d, mags)))
         die("expert %d %s: bad descriptor (off %llu, fmt %u, s2 %g)", e, proj[m], (unsigned long long)d.off, d.fmt, d.s2);
       long b = 0;
+      const uint8_t* pm = ent.data() + (d.off - eoff);
       for (int n = 0; n < N; n++)
         for (int k = 0; k < K; k++) {
-          const float got = gx::read_q4(ent.data() + (d.off - eoff), K, n, k), want = gx::canon_q4(w.data(), s.data(), K, n, k);
+          const float got = s3 ? gx::read_s3(pm, mags, K, n, k) : gx::read_q4(pm, K, n, k);
+          const float want = s3 ? gx::canon_s3(w.data(), s.data(), mags, K, n, k) : gx::canon_q4(w.data(), s.data(), K, n, k);
           b += std::memcmp(&got, &want, 4) != 0;
         }
       std::printf("layer %d expert %3d %-4s [%d][%d] off %10llu s2 %.6g: %ld of %d values differ\n", L, e, proj[m], N,

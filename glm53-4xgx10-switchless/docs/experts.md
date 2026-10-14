@@ -20,6 +20,7 @@ contract, how it was tested and what it measured. Written 2026-10-13. The math i
 10. [What remains](#10-what-remains)
 11. [2026-10-14: prefill tuning](#11-2026-10-14-prefill-tuning)
 12. [2026-10-14 (T6): where the chained down's time goes](#12-2026-10-14-t6-where-the-chained-downs-time-goes)
+13. [2026-10-14 (E1): S3×2, the quantiser's format, in the engine](#13-2026-10-14-e1-s32-the-quantisers-format-in-the-engine)
 
 ## 1. What is built
 
@@ -60,6 +61,8 @@ run in one launch (the kernels branch on the descriptor, warp-uniformly).
   little-endian 48-bit word with value j at bits 3j…3j+2 (code c = sign << 2 | index); `s [N][K/16]` with
   bit 7 the group's subset and bits 6:0 its e4m3 scale; `s2` f32.
   W(n, k) = (−1)^(c>>2) · mags[s>>7][c & 3] · e4m3(s & 0x7f) · s2.
+  **S3×2** (the quantiser's format, § 13) is S3 with the subsets {0.5, 2, 4, 6} and {0.5, 1.5, 3, 6}
+  (`kS3x2Mags`, `make_desc_s3x2`); the converter packs it with `engine/weights/s3x2_pack.py`.
 
 **The engine layout** (a lossless re-tiling; `pack_nvfp4`, `pack_s3` are the specification, and the
 `--cpu` checks prove packer + kernel decoder = canonical reader for every value):
@@ -240,7 +243,8 @@ prefill checks (ranges, determinism, chunk invariance) now run on the new kernel
 | (2026-10-14) the same with `up = 2`, `down = 2` (warp-specialised chained down), 256-column passes claimed 3 round-robin, the shared expert on a side stream | 0 differ |
 
 Test data: 10 stored experts in five format patterns (all NVFP4; S3 with one subset; S3 with two; S3 gate/up +
-NVFP4 down; NVFP4 gate/up + S3 down) mapped over the 256 ids. The subsets are {0.5, 2, 4, 6} and {0, 1, 3, 6}.
+NVFP4 down; NVFP4 gate/up + S3 down) mapped over the 256 ids. The subsets are {0.5, 2, 4, 6} and {0, 1, 3, 6}
+(until E1; since 2026-10-14 the S3×2 pair {0.5, 2, 4, 6} + {0.5, 1.5, 3, 6}, the odd pairs keeping {0, 1, 3, 6}; § 13).
 Random scales; x random bf16; picks with six hot experts (prefill).
 
 ## 8. Measurements
@@ -614,3 +618,136 @@ the same kernels; the 2 ms between the jobs is not explained here).
 
 `test_experts` (`run.sh test`) on every build of this section: all pass, 0 failed (f1.log: the final sources;
 p1–p4.log: the dropped variants' checks as well).
+
+## 13. 2026-10-14 (E1): S3×2, the quantiser's format, in the engine
+
+**Goal:** the quantiser's chosen expert format ([quantiser.md](quantiser.md) Q1: S3×2 gate/up + NVFP4 down, the
+main track; S3×2 on every projection, the bracket) in the engine, every value exact to the format's definition
+in `quant/formats.py`. **Result:** the kernels needed no new decode path (S3 always carried two subsets in
+`MatDesc`); E1 fixes the pair, gives the converter a packer that is byte-for-byte `layout.h`, checks the
+quantiser's own bytes on real experts through every reader and kernel, adds a decode variant equal to prefill
+bit for bit, and makes the loader check S3 descriptors and scale bytes. Experiment row E1.
+
+### The format, exactly
+
+S3×2 is `kS3` with the subsets `kS3x2Mags` (experts.h): **A = {0.5, 2, 4, 6}** where a group's scale byte has
+bit 7 clear, **B = {0.5, 1.5, 3, 6}** where it is set (quantiser.md § 2, `levelset3` with two subsets):
+
+- a group is 16 consecutive k of one row (K is the GEMM's input dimension, torch `W[out][in]`'s `in`);
+- per group the quantiser tries both subsets × the multipliers {1, .95, .9, .85, .8, .75, .7}, scale
+  `e4m3_rne(amax₁₆ / 6 · m / s2)`, values to the nearest level (ties to the lower), and keeps the least squared
+  error (first in (subset, multiplier) order on ties); the winner's subset is bit 7 and its e4m3 scale bits 6:0;
+- `s2 = f32(amax) / f32(2688)` over the whole tensor (a division, unlike NVFP4's multiply by f32(1/2688); per
+  tensor, gate and up not shared, unlike NVFP4);
+- code `c = sign << 2 | j` means (−1)^sign · m_j of the group's subset; 16 codes a little-endian 48-bit word,
+  value i at bits 3i…3i+2; W = (−1)^(c>>2) · mags[s>>7][c&3] · e4m3(s & 0x7F) · s2.
+- 3.5 bpw a matrix (3 bits + an 8-bit scale per 16); the main track averages 3.83 (NVFP4 down at 4.5).
+
+In the engine nothing about the format is new: the block is S3's (1,792 B for 8 rows × 512 k, § 2), the
+subset bit travels in the scale byte, and the two subsets are the descriptor's prmt tables (`tab[0..3]` A,
+`tab[4..7]` B) and FP4 nibble words (`nib[0]`, `nib[1]`). Every product mag · e4m3 is exact in bf16 (at most 6
+significant bits; 1.5 adds one bit to 0.5's), so the decoded weights are the format's values exactly. A
+matrix's descriptor is `make_desc_s3x2(off, s2)`; a layer mixes formats per projection as before (each of an
+expert's three `MatDesc`s has its own `fmt`; the kernels branch warp-uniformly on it).
+
+The tests used {0, 1, 3, 6} as the second subset until E1; they now use the measured pair, and the odd-pairs
+pattern keeps {0, 1, 3, 6} so a pair with a 0 stays covered.
+
+**The FP4 tensor-core path and the two subsets.** Both subsets are E2M1 magnitudes, so each code is an E2M1 value
+times the group's e4m3 scale. `k_pup_f4` / `k_pdown_f4` turn each code into its E2M1 nibble through the subset's
+nibble word (`nib[s >> 7]`, by prmt), clear bit 7 of the scale byte and hand it to `mma … kind::mxf4nvf4
+.block_scale.scale_vec::4X` as the ue4m3 scale of the same 16 values: the weight side of the MMA is the format's
+value, bit for bit. The path is still not output-preserving: it quantises the activations to NVFP4 (§ 5), which
+the contract (bf16 activations, f32 accumulation) does not allow, and on these weights it moves the routed output
+by 15.8–17.2 % relative RMS (below). Under the contract prefill runs the bf16 `mma.sync` path, the weights decoded
+to bf16 by the decode kernels' own functions.
+
+### What the converter calls
+
+`engine/weights/s3x2_pack.py` (needs only `quant/formats.py`, numpy, torch; CPU):
+
+```
+q  = quantise_expert(W_gate, W_up, W_down, recipe="mix")       # [(fmt, canonical)] x 3, full f32 tensors
+sl = [rank_slice(f, c, m, r) for m, (f, c) in enumerate(q)]    # gate/up rows [512r, +512), down cols [512r, +512)
+entry, tag, moff = expert_entry(sl)                            # the TOC entry's bytes, fmt tag, matrix offsets
+descs = expert_descs(sl, entry_off_in_pool)                    # 3 x 64 B MatDesc (make_desc_s3x2 / make_desc)
+```
+
+Recipes: `mix` (S3×2, S3×2, NVFP4; an expert 4,521,984 B a rank), `s3x2` (4,128,768 B), `nvfp4` (NVIDIA's recipe,
+gate/up sharing amax; 5,308,416 B). `pack_s3` is a vectorised port of `layout.h pack_s3`; `pack_nvfp4` repeats
+experts_fill.py's port so the module stands alone. The reserved entries are sized for NVFP4, so an S3 fill must
+re-declare each expert entry's `fmt`, `shape` and `reserve_bytes` (as `tests/s3x2_layer_test.py` does on a copy).
+Time: ~2.2–2.8 s an expert at 4 threads (quantise all three, cut, pack), ~12 min a layer a rank at 4 threads if
+each rank quantised alone; quantising once and cutting four ranks is ~4× cheaper.
+
+### Checks (all 2026-10-14, all pass)
+
+| Check | Where | Result |
+|---|---|---|
+| `s3x2_pack.py selftest`: vectorised packers vs a per-element port of `read_s3`/`read_q4` on random bits; Gaussian 2048 × 6144 / 6144 × 2048 tensors through levelset3 / nvfp4_rtn, 4 rank slices = slices of the full tensor's values, 8,000 packed values each read back; descriptor tables decode to the subsets | CPU | 0 bad |
+| The quantiser's bytes (dumps of layer 3 experts 0, 51, 102, 153, 204, 255 cut to rank 1, layer 40's to rank 2, mix and s3x2; 4 random experts × 2 recipes): Python packer = `layout.h` packer; Python MatDesc = `make_desc_s3x2` / `make_desc`; the torch model (levelset3_dequant / nvfp4_dequant without s2) = `canon_s3`/`canon_q4` and = `read_s3`/`read_q4` of the Python-packed blocks; scale bytes | `test_experts --real` (host) | 0 of 113,246,208 values a layer differ (75,497,472 random), 0 bytes, 0 descriptors; subset B in 40.3 % (layer 3), 38.0 % (layer 40), 50.0 % (random) of the groups |
+| The GPU decode (`dec_group`, the kernels' fragment mapping) of every value vs the torch model | GPU | 0 of 113,246,208 differ, each layer (NVFP4 as bf16(v · 2⁻³⁰)) |
+| Decode at M = 1, 3, 5, 6, 8, 9, 16 on a layer of these 12 real experts (both recipes) mapped over 256 ids: h against double (the f32-sum range), outputs against double from the GPU's h, batch invariance, determinism, all 9 up and 5 down variants | GPU | all pass; h 99.98 % bit-exact (e.g. M = 16: 425,890 of 425,984), outputs ≤ 2.1e−7 of Σ\|terms\| |
+| Prefill at T = 1, 37, 300 on the same layers: h, outputs against double; default kernels vs those of 2026-10-13 and the variants (bit-identical); the FP4 path (activation bits, h range, outputs) | GPU | all pass |
+| **Decode = prefill**: the wk1 decode variants (`DecodeCfg::up = kUpPrefillOrder` = 6, and 7, 8) against moe_prefill, every h (8 picks + shared) and every yr and ys value, 16-row steps | GPU, real (both layers), random and synthetic layers | **0 differ**: h 0 of 1,382,400, outputs 0 of 3,686,400 at T = 300, each layer |
+| Synthetic `test_experts` with the measured pair (109 checks; adds M = 6, the descriptor check, subsets A, B, C) | GPU | all pass |
+| `glw_kcheck --partial --layers 3 --blocks` on the NVFP4 layer-3 test file | CPU | 3,123 ok, 0 bad (768 new block checks) |
+| A copy of that file with layer 3 re-filled in S3×2 mix from the master by `s3x2_pack.py` (`tests/s3x2_layer_test.py`, 706 s, 1,211,736,064 B): `glw_check`; `glw_kcheck --blocks`; `glw_expert_fill_test` experts 0, 17, 255 (read_s3 / read_q4 through each descriptor vs the canonical slices) | CPU | CRCs, padding, geometry OK; 3,635 ok, 0 bad: 512 S3 descriptors all the S3×2 pair, 150,994,944 scale bytes, 40,203,464 groups of subset B; 0 of 28,311,552 values differ |
+
+A damaged copy of the S3×2 file (one scale byte made the e4m3 NaN, one table byte flipped) was refused by the
+loader's CRC check before kcheck's own checks ran; those are covered by the host unit check ("cpu s3 descriptor
+check": a flipped table byte, a flipped nibble word, an off-grid and a descending subset, an NVFP4 descriptor all
+refused; another pair accepted and reported).
+
+### Decode against the floor
+
+One GB10 (rank 0's), `ring.sh` job j2 (bin-2, sources `e440cbbea4af725c`), streaming probe 227.5–229.4 GB/s in
+the window. Each figure is the median of 7 replays of a 64-step graph (route + up + down, the shared expert
+included), % of 235 GB/s; the runs were in the order A B C D D C B A (A = the default wk6, B–D = wk1 p2, p4, nt2),
+the cells give A's two runs and B's two.
+
+| Rows | mix (S3×2 gate/up + NVFP4 down): default | mix: wk1 p2 (= prefill) | S3×2 all: default | S3×2 all: wk1 p2 |
+|---:|---|---|---|---|
+| 1 | 88.9 / 90.0 % (218.2 / 215.8 µs) | 83.1 / 83.5 % (233.5 / 232.5 µs) | 91.6 / 91.8 % (197.3 / 196.9 µs) | 82.8 / 82.2 % |
+| 6 | 94.6 / 93.7 % (945 / 955 µs) | 89.1 / 87.3 % | 92.1 / 97.1 % (890 / 845 µs) | 86.5 / 88.0 % |
+| 16 | 94.8 / 94.4 % (2,121 / 2,129 µs) | 90.4 / 90.3 % | 92.6 / 93.4 % (1,987 / 1,968 µs) | 89.7 / 89.5 % |
+
+- The default keeps experiment 1's 91–93 % (S3) and K2's range: S3×2 91.6–97.1 %, mix 88.9–94.8 % of 235
+  (91.9–99.9 % of the measured window). Per token, 75 layers at 1 row: mix 16.2–16.4 ms, S3×2 14.8 ms.
+- **The prefill-order decode costs 5–10 %.** One warp a strip pair sums all 6,144 k (prefill's order) instead of
+  six warps 1,024 each; its tasks are six times longer and the up wave's tail grows (up alone at 1 row: 147 vs
+  134 µs). p4 and nt2 are no better than p2. Kept as a variant, not the default: the default stays the
+  engine's decode; choosing decode = prefill for the runner (its `DecodeCfg::up`) is the orchestrator's call
+  (engine/model is outside E1).
+
+### Prefill
+
+j3 (bin-2), 256 distinct experts in the format, balanced picks, median of 5 replays (§ 8's method), the defaults
+(warp-specialised gate/up, chained down):
+
+| Format | 1k rows: ms, TFLOPS (% of 107) | 4k | 8k |
+|---|---|---|---|
+| mix, bf16 | 8.07, 21.6 (20.1 %) | 18.83, 37.0 (34.5 %) | 36.38, 38.2 (35.7 %) |
+| S3×2, bf16 | 7.96, 21.9 (20.4 %) | 18.41, 37.8 (35.3 %) | 36.33, 38.3 (35.8 %) |
+| mix, FP4 activations (not exact) | 9.47, 18.4 | 21.04, 33.1 | 38.07, 36.6 |
+| S3×2, FP4 activations (not exact) | 9.05, 19.2 | 20.39, 34.1 | 37.32, 37.3 |
+
+As T1/T6 measured for the same kernels; the gate/up runs at 58–60 TFLOPS at 8k (mix 13.8 ms) and the chained
+down's ordered adds (16.7 ms) bound the layer. The FP4 path (its 2026-10-13 kernels, `up 0 down 0`) is now
+slower than the exact path at every size: its gate/up is faster (78.7–79.7 TFLOPS) but its down and combine are
+the old ones.
+
+### Failures and what is left
+
+- **Decode = prefill is a variant, not the default**: 5–10 % slower at decode (above). The other way round,
+  prefill in the default decode's order (six 1,024-k chains summed in order), needs a second accumulator set in
+  the gate/up kernel (64 more registers a thread in `k_pup_ws`, which is capped at 128 a thread at 512
+  threads) or 64 KB more shared memory a CTA; not tried.
+- No S3×2 fill of the rank files: experts_fill.py (another agent's) must call `s3x2_pack` and re-declare the
+  entries' format and size (reserved for NVFP4 today); `tests/s3x2_layer_test.py` shows the calls on a copy.
+- The real-expert decode/prefill tests use synthetic x (unit-RMS bf16) and a synthetic shared expert; no real
+  activations, no KL (experiment 3).
+- kcheck's new checks were not seen to fire on a damaged file (the CRC refused it first); the unit check covers
+  their verdicts.
+- Runs: `~/dsgb10-data/glm53-e1/` (j1–j3.tsv, ring1–3.txt; job1–3.sh), dumps in `/data/scratch/glm53-e1/` (not in
+  the repo).

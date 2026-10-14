@@ -218,7 +218,13 @@ format), and `glw_expert_fill_test` on experts 0, 17, 255: every value of every 
 descriptor with `gx::read_q4` equals `gx::canon_q4` of the canonical slice (28,311,552 values, 0 differ).
 
 **The second fill** (S3 from the quantiser) writes the same entries with their own tags; it rewrites the expert
-tail (truncate at the first expert entry, append again), leaving the non-expert bytes in place.
+tail (truncate at the first expert entry, append again), leaving the non-expert bytes in place. Its packing is
+[s3x2_pack.py](../engine/weights/s3x2_pack.py) (E1, [experts.md § 13](experts.md#13-2026-10-14-e1-s32-the-quantisers-format-in-the-engine)):
+`quantise_expert` → `rank_slice` → `expert_entry` / `expert_descs`; each entry's `fmt`, `shape` and `reserve_bytes`
+must be re-declared for its format (mix 4,521,984 B, S3×2 4,128,768 B). Tried on a copy of the layer-3 test file
+(`tests/s3x2_layer_test.py`, 2026-10-14): `glw_check`, `glw_kcheck --partial --layers 3 --blocks` (3,635 ok) and
+`glw_expert_fill_test` (0 of 28,311,552 values differ) pass. `glw_kcheck` now checks every S3 descriptor's
+tables against `make_desc` and, with `--blocks`, every expert scale byte.
 
 ## 7. Verification
 

@@ -3,6 +3,8 @@
 #pragma once
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <vector>
 
 #include "common/check.h"
@@ -10,8 +12,9 @@
 
 namespace gx {
 
-static const float kSubA[4] = {0.5f, 2.f, 4.f, 6.f};  // quantisation.md 3.3's best single subset
-static const float kSubB[4] = {0.f, 1.f, 3.f, 6.f};   // a second one, with 0
+static const float kSubA[4] = {0.5f, 2.f, 4.f, 6.f};  // S3x2 subset A (kS3x2Mags[0]), the best single subset
+static const float kSubB[4] = {0.5f, 1.5f, 3.f, 6.f};  // S3x2 subset B (kS3x2Mags[1]), the measured partner (Q1)
+static const float kSubC[4] = {0.f, 1.f, 3.f, 6.f};    // the tests' second subset before E1 (2026-10-14), with a 0
 
 struct HostMat {
   uint32_t fmt = kNVFP4;
@@ -115,9 +118,15 @@ struct TestLayer {
         const int N = j < 2 ? kI : kH, K = j < 2 ? kH : kI;
         const uint64_t sd = seed * 131 + e * 3 + j;
         const float s2 = j < 2 ? kS2Up : kS2Down;
-        m.push_back(p.f[j] == kNVFP4 ? make_q4(N, K, sd, s2) : make_s3(N, K, sd, s2, p.nsub[j], kSubA, kSubB));
+        // the odd pairs (pattern 4) keep the pre-E1 second subset with a 0: any pair decodes the same way
+        const bool odd = &p == &kPatterns[4];
+        m.push_back(p.f[j] == kNVFP4 ? make_q4(N, K, sd, s2) : make_s3(N, K, sd, s2, p.nsub[j], kSubA, odd ? kSubC : kSubB));
       }
     }
+    finish(seed);
+  }
+  // the shared expert (synthetic FP8), the pool offsets and the id -> stored expert map, after m is filled
+  void finish(uint64_t seed) {
     sg = make_fp8(kI, kH, seed * 17 + 1, 1.f / 1024);
     su = make_fp8(kI, kH, seed * 17 + 2, 1.f / 1024);
     sd = make_fp8(kH, kI, seed * 17 + 3, 1.f / 256);
@@ -163,6 +172,67 @@ struct TestLayer {
     d_pool = nullptr;
   }
 };
+
+// Real (or random) experts written by engine/weights/s3x2_pack.py dump / dump-random: index.tsv has a line
+// "S recipe expert" per stored expert, then three "M proj fmt s2-bits-hex N K prefix"; each matrix's files are
+// prefix.w / .s (the canonical slice), .packed (the Python packer's blocks), .desc (its MatDesc at off 0) and .val
+// (the torch model's values without s2, bf16 [N][K]).
+struct RealMat {
+  std::string recipe, proj, prefix;
+  int expert = 0;
+  std::vector<uint8_t> desc;
+  std::vector<uint16_t> val;
+};
+inline std::vector<uint8_t> slurp(const std::string& p) {
+  FILE* f = fopen(p.c_str(), "rb");
+  if (!f) die("%s: cannot open", p.c_str());
+  std::vector<uint8_t> v;
+  uint8_t buf[1 << 16];
+  for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) v.insert(v.end(), buf, buf + n);
+  fclose(f);
+  return v;
+}
+inline void load_real(TestLayer& L, std::vector<RealMat>& rm, const std::string& dir, uint64_t seed) {
+  FILE* f = fopen((dir + "/index.tsv").c_str(), "r");
+  if (!f) die("%s/index.tsv: cannot open", dir.c_str());
+  L.m.clear();
+  rm.clear();
+  char line[1024], a[64], b[64], c[512];
+  std::string recipe;
+  int expert = 0;
+  while (fgets(line, sizeof line, f)) {
+    if (line[0] == 'S') {
+      if (sscanf(line, "S %63s %d", a, &expert) != 2) die("%s: bad line %s", dir.c_str(), line);
+      recipe = a;
+      continue;
+    }
+    unsigned fmt, s2b;
+    int N, K;
+    if (sscanf(line, "M %63s %u %x %d %d %511s", b, &fmt, &s2b, &N, &K, c) != 6) die("%s: bad line %s", dir.c_str(), line);
+    HostMat m;
+    m.fmt = fmt, m.N = N, m.K = K;
+    memcpy(&m.s2, &s2b, 4);
+    m.nsub = fmt == kS3 ? 2 : 1;
+    memcpy(m.mags, kS3x2Mags, sizeof m.mags);
+    const std::string p = dir + "/" + c;
+    m.w = slurp(p + ".w"), m.s = slurp(p + ".s"), m.packed = slurp(p + ".packed");
+    RealMat r;
+    r.recipe = recipe, r.proj = b, r.prefix = c, r.expert = expert, r.desc = slurp(p + ".desc");
+    const std::vector<uint8_t> v = slurp(p + ".val");
+    r.val.resize(v.size() / 2);
+    memcpy(r.val.data(), v.data(), v.size());
+    const size_t wb = fmt == kS3 ? (size_t)N * K / 16 * 6 : (size_t)N * K / 2;
+    if (m.w.size() != wb || m.s.size() != (size_t)N * K / 16 || m.packed.size() != mat_bytes(fmt, N, K) ||
+        r.desc.size() != sizeof(MatDesc) || r.val.size() != (size_t)N * K)
+      die("%s: sizes", p.c_str());
+    L.m.push_back(std::move(m));
+    rm.push_back(std::move(r));
+  }
+  fclose(f);
+  if (L.m.empty() || L.m.size() % 3) die("%s: %zu matrices", dir.c_str(), L.m.size());
+  L.NS = (int)L.m.size() / 3;
+  L.finish(seed);
+}
 
 // bf16 activations, roughly unit RMS (a normed hidden state)
 inline void rnd_x(std::vector<__nv_bfloat16>& x, size_t n, uint64_t seed) {

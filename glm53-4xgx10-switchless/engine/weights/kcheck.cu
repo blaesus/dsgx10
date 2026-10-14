@@ -9,6 +9,9 @@
 //                                            into a glm::GemvSeg as the layer runner will
 //   glw_kcheck FILE --rank R --partial --layers 3
 //                                            a test file holding some layers (convert.py --only): those only
+//   ... --blocks                             also reads every filled expert entry and checks its scale bytes
+//                                            (no e4m3 NaN; NVFP4's positive); S3 descriptors are always checked
+//                                            against make_desc (two ascending E2M1 subsets; the S3x2 pair counted)
 //   glw_kcheck FILE --rank R --gpu [--layers 0,3,10,78] [--rows 4]
 //                                            also loads those layers (and the head) and runs glm::gemv on each FP8
 //                                            projection and the BF16 head with random bf16 inputs, against a host
@@ -31,6 +34,7 @@
 
 #include "attn/attn.h"
 #include "experts/experts.h"
+#include "experts/layout.h"
 #include "common/check.h"
 #include "weights/loader.h"
 
@@ -39,6 +43,9 @@ using namespace glw;
 namespace {
 
 int g_bad = 0, g_ok = 0;
+bool g_blocks = false;                    // --blocks: scan the filled experts' scale bytes
+size_t g_s3_pair = 0, g_s3_other = 0;     // S3 descriptors with the S3x2 pair / another pair
+size_t g_scale_bytes = 0, g_subset_b = 0;  // --blocks: scale bytes scanned, S3 groups of subset B
 void expect(bool ok, const std::string& what) {
   if (ok) {
     ++g_ok;
@@ -146,9 +153,37 @@ void check_experts(const WeightFile& wf, int L) {
         expect(d.off == t->file_offset - base + moff[m] && d.off % 256 == 0 &&
                    d.fmt == expert_matrix_fmt(t->fmt, m) && d.s2 > 0 && std::isfinite(d.s2),
                t->name + ": descriptor " + std::to_string(m));
+        // S3: the prmt tables and the FP4 nibble words are make_desc's for two ascending E2M1 subsets
+        // (layout.h s3_desc_check); S3x2's pair is the one the converter writes, another pair is reported
+        if (d.fmt == gx::kS3) {
+          float mg[2][4];
+          bool pair = false;
+          expect(gx::s3_desc_check(d, mg, &pair), t->name + ": S3 descriptor " + std::to_string(m) + " tables");
+          g_s3_pair += pair, g_s3_other += !pair;
+        }
       }
+    // --blocks: every stored scale byte of the expert's matrices (not the e4m3 NaN; NVFP4's positive, as the FP4
+    // path's ue4m3 reads them), so a damaged or misaligned fill is found before the kernels read it
+    if (g_blocks) {
+      const std::vector<uint8_t> ent = wf.read_host(*t);
+      for (int m = 0; m < 3; m++) {
+        const uint32_t f = expert_matrix_fmt(t->fmt, m);
+        size_t nb = 0;
+        const size_t bad = gx::scale_bytes_check(ent.data() + moff[m], f, N[m], K[m], &nb);
+        expect(bad == 0, t->name + ": matrix " + std::to_string(m) + " has " + std::to_string(bad) + " bad scale bytes");
+        g_scale_bytes += size_t(N[m]) * K[m] / 16, g_subset_b += nb;
+      }
+    }
   }
   expect(filled == 0 || (filled == gx::kE && !ed->reserved()), p + ": all 256 experts and the desc filled, or none");
+}
+
+void print_expert_summary() {
+  if (g_s3_pair + g_s3_other)
+    std::printf("S3 descriptors: %zu with the S3x2 pair {0.5, 2, 4, 6} + {0.5, 1.5, 3, 6}, %zu with another pair\n",
+                g_s3_pair, g_s3_other);
+  if (g_blocks)
+    std::printf("--blocks: %zu scale bytes scanned, %zu S3 groups of subset B\n", g_scale_bytes, g_subset_b);
 }
 
 struct LayerSegs {
@@ -370,6 +405,7 @@ int main(int argc, char** argv) {
     if (a == "--rank" && i + 1 < argc) rank = std::atoi(argv[++i]);
     else if (a == "--gpu") gpu = true;
     else if (a == "--partial") partial = true;  // a test file (convert.py --only): check just --layers
+    else if (a == "--blocks") g_blocks = true;
     else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
     else if (a == "--layers" && i + 1 < argc) {
       layers.clear();
@@ -387,6 +423,7 @@ int main(int argc, char** argv) {
     std::printf("%s: rank %d, %zu entries; host binding of layers", file.c_str(), rank, wf.tensors().size());
     for (int L : layers) std::printf(" %d", L);
     std::printf(": %d checks ok, %d bad\n", g_ok, g_bad);
+    print_expert_summary();
     return g_bad ? 1 : 0;
   }
   need(wf, "embed.weight", {DType::BF16, {kVocabRank, kDim}, Layout::Natural});
@@ -398,6 +435,7 @@ int main(int argc, char** argv) {
   expect(full == 22, "full-indexer layers: " + std::to_string(full) + " (21 + the MTP layer's)");
   std::printf("%s: rank %d, %zu entries; host binding: %d checks ok, %d bad\n", file.c_str(), rank,
               wf.tensors().size(), g_ok, g_bad);
+  print_expert_summary();
   if (!gpu) return g_bad ? 1 : 0;
 
   // device: load the chosen layers and the head, run the GEMVs

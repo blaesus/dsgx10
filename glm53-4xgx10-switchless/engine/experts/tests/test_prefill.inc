@@ -71,10 +71,10 @@ static PrefillOut run_prefill(const TestLayer& L, const __nv_bfloat16* dx, const
   return PrefillOut{d2h(dyr, (size_t)T * kH), d2h(dys, (size_t)T * kH)};
 }
 
-void test_prefill() {
-  TestLayer L;
-  L.build(10, 3);
-  L.upload();
+void test_prefill(TestLayer* ext, bool light) {  // ext: an uploaded layer (the real experts); light: T <= 300 only
+  TestLayer syn;
+  if (!ext) syn.build(10, 3), syn.upload();
+  TestLayer& L = ext ? *ext : syn;
   Ref R(L);
   const int TB = 2500;  // two down passes
   void *ws, *dws;
@@ -103,7 +103,7 @@ void test_prefill() {
   cudaStream_t side;
   CUDA_CHECK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
 
-  for (int T : {1, 37, 300, TB}) {
+  for (int T : light ? std::vector<int>{1, 37, 300} : std::vector<int>{1, 37, 300, TB}) {
     const PrefillOut p = run_prefill(L, dx, di, dw, T, ws, dyr, dys);
     char name[96];
     // sampled rows: each pick's h (from the workspace) within the range of f32 sums of the double gate/up, and
@@ -219,9 +219,49 @@ void test_prefill() {
       snprintf(name, sizeof name, "prefill T=%d vs decode, every row", T);
       check(name, worst <= 2e-3, "%zu of %zu outputs bit-identical, max diff %.2e of the row's largest output", same, n, worst);
     }
+    // decode in prefill's K order (DecodeCfg::up = kUpPrefillOrder and the other wk1 variants): every h (each
+    // pick's and the shared expert's) and every output bit for bit equal to the prefill's, 16-row steps
+    if (T <= 300) {
+      const PrefillView v = prefill_view(ws, T);
+      const auto rpos = d2h(v.rpos, (size_t)T * kTopK), re = d2h(v.re, (size_t)T * kTopK);
+      const auto hall = d2h(v.h, (size_t)T * kTopK * kI);
+      const auto hsh = d2h(v.hsh, (size_t)T * kI);
+      for (int uv = 0; uv < decode_up_variants(); ++uv) {
+        if (!strstr(decode_up_name(uv), "wk1")) continue;
+        size_t yd = 0, hd = 0, hn = 0;
+        for (int t0 = 0; t0 < T; t0 += kMaxRows) {
+          const int M = std::min(kMaxRows, T - t0);
+          DecodeCfg c;
+          c.up = uv;
+          moe_decode(L.layer(), dx + (size_t)t0 * kH, di + t0 * kTopK, dw + t0 * kTopK, M, dws, dyr2, dys2, 0, c);
+          CUDA_CHECK(cudaDeviceSynchronize());
+          const auto dr = d2h(dyr2, (size_t)M * kH), ds = d2h(dys2, (size_t)M * kH);
+          const auto dh = d2h(reinterpret_cast<const __nv_bfloat16*>(dws), (size_t)(kMaxUnion + 1) * kMaxRows * kI);
+          for (int m = 0; m < M; ++m)
+            for (int cc = 0; cc < kH; ++cc) {
+              const size_t i = (size_t)(t0 + m) * kH + cc;
+              yd += fbits(p.yr[i]) != fbits(dr[m * kH + cc]);
+              yd += fbits(p.ys[i]) != fbits(ds[m * kH + cc]);
+            }
+          std::set<int> us(idx.begin() + (size_t)t0 * kTopK, idx.begin() + (size_t)(t0 + M) * kTopK);
+          const std::vector<int> uni(us.begin(), us.end());
+          for (int m = 0; m < M; ++m) {
+            const int t = t0 + m;
+            for (int k = 0; k <= kTopK; ++k) {
+              const bool sh = k == kTopK;
+              const int slot = sh ? kShSlot : (int)(std::lower_bound(uni.begin(), uni.end(), re[(size_t)t * kTopK + k]) - uni.begin());
+              const __nv_bfloat16* hp = sh ? &hsh[(size_t)t * kI] : &hall[(size_t)rpos[(size_t)t * kTopK + k] * kI];
+              for (int cc = 0; cc < kI; ++cc) hd += bits(hp[cc]) != bits(dh[((size_t)slot * M + m) * kI + cc]), ++hn;
+            }
+          }
+        }
+        snprintf(name, sizeof name, "prefill T=%d = decode up %s, bit for bit", T, decode_up_name(uv));
+        check(name, yd == 0 && hd == 0, "h: %zu of %zu differ; outputs: %zu of %zu differ", hd, hn, yd, (size_t)2 * T * kH);
+      }
+    }
   }
   // determinism and chunk invariance: the first 300 rows inside the 2500-row chunk, run twice
-  {
+  if (!light) {
     const PrefillOut a = run_prefill(L, dx, di, dw, 300, ws, dyr, dys);
     const PrefillOut b = run_prefill(L, dx, di, dw, TB, ws, dyr, dys);
     const PrefillOut c = run_prefill(L, dx, di, dw, TB, ws, dyr, dys);
@@ -331,5 +371,5 @@ void test_prefill() {
   }
   cudaStreamDestroy(side);
   cudaFree(ws), cudaFree(dws), cudaFree(dyr), cudaFree(dys), cudaFree(dyr2), cudaFree(dys2), cudaFree(di), cudaFree(dw), cudaFree(dx);
-  L.free_dev();
+  if (!ext) L.free_dev();
 }

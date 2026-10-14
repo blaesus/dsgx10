@@ -1,6 +1,8 @@
 // Benchmarks of the routed-expert kernels on one GB10 (GPU: only through ring.sh).
 //   bench_experts --bw                                   the window's streaming read
-//   bench_experts --decode q4|s3|mix [--rows 1,2,4,6,8,16,6c] [--sweep] [--out f.tsv]
+//   bench_experts --decode q4|s3|mix [--rows 1,2,4,6,8,16,6c] [--sweep | --ups 0,6,6,0] [--out f.tsv]
+//                 (s3: S3x2 on every projection, the bracket; mix: S3x2 gate/up + NVFP4 down, the main track; --ups:
+//                 those up variants in that order, e.g. the default against the prefill-order wk1, A B B A)
 //   bench_experts --prefill q4|s3|mix [--chunks 1024,4096,8192] [--fp4] [--down 0,1] [--yrkb 0] [--side 0] [--cq 4] [--up 0,1] [--sh 128] [--diag]
 //                 [--out f.tsv]   (down: PrefillCfg::down variants; yrkb: chained-down L2 budgets, KB; side: the
 //                 shared expert on a second stream; cq: chained-down passes in flight; up: PrefillCfg::up variants; diag: the gate/up kernel and the chained down with parts switched off; sh: the shared down's rows a CTA)
@@ -21,6 +23,7 @@
 using namespace gx;
 
 static FILE* g_out = nullptr;
+static std::vector<int> g_ups;  // --ups 0,6,6,0: decode up variants timed in this order
 static void result(const char* fmt, ...) {
   char buf[1024];
   va_list ap;
@@ -299,6 +302,16 @@ static void bench_decode(const std::string& fname, const std::string& rows_s, bo
         line("step", c, t, t_route);
         if (t < best_t) best_t = t, best = c;
       }
+    } else if (!g_ups.empty()) {  // --ups: these up variants in this order (A B B A), each with its parts
+      for (int u : g_ups) {
+        DecodeCfg c;
+        c.up = u;
+        line("step", c, time_cfg(c, true), t_route);
+        line("no route", c, time_cfg(c, false), t_route);
+        c.parts = 1;
+        line("up only", c, time_cfg(c, false), t_route);
+      }
+      continue;
     } else {
       best_t = time_cfg(best, true);
       line("step", best, best_t, t_route);
@@ -342,6 +355,10 @@ int main(int argc, char** argv) {
     else if (a == "--rows" && i + 1 < argc) rows = argv[++i];
     else if (a == "--chunks" && i + 1 < argc) chunks = argv[++i];
     else if (a == "--sweep") sweep = true;
+    else if (a == "--ups" && i + 1 < argc) {
+      std::vector<std::string> nm;
+      g_ups = parse_rows(argv[++i], nm);
+    }
     else if (a == "--fp4") fp4 = true;
     else if (a == "--down" && i + 1 < argc) po.down = argv[++i];
     else if (a == "--sh" && i + 1 < argc) po.sh = argv[++i];
