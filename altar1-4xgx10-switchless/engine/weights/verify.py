@@ -177,8 +177,11 @@ def cut2(t, rows, cols):
 def plain_bytes(C, pcs, inter):
     arrs = []
     for src, rows, cols, tr in pcs:
-        t = C.get(src)
-        t = cut2(t.reshape(t.shape[0], -1) if t.ndim > 1 else t, rows, cols)
+        if rows and not cols and src not in C.c and C.ck.nbytes(src) > (256 << 20):
+            t = C.ck.get_rows(src, *rows)[0]  # a rank's rows of the embedding or head: not the whole 1.9 GB
+        else:
+            t = C.get(src)
+            t = cut2(t.reshape(t.shape[0], -1) if t.ndim > 1 else t, rows, cols)
         arrs.append(np.ascontiguousarray(t.T if tr else t))
     if inter:
         g, u = arrs
