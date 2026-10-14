@@ -6,6 +6,8 @@
 //   bench_experts --prefill i4|b16|q4 [--chunks 1024,4096,8192] [--down 0,1] [--yrkb 0] [--cq 4] [--up 0,1] [--diag]
 //                 [--out f.tsv]   (down / up: PrefillCfg variants; yrkb: chained-down L2 budgets, KB; cq: chained-down
 //                 passes in flight; diag: the gate/up kernel and the chained down with parts switched off)
+//   bench_experts --shfused i4|b16 [--rows 1,6,16]   the BF16 shared expert fused into the decode kernels: bits against
+//                 the GEMVs (every variant) and time A/B/B/A against GEMVs + experts (bench_shfused)
 //   bench_experts --shared [--rows 1,6,16]   altar-1's BF16 shared expert through attn's BF16 GEMV (gate/up
 //                 interleaved, SwiGLU epilogue; down to f32 partials), every split-K
 // Decode: a pool of >= 2.2 GB of experts in the format (random bits, valid scales) is cycled so L2 holds no
@@ -298,6 +300,150 @@ static void bench_decode(const std::string& fname, const std::string& rows_s, bo
   cudaFree(ws), cudaFree(P.d);
 }
 
+// ---- the BF16 shared expert fused into the decode kernels (SharedW::bgu, bd) against attn's two GEMVs ----------------
+// A layer of the format (the decode bench's pool, picks and descriptors) plus 8 copies of a BF16 shared expert in
+// kBF16T (gate/up interleaved [1024][6144], down [6144][512]), cycled with the steps. (1) bits: for every up and
+// down variant, the fused step's ys and shared h against gemv(kSwiGLU, split-K 4) + gemv(kF32, split-K 1) on the
+// same bytes, and its yr against the unfused step's; (2) time: A = route + the two GEMVs + the unfused experts
+// (the runner's step until now), B = route + the fused experts, in the order A B B A; also the experts alone.
+static int g_fail = 0;
+static void bench_shfused(const std::string& fname, const std::string& rows_s) {
+  const uint32_t fmt = fmt_of(fname);
+  Pool P = make_pool(fmt, 2.2e9);
+  constexpr int NS = 64, NC = 8;
+  const size_t gu = (size_t)2 * kI * kH, dn = (size_t)kH * kI;  // elements
+  uint16_t* shw;
+  CUDA_CHECK(cudaMalloc(&shw, NC * (gu + dn) * 2));
+  k_fill_b16<<<384, 256>>>(shw, NC * (gu + dn), 99);
+  MatDesc* ddesc;
+  float *dl, *db, *yr, *ys, *yr0, *ys0;
+  int* di;
+  float* dw;
+  __nv_bfloat16 *dx, *hm;
+  void* ws;
+  CUDA_CHECK(cudaMalloc(&ddesc, (size_t)NS * kE * 3 * sizeof(MatDesc)));
+  CUDA_CHECK(cudaMalloc(&dl, (size_t)NS * kMaxRows * kE * 4));
+  CUDA_CHECK(cudaMalloc(&db, kE * 4));
+  CUDA_CHECK(cudaMemset(db, 0, kE * 4));
+  for (float** p : {&yr, &ys, &yr0, &ys0}) CUDA_CHECK(cudaMalloc(p, (size_t)kMaxRows * kH * 4));
+  CUDA_CHECK(cudaMalloc(&di, (size_t)NS * kMaxRows * kTopK * 4));
+  CUDA_CHECK(cudaMalloc(&dw, (size_t)NS * kMaxRows * kTopK * 4));
+  CUDA_CHECK(cudaMalloc(&dx, (size_t)kMaxRows * kH * 2));
+  CUDA_CHECK(cudaMalloc(&hm, (size_t)kMaxRows * kI * 2));
+  CUDA_CHECK(cudaMalloc(&ws, decode_ws_bytes()));
+  CUDA_CHECK(cudaMemset(ws, 0, decode_ws_bytes()));
+  {
+    std::vector<__nv_bfloat16> hx;
+    rnd_x(hx, (size_t)kMaxRows * kH, 5);
+    CUDA_CHECK(cudaMemcpy(dx, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
+    std::vector<MatDesc> d((size_t)NS * kE * 3);
+    for (int s = 0; s < NS; ++s)
+      for (int e = 0; e < kE; ++e)
+        for (int j = 0; j < 3; ++j) d[((size_t)s * kE + e) * 3 + j] = pool_desc(P, (int)(((size_t)s * kE + e) % P.NP), j);
+    CUDA_CHECK(cudaMemcpy(ddesc, d.data(), d.size() * sizeof(MatDesc), cudaMemcpyHostToDevice));
+  }
+  printf("== shfused %s: %d experts in the pool (%.2f GB), %d BF16 shared experts of %.2f MB\n", fname.c_str(), P.NP,
+         P.total / 1e9, NC, (gu + dn) * 2 / 1e6);
+  std::vector<std::string> names;
+  const std::vector<int> rows = parse_rows(rows_s, names);
+  for (size_t ri = 0; ri < rows.size(); ++ri) {
+    const int M = rows[ri];
+    std::vector<float> lg((size_t)NS * kMaxRows * kE, -8.f);
+    double rbytes = 0;
+    for (int s = 0; s < NS; ++s) {
+      std::set<int> uni;
+      for (int m = 0; m < M; ++m) {
+        std::set<int> row;
+        uint64_t h = mix64((uint64_t)s * 1000 + m * 17 + M);
+        while ((int)row.size() < kTopK) row.insert((int)((h = mix64(h)) % kE));
+        int r = 0;
+        for (int e : row) lg[((size_t)s * kMaxRows + m) * kE + e] = 8.f + 0.01f * r++, uni.insert(e);
+      }
+      rbytes += (double)P.per * uni.size();
+    }
+    rbytes /= NS;
+    const double bytes = rbytes + (gu + dn) * 2.0;
+    CUDA_CHECK(cudaMemcpy(dl, lg.data(), lg.size() * 4, cudaMemcpyHostToDevice));
+    auto layer = [&](int s, bool fused) {
+      LayerW L;
+      L.pool = P.d, L.desc = ddesc + (size_t)s * kE * 3, L.fmt = fmt;
+      if (fused) {
+        const uint16_t* w = shw + (size_t)(s % NC) * (gu + dn);
+        L.sh.bgu = reinterpret_cast<const uint8_t*>(w), L.sh.bd = reinterpret_cast<const uint8_t*>(w + gu);
+      }
+      return L;
+    };
+    auto rt = [&](int s, cudaStream_t st) {
+      route(dl + (size_t)s * kMaxRows * kE, db, M, di + s * kMaxRows * kTopK, dw + s * kMaxRows * kTopK, st);
+    };
+    auto gemvs = [&](int s, cudaStream_t st, float* y) {  // the runner's GEMV path (model.cu), kBF16T
+      const uint16_t* w = shw + (size_t)(s % NC) * (gu + dn);
+      glm::GemvSeg g;
+      g.fmt = glm::WFmt::kBF16T, g.w = w, g.n = 2 * kI, g.y = hm, g.ldy = kI;
+      glm::gemv(reinterpret_cast<const uint16_t*>(dx), kH, M, kH, &g, 1, glm::GemvOut::kSwiGLU, kShParts, st, true);
+      glm::GemvSeg d;
+      d.fmt = glm::WFmt::kBF16T, d.w = w + gu, d.n = kH, d.y = y, d.ldy = kH;
+      glm::gemv(reinterpret_cast<const uint16_t*>(hm), kI, M, kI, &d, 1, glm::GemvOut::kF32, 1, st, true);
+    };
+    auto dec = [&](int s, cudaStream_t st, bool fused, const DecodeCfg& c, float* r, float* sy) {
+      moe_decode(layer(s, fused), dx, di + s * kMaxRows * kTopK, dw + s * kMaxRows * kTopK, M, ws, r, sy, st, c);
+    };
+    for (int s = 0; s < NS; ++s) rt(s, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // (1) bits, steps 0 and 5 (two shared copies), every variant
+    const size_t n = (size_t)M * kH;
+    std::vector<uint32_t> a(n), b(n), c(n), d(n);
+    std::vector<uint16_t> ha((size_t)M * kI), hb((size_t)M * kI);
+    int bad = 0, cases = 0;
+    for (int s : {0, 5})
+      for (int u = 0; u < decode_up_variants(); ++u)
+        for (int dv = 0; dv < decode_down_variants(); ++dv) {
+          if (u && dv) continue;  // every up with the default down, every down with the default up
+          DecodeCfg cf;
+          cf.up = u, cf.down = dv;
+          CUDA_CHECK(cudaMemset(ys0, 0xFF, n * 4));
+          CUDA_CHECK(cudaMemset(ys, 0xFF, n * 4));
+          gemvs(s, 0, ys0);
+          dec(s, 0, false, cf, yr0, ys0);
+          CUDA_CHECK(cudaDeviceSynchronize());
+          CUDA_CHECK(cudaMemcpy(hb.data(), hm, hb.size() * 2, cudaMemcpyDeviceToHost));
+          dec(s, 0, true, cf, yr, ys);
+          CUDA_CHECK(cudaDeviceSynchronize());
+          CUDA_CHECK(cudaMemcpy(ha.data(), static_cast<uint16_t*>(ws) + (size_t)kShSlot * M * kI, ha.size() * 2,
+                                cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(a.data(), ys, n * 4, cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(b.data(), ys0, n * 4, cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(c.data(), yr, n * 4, cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(d.data(), yr0, n * 4, cudaMemcpyDeviceToHost));
+          size_t dh = 0, dys = 0, dyr = 0;
+          for (size_t i = 0; i < ha.size(); ++i) dh += ha[i] != hb[i];
+          for (size_t i = 0; i < n; ++i) dys += a[i] != b[i], dyr += c[i] != d[i];
+          ++cases;
+          if (dh || dys || dyr) {
+            ++bad;
+            result("SHFUSED\t%s\trows %d\tstep %d\tup %s\tdown %s\tFAIL: h %zu, ys %zu, yr %zu of %zu differ", fname.c_str(), M, s,
+                   decode_up_name(u), decode_down_name(dv), dh, dys, dyr, n);
+          }
+        }
+    g_fail += bad;
+    result("SHFUSED\t%s\trows %d\tbits\t%s: fused h, ys and yr = the GEMVs' and the unfused step's in %d of %d cases (every up "
+           "and down variant, two shared copies)", fname.c_str(), M, bad ? "FAIL" : "PASS", cases - bad, cases);
+    // (2) time, default variants, A B B A
+    const DecodeCfg cf;
+    auto tA = [&] { return time_graph(NS, [&](int s, cudaStream_t st) { rt(s, st); gemvs(s, st, ys); dec(s, st, false, cf, yr, ys); }); };
+    auto tB = [&] { return time_graph(NS, [&](int s, cudaStream_t st) { rt(s, st); dec(s, st, true, cf, yr, ys); }); };
+    const double a1 = tA(), b1 = tB(), b2 = tB(), a2 = tA();
+    const double r0 = time_graph(NS, [&](int s, cudaStream_t st) { rt(s, st); dec(s, st, false, cf, yr, ys); });
+    const double ta = (a1 + a2) / 2, tb = (b1 + b2) / 2;
+    result("SHFUSED\t%s\trows %s\ttime\tA gemvs+experts %.1f / %.1f us\tB fused %.1f / %.1f us\t(A B B A)\tB/A %.4f\tgain %.1f us "
+           "a layer\texperts alone %.1f us\tshared adds: A %.1f, B %.1f us\tMB %.2f\tB %% of 235 %.1f", fname.c_str(),
+           names[ri].c_str(), a1, a2, b1, b2, tb / ta, ta - tb, r0, ta - r0, tb - r0, bytes / 1e6,
+           100 * bytes / tb / 1e3 / 235.0);
+  }
+  cudaFree(ddesc), cudaFree(dl), cudaFree(db), cudaFree(yr), cudaFree(ys), cudaFree(yr0), cudaFree(ys0), cudaFree(di);
+  cudaFree(dw), cudaFree(dx), cudaFree(hm), cudaFree(ws), cudaFree(P.d), cudaFree(shw);
+}
+
 // ---- altar-1's BF16 shared expert through attn's BF16 GEMV ----------------------------------------------------------
 // A rank's slice: gate and up [512][6144] interleaved row by row (2i gate, 2i + 1 up: GemvOut::kSwiGLU's order),
 // down [6144][512]; 8 copies cycled so L2 (24 MB) holds none across steps. A step = the SwiGLU GEMV then the down
@@ -363,6 +509,7 @@ int main(int argc, char** argv) {
     else if (a == "--decode" && i + 1 < argc) mode = "decode", fmt = argv[++i];
     else if (a == "--prefill" && i + 1 < argc) mode = "prefill", fmt = argv[++i];
     else if (a == "--shared") mode = "shared";
+    else if (a == "--shfused" && i + 1 < argc) mode = "shfused", fmt = argv[++i];
     else if (a == "--rows" && i + 1 < argc) rows = argv[++i];
     else if (a == "--chunks" && i + 1 < argc) chunks = argv[++i];
     else if (a == "--sweep") sweep = true;
@@ -385,7 +532,8 @@ int main(int argc, char** argv) {
   if (mode == "decode") bench_decode(fmt, rows, sweep);
   else if (mode == "prefill") bench_prefill(fmt, chunks, po);
   else if (mode == "shared") bench_shared(rows);
-  return 0;
+  else if (mode == "shfused") bench_shfused(fmt, rows);
+  return g_fail ? 1 : 0;
 }
 
 #include "experts/tests/bench_prefill.inc"

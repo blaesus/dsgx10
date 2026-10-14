@@ -313,13 +313,20 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     // (h = bf16(bf16(silu(g)) * u)) at split-K 4, then down to f32 partials in ys, which the routed step forwards
     // (posted) or the all-reduce takes beside yr: y = bf16(bf16(sum routed) + bf16(sum shared)) as before
     float* ys = yr + (size_t)R * kDim;
-    {
+    // kTuneShFused: the same two GEMVs' work inside the routed kernels (gx::SharedW::bgu, bd: their K split, MMA
+    // order and epilogues, so the same h and ys bits), its gate/up tasks ahead of the routed ones in k_up and its down
+    // in k_down, which writes ys (posted or not); ys stays the all-reduce's second partial
+    gx::LayerW moe = w.moe;
+    if (tune(kTuneShFused) && w.sh_gate_up.fmt == WFmt::kBF16T && w.sh_down.fmt == WFmt::kBF16T) {
+      moe.sh.bgu = static_cast<const uint8_t*>(w.sh_gate_up.w);
+      moe.sh.bd = static_cast<const uint8_t*>(w.sh_down.w);
+    } else {
       const GemvSeg g = w.sh_gate_up.seg(hm, kSharedInterRank);
-      gemv(xn_, kDim, R, kDim, &g, 1, GemvOut::kSwiGLU, 4, st, P);
+      gemv(xn_, kDim, R, kDim, &g, 1, GemvOut::kSwiGLU, gx::kShParts, st, P);
       const GemvSeg d = w.sh_down.seg(ys, kDim);
       gemv(hm, kSharedInterRank, R, kSharedInterRank, &d, 1, GemvOut::kF32, 1, st, P);
+      mark(kKShared, l);
     }
-    mark(kKShared, l);
     gx::DecodeCfg dc;
     dc.pdl = P;
     dc.up = opt.moe_up;
@@ -327,7 +334,7 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     else gx::route(gl, w.router_bias, R, ridx, rw, st, P);
     const bool post = tune(kTunePost);
     if (post) dc.post = &ch;
-    gx::moe_decode(w.moe, reinterpret_cast<const __nv_bfloat16*>(xn_), ridx, rw, R, moe_ws, yr, ys, st, dc);
+    gx::moe_decode(moe, reinterpret_cast<const __nv_bfloat16*>(xn_), ridx, rw, R, moe_ws, yr, ys, st, dc);
     mark(kKMlp, l);
     l2pf(1, l + 1, R);
     if (post) comm::glm::allreduce2_add_norm_posted(ch, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);

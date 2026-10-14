@@ -14,6 +14,8 @@
 #   p-<fmt>                    prefill at chunks 1024, 4096, 8192, up 0/1, down 0/1
 #   pd-<fmt>                   prefill kernel parts switched off (INT4)
 #   sh                         the BF16 shared expert through attn's GEMV at ROWS, every split-K
+#   shf-<fmt>                  the BF16 shared expert fused into the decode kernels of a <fmt> layer: bits against the
+#                              GEMVs, time A B B A against GEMVs + experts, at ROWS
 #   topk                       tools/probe_topk_ties.py on the GPU (torch.topk's order over 168 experts) with PY
 # Binaries: BIN (default ~/dsgb10-data/altar1-experts/bin, installed by install.sh from the build with the sources'
 # hash); results: OUT.
@@ -53,6 +55,7 @@ for s in "${steps[@]}"; do
     p-*) cmd=("$BIN/bench_experts" --prefill "${s#p-}") ;;
     pd-*) cmd=("$BIN/bench_experts" --prefill "${s#pd-}" --chunks 8192 --up 1 --down 1 --diag) ;;
     sh) cmd=("$BIN/bench_experts" --shared --rows "$ROWS") ;;
+    shf-*) cmd=("$BIN/bench_experts" --shfused "${s#shf-}" --rows "$ROWS") ;;
     topk) cmd=("$PY" -I "$TOOLS/probe_topk_ties.py" --device cuda) ;;
     *) echo "unknown step $s"; rc=2; continue ;;
   esac

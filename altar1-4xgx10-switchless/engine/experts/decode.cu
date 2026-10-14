@@ -103,6 +103,8 @@ __device__ void build_union(Union<W>& U, const Params& a) {
   __syncthreads();
 }
 
+__device__ __forceinline__ float bf_round(float f) { return __bfloat162float(__float2bfloat16_rn(f)); }
+
 __device__ __forceinline__ float silu_mul(float g, float u) {  // h = bf16(bf16(silu(g)) * u), g and u bf16 values
   const float s = __bfloat162float(__float2bfloat16_rn(g / (1.f + expf(-g))));
   return s * u;
@@ -110,12 +112,19 @@ __device__ __forceinline__ float silu_mul(float g, float u) {  // h = bf16(bf16(
 
 // ---------------------------------------------------------------------------------------------------------------
 // k_up. NT strips of gate and of up a task (64 / NT tasks an expert), WK warps along K, P blocks in flight a warp.
-template <class F, int NT, int WK, int P, bool R16>
+template <class F, int NT, int WK, int P, bool R16, bool SHB>
 __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
   constexpr int NTL = 2 * NT, TPE = 64 / NT, PS = 2;  // tiles a task, tasks an expert, FP8 units in flight
   constexpr int kUpB = kH / F::kBK;                   // blocks of gate/up along K (12 INT4/NVFP4, 48 BF16)
   using Raw = typename F::Raw;
-  const int nsh = a.sh ? TPE : 0;                     // the fused shared expert's tasks
+  // The BF16 shared expert (a.shb): a task is BT 8-row tiles of the interleaved gate/up, each tile's K in kShParts
+  // parts of BC 64-k chunks as attn's gemv at split-K 4; warp w takes BU consecutive parts of one tile (BT * 4 = BU *
+  // WK), BPS chunks in flight a lane.
+  constexpr int BT = WK % 4 == 0 ? WK / 4 : WK % 2 == 0 ? WK / 2 : WK, BU = kShParts * BT / WK;
+  constexpr int BC = kH / 64 / kShParts, BPS = 8;
+  static_assert(BU * WK == kShParts * BT && BC % BPS == 0, "the BF16 shared expert's split");
+  static_assert(WK == 1 || WK * 2 * NT >= kShParts * BT, "red holds the BF16 shared expert's partials");
+  const int nsh = a.sh ? TPE : SHB ? (kShTiles + BT - 1) / BT : 0;  // the fused shared expert's tasks
   __shared__ Union<false> U;
   __shared__ float red[WK][NTL][32][4];
   __shared__ int s_next[2];
@@ -139,12 +148,23 @@ __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
       sb[s][i].q1 = ldg_stream128(p + 16);
     }
   };
+  // the BF16 shared expert's place in a task: tile task * BT + bto, parts bp0 .. bp0 + BU - 1
+  const int bto = BU * warp / kShParts, bp0 = BU * warp % kShParts;
+  auto bptr = [&](int tk) {
+    return a.L.sh.bgu + ((size_t)(tk * BT + bto) * (kH / 64) + bp0 * BC) * 1024 + 16 * lane;
+  };
   int task = blockIdx.x;
   bool pre = task < nsh;
-  if (pre)
+  if (pre && !SHB)  // (SHB: no FP8 shared expert; moe_decode refuses both)
 #pragma unroll
     for (int s = 0; s < PS; ++s)
       if (s < nu) sh_load(task, s, s);
+  if (pre && SHB && task * BT + bto < kShTiles) {  // the warp's BU parts (contiguous) into L2 before the wait
+    const uint8_t* p = bptr(task) - 16 * lane;
+#pragma unroll
+    for (int i = 0; i < BU * BC * 1024 / 32 / 128; ++i)
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(p + 128 * (lane + 32 * i)));
+  }
   pdl_wait();
   build_union(U, a);
   pdl_launch_dependents();
@@ -155,6 +175,79 @@ __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
 #pragma unroll 1
   for (int it = 0; task < ntask; ++it) {
     if (a.ctr && threadIdx.x == 0) s_next[it & 1] = (int)gridDim.x + atomicAdd(a.ctr, 1);
+    if constexpr (SHB) if (task < nsh) {
+      // the BF16 shared expert: attn's gemv(kSwiGLU, split-K 4) for BT tiles, bit for bit
+      const bool bv = task * BT + bto < kShTiles;
+      const uint8_t* bp = bptr(task);
+      uint4 bb[BPS][2];  // BPS chunks in flight a lane (only here: no registers held across the routed tasks)
+      auto bload = [&](int s, int c) {
+        bb[s][0] = ldg_stream128(bp + (size_t)c * 1024);
+        bb[s][1] = ldg_stream128(bp + (size_t)c * 1024 + 512);
+      };
+      if (bv)
+#pragma unroll
+        for (int s = 0; s < BPS; ++s) bload(s, s);
+      float cs[BU][4];
+#pragma unroll
+      for (int u = 0; u < BU; ++u) cs[u][0] = cs[u][1] = cs[u][2] = cs[u][3] = 0.f;
+      if (bv) {
+#pragma unroll
+        for (int u = 0; u < BU; ++u)
+#pragma unroll 1
+          for (int c0 = 0; c0 < BC; c0 += BPS)
+#pragma unroll
+            for (int s = 0; s < BPS; ++s) {
+              const int cc = u * BC + c0 + s;
+              const uint32_t o[8] = {bb[s][0].x, bb[s][0].y, bb[s][0].z, bb[s][0].w,
+                                     bb[s][1].x, bb[s][1].y, bb[s][1].z, bb[s][1].w};
+              if (cc + BPS < BU * BC) bload(s, cc + BPS);
+              XF f;
+              load_x<R16>(f, x0, x1, 64 * (bp0 * BC + cc));
+              mma4(cs[u], f, o);
+            }
+      }
+      // the parts added in part order (gemv's finish), then its SwiGLU epilogue
+      auto out = [&](int tile, const float (&acc)[4]) {
+        const int col = 4 * tile + t;  // the intermediate of columns 2t (gate) and 2t + 1 (up)
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+          const int r = g + 8 * hh;
+          if (hh ? !(R16 && r < M) : r >= M) continue;
+          const float gt = bf_round(acc[2 * hh]), up = bf_round(acc[2 * hh + 1]);
+          const float sl = bf_round(__fdiv_rn(gt, __fadd_rn(1.f, expf(-gt))));
+          a.h[((size_t)kShSlot * M + r) * kI + col] = __float2bfloat16_rn(__fmul_rn(sl, up));
+        }
+      };
+      if constexpr (WK == 1) {
+        float acc[4] = {cs[0][0], cs[0][1], cs[0][2], cs[0][3]};
+#pragma unroll
+        for (int k = 1; k < kShParts; ++k)
+#pragma unroll
+          for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], cs[k][e]);
+        if (bv) out(task * BT + bto, acc);
+      } else {
+        float(*rp)[32][4] = reinterpret_cast<float(*)[32][4]>(&red[0][0][0][0]);
+#pragma unroll
+        for (int u = 0; u < BU; ++u)
+          *reinterpret_cast<float4*>(&rp[BU * warp + u][lane][0]) = make_float4(cs[u][0], cs[u][1], cs[u][2], cs[u][3]);
+        __syncthreads();
+        const int tile = task * BT + warp;
+        if (warp < BT && tile < kShTiles) {
+          float acc[4];
+#pragma unroll
+          for (int e = 0; e < 4; ++e) acc[e] = rp[kShParts * warp][lane][e];
+#pragma unroll
+          for (int k = 1; k < kShParts; ++k)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], rp[kShParts * warp + k][lane][e]);
+          out(tile, acc);
+        }
+      }
+      pre = false;
+      __syncthreads();
+      task = a.ctr ? s_next[it & 1] : task + (int)gridDim.x;
+      continue;
+    }
     float c[NTL][4];
 #pragma unroll
     for (int i = 0; i < NTL; ++i) c[i][0] = c[i][1] = c[i][2] = c[i][3] = 0.f;
@@ -297,7 +390,7 @@ __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
 // The routed part runs as one pipeline over (slot, block) steps: a strip's K = 512 is kDB blocks (1 INT4/NVFP4,
 // 4 BF16); a slot's sums c restart at its first block and go into acc after its last, so the MMA order a slot is
 // the same for every format.
-template <class F, int NT, int P, bool R16>
+template <class F, int NT, int P, bool R16, bool SHB>
 __global__ void __launch_bounds__(128) k_down(Params a) {
   __shared__ Union<true> U;
   constexpr int kDB = kI / F::kBK;
@@ -307,6 +400,10 @@ __global__ void __launch_bounds__(128) k_down(Params a) {
   const int r0 = min(g, M - 1), r1 = min(g + 8, M - 1);
   const int s0 = (blockIdx.x * 4 + warp) * NT;
   Raw8 sb[NT][4];
+  if constexpr (SHB)  // the BF16 shared down's NT strips (8 KB each, contiguous) into L2 now, read after the wait
+#pragma unroll
+    for (int i = 0; i < 2 * NT; ++i)
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(a.L.sh.bd + (size_t)s0 * 8192 + 128 * (lane + 32 * i)));
   if (a.sh)
 #pragma unroll
     for (int i = 0; i < NT; ++i) {
@@ -371,6 +468,27 @@ __global__ void __launch_bounds__(128) k_down(Params a) {
       const int ch = 8 * (s0 + i) + 2 * t;
       if (g < M) *reinterpret_cast<float2*>(ys + (size_t)g * kH + ch) = make_float2(acc[i][0], acc[i][1]);
       if (R16 && g + 8 < M) *reinterpret_cast<float2*>(ys + (size_t)(g + 8) * kH + ch) = make_float2(acc[i][2], acc[i][3]);
+    }
+  } else if (SHB) {  // the BF16 shared down: attn's gemv(kF32, split-K 1), one MMA chain over the 512 k a strip
+    const __nv_bfloat16* h0 = a.h + ((size_t)kShSlot * M + r0) * kI + 16 * t;
+    const __nv_bfloat16* h1 = a.h + ((size_t)kShSlot * M + r1) * kI + 16 * t;
+#pragma unroll 1
+    for (int i = 0; i < NT; ++i) {
+      const uint8_t* p = a.L.sh.bd + (size_t)(s0 + i) * 8192 + 16 * lane;
+      uint4 v[kI / 64][2];
+#pragma unroll
+      for (int j = 0; j < kI / 64; ++j) v[j][0] = ldg_stream128(p + 1024 * j), v[j][1] = ldg_stream128(p + 1024 * j + 512);
+      float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+      for (int j = 0; j < kI / 64; ++j) {
+        const uint32_t o[8] = {v[j][0].x, v[j][0].y, v[j][0].z, v[j][0].w, v[j][1].x, v[j][1].y, v[j][1].z, v[j][1].w};
+        XF f;
+        load_x<R16>(f, h0, h1, 64 * j);
+        mma4(acc, f, o);
+      }
+      const int ch = 8 * (s0 + i) + 2 * t;
+      if (g < M) *reinterpret_cast<float2*>(ys + (size_t)g * kH + ch) = make_float2(acc[0], acc[1]);
+      if (R16 && g + 8 < M) *reinterpret_cast<float2*>(ys + (size_t)(g + 8) * kH + ch) = make_float2(acc[2], acc[3]);
     }
   } else if (a.post) {  // the shared expert ran outside (its f32 output in a.ys): forward the warp's columns
 #pragma unroll
@@ -482,16 +600,28 @@ int fit(K kernel, int threads, int cps) {
   CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, threads, 0));
   return cps > 0 && cps < n ? cps : n;
 }
+template <class F, int NT, int WK, int P, bool SHB>
+void up_launch2(const Params& p, int cps, cudaStream_t st, bool pdl) {
+  if (p.M > 8)
+    launch(k_up<F, NT, WK, P, true, SHB>, num_sms() * fit(k_up<F, NT, WK, P, true, SHB>, 32 * WK, cps), 32 * WK, st, pdl, p);
+  else
+    launch(k_up<F, NT, WK, P, false, SHB>, num_sms() * fit(k_up<F, NT, WK, P, false, SHB>, 32 * WK, cps), 32 * WK, st, pdl, p);
+}
 template <class F, int NT, int WK, int P>
 void up_launch(const Params& p, int cps, cudaStream_t st, bool pdl) {
-  if (p.M > 8) launch(k_up<F, NT, WK, P, true>, num_sms() * fit(k_up<F, NT, WK, P, true>, 32 * WK, cps), 32 * WK, st, pdl, p);
-  else launch(k_up<F, NT, WK, P, false>, num_sms() * fit(k_up<F, NT, WK, P, false>, 32 * WK, cps), 32 * WK, st, pdl, p);
+  if (p.L.sh.bf16()) up_launch2<F, NT, WK, P, true>(p, cps, st, pdl);
+  else up_launch2<F, NT, WK, P, false>(p, cps, st, pdl);
 }
 template <class F, int NT, int P>
 void down_launch(const Params& p, cudaStream_t st, bool pdl) {
   const int grid = kStrips / NT / 4;
-  if (p.M > 8) launch(k_down<F, NT, P, true>, grid, 128, st, pdl, p);
-  else launch(k_down<F, NT, P, false>, grid, 128, st, pdl, p);
+  if (p.L.sh.bf16()) {
+    if (p.M > 8) launch(k_down<F, NT, P, true, true>, grid, 128, st, pdl, p);
+    else launch(k_down<F, NT, P, false, true>, grid, 128, st, pdl, p);
+  } else {
+    if (p.M > 8) launch(k_down<F, NT, P, true, false>, grid, 128, st, pdl, p);
+    else launch(k_down<F, NT, P, false, false>, grid, 128, st, pdl, p);
+  }
 }
 
 template <class F>
@@ -533,12 +663,15 @@ void moe_decode(const LayerW& L, const __nv_bfloat16* x, const int* idx, const f
   if (!cfg.logits != !cfg.bias || (!cfg.logits && (!idx || !w))) die("moe_decode: idx and w, or logits and bias");
   Params p{x, L.sh.fused(), M, idx, w, cfg.logits, cfg.bias, L, reinterpret_cast<__nv_bfloat16*>(ws), yr, ys,
            cfg.dyn ? reinterpret_cast<int*>(static_cast<uint8_t*>(ws) + kWsH) : nullptr, cfg.post != nullptr, {}};
+  if (L.sh.fused() && L.sh.bf16()) die("moe_decode: an FP8 and a BF16 shared expert");
+  if (L.sh.bf16() && (!L.sh.bd || (!cfg.post && (cfg.parts & 2) && !ys)))
+    die("moe_decode: the BF16 shared expert needs its down and ys");
   if (cfg.post) {
     p.ch = *cfg.post;
     if ((size_t)2 * M * kH * 4 > p.ch.cap) die("moe_decode: %d rows' two partials exceed the channel (%u B)", M, p.ch.cap);
     if (!(cfg.parts & 2)) die("moe_decode: posted outputs need the down kernel");
   }
-  if (!L.sh.fused() && (cfg.parts & 2) && cfg.post && !ys) die("moe_decode: posting without a fused shared expert needs its output in ys");
+  if (!L.sh.fused() && !L.sh.bf16() && (cfg.parts & 2) && cfg.post && !ys) die("moe_decode: posting without a fused shared expert needs its output in ys");
   switch (L.fmt) {
     case kINT4: decode_fmt<FmtINT4>(p, cfg, st); break;
     case kBF16: decode_fmt<FmtBF16>(p, cfg, st); break;
