@@ -18,6 +18,7 @@ ran, so the golden comparisons, `tf`, `refhash` and the real-file profile are st
 6. [Measurements](#6-measurements)
 7. [Memory](#7-memory)
 8. [Runs, failures and what remains](#8-runs-failures-and-what-remains)
+9. [Tuning: the fused shared expert and the routed gate/up's prefetch](#9-tuning-the-fused-shared-expert-and-the-routed-gateups-prefetch)
 
 ## 1. What is identical
 
@@ -66,7 +67,8 @@ and BF16 expert pools with valid descriptors; 12.68 GB a rank at 4 INT4 pools.
   gone; `kTuneOprojRemoved` is accepted and ignored).
 - **Shared expert** (A3e's measured best): gate_up GEMV with the SwiGLU epilogue, split-K 4, into `hm`; down GEMV
   to f32, split 1, into `ys` (`yr + R` rows, contiguous with the routed output), **before** `moe_decode`, which adds
-  `ys` as glm53's fused FP8 path did. Not fused into `k_up`/`k_down` (§ 8).
+  `ys` as glm53's fused FP8 path did. Since § 9 (`kTuneShFused`, in the default since 2026-10-14) the same work runs
+  inside `k_up`/`k_down` with the GEMVs' bits; the GEMVs remain for row-major shared weights and with the bit off.
 - **Routed experts**: `moe_decode` on the layer's format; `Options::moe_up` picks the up variant (0 default; 6 =
   `gx::kUpPrefillOrder`, the K order of prefill, which makes decode = prefill bit for bit in every layer: `check6`).
 - **L2 prefetch windows** sized from each `Proj`'s bytes (attention window; FFN window: router, shared gate_up and
@@ -219,7 +221,196 @@ step repeated with other `EXTRA` options needs its DONE line removed (done by ha
   `weights`, `tf` against `~/altar1-ref/golden/` (compare_golden.py, layers 0, 2, 3, 4, 6, 76, 77, 78), the
   `refhash` pins, `check` on the real files, the profile at 1, 2, 4, 6, 16 rows, MemAvailable with 76.6 GiB loaded.
   `run.sh`'s `GOLD` points at `~/dsgb10-data/altar1-model/gold/all`, not made yet.
-- **The shared expert** (8.55 ms at 1 row, 6.4 ms at its floor): fuse it into `k_up`/`k_down` as glm53 did with FP8,
-  or at least overlap the down GEMV; A3e measured the standalone GEMVs only.
-- The INT4 GEMVs below 93 % at 1 and 16 rows (experts.md), the 1-row `l2pf` repeat, a step-level kBF16T vs
-  `--rowmajor` A/B (attention.md measured it per kernel: 98–100 % vs 92–95 %).
+- ~~The shared expert~~ fused, ~~the routed INT4 gate/up below 93 %~~ 96–100 % now, ~~the 1-row `l2pf` repeat~~ done:
+  § 9. Still open: a step-level kBF16T vs `--rowmajor` A/B (attention.md measured it per kernel: 98–100 % vs
+  92–95 %), and the items at the end of § 9.
+
+## 9. Tuning: the fused shared expert and the routed gate/up's prefetch
+
+Two exact levers, written 2026-10-14 (commits 2c4f6f7 to 5b85463, merged with altar1 at 4d888c8 before the last jobs):
+**`kTuneShFused`** (bit 9) and **`kTuneUpXpf`** (bit 10), both in `kTuneDefault`, now **0x7f7** (was 0x1f7). Neither
+changes a bit: every A/B below printed the same output hash for A and B, and those hashes equal the earlier 0x1f7
+default's at every row count (1 row aa5124b549d4091c, 2 rows 74f6421cf905b042, 4 rows 8a0e4df83ce778d4, 6 rows
+4752875ee45d0d7b, 16 rows 909806d4f89f5930: last hidden rows, sampled tokens and every layer's cache, all four
+ranks). Synthetic weights in the real formats throughout (4 INT4 pools, context 4,096; the real rank files were not
+bound).
+
+### 9.1 Where the shared expert's partial is summed (no contract change)
+
+The task statement allowed the shared expert's partial to join the routed experts' f32 sum. **It does not, in this
+engine, and the fusion does not move it.** DESIGN decision 2 cites glm53's decision 8 ("the weighted outputs of a
+row's eight routed experts and the shared expert are summed in f32 across experts and ranks and rounded to bf16
+once"), but the code of both engines, the CPU reference and glm53's golden data compute
+**y = bf16(bf16(Σ_ranks yr) + bf16(Σ_ranks ys))**: the routed sum and the shared sum are two partials, each
+all-reduced in f32 and rounded once, then added and rounded again (`comm::glm::allreduce2_add_norm`, kTwo:
+`bfround(bfround(v) + bfround(u))`; `gx::finalize` "as the reference adds the shared expert"; prefill's
+`sublayer_end` takes `p.yr` and `p.ys` the same way). Folding ys into yr would change outputs against the
+reference and against prefill. So the fused kernels still write **ys as its own f32 partial** (k_down, posted into
+the all-reduce's send buffer beside yr, as glm53's fused FP8 path did), and decode's ys equals the two GEMVs'
+bit for bit (§ 9.2). Prefill is unchanged: its shared expert is still `gemm()` at split-K 4 / 1 into `p.ys`, which
+equals the GEMV by attn's test P; `check6` shows decode = prefill in all 79 caches with the fused path (§ 9.4).
+The wording of decision 8 ("and the shared expert") is looser than the code; it is the code's order that the
+golden data pins.
+
+### 9.2 The fused BF16 shared expert (`gx::SharedW::bgu, bd`; docs/experts.md § 11)
+
+The shared gate/up [1024][6144] (interleaved) and down [6144][512] are kBF16T, which is byte for byte the BF16 expert
+block's lane order, so the expert kernels read them with their own fragment code. To keep the GEMVs' bits:
+
+- **k_up**: shared tasks first (they need no routing), each of BT 8-row tiles (BT = 3 at WK 6, 1 at WK 4, 2, 1);
+  every tile's K in the GEMV's 4 parts of 1,536 k, each part one MMA chain over its 24 chunks in k order (the
+  GEMV's `mma_chunk` = the experts' `mma4`), the parts added in part order in shared memory, then the GEMV's SwiGLU
+  epilogue (`__fdiv_rn`, `__fadd_rn`, `__fmul_rn`, the same rounding points) into h's shared slot. Its weights
+  are prefetched into L2 before `griddepcontrol.wait` (only an L2 prefetch: holding them in registers across the
+  routed tasks took the default kernel from 132 to 223 registers).
+- **k_down**: each warp's NT shared down strips (8 KB each) prefetched into L2 before the wait, then one MMA chain
+  over the 512 k from zero (the GEMV at split-K 1) into ys, posted with yr.
+- A **template parameter** (`SHB`): the unfused instantiations compile to the earlier code (the default INT4
+  `k_up<1,6,2>` 132 registers, `k_down<2,1>` 155, as before); the fused ones take 168 (8 B of spill) and 218.
+  moe_decode picks SHB from `LayerW::sh.bf16()`. The runner sets it with `kTuneShFused` when both
+  shared tensors are kBF16T (row-major ones keep the GEMVs).
+
+**Kernel bench** (`bench_experts --shfused`, rank 0, job 12:24, experts commit 2c4f6f7; A = route + the two GEMVs +
+the unfused experts, B = route + the fused experts, A B B A, µs a layer; bits: fused h, ys and yr against the GEMVs
+and the unfused step for every up and down variant and two shared copies, **26 of 26 identical** at every row count):
+
+| Rows | INT4 A | INT4 B | B/A | BF16 A | BF16 B | B/A |
+|---:|---|---|---:|---|---|---:|
+| 1 | 283.4 / 278.7 | 277.6 / 276.7 | 0.986 | 742.3 / 741.7 | 734.5 / 731.7 | 0.988 |
+| 2 | 457.6 / 458.0 | 460.6 / 458.0 | 1.003 | 1360.1 / 1354.5 | 1346.1 / 1345.2 | 0.991 |
+| 4 | 795.7 / 798.2 | 798.5 / 799.5 | 1.003 | 2518.0 / 2518.6 | 2515.0 / 2513.2 | 0.998 |
+| 6 | 1111.6 / 1091.8 | 1114.2 / 1100.4 | 1.005 | 3548.7 / 3529.4 | 3531.9 / 3528.6 | 0.998 |
+| 16 | 2279.4 / 2283.8 | 2246.4 / 2246.9 | 0.985 | 7413.4 / 7419.3 | 7416.0 / 7411.4 | 1.000 |
+
+The shared expert's 18.87 MB cost 80.3 µs at 235 GB/s; in a graph with PDL the two GEMVs already add only 75–85 µs
+to the experts at 1 row, so the fusion cannot save bytes, only launch boundaries and tails.
+
+**In the step** (`run.sh ab`, 10 rounds A B / B A in one process, chunk 8,192; gain = 1 − median of the rounds'
+B/A, its range in brackets):
+
+| Rows | 0x1f7 → 0x3f7 (job 12:30, commit 528a058) | 0x3f7 → 0x1f7 (job 12:40) |
+|---:|---|---|
+| 1 | 48.63 → 47.52 ms, **+1.82 %** (0.906..1.060) | 46.78 → 47.27 ms, **+1.08 %** for 0x3f7 (0.935..1.087) |
+| 2 | 63.22 → 63.08, +0.13 % | 62.94 → 63.67, +1.05 % |
+| 4 | 83.19 → 83.11, +0.26 % | 81.97 → 82.66, +0.11 % |
+| 6 | 100.65 → 99.04, +0.73 % | 98.31 → 100.55, +1.44 % |
+| 16 | 142.50 → 141.82, +0.73 % | 144.04 → 145.49, +1.46 % |
+
+Small, positive in every cell of both orders, the same bits: kept (default since commit fd5528c).
+
+**Failure: four chunks in flight at 9–16 rows** (commit c3cb8c6, reverted in c9bc785). The R16 instantiation of the
+fused k_up (before § 9.3's prefetch) uses 207 registers, so one CTA of 6 warps fits an SM (grid 48). Holding 4 chunks instead of 8 brought it
+to 138 registers (grid 96) but was slower, A B B A over two binaries (job ~13:00): 9 rows 1472.7 / 1471.5 µs
+(8 chunks) and 1503.8 / 1501.0, 1508.9 / 1515.3 (4 chunks) and 1472.1 / 1475.9 (8 chunks again); 16 rows 2227.6 /
+2226.7 against 2279.9 / 2279.4, 2280.3 / 2282.1, then 2230.8 / 2230.7.
+
+### 9.3 The routed gate/up's cross-task prefetch (`gx::DecodeCfg::xpf`, `kTuneUpXpf`)
+
+The second lever of the list (experts.md § 10 (b)). With the default WK 6, a warp owns 2 of an INT4 gate/up's 12
+blocks and loads both at the start of its task, so nothing of the next task is in flight while one finishes. Now,
+after the task's partials' barrier, each warp loads the next task's first P blocks (the dynamic queue's next task is
+known then) and the epilogue runs over them; the next task skips its own first loads. The blocks, the MMA order and
+the reduction are unchanged (the same bits; WK 1 variants have no such barrier and stay as they were). Cost:
+the default INT4 k_up (fused shared expert and prefetch) takes 231 registers, 233 unfused, 248 at 9–16 rows: one
+CTA an SM (`-Xptxas -v` of decode.cu at commit 5b85463's sources, no spills).
+
+**Kernel bench** (`bench_experts --decode --ups 0,0,0,0 --xpfs 0,1,1,0`, one process, job ~13:20, commit 5b85463;
+the decode step = route + k_up + k_down, µs and % of 235 GB/s):
+
+| Rows | INT4 off | INT4 on | BF16 off | BF16 on |
+|---:|---|---|---|---|
+| 1 | 199.7 / 199.3 (93.0, 93.2 %) | 192.9 / 191.2 (**96.3, 97.1 %**) | 653.8 / 654.4 (98.3, 98.2) | 655.5 / 653.2 (98.0, 98.4) |
+| 2 | 382.6 / 385.3 (94.9, 94.2) | 367.4 / 367.7 (**98.8, 98.8**) | 1269.7 / 1268.5 | 1269.4 / 1269.8 |
+| 4 | 733.1 / 731.3 (95.2, 95.4) | 697.4 / 697.6 (**100.1, 100.0**) | 2444.1 / 2430.1 | 2435.7 / 2432.6 |
+| 6 | 1031.0 / 1028.9 (95.8, 96.0) | 987.0 / 985.6 (**100.1, 100.3**) | 3437.7 / 3439.2 | 3443.7 / 3446.6 |
+| 16 | 2325.6 / 2317.1 (90.4, 90.8) | 2102.8 / 2112.0 (**100.0, 99.6**) | 7506.7 / 7496.8 (96.9, 97.0) | 7285.1 / 7280.2 (**99.9, 99.9**) |
+
+The experts' GPU suite passes with it on (`test_experts --fmt i4|b16|q4 decode prefill`, `equiv`: INT4 = BF16 on the
+dequantised matrices bit for bit, every variant, decode wk1 = prefill, batch invariance, determinism; 0 failures).
+A first build with it unconditional (d701398, bin3) against 2c4f6f7, two binaries A B B A, gave the same picture.
+
+**In the step**:
+
+| Rows | 0x3f7 → 0x7f7 (job 13:23, commit 5b85463) | 0x7f7 → 0x3f7 (job 13:28, commit 0a594e2) |
+|---:|---|---|
+| 1 | 47.80 → 47.06 ms, **+1.25 %** (0.926..1.062) | 46.41 / 46.28 ms, B/A 1.0070: **+0.70 %** for 0x7f7 (0.913..1.090) |
+| 2 | 62.62 → 61.28, +1.53 % | 64.84 / 65.68, +1.65 % |
+| 4 | 83.02 → 81.25, +2.11 % | 81.74 / 82.97, +1.86 % |
+| 6 | 98.52 → 96.48, +2.62 % | 97.72 / 99.51, +1.77 % |
+| 16 | 142.43 → 139.86, +1.72 % | 143.13 / 145.40, +1.49 % |
+
+(At 1 row in the reverse job the medians of the blocks and the median of the rounds' ratios disagree in sign;
+the ratio, taken within each round, is the reading.)
+
+### 9.4 Before and after, and the checks
+
+**The step, 0x1f7 (A4's default) against 0x7f7** (`run.sh ab`, commit 0a594e2, ms medians of 10 rounds):
+
+| Rows | 0x1f7 → 0x7f7 (job 13:30) | 0x7f7 → 0x1f7 (job 14:16) | gain, both orders |
+|---:|---|---|---|
+| 1 | 46.98 → 46.91, +0.99 % (0.940..1.059) | 46.90 / 47.45, +0.84 % (0.998..1.142) | **+0.8–1.0 %** |
+| 2 | 62.29 → 60.87, +2.62 % | 62.15 / 63.39, +1.91 % | **+1.9–2.6 %** |
+| 4 | 82.05 → 79.70, +3.44 % | 82.34 / 84.58, +2.86 % | **+2.9–3.4 %** |
+| 6 | 97.84 → 95.26, +2.26 % | 97.25 / 99.76, +1.40 % | **+1.4–2.3 %** |
+| 16 | 145.96 → 142.71, +2.01 % | 139.70 / 141.65, +1.53 % | **+1.5–2.0 %** |
+
+At 1 row the step is ~46.9 ms in these jobs (floor 37.05 ms, × 1.27); A4's 46.27 ms was one `bench` reading, and
+single readings move by ±2 ms between jobs on this fleet (the service's and the serving agent's ring jobs, the CPU
+reference on rank 2), so only the interleaved rounds carry a gain.
+
+**Where the time goes**, eager without PDL (`run.sh bench`, ms; before: `--tune 1f7` job 12:53, commit fd5528c;
+after: job 14:22, commit 0a594e2; the other classes within ±0.2 ms except the collectives, which wander by job):
+
+| Class | 1 row before → after | 2 | 4 | 6 | 16 |
+|---|---|---|---|---|---|
+| routed MoE + shared expert | 18.32 + 8.52 = 26.84 → **25.17** | 39.10 → 37.56 | 55.48 → 53.01 | 68.07 → 64.64 | 94.72 → 90.16 |
+| o_proj | 6.37 → 6.36 | 6.41 → 6.47 | 6.46 → 6.42 | 6.50 → 6.42 | 6.89 → 6.89 |
+| x-projection | 3.32 → 3.32 | 3.34 → 3.37 | 3.38 → 3.35 | 3.50 → 3.39 | 3.60 → 3.47 |
+| q_b + wq_b | 3.09 → 3.07 | 3.16 → 3.15 | 3.17 → 3.18 | 3.25 → 3.18 | 3.51 → 3.43 |
+| W_UK + W_UV | 2.41 → 2.43 | 2.47 → 2.48 | 2.51 → 2.50 | 2.54 → 2.51 | 2.77 → 2.77 |
+| attn_prep + index_select + sparse_attn | 4.04 → 4.02 | 4.63 → 4.61 | 4.80 → 4.82 | 5.42 → 5.37 | 9.15 → 9.04 |
+| head + sample | 2.47 → 2.27 | | | | |
+| collectives | 9.16 → 7.22 | 10.93 → 10.15 | 19.25 → 12.77 | 22.32 → 18.85 | 39.04 → 32.97 |
+| **total (eager)** | 57.76 → 53.91 | 72.30 → 69.98 | 97.33 → 88.59 | 114.41 → 106.56 | 161.85 → 151.09 |
+
+The eager figure overstates the old shared expert (two launches with events between classes); in the graph the
+routed + shared critical path on rank 0 at 1 row (`run.sh trace`, `tools/step_profile.py`, increments) went from
+k_up 11.06 + k_down 4.97 + the shared GEMVs ~4.3 = ~20.3 ms (A4, job 11:41) to k_up 14.16 + k_down 5.67 = 19.83 ms
+(fused only, job 12:50) and k_up 13.56 + k_down 6.08 = 19.64 ms (both levers, job 14:22; rank 2, the reference's
+box, 15.04 + 7.17). The trace steps of that last job (49.57 / 65.59 / 85.83 / 102.98 / 147.05 ms) are slower than
+the 12:50 job's (46.30 / 64.33 / 80.27 / 99.26 / 143.77) in every kernel class, the ring's conditions, not the
+levers (the interleaved A/Bs above).
+
+**Checks on 0x7f7** (`run.sh check`, `check6`, job 13:25–13:27, commit 5b85463; the same on 0x3f7 at 12:45, fd5528c):
+chunkings 79/79 caches identical; decode = prefill in layers 0–3 (default K order) and **in all 79 caches with
+`--moe-up 6`** (the fused shared expert's WK 1 path against prefill's GEMMs); 16 rows = 16 × 1 row (batch
+invariance: tokens, logits and 78 caches); graph = eager; the four ranks identical; sampling. All PASS.
+
+### 9.5 The L2 prefetch at 1 row, repeated
+
+`glm_run l2pf` now runs `--ab-rounds` (10) interleaved rounds (off on / on off, 12 steps a block, the median of the
+last 8; graphs recaptured at each switch) and prints every round's ratio. Job 12:35, commit 528a058, default 0x1f7:
+
+| Rows | off | on | on/off median (range) | gain | ratios |
+|---:|---:|---:|---|---:|---|
+| 1 | 48.46 | 47.95 | 0.9911 (0.940..1.037) | **+0.89 %** | 1.022 0.971 1.021 0.996 0.966 1.028 1.037 0.986 0.958 0.940 |
+| 6 | 102.15 | 100.86 | 0.9783 (0.951..1.014) | +2.17 % | |
+| 16 | 148.02 | 144.20 | 0.9802 (0.904..1.003) | +1.98 % | |
+
+A4.1's −3.36 % at 1 row was the outlier: over ten rounds the 1-row effect is +0.9 % with 6 of 10 rounds below 1,
+inside the spread (a wash at 1 row); +2 % at 6 and 16 rows as before. Kept on.
+
+### 9.6 Levers not taken, failures, what remains
+
+- **(b) the shared expert on a second stream** beside the router / routed kernels: not built. The fused path
+  removes both launches; the GEMV pair already added only 75–85 µs a layer in a graph against its 80 µs of bytes,
+  and the persistent k_up holds every SM, so a concurrent stream has no idle bandwidth to use.
+- **(c) a faster standalone GEMV**: only bit-neutral launch shapes are allowed (the split-K is part of the bits);
+  the GEMV is at 93.7–94.7 % standalone (experts.md § 8.3) and superseded by the fusion.
+- **Failure**: `run.sh` skipped a repeated `ab` with other `AB`/`ABBASE` (DONE per sources hash, as A5.1); the
+  scratch job script now deletes the `ab` DONE line before each pair. A session interruption at 13:38 killed one
+  reverse-order A/B while it waited for the ring; it was rerun at 14:16.
+- **Failure**: the 4-chunk fused shared expert at 9–16 rows (§ 9.2), reverted.
+- **Left**: the INT4 k_up now runs one CTA an SM (231 registers by default, 248 at 9–16 rows); a `__launch_bounds__(192, 2)` variant (≤ 170 registers, maybe spills) was not tried. The
+  attention-side INT4 GEMVs (q_b, W_UV, o_proj: 95–100 % at 1 row) were not touched. The real rank files were not
+  bound for these A/Bs: the profile on them is the next measurement.
