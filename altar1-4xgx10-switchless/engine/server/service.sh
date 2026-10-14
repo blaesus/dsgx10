@@ -23,6 +23,8 @@
 #   ALTAR1_ADDR, ALTAR1_PORT     the front-end's addresses (127.0.0.1; one or more specific IPv4 addresses, never
 #                                0.0.0.0) and port (18895). Ports 8888 (the DeepSeek service's) and 18894 (the GLM-5.3
 #                                service's) are refused
+#   ALTAR1_PROD=1                allows port 8888, the production endpoint, when altar-1 serves there in place of
+#                                the DeepSeek service (stopped first; decided by the user on 2026-10-14)
 #   ALTAR1_KEY_FILE              the API key file (mode 600): ~/dsgb10-data/dev-api-key
 #   ALTAR1_ENGINE_ARGS           altar1_rank's arguments after --mode serve --socket <run/engine.sock>; default
 #                                "--chunk 2048 --index-scratch-mib 128" (the fleet's memory rule while the CPU
@@ -105,7 +107,7 @@ check() {
   done
   [ "$(addrs | sort | uniq -d)" = "" ] || die "ALTAR1_ADDR names an address twice"
   [[ $PORT =~ ^[0-9]+$ ]] || die "ALTAR1_PORT '$PORT' is not a port"
-  [ "$PORT" != 8888 ] || die "port 8888 is the DeepSeek service's"
+  [ "$PORT" != 8888 ] || [ "${ALTAR1_PROD:-}" = 1 ] || die "port 8888 is the DeepSeek service's: ALTAR1_PROD=1 serves altar-1 there in its place (stop it first)"
   [ "$PORT" != 18894 ] || die "port 18894 is the GLM-5.3 service's"
   [ -r "$KEY" ] || die "no API key file $KEY"
   [ $((8#$(stat -c %a "$KEY") & 8#077)) = 0 ] || die "$KEY can be read by others: chmod 600 it"
