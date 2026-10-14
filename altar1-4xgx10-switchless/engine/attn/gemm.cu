@@ -322,7 +322,11 @@ int gemm_args(GArgs& a, const uint16_t* x, int ldx, int rows, int K, const GemvS
   a.K = K;
   a.splitk = splitk;
   a.nseg = nseg;
-  a.gm = g_gemm_gm >= 0 ? g_gemm_gm : kGemmRaster;
+  // the raster by the launch's weight bytes: grouped once they outgrow the L2 (measured: 2x on o_proj, the dense
+  // MLP and the head; 5-30 % slower on the small shapes, whose weights stay in L2 in blockIdx order)
+  size_t wbytes = 0;
+  for (int i = 0; i < nseg; ++i) wbytes += (size_t)segs[i].n * K * (fp8 ? 1 : 2);
+  a.gm = g_gemm_gm >= 0 ? g_gemm_gm : wbytes >= ((size_t)32 << 20) ? kGemmRaster : 0;
   int c0 = 0;
   for (int i = 0; i < nseg; ++i) {
     const GemvSeg& g = segs[i];

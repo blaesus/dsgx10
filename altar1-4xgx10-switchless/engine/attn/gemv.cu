@@ -413,7 +413,10 @@ void launch_gemv(const uint16_t* x, int ldx, int rows, int K, const Segs& sd, in
       default: launch_gemv_cfg<true, OUT, HI, 8, 4, false>(x, ldx, rows, K, sd, splitk, none, s, pdl); return;
     }
   } else {
-    if (want < 0) want = 0;  // glm53's BF16 shape (4 chunks in flight, 4 warps) until measured otherwise
+    if (want < 0) {  // by shape, measured on GB10 (docs/attention.md § 5): bit-neutral
+      const size_t N = (size_t)sd.tile_end * 8;
+      want = K <= 512 ? 2 : N * K <= ((size_t)1 << 21) ? 4 : N >= 16384 ? 0 : 1;
+    }
     switch (want) {
       case 1: launch_gemv_cfg<false, OUT, HI, 8, 4, false>(x, ldx, rows, K, sd, splitk, none, s, pdl); return;
       case 2: launch_gemv_cfg<false, OUT, HI, 4, 8, false>(x, ldx, rows, K, sd, splitk, none, s, pdl); return;

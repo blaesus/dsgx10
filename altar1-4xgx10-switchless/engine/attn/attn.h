@@ -119,8 +119,11 @@ void gemv(bool fp8, const uint16_t* x, int ldx, int rows, int K, const GemvSeg* 
 // bench knob: the GEMV launch shape (-1, the default: by shape and format; outputs never depend on it).
 //  FP8: loads in flight a lane and warps a CTA: 0: 8, 4; 1: 16, 4; 2: 24, 4; 3: 8, 2; 4: 8, 8; 5: 16, 2 (a split-K
 //       a configuration does not fit uses 0); default 1 for the grouped W_UV, else 4.
-//  BF16: 64-k chunks in flight a lane and warps a CTA: 0: 4, 4; 1: 8, 4; 2: 4, 8; 3: 8, 8; 4: 16, 4; 5: 2, 8.
-//  INT4: 512-k blocks in flight a lane and warps a CTA: 0: 1, 4; 1: 2, 4; 2: 1, 8; 3: 2, 8; 4: 3, 4; 5: 4, 4.
+//  BF16: 64-k chunks in flight a lane and warps a CTA: 0: 4, 4; 1: 8, 4; 2: 4, 8; 3: 8, 8; 4: 16, 4; 5: 2, 8;
+//       default 2 for K <= 512, 4 for N x K <= 2^21 (wq_b alone), 0 for N >= 16384 (the head), else 1. With the
+//       index weights in the launch: 4, 4 always.
+//  INT4: 512-k blocks in flight a lane and warps a CTA: 0: 1, 4; 1: 2, 4; 2: 1, 8; 3: 2, 8; 4: 3, 4; 5: 4, 4;
+//       default 1.
 void gemv_config(int cfg);
 
 // GEMM for prefill chunks (any number of rows): the same segments, output kinds and split-K as gemv(), and every
@@ -135,8 +138,9 @@ void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int 
 // bench knob: the FP8 GEMM tile configuration (-1, the default: 4 for a split-K, else 0; 0-5: gemm.cu). Outputs do
 // not depend on it.
 void gemm_config(int cfg);
-// bench knob: the GEMMs' raster, groups of gm row tiles with row tiles fastest (-1, the default: kGemmRaster; 0:
-// blockIdx order, the column tiles fastest). Outputs do not depend on it.
+// bench knob: the GEMMs' raster, groups of gm row tiles with row tiles fastest (-1, the default: kGemmRaster when
+// the launch's weights take 32 MiB or more, else 0; 0: blockIdx order, the column tiles fastest). Outputs do not
+// depend on it.
 inline constexpr int kGemmRaster = 8;
 void gemm_raster(int gm);
 // BF16 weights only (the router, the head): gemm() with every segment taken as BF16 (kNone allowed).
