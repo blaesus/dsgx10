@@ -8,8 +8,10 @@
 //   --slots N (4: sessions a decode step, B2), --slice N (64: time-slicing's turns, B1), --chunk N (8192: rows a
 //   prefill chunk), --splits N (16: sparse attention's split-K at every row count, so that a session's tokens do
 //   not depend on the others in its steps), --name NAME (altar-1).
-// The cache pool (paged, docs/serving.md): pages of --page N positions (1024); every rank offers its free device
-//   memory and its available host memory after the weights and the prefill buffers, less --margin-gib (8 on rank
+// The cache pool (paged, docs/serving.md): pages of --page N positions (1024); every rank offers its MemAvailable
+//   (--pool-basis avail, the default: CUDA's allocations reclaim the page cache, which free device memory leaves
+//   out; --pool-basis free: the smaller of free device memory and MemAvailable, glm53's rule) after the weights and
+//   the prefill buffers, less --margin-gib (8 on rank
 //   0, --worker-margin-gib 8 on the others: the fleet's memory rule keeps 8 GiB available on every box), and all
 //   take the smallest offer, at most --kv-gib (default: no cap). The memory guard: after the weights and the prefill
 //   buffers every rank reports its MemAvailable, and all ranks stop when one has less than --min-free-gib (8) plus
@@ -85,6 +87,19 @@ size_t meminfo(const char* key) {  // /proc/meminfo's key, bytes
   return kb << 10;
 }
 
+// The rank file's pages in the page cache dropped before the load (posix_fadvise DONTNEED, no root needed): a copy
+// of the file leaves up to its whole size cached (24 and 16.5 GiB on ranks 1 and 2 on 2026-10-14), memory CUDA's
+// free count does not see; the loader reads with O_DIRECT, so the cached pages serve nothing.
+void drop_cache(const std::string& path, int rk) {
+  const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;  // the loader reports a missing file
+  const size_t before = meminfo("MemFree");
+  const int e = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+  close(fd);
+  std::printf("rank %d: the rank file's page cache dropped%s: MemFree %.2f -> %.2f GiB\n", rk, e ? " (failed)" : "",
+              before / 1073741824.0, meminfo("MemFree") / 1073741824.0);
+}
+
 struct Args {
   int rank = -1;
   std::string fleet, mode, weights = "fleet", socket = fe::kDefaultSocket, name = "altar-1";
@@ -97,6 +112,7 @@ struct Args {
   std::string disk_dir, disk_tag;
   int step_timeout = 120;
   int index_scratch_mib = 512;  // the prefill indexer's score scratch (Options::index_scratch)
+  bool pool_free = false;  // --pool-basis free: the pool from min(free device memory, MemAvailable), not MemAvailable
   bool spec = true;
   int spec_drafts = 3, spec_force = 0;
   bool spec_oracle = false;
@@ -153,6 +169,7 @@ int main(int argc, char** argv) {
     else if (s == "--margin-gib") a.margin_gib = std::atof(val().c_str());
     else if (s == "--worker-margin-gib") a.worker_margin_gib = std::atof(val().c_str());
     else if (s == "--min-free-gib") a.min_free_gib = std::atof(val().c_str());
+    else if (s == "--pool-basis") { const std::string v = val(); if (v != "free" && v != "avail") die("--pool-basis free|avail"); a.pool_free = v == "free"; }
     else if (s == "--disk-gib") a.disk_gib = std::atof(val().c_str());
     else if (s == "--disk-margin-gib") a.disk_margin_gib = std::atof(val().c_str());
     else if (s == "--disk-rank0-gib") a.disk_rank0_gib = std::atof(val().c_str());
@@ -219,6 +236,7 @@ int main(int argc, char** argv) {
     if (a.weights == "fleet") std::snprintf(path, sizeof path, "%s", comm::fleet_path(fl.rank[rk].weights, rk).c_str());
     else std::snprintf(path, sizeof path, expand(a.weights).c_str(), rk);
     wpath = path;
+    drop_cache(wpath, rk);  // the file's page cache (a copy leaves it; the loader reads with O_DIRECT)
     wf = std::make_unique<glw::WeightFile>(wpath, rk, model::kRanks);
     for (const glw::DeviceTensor& t : wf->tensors()) file_gib += (t.reserved() ? t.reserve_bytes : t.bytes) / kGiB;
     wf->load();
@@ -300,7 +318,8 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
   const size_t avail = meminfo("MemAvailable"), total = meminfo("MemTotal");
   const size_t margin = (size_t)(std::max(rk == 0 ? a.margin_gib : a.worker_margin_gib, a.min_free_gib) * kGiB);
-  const size_t offer = std::min(dfree, avail) > margin ? std::min(dfree, avail) - margin : 0;
+  const size_t basis = a.pool_free ? std::min(dfree, avail) : avail;  // MemAvailable: CUDA reclaims page cache (§ 3)
+  const size_t offer = basis > margin ? basis - margin : 0;
   const double wgib = m.weight_bytes() / kGiB;
   const double mine[6] = {(double)offer, dfree / kGiB, avail / kGiB, wgib, file_gib, (double)m.file_expert_layers()};
   double all[4][6];
@@ -329,7 +348,8 @@ int main(int argc, char** argv) {
                 "available host memory before it, ranks 0-3:",
                 pages, a.page, pages * a.page, pages * (double)page_bytes / kGiB, pos_bytes);
     for (const auto& r : all) std::printf(" %.2f / %.2f", r[1], r[2]);
-    std::printf(" GiB, less margins of %.1f (rank 0) and %.1f GiB\n", a.margin_gib, a.worker_margin_gib);
+    std::printf(" GiB; the offer: %s less margins of %.1f (rank 0) and %.1f GiB\n",
+                a.pool_free ? "min(free device, MemAvailable)" : "MemAvailable", a.margin_gib, a.worker_margin_gib);
     std::printf("weights: %s, %.2f GiB a rank bound (%d MoE layers' experts from the file); the file at its reserved "
                 "size: %.2f GiB; MemTotal %.2f GiB\n",
                 wpath.c_str(), wgib, m.file_expert_layers(), file_gib, total / kGiB);
