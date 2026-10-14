@@ -89,7 +89,9 @@ enum Tune : uint32_t {
   kTuneIw = 1u << 2,     // full layers: the indexer's head weights in the x-projection's launch (attn's GemvIw)
   kTuneOproj = 1u << 3,  // o_proj posts its partials to the ring itself (oproj.cu): measured neutral, off by default
   kTuneArRow = 1u << 4,  // the fused all-reduces with one block a row (comm::glm slices = 1)
-  kTuneDefault = kTuneRoute | kTunePost | kTuneIw | kTuneArRow,
+  kTunePfGemm = 1u << 5,    // prefill: the FP8 projections as attn's gemm(), not 16-row GEMV launches (prefill.cu)
+  kTunePfRouter = 1u << 6,  // prefill: the BF16 router as attn's gemm_bf16(), not 16-row GEMV launches
+  kTuneDefault = kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter,
   kTuneAll = 0xffffffffu,
 };
 

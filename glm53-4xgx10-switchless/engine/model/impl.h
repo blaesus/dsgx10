@@ -51,6 +51,11 @@ struct LayerW {
   const float* router_bias = nullptr;
   gx::LayerW moe{};                                           // MoE: the routed pool, descriptors, shared expert
 };
+// An FP8 projection of M rows, the segments' y at row 0 (prefill.cu): attn's prefill gemm() in one launch when
+// use_gemm and M > 16 (each output the GEMV's bits at the same split-K, attn's test P), else 16-row GEMV launches.
+void pf_proj(bool use_gemm, const uint16_t* x, int ldx, int M, int K, const ::glm::GemvSeg* segs, int nseg,
+             ::glm::GemvOut out, int splitk, cudaStream_t st, bool pdl);
+
 struct MtpW {
   const uint16_t *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
   Fp8W eh;  // [1536][12288] rows of this rank
@@ -207,7 +212,7 @@ struct Model::Impl {
   // after it, the next passes chained
   void drafts(int R, uint32_t flags, Sink* sink);
   // the MTP layer's input for n rows: x = eh_proj([enorm(e) | hnorm(hid)]) all-gathered into out [n][6144] (x12
-  // [n][12288] scratch); e, hid [n][6144] bf16. Decode (n <= 16) or prefill (16-row GEMVs).
+  // [n][12288] scratch); e, hid [n][6144] bf16. Decode (n <= 16: a GEMV) or prefill (pf_proj).
   void mtp_project(int n, const uint16_t* e, const uint16_t* hid, uint16_t* x12, uint16_t* out);
   // prefill: the MTP cache entries of rows t in [t0, t1) of a chunk at a (embedding rows of tokens t + 1 in emb at
   // row t + 1 - a; hidden rows of the main model's final output at row t - a, or the slot's pending row)

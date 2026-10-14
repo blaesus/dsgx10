@@ -16,11 +16,10 @@ void Model::Impl::mtp_project(int n, const uint16_t* e, const uint16_t* hid, uin
   const bool P = pdl();
   ::glm::rmsnorm(e, kDim, mtp.enorm, ::glm::kNormEps, kDim, x12, kEhK, n, st, P);
   ::glm::rmsnorm(hid, kDim, mtp.hnorm, ::glm::kNormEps, kDim, x12 + kDim, kEhK, n, st, P);
-  for (int r0 = 0; r0 < n; r0 += kMaxRows) {  // this rank's 1536 rows of eh_proj into its block of out
-    const int rows = std::min(kMaxRows, n - r0);
+  {  // this rank's 1536 rows of eh_proj into its block of out
     ::glm::GemvSeg s;
-    s.w = mtp.eh.w, s.s = mtp.eh.s, s.n = kEhRows, s.y = out + (size_t)r0 * kDim + (size_t)rank * kEhRows, s.ldy = kDim;
-    ::glm::gemv(true, x12 + (size_t)r0 * kEhK, kEhK, rows, kEhK, &s, 1, ::glm::GemvOut::kBF16, 1, st, P);
+    s.w = mtp.eh.w, s.s = mtp.eh.s, s.n = kEhRows, s.y = out + (size_t)rank * kEhRows, s.ldy = kDim;
+    detail::pf_proj(tune(kTunePfGemm), x12, kEhK, n, kEhK, &s, 1, ::glm::GemvOut::kBF16, 1, st, P);
   }
   const size_t ld = (size_t)kDim * 2, rb = (size_t)kEhRows * 2;
   const comm::glm::RowSeg g{out + (size_t)rank * kEhRows, ld, out, ld, rb};

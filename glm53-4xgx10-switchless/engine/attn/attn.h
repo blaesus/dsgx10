@@ -105,6 +105,11 @@ void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int 
 // bench knob: the GEMM tile configuration (-1, the default: 4 for a split-K, else 0; 0-5: gemm.cu). Outputs do not
 // depend on it.
 void gemm_config(int cfg);
+// The same for BF16 weights (row-major [N][K], no scales; the router, the head): every output equals
+// gemv(false, ...)'s at the same splitk bit for bit (the GEMV's MMAs accumulating in k order, split-K parts added
+// in part order). Outputs kBF16 and kF32; one tile shape (128 x 64; gemm_config does not apply).
+void gemm_bf16(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
+               cudaStream_t s, bool pdl = false);
 
 // ---- norms, RoPE, cache entries ------------------------------------------------------------------------------
 // RMSNorm as the reference: bf16(w * bf16(x * rsqrt(mean(x^2) + eps))), fp32 statistics. [rows][D] bf16.
