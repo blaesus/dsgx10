@@ -121,7 +121,7 @@ __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
   // parts of BC 64-k chunks as attn's gemv at split-K 4; warp w takes BU consecutive parts of one tile (BT * 4 = BU *
   // WK), BPS chunks in flight a lane.
   constexpr int BT = WK % 4 == 0 ? WK / 4 : WK % 2 == 0 ? WK / 2 : WK, BU = kShParts * BT / WK;
-  constexpr int BC = kH / 64 / kShParts, BPS = 8;
+  constexpr int BC = kH / 64 / kShParts, BPS = R16 ? 4 : 8;  // R16: 4, so that two CTAs of 6 warps fit an SM
   static_assert(BU * WK == kShParts * BT && BC % BPS == 0, "the BF16 shared expert's split");
   static_assert(WK == 1 || WK * 2 * NT >= kShParts * BT, "red holds the BF16 shared expert's partials");
   const int nsh = a.sh ? TPE : SHB ? (kShTiles + BT - 1) / BT : 0;  // the fused shared expert's tasks
