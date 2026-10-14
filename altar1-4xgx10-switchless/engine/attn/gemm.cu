@@ -100,8 +100,10 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
 #pragma unroll
   for (int j = 0; j < BCH; ++j) {
     const int i = tid + j * NTH;
-    if constexpr (BW) {  // 16-byte half hf of lane l's 32 bytes: row 8 nt + g, k = 16t + 8hf .. + 7
-      const int nt = i >> 6, l = (i >> 1) & 31, hf = i & 1, n = n0 + 8 * nt + (l >> 2);
+    if constexpr (BW) {  // 16-byte half hf of lane l's 32 bytes: row 8 nt + g, k = 16t + 8hf .. + 7; consecutive
+                         // threads read consecutive source bytes (kBF16T: half-major, rows: lane-major)
+      const int nt = i >> 6, l = sg.tiled ? i & 31 : (i >> 1) & 31, hf = sg.tiled ? (i >> 5) & 1 : i & 1;
+      const int n = n0 + 8 * nt + (l >> 2);
       bok[j] = n < sg.n;
       bsrc[j] = sg.tiled ? sg.w + ((size_t)(bok[j] ? n >> 3 : 0) * J) * 1024 + 512 * hf + 16 * l
                          : sg.w + ((size_t)(bok[j] ? n : 0) * K + 16 * (l & 3) + 8 * hf) * 2;
