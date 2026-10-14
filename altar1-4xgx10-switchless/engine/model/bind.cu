@@ -112,22 +112,22 @@ void Model::Impl::synth_pools(const SynthOptions& so, std::vector<const uint8_t*
   if (!synth) synth.reset(new Synth()), synth->seed = so.seed;
   Synth& S = *synth;
   const int npool = std::max(1, so.expert_pools);
-  const uint32_t fmt = so.s3 ? gx::kS3 : gx::kNVFP4;
+  if (so.s3) die("model: synthetic S3 experts: S3 is GLM-5.3's format, retired in this engine");
+  const uint32_t fmt = gx::kNVFP4;
   const size_t gu = gx::mat_bytes(fmt, gx::kI, gx::kH), dn = gx::mat_bytes(fmt, gx::kH, gx::kI);
   const size_t per = 2 * gu + dn, pool_bytes = per * gx::kE;
   exp_bytes = (double)per;
   pools.assign(npool, nullptr), descs.assign(npool, nullptr);
-  const float mags[2][4] = {{0.5f, 2.f, 4.f, 6.f}, {0.f, 1.f, 3.f, 6.f}};
   for (int i = 0; i < npool; ++i) {
     uint8_t* p = S.alloc<uint8_t>(pool_bytes);
-    const uint32_t blk = so.s3 ? gx::kS3Blk : gx::kQ4Blk, sc = so.s3 ? 1536 : 2048;
+    const uint32_t blk = gx::kQ4Blk, sc = 2048;
     k_fill_pool<<<grid_of(pool_bytes), 256>>>(p, pool_bytes, S.next(), blk, sc);
     // weight rms ~ 2.9 (e2m1) x ~1.4 (scales) x s2: gate/up and down outputs of rms ~ their inputs'
     const float s2gu = 1.f / (4.2f * std::sqrt((float)gx::kH)), s2dn = 1.f / (4.2f * std::sqrt(4.f * gx::kI));
     std::vector<gx::MatDesc> d((size_t)gx::kE * 3);
     for (int e = 0; e < gx::kE; ++e)
       for (int j = 0; j < 3; ++j)
-        d[e * 3 + j] = gx::make_desc(per * e + gu * j, j < 2 ? s2gu : s2dn, fmt, 1, mags);
+        d[e * 3 + j] = gx::make_desc(per * e + gu * j, j < 2 ? s2gu : s2dn, fmt);
     gx::MatDesc* dd = S.alloc<gx::MatDesc>(d.size());
     CUDA_CHECK(cudaMemcpy(dd, d.data(), d.size() * sizeof(gx::MatDesc), cudaMemcpyHostToDevice));
     pools[i] = p, descs[i] = dd;

@@ -1,4 +1,5 @@
-// glw_kcheck: does a rank's .glw file hold what the kernels read? (the DeepSeek engine's dsw_kcheck, for GLM-5.3)
+// glw_kcheck: does a rank's .glw file hold what the kernels read? (the DeepSeek engine's dsw_kcheck, for GLM-5.3;
+// the routed experts' part for altar-1: 168 experts a layer, INT4 or BF16 by layer, experts.h's formats)
 //
 //   glw_kcheck FILE --rank R                 host only, no device: every layer's tensors against engine/attn/attn.h's
 //                                            constants and GemvSeg conventions (shapes, dtypes, layouts, the scale
@@ -9,9 +10,9 @@
 //                                            into a glm::GemvSeg as the layer runner will
 //   glw_kcheck FILE --rank R --partial --layers 3
 //                                            a test file holding some layers (convert.py --only): those only
-//   ... --blocks                             also reads every filled expert entry and checks its scale bytes
-//                                            (no e4m3 NaN; NVFP4's positive); S3 descriptors are always checked
-//                                            against make_desc (two ascending E2M1 subsets; the S3x2 pair counted)
+//   ... --blocks                             also reads every filled expert entry and checks its scale fields
+//                                            (INT4: bf16 finite and positive; NVFP4: no e4m3 NaN, positive); every
+//                                            descriptor is checked with layout.h desc_ok (tag, alignment, s2, reserved)
 //   glw_kcheck FILE --rank R --gpu [--layers 0,3,10,78] [--rows 4]
 //                                            also loads those layers (and the head) and runs glm::gemv on each FP8
 //                                            projection and the BF16 head with random bf16 inputs, against a host
@@ -44,8 +45,8 @@ namespace {
 
 int g_bad = 0, g_ok = 0;
 bool g_blocks = false;                    // --blocks: scan the filled experts' scale bytes
-size_t g_s3_pair = 0, g_s3_other = 0;     // S3 descriptors with the S3x2 pair / another pair
-size_t g_scale_bytes = 0, g_subset_b = 0;  // --blocks: scale bytes scanned, S3 groups of subset B
+size_t g_fmt_mats[4] = {};                // filled matrices by format tag
+size_t g_scales = 0;                       // --blocks: scale fields scanned
 void expect(bool ok, const std::string& what) {
   if (ok) {
     ++g_ok;
@@ -107,21 +108,30 @@ glm::GemvSeg fp8(const WeightFile& wf, const std::string& base, int N, int K, in
   return s;
 }
 
-// The routed experts of a MoE layer: the desc entry and 256 expert entries, each sized by its format tag with
-// experts.h's mat_bytes; once filled, the entries are back to back (the layer's pool) and every MatDesc points at
-// its matrix inside its expert's entry with the entry's format.
+// The format of layer L's routed experts (glw.py layer_expert_fmt): BF16 on 3, 77 and the MTP layer 78, INT4 on 4-76;
+// the MTP layer may also hold NVFP4 (DESIGN decision 5's option).
+bool layer_fmt_ok(int L, uint32_t f) {
+  if (L == 78) return f == gx::kBF16 || f == gx::kNVFP4;
+  return f == (L == 3 || L == 77 ? gx::kBF16 : gx::kINT4);
+}
+
+// The routed experts of a MoE layer: the desc entry and 168 expert entries, each sized by its format tag with
+// experts.h's mat_bytes; one format for the whole layer (LayerW::fmt: the kernels are instantiated per format), the
+// layer's own; once filled, the entries are back to back (the layer's pool) and every MatDesc points at its matrix
+// inside its expert's entry with the entry's format and passes layout.h's desc_ok.
 void check_experts(const WeightFile& wf, int L) {
   const std::string p = "layers." + std::to_string(L) + ".experts.";
   const DeviceTensor* ed = wf.find(p + "desc");
   expect(ed && ed->ndim == 3 && ed->shape[0] == gx::kE && ed->shape[1] == 3 &&
              ed->shape[2] == int64_t(sizeof(gx::MatDesc)),
-         p + "desc: [256][3][sizeof(gx::MatDesc)]");
+         p + "desc: [168][3][sizeof(gx::MatDesc)]");
   if (!ed) return;
   std::vector<uint8_t> db;
   if (!ed->reserved()) db = wf.read_host(*ed);
   const auto* desc = reinterpret_cast<const gx::MatDesc*>(db.data());
   uint64_t base = 0, next = 0;
   int filled = 0;
+  uint32_t layer_fmt = 0xFFFFFFFFu;
   for (int e = 0; e < gx::kE; e++) {
     const DeviceTensor* t = wf.find(p + std::to_string(e));
     if (!t) {
@@ -132,7 +142,9 @@ void check_experts(const WeightFile& wf, int L) {
     uint64_t want = 0, moff[3];
     for (int m = 0; m < 3; m++) {
       const uint32_t f = expert_matrix_fmt(t->fmt, m);
-      expect(f == gx::kNVFP4 || f == gx::kS3, t->name + ": format tag");
+      expect(gx::fmt_known(f) && layer_fmt_ok(L, f), t->name + ": format tag " + std::to_string(f) + " of matrix " + std::to_string(m));
+      if (layer_fmt == 0xFFFFFFFFu) layer_fmt = f;
+      expect(f == layer_fmt, t->name + ": format " + std::to_string(f) + ", the layer's is " + std::to_string(layer_fmt));
       moff[m] = want;
       want += gx::mat_bytes(f, N[m], K[m]);
     }
@@ -150,40 +162,32 @@ void check_experts(const WeightFile& wf, int L) {
     if (desc)
       for (int m = 0; m < 3; m++) {
         const gx::MatDesc& d = desc[3 * e + m];
-        expect(d.off == t->file_offset - base + moff[m] && d.off % 256 == 0 &&
-                   d.fmt == expert_matrix_fmt(t->fmt, m) && d.s2 > 0 && std::isfinite(d.s2),
+        const uint32_t f = expert_matrix_fmt(t->fmt, m);
+        expect(d.off == t->file_offset - base + moff[m] && gx::fmt_known(f) && gx::desc_ok(d, f),
                t->name + ": descriptor " + std::to_string(m));
-        // S3: the prmt tables and the FP4 nibble words are make_desc's for two ascending E2M1 subsets
-        // (layout.h s3_desc_check); S3x2's pair is the one the converter writes, another pair is reported
-        if (d.fmt == gx::kS3) {
-          float mg[2][4];
-          bool pair = false;
-          expect(gx::s3_desc_check(d, mg, &pair), t->name + ": S3 descriptor " + std::to_string(m) + " tables");
-          g_s3_pair += pair, g_s3_other += !pair;
-        }
+        if (gx::fmt_known(f)) ++g_fmt_mats[f];
       }
-    // --blocks: every stored scale byte of the expert's matrices (not the e4m3 NaN; NVFP4's positive, as the FP4
-    // path's ue4m3 reads them), so a damaged or misaligned fill is found before the kernels read it
+    // --blocks: every stored scale field of the expert's matrices (INT4: bf16, finite and positive; NVFP4: not the
+    // e4m3 NaN, positive), so a damaged or misaligned fill is found before the kernels read it
     if (g_blocks) {
       const std::vector<uint8_t> ent = wf.read_host(*t);
       for (int m = 0; m < 3; m++) {
         const uint32_t f = expert_matrix_fmt(t->fmt, m);
-        size_t nb = 0;
-        const size_t bad = gx::scale_bytes_check(ent.data() + moff[m], f, N[m], K[m], &nb);
-        expect(bad == 0, t->name + ": matrix " + std::to_string(m) + " has " + std::to_string(bad) + " bad scale bytes");
-        g_scale_bytes += size_t(N[m]) * K[m] / 16, g_subset_b += nb;
+        if (!gx::fmt_known(f)) continue;
+        const size_t bad = gx::scale_bytes_check(ent.data() + moff[m], f, N[m], K[m]);
+        expect(bad == 0, t->name + ": matrix " + std::to_string(m) + " has " + std::to_string(bad) + " bad scales");
+        g_scales += f == gx::kINT4 ? size_t(N[m]) * K[m] / 32 : f == gx::kNVFP4 ? size_t(N[m]) * K[m] / 16 : 0;
       }
     }
   }
-  expect(filled == 0 || (filled == gx::kE && !ed->reserved()), p + ": all 256 experts and the desc filled, or none");
+  expect(filled == 0 || (filled == gx::kE && !ed->reserved()), p + ": all 168 experts and the desc filled, or none");
 }
 
 void print_expert_summary() {
-  if (g_s3_pair + g_s3_other)
-    std::printf("S3 descriptors: %zu with the S3x2 pair {0.5, 2, 4, 6} + {0.5, 1.5, 3, 6}, %zu with another pair\n",
-                g_s3_pair, g_s3_other);
-  if (g_blocks)
-    std::printf("--blocks: %zu scale bytes scanned, %zu S3 groups of subset B\n", g_scale_bytes, g_subset_b);
+  if (g_fmt_mats[gx::kNVFP4] + g_fmt_mats[gx::kINT4] + g_fmt_mats[gx::kBF16])
+    std::printf("expert matrices: %zu INT4, %zu BF16, %zu NVFP4\n", g_fmt_mats[gx::kINT4], g_fmt_mats[gx::kBF16],
+                g_fmt_mats[gx::kNVFP4]);
+  if (g_blocks) std::printf("--blocks: %zu scale fields scanned\n", g_scales);
 }
 
 struct LayerSegs {

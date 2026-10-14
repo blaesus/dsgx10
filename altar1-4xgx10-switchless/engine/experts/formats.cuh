@@ -1,5 +1,7 @@
 // The routed formats' decoders, host and device (__host__ __device__ so the CPU checks run the very code the
-// kernels run), adapted from micro/common.cuh (experiment 1), plus the device-only helpers the kernels share.
+// kernels run), plus the device-only helpers the kernels share and the format traits they are templated on.
+// GLM-5.3's NVFP4 decoders unchanged; the INT4-g32 (compressed-tensors pack-quantized) and BF16 families new
+// (docs/experts.md section 2).
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -7,7 +9,6 @@
 #include <cstring>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
@@ -29,7 +30,7 @@ GX_HD uint32_t bperm(uint32_t x, uint32_t y, uint32_t s) {  // prmt.b32 default 
 #endif
 }
 inline float bf16_bits_to_f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
-inline uint16_t f_to_bf16_bits(float f) {  // round to nearest even (finite f)
+inline uint16_t f_to_bf16_bits(float f) {  // round to nearest even (finite f, subnormals included)
   uint32_t u; memcpy(&u, &f, 4);
   u += 0x7FFFu + ((u >> 16) & 1u);
   return (uint16_t)(u >> 16);
@@ -41,7 +42,10 @@ inline float e2m1_to_f(int c) {
   return t[c & 15];
 }
 
-// bf16x2 multiply; every use multiplies values whose product is exact in bf16.
+// bf16x2 multiply: the exact product of the two bf16 operands rounded once to nearest even (the device's
+// mul.rn.bf16x2 / fma.rn with -0; on the host the f32 product of two bf16 values is exact, 16 significant bits,
+// and f_to_bf16_bits rounds it). NVFP4's uses are exact in bf16; INT4's (u - z) * s is not always (up to 12
+// significant bits) and rounds as compressed-tensors' dequantize does.
 GX_HD uint32_t bmul2(uint32_t a, uint32_t b) {
 #ifdef __CUDA_ARCH__
   __nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), *reinterpret_cast<__nv_bfloat162*>(&b));
@@ -49,6 +53,17 @@ GX_HD uint32_t bmul2(uint32_t a, uint32_t b) {
 #else
   const uint16_t lo = f_to_bf16_bits(bf16_bits_to_f(a & 0xFFFF) * bf16_bits_to_f(b & 0xFFFF));
   const uint16_t hi = f_to_bf16_bits(bf16_bits_to_f(a >> 16) * bf16_bits_to_f(b >> 16));
+  return lo | (uint32_t)hi << 16;
+#endif
+}
+// bf16x2 subtract; INT4's use (128 + u) - (128 + z) is exact (an integer in [-15, 15])
+GX_HD uint32_t bsub2(uint32_t a, uint32_t b) {
+#ifdef __CUDA_ARCH__
+  __nv_bfloat162 r = __hsub2(*reinterpret_cast<__nv_bfloat162*>(&a), *reinterpret_cast<__nv_bfloat162*>(&b));
+  return *reinterpret_cast<uint32_t*>(&r);
+#else
+  const uint16_t lo = f_to_bf16_bits(bf16_bits_to_f(a & 0xFFFF) - bf16_bits_to_f(b & 0xFFFF));
+  const uint16_t hi = f_to_bf16_bits(bf16_bits_to_f(a >> 16) - bf16_bits_to_f(b >> 16));
   return lo | (uint32_t)hi << 16;
 #endif
 }
@@ -75,97 +90,35 @@ inline uint32_t q4_scale_f2_host(uint8_t s) {  // bf16(e4m3(s) * 2^96), both hal
   const uint16_t b = f_to_bf16_bits(e4m3_to_f(s) * 0x1p96f);
   return b | (uint32_t)b << 16;
 }
-inline uint32_t s3_scale_f2_host(uint8_t s) {  // bf16(e4m3(s & 0x7f)), both halves
-  const uint16_t b = f_to_bf16_bits(e4m3_to_f(s & 0x7F));
-  return b | (uint32_t)b << 16;
-}
 
-// ---- E2M1-subset 3-bit code (S3) ----------------------------------------------------------------------------
-// A tensor has one or two subsets of four E2M1 magnitudes m0 < m1 < m2 < m3 (m0 may be 0); code c = s << 2 | j
-// means (-1)^s m_j; bit 7 of a group's scale byte picks the subset, its low 7 bits are the e4m3 scale.
-// A lane's 32 values v[0..31] (two groups of 16) of one 128-k unit are three words:
-//   P0 nibble m: bits 1:0 = v[m] & 3, bits 3:2 = v[m + 8] & 3;  P1: the same for v[16 + m], v[24 + m];
-//   Q  nibble m: bit 0 = v[m] >> 2, bit 1 = v[m + 8] >> 2, bit 2 = v[m + 16] >> 2, bit 3 = v[m + 24] >> 2.
-// Decode: two lop3s give a word of eight 3-bit selectors and prmt reads each code's bf16 from the subset's
-// 8-entry table (low bytes T[0]:T[1], high bytes T[2]:T[3]), then one exact multiply by the group's scale.
-struct S3Tab { uint32_t tl0, tl1, th0, th1; };
-inline S3Tab s3_table(const float mags[4]) {  // mags ascending, E2M1 magnitudes
-  S3Tab t{0, 0, 0, 0};
-  for (int c = 0; c < 8; ++c) {
-    const float v = (c & 4 ? -1.f : 1.f) * mags[c & 3];
-    const uint16_t b = f_to_bf16_bits(v);
-    const uint32_t lo = b & 0xFF, hi = b >> 8;
-    if (c < 4) { t.tl0 |= lo << 8 * c; t.th0 |= hi << 8 * c; }
-    else { t.tl1 |= lo << 8 * (c - 4); t.th1 |= hi << 8 * (c - 4); }
-  }
-  return t;
-}
-GX_HD uint32_t s3_sel(uint32_t P0, uint32_t P1, uint32_t Q, int which) {  // selectors of values 8 which .. + 7
-  switch (which) {
-    case 0: return (P0 & 0x33333333u) | ((Q << 2) & 0x44444444u);
-    case 1: return ((P0 >> 2) & 0x33333333u) | ((Q << 1) & 0x44444444u);
-    case 2: return (P1 & 0x33333333u) | (Q & 0x44444444u);
-    default: return ((P1 >> 2) & 0x33333333u) | ((Q >> 1) & 0x44444444u);
-  }
-}
-// four values (selectors in sel's low 16 bits) -> two bf16x2 words (values 0,1 and 2,3) times f2
-GX_HD void s3_dec4(uint32_t sel, const S3Tab& T, uint32_t f2, uint32_t& w0, uint32_t& w1) {
-  const uint32_t lo = bperm(T.tl0, T.tl1, sel), hi = bperm(T.th0, T.th1, sel);
-  w0 = bmul2(bperm(lo, hi, 0x5140), f2);
-  w1 = bmul2(bperm(lo, hi, 0x7362), f2);
-}
-// one group (16 values, q = 0: v[0..15], 1: v[16..31]) -> 8 bf16x2 words
-GX_HD void s3_group(uint32_t P0, uint32_t P1, uint32_t Q, int q, const S3Tab& T, uint32_t f2, uint32_t (&o)[8]) {
-  const uint32_t sa = s3_sel(P0, P1, Q, 2 * q), sb = s3_sel(P0, P1, Q, 2 * q + 1);
-  s3_dec4(sa, T, f2, o[0], o[1]);
-  s3_dec4(sa >> 16, T, f2, o[2], o[3]);
-  s3_dec4(sb, T, f2, o[4], o[5]);
-  s3_dec4(sb >> 16, T, f2, o[6], o[7]);
-}
-inline void s3_pack_lane(const uint8_t v[32], uint32_t& P0, uint32_t& P1, uint32_t& Q) {
-  P0 = P1 = Q = 0;
-  for (int m = 0; m < 8; ++m) {
-    P0 |= (uint32_t)(v[m] & 3) << 4 * m | (uint32_t)(v[m + 8] & 3) << (4 * m + 2);
-    P1 |= (uint32_t)(v[m + 16] & 3) << 4 * m | (uint32_t)(v[m + 24] & 3) << (4 * m + 2);
-    Q |= (uint32_t)(v[m] >> 2) << 4 * m | (uint32_t)(v[m + 8] >> 2) << (4 * m + 1) |
-         (uint32_t)(v[m + 16] >> 2) << (4 * m + 2) | (uint32_t)(v[m + 24] >> 2) << (4 * m + 3);
-  }
-}
-// S3 code -> e2m1 nibble of the same value (for the FP4 tensor-core path): magnitude index of m_j in the
-// E2M1 grid {0, .5, 1, 1.5, 2, 3, 4, 6}, sign in bit 3. The table packs the 8 nibbles of a subset in a word.
-inline uint32_t s3_nibble_table(const float mags[4]) {
-  static const float g[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
-  uint32_t t = 0;
-  for (int c = 0; c < 8; ++c) {
-    int m = 0;
-    for (int i = 0; i < 8; ++i)
-      if (g[i] == mags[c & 3]) m = i;
-    t |= (uint32_t)((c & 4 ? 8 : 0) | m) << (4 * c);
-  }
-  return t;
-}
-
-// ---- NVFP4 activations (the FP4 prefill path) ---------------------------------------------------------------
-// A group of 16 values x with the static input scale S: amax = max |x|, sb = e4m3_rn_sat(amax / (6 S)),
-// d = e4m3(sb) S (f32), q = e2m1_rn_sat(x / d) (0 when d = 0); x ~ e2m1(q) e4m3(sb) S. Every step is one
-// IEEE f32 operation, so the host function below and the device kernel give the same bits.
-inline void nvfp4_quant16_host(const float* x, float S, uint8_t* q8, uint8_t& sb) {
-  float amax = 0;
-  for (int i = 0; i < 16; ++i) amax = std::max(amax, fabsf(x[i]));
-  const float t = amax / (6.f * S);
-  sb = (uint8_t)__nv_cvt_float_to_fp8(t, __NV_SATFINITE, __NV_E4M3);
-  const float d = e4m3_to_f(sb) * S;
-  for (int i = 0; i < 8; ++i) {
-    uint8_t b = 0;
-    for (int h = 0; h < 2; ++h) {
-      const float v = d > 0 ? x[2 * i + h] / d : 0.f;
-      b |= (uint8_t)(__nv_cvt_float_to_fp4(v, __NV_E2M1, cudaRoundNearest) & 15) << (4 * h);
+// ---- INT4-g32, asymmetric (compressed-tensors pack-quantized) --------------------------------------------------
+// The checkpoint stores a signed 4-bit value q and zero point z as nibbles u = q + 8, u_z = z + 8, and
+// compressed-tensors' dequantize is bf16(bf16(q) - bf16(z)) * bf16 scale in BF16 arithmetic: the difference
+// q - z = u - u_z is exact, the product is rounded once to nearest even (docs/model.md, docs/findings.md A0).
+// Here: (0x4300 | u) is the bf16 128 + u exactly (ulp 1 in [128, 256)); subtracting 128 + u_z gives u - u_z
+// exactly; one bf16 multiply by the scale rounds the exact product as the library does.
+// 16 stored nibbles of one group (lo = values 0..7, hi = 8..15, value i at bits 4 (i % 8): the checkpoint's own
+// order) -> 8 bf16x2 words, word m = values (2m, 2m + 1). zz = 0x4300 | u_z in both halves, s2 = the scale in both.
+GX_HD void i4_dec16(uint32_t lo, uint32_t hi, uint32_t zz, uint32_t s2, uint32_t (&o)[8]) {
+  const uint32_t v[2] = {lo, hi};
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const uint32_t w4 = v[h] >> 4;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t y = bperm(v[h], w4, (4 + j) << 8 | j);  // byte 0: values 2j (low nibble), byte 2: 2j + 1
+      o[4 * h + j] = bmul2(bsub2((y & 0x000F000Fu) | 0x43004300u, zz), s2);
     }
-    q8[i] = b;
   }
 }
+GX_HD uint32_t i4_zz(uint32_t uz) { return (uz & 15u) * 0x00010001u | 0x43004300u; }
+GX_HD uint32_t bf16x2_bcast(uint32_t b16) { return (b16 & 0xFFFFu) * 0x00010001u; }
+// The contract's weight, one value: bf16((u - u_z) * s) as bf16 bits (the host reference of every check)
+inline uint16_t i4_value_bits(int u, int uz, uint16_t s) {
+  return f_to_bf16_bits((float)(u - uz) * bf16_bits_to_f(s));
+}
 
-// ---- FP8 e4m3 (the shared expert): four bytes -> two bf16x2 words of the exact values (bits into bf16's
+// ---- FP8 e4m3 (a fused FP8 shared expert): four bytes -> two bf16x2 words of the exact values (bits into bf16's
 // fields give v * 2^-120, then one exact multiply by 2^120).
 GX_HD void fp8x4_to_bf16(uint32_t v, uint32_t& o0, uint32_t& o1) {
   const uint32_t k = 0x7B807B80u;  // bf16 2^120 in both halves
@@ -238,19 +191,31 @@ __device__ __forceinline__ uint2 ldg_stream64(const void* p) {
   asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
   return r;
 }
+__device__ __forceinline__ uint32_t ldg_stream32(const void* p) {
+  uint32_t r;
+  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(r) : "l"(p));
+  return r;
+}
 __device__ __forceinline__ void pdl_launch_dependents() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 
-// One row's routing by one warp (all 32 lanes), eight experts a lane (e = lane + 32 j): lane k < 8 writes pick k's
-// expert to idx[k] and its weight to w[k]. k_route's body; the decode kernels run it on the router's logits
-// themselves (DecodeCfg::logits) with the same bits.
+// One row's routing by one warp (all 32 lanes), the experts e = lane + 32 j, j < kRJ (kRJ * 32 >= kE; slots past
+// kE hold key -inf and never win): lane k < 8 writes pick k's expert to idx[k] and its weight to w[k]. k_route's
+// body; the decode kernels run it on the router's logits themselves (DecodeCfg::logits) with the same bits. Ties
+// go to the lower expert id (torch.topk's order on the reference's keys, tested).
+constexpr int kRJ = (kE + 31) / 32;  // 6 at 168
 __device__ __forceinline__ void route_warp(const float* __restrict__ logits_row, const float* __restrict__ bias, int lane,
                                            int* idx, float* wout) {
-  float s[8], key[8];
+  float s[kRJ], key[kRJ];
 #pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    s[j] = route_sigmoid(__ldcg(logits_row + lane + 32 * j));
-    key[j] = s[j] + __ldg(bias + lane + 32 * j);
+  for (int j = 0; j < kRJ; ++j) {
+    const int e = lane + 32 * j;
+    if (e < kE) {
+      s[j] = route_sigmoid(__ldcg(logits_row + e));
+      key[j] = s[j] + __ldg(bias + e);
+    } else {
+      s[j] = 0.f, key[j] = -INFINITY;
+    }
   }
   float picked[8];
   int ids[8];
@@ -259,7 +224,7 @@ __device__ __forceinline__ void route_warp(const float* __restrict__ logits_row,
     float bv = -INFINITY;
     int bj = 0;
 #pragma unroll
-    for (int j = 0; j < 8; ++j)
+    for (int j = 0; j < kRJ; ++j)
       if (key[j] > bv) bv = key[j], bj = j;
     int be = bv == -INFINITY ? 1 << 30 : lane + 32 * bj;
 #pragma unroll
@@ -271,7 +236,7 @@ __device__ __forceinline__ void route_warp(const float* __restrict__ logits_row,
     ids[k] = be;
     float sv = 0.f;
 #pragma unroll
-    for (int j = 0; j < 8; ++j)
+    for (int j = 0; j < kRJ; ++j)
       if (lane + 32 * j == be) sv = s[j], key[j] = -INFINITY;
     picked[k] = __shfl_sync(0xffffffffu, sv, be & 31);
   }
@@ -281,36 +246,76 @@ __device__ __forceinline__ void route_warp(const float* __restrict__ logits_row,
     if (lane == k) idx[k] = ids[k], wout[k] = picked[k] / sum * 2.5f;
 }
 
-// ---- a routed block in registers and its decode (decode and prefill kernels) -----------------------------------
-struct Raw {
-  uint4 v[4];  // NVFP4: unit jj's 16 B; S3: P0, P1, Q (each 4 words, one a unit)
-  uint2 s;     // the eight scale bytes, byte 2 jj + q
-};
-__device__ __forceinline__ void load_blk(Raw& r, const uint8_t* blk, uint32_t fmt, int lane) {
-  if (fmt == kNVFP4) {
+// ---- the routed formats as kernel template parameters ----------------------------------------------------------
+// A block is 8 rows x kBK k (kU units of 128 k); lane l = 4 g + t holds row g of it and, in unit jj, the 32
+// values k = 128 jj + 64 q + 16 t + i (q = 0, 1; i < 16), two groups of 16 that each feed four m16n8k16 MMAs as
+// B fragments. Raw is a lane's share of one block in registers; dec(r, jj, q, o) makes group q of unit jj into
+// 8 bf16x2 words (o[m] = values 2m, 2m + 1). kMul is the epilogue's factor besides MatDesc::s2 (NVFP4's 2^30).
+// Every format feeds the MMAs the same lane map in the same k order, so a matrix's sums depend only on its
+// decoded bf16 values: INT4's equal BF16's on the dequantised matrix bit for bit.
+struct FmtNVFP4 {
+  static constexpr uint32_t kFmt = kNVFP4;
+  static constexpr int kBK = kBlkK, kBlk = kQ4Blk, kU = kBK / 128;
+  static constexpr float kMul = 0x1p30f;
+  struct Raw {
+    uint4 v[4];  // unit jj's 16 B
+    uint2 s;     // the eight scale bytes, byte 2 jj + q
+  };
+  __device__ static __forceinline__ void load(Raw& r, const uint8_t* blk, int lane) {
 #pragma unroll
     for (int jj = 0; jj < 4; ++jj) r.v[jj] = ldg_stream128(blk + 512 * jj + 16 * lane);
     r.s = ldg_stream64(blk + 2048 + 8 * lane);
-  } else {
+  }
+  __device__ static __forceinline__ uint32_t w(const uint4& v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
+  __device__ static __forceinline__ void dec(const Raw& r, int jj, int q, uint32_t (&o)[8]) {
+    const uint32_t sc = ((jj < 2 ? r.s.x : r.s.y) >> (8 * (2 * (jj & 1) + q))) & 0xFFu;
+    q4_widen16(w(r.v[jj], 2 * q), w(r.v[jj], 2 * q + 1), e4m3_to_bf16x2(sc, 0x1p96f), o);
+  }
+};
+// INT4 block (layout.h pack_int4): values as NVFP4's (unit jj at 512 jj + 16 l, byte 8 q + i / 2); the lane's
+// eight groups (jj, q) have scale bf16 at 2048 + 32 g + 16 (t >> 1) + 2 (2 jj + q) and zero-point nibble 2 jj + q
+// of the word at 2304 + 8 g + 4 (t >> 1) (lanes t = 0, 1 and t = 2, 3 read the same words).
+struct FmtINT4 {
+  static constexpr uint32_t kFmt = kINT4;
+  static constexpr int kBK = kBlkK, kBlk = kI4Blk, kU = kBK / 128;
+  static constexpr float kMul = 1.f;
+  struct Raw {
+    uint4 v[4];
+    uint4 s;     // bf16 scales of groups (jj, q) at half 2 jj + q
+    uint32_t z;  // zero-point nibbles, nibble 2 jj + q
+  };
+  __device__ static __forceinline__ void load(Raw& r, const uint8_t* blk, int lane) {
 #pragma unroll
-    for (int p = 0; p < 3; ++p) r.v[p] = ldg_stream128(blk + 512 * p + 16 * lane);
-    r.s = ldg_stream64(blk + 1536 + 8 * lane);
+    for (int jj = 0; jj < 4; ++jj) r.v[jj] = ldg_stream128(blk + 512 * jj + 16 * lane);
+    const int g = lane >> 2, h = (lane >> 1) & 1;
+    r.s = ldg_stream128(blk + 2048 + 32 * g + 16 * h);
+    r.z = ldg_stream32(blk + 2304 + 8 * g + 4 * h);
   }
-}
-__device__ __forceinline__ uint32_t word(const uint4& v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
-// group q of unit jj -> 8 bf16x2 words (B fragments of four MMAs); NVFP4 values carry 2^-30
-__device__ __forceinline__ void dec_group(const Raw& r, int jj, int q, uint32_t fmt, const uint32_t (&tab)[8],
-                                          uint32_t (&o)[8]) {
-  const uint32_t sc = ((jj < 2 ? r.s.x : r.s.y) >> (8 * (2 * (jj & 1) + q))) & 0xFFu;
-  if (fmt == kNVFP4) {
-    q4_widen16(word(r.v[jj], 2 * q), word(r.v[jj], 2 * q + 1), e4m3_to_bf16x2(sc, 0x1p96f), o);
-  } else {
-    const bool hi = sc & 0x80u;
-    const S3Tab T{hi ? tab[4] : tab[0], hi ? tab[5] : tab[1], hi ? tab[6] : tab[2], hi ? tab[7] : tab[3]};
-    s3_group(word(r.v[0], jj), word(r.v[1], jj), word(r.v[2], jj), q, T, e4m3_to_bf16x2(sc & 0x7Fu, 1.f), o);
+  __device__ static __forceinline__ void dec(const Raw& r, int jj, int q, uint32_t (&o)[8]) {
+    const uint32_t sw = FmtNVFP4::w(r.s, jj);
+    const uint32_t s2 = bperm(sw, 0, q ? 0x3232 : 0x1010);
+    i4_dec16(FmtNVFP4::w(r.v[jj], 2 * q), FmtNVFP4::w(r.v[jj], 2 * q + 1), i4_zz(r.z >> (4 * (2 * jj + q))), s2, o);
   }
-}
-__device__ __forceinline__ float fmt_k(uint32_t fmt) { return fmt == kNVFP4 ? 0x1p30f : 1.f; }
+};
+// BF16 block (layout.h pack_bf16): 8 rows x 128 k, the lane's 16 B at 512 p + 16 l = values 8p .. 8p + 7 of its
+// 32 (k = 64 (p >> 1) + 16 t + 8 (p & 1) + 0..7): group q is v[2q], v[2q + 1] as they are.
+struct FmtBF16 {
+  static constexpr uint32_t kFmt = kBF16;
+  static constexpr int kBK = kBlkKBF16, kBlk = kB16Blk, kU = kBK / 128;
+  static constexpr float kMul = 1.f;
+  struct Raw {
+    uint4 v[4];
+  };
+  __device__ static __forceinline__ void load(Raw& r, const uint8_t* blk, int lane) {
+#pragma unroll
+    for (int p = 0; p < 4; ++p) r.v[p] = ldg_stream128(blk + 512 * p + 16 * lane);
+  }
+  __device__ static __forceinline__ void dec(const Raw& r, int jj, int q, uint32_t (&o)[8]) {
+    (void)jj;
+    const uint4 a = r.v[2 * q], b = r.v[2 * q + 1];
+    o[0] = a.x, o[1] = a.y, o[2] = a.z, o[3] = a.w, o[4] = b.x, o[5] = b.y, o[6] = b.z, o[7] = b.w;
+  }
+};
 
 // A fragments of a 16-k group (k = k0 + 0..15 of rows r0 and r1) and the four MMAs against one tile
 struct XF { uint4 a, c, a2, c2; };

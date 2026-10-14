@@ -68,16 +68,34 @@ def master(n, k, g):
     return w.to(bf)
 
 
+def u16(t):
+    return t.contiguous().view(torch.int16).numpy().view(np.uint16)
+
+
+def int4_random(n, k, g):
+    """a random canonical compressed-tensors INT4 tensor [n][k] (packed uint32 [n][k/8], scale bf16 bits [n][k/32],
+    zero points uint32 [n/8][k/32]): every nibble value for weights and zero points, positive bf16 scales spread over
+    2^-3..2^3 of ~1/(7.5 sqrt(k)) by 128-row block (so the dequantised rows have unit-ish norm, the products round)"""
+    nib = torch.randint(0, 16, (n, k), generator=g).numpy().astype(np.uint8)
+    znib = torch.randint(0, 16, (n, k // 32), generator=g).numpy().astype(np.uint8)
+    nb = (n + 127) // 128
+    f = torch.exp2(torch.randint(-3, 4, (nb, 1), generator=g).float()).repeat_interleave(128, 0)[:n]
+    s = (torch.rand(n, k // 32, generator=g) + 0.5) * f / (7.5 * math.sqrt(k))
+    return pack.int4_pack_nibbles(nib), u16(s.to(bf)), pack.int4_pack_zp(znib)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--S", type=int, default=4600)
     ap.add_argument("--decode", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--fmt", choices=("int4", "bf16", "fp8"), default="int4",
+                    help="the layer's weight formats: an altar-1 INT4 layer (4-76), a BF16 layer (0-3, 77, 78), or glm53's FP8")
     ap.add_argument("--mlp", action="store_true", help="also the dense MLP, the shared expert and rank 0's head")
     ap.add_argument("--hf", action="store_true", help="check the reference against transformers' GlmMoeDsaAttention")
     a = ap.parse_args()
-    torch.set_num_threads(min(16, os.cpu_count()))
+    torch.set_num_threads(min(8, os.cpu_count()))
     g = torch.Generator().manual_seed(a.seed)
     rec = Rec(a.out)
     S, t0 = a.S, time.time()
@@ -85,17 +103,37 @@ def main():
     def log(m):
         print(f"[{time.time() - t0:7.1f}s] {m}", flush=True)
 
-    # ---- weights: master -> zai FP8 -> engine tiles (4 ranks) ----
+    # ---- weights: each tensor in its format (--fmt), then the engine's per-rank tiles (4 ranks) ----
+    # int4: q_b, kv_b, o_proj in compressed-tensors INT4 (an altar-1 layer 4-76), the rest BF16; bf16: all BF16
+    # (layers 0-3, 77, 78); fp8: glm53's zai FP8 from random masters
     shapes = {"q_a": (QL, D), "kv_a": (KL + R, D), "q_b": (H * QK, QL), "kv_b": (H * (NOPE + VD), KL),
               "o_proj": (D, H * VD), "wq_b": (IH * ID, QL), "wk": (ID, D)}
-    fp8, dq = {}, {}
+    fmt_of = {n: a.fmt if a.fmt == "fp8" else ("int4" if a.fmt == "int4" and n in ("q_b", "kv_b", "o_proj") else "bf16")
+              for n in shapes}
+    src, dq = {}, {}
     for name, (n, k) in shapes.items():
-        fp8[name] = pack.fp8_from_master(master(n, k, g))
-        dq[name] = torch.from_numpy(pack.dequant(*fp8[name]))
-        rec("zai_" + name + "_scale", fp8[name][1])
-    for name in ("q_a", "kv_b"):  # the global codes of two tensors, for the tile decode check
-        rec("zai_" + name + "_codes", fp8[name][0])
-    log("weights quantised")
+        f = fmt_of[name]
+        if f == "fp8":
+            src[name] = pack.fp8_from_master(master(n, k, g))
+            dq[name] = torch.from_numpy(pack.dequant(*src[name]))
+            rec("zai_" + name + "_scale", src[name][1])
+        elif f == "bf16":
+            w = master(n, k, g)
+            src[name] = u16(w)
+            dq[name] = w.float()
+        else:
+            src[name] = int4_random(n, k, g)
+            dq[name] = torch.from_numpy(pack.bf16_to_f32(pack.int4_dequant(*src[name])).copy())
+            for i, part in enumerate(("packed", "scale", "zp")):
+                if name != "kv_b":
+                    rec(f"ct_{name}_{part}", src[name][i])
+    if a.fmt == "fp8":
+        for name in ("q_a", "kv_b"):  # the global codes of two tensors, for the tile decode check
+            rec("zai_" + name + "_codes", src[name][0])
+    else:  # the reference's weights of two tensors (bf16 bits), for the tile decode checks
+        rec("dq_q_a", pack.f32_to_bf16(dq["q_a"].numpy()))
+        rec("dq_kv_b", pack.f32_to_bf16(dq["kv_b"].numpy()))
+    log(f"weights made ({a.fmt}: {fmt_of})")
     norm = lambda n, lo=0.5, hi=1.5: (torch.rand(n, generator=g) * (hi - lo) + lo).to(bf)
     w_in, w_qn, w_kvn = norm(D), norm(QL), norm(KL)
     kn_w, kn_b = norm(ID), (torch.randn(ID, generator=g) * 0.1).to(bf)
@@ -103,17 +141,36 @@ def main():
     for n, t in (("w_in", w_in), ("w_qn", w_qn), ("w_kvn", w_kvn), ("kn_w", kn_w), ("kn_b", kn_b), ("wp", wp)):
         rec(n, t)
     for r in range(TP):
-        for name, (t, s, rs, ks) in {
-            "xproj": pack.xproj(fp8["q_a"], fp8["kv_a"], fp8["wk"], r),
-            "q_b": pack.rows_block(fp8["q_b"], r, 4096),
-            "wq_b": pack.rows_block(fp8["wq_b"], r, 1024),
-            "w_uk": pack.w_uk(fp8["kv_b"], r),
-            "w_uv": pack.w_uv(fp8["kv_b"], r),
-            "o_proj": pack.cols_block(fp8["o_proj"], r, 4096),
-        }.items():
-            rec(f"r{r}_{name}_w", t)
-            rec(f"r{r}_{name}_s", s)
-    log("tiles packed")
+        if a.fmt == "fp8":
+            tiles = {
+                "xproj": pack.xproj(src["q_a"], src["kv_a"], src["wk"], r),
+                "q_b": pack.rows_block(src["q_b"], r, 4096),
+                "wq_b": pack.rows_block(src["wq_b"], r, 1024),
+                "w_uk": pack.w_uk(src["kv_b"], r),
+                "w_uv": pack.w_uv(src["kv_b"], r),
+                "o_proj": pack.cols_block(src["o_proj"], r, 4096),
+            }
+        else:
+            i4 = a.fmt == "int4"
+            tiles = {
+                "xproj": (pack.bf16_xproj(src["q_a"], src["kv_a"], src["wk"], r),),
+                "q_b": (pack.int4_q_b(src["q_b"], r) if i4 else pack.bf16_rows(src["q_b"], r, 4096),),
+                "wq_b": (pack.bf16_rows(src["wq_b"], r, 1024),),
+                "w_uk": (pack.int4_w_uk(src["kv_b"], r) if i4 else pack.bf16_w_uk(src["kv_b"], r),),
+                "w_uv": (pack.int4_w_uv(src["kv_b"], r) if i4 else pack.bf16_w_uv(src["kv_b"], r),),
+                "o_proj": (pack.int4_o_proj(src["o_proj"], r) if i4 else pack.bf16_cols(src["o_proj"], r, 4096),),
+            }
+            if i4 and r in (0, 3):  # the dequantised tiles (pack.py's own reader), for the INT4 = BF16 checks
+                rec(f"r{r}_q_b_deq", pack.int4_dequant(*pack.int4_rows(src["q_b"], 4096 * r, 4096)))
+                rec(f"r{r}_w_uv_deq", pack.int4_dequant(*pack.int4_untile(tiles["w_uv"][0], 4096, KL)))
+                rec(f"r{r}_o_proj_deq", pack.int4_dequant(*pack.int4_cols(src["o_proj"], 4096 * r, 4096)))
+        for name, t in tiles.items():
+            rec(f"r{r}_{name}_w", t[0])
+            if len(t) > 1:
+                rec(f"r{r}_{name}_s", t[1])
+    tile_fmt = {"xproj": "q_a", "q_b": "q_b", "wq_b": "wq_b", "w_uk": "kv_b", "w_uv": "kv_b", "o_proj": "o_proj"}
+    fmts = {t: ("bf16" if t == "w_uk" and fmt_of[s] == "int4" else fmt_of[s]) for t, s in tile_fmt.items()}
+    log(f"tiles packed {fmts}")
 
     # ---- inputs ----
     x_raw = (torch.randn(S, D, generator=g) * (0.5 + torch.rand(S, 1, generator=g))).to(bf)
@@ -201,22 +258,33 @@ def main():
     rec("out_ref", out_ref)
     log("attention")
 
-    extra = {"S": S, "decode": a.decode, "seed": a.seed}
+    extra = {"S": S, "decode": a.decode, "seed": a.seed, "fmt": a.fmt, "fmts": fmts}
     if a.mlp:
         nd = a.decode
         xd = x[S - nd:]
+        mf = "fp8" if a.fmt == "fp8" else "bf16"  # altar-1's dense MLPs and shared experts are BF16
+        extra["fmts"]["mlp"] = mf
         for nm, inter, rk in (("dense", 12288, 3072), ("shared", 2048, 512)):
-            wg, wu, wd = (pack.fp8_from_master(master(inter, D, g)), pack.fp8_from_master(master(inter, D, g)),
-                          pack.fp8_from_master(master(D, inter, g)))
-            gt, up = lin(xd, torch.from_numpy(pack.dequant(*wg))), lin(xd, torch.from_numpy(pack.dequant(*wu)))
+            ms = (master(inter, D, g), master(inter, D, g), master(D, inter, g))
+            if mf == "fp8":
+                wg, wu, wd = (pack.fp8_from_master(m) for m in ms)
+                fg, fu, fd = (torch.from_numpy(pack.dequant(*w)) for w in (wg, wu, wd))
+            else:
+                wg, wu, wd = (u16(m) for m in ms)
+                fg, fu, fd = (m.float() for m in ms)
+            gt, up = lin(xd, fg), lin(xd, fu)
             h = (torch.nn.functional.silu(gt) * up)
             rec(f"{nm}_h", h)
-            rec(f"{nm}_y", lin(h, torch.from_numpy(pack.dequant(*wd))))
+            rec(f"{nm}_y", lin(h, fd))
             for r in range(TP):
-                t, s, _, _ = pack.gate_up(wg, wu, r, rk)
-                rec(f"r{r}_{nm}_gu_w", t); rec(f"r{r}_{nm}_gu_s", s)
-                t, s, _, _ = pack.cols_block(wd, r, rk)
-                rec(f"r{r}_{nm}_down_w", t); rec(f"r{r}_{nm}_down_s", s)
+                if mf == "fp8":
+                    t, s, _, _ = pack.gate_up(wg, wu, r, rk)
+                    rec(f"r{r}_{nm}_gu_w", t); rec(f"r{r}_{nm}_gu_s", s)
+                    t, s, _, _ = pack.cols_block(wd, r, rk)
+                    rec(f"r{r}_{nm}_down_w", t); rec(f"r{r}_{nm}_down_s", s)
+                else:
+                    rec(f"r{r}_{nm}_gu_w", pack.bf16_gate_up(wg, wu, r, rk))
+                    rec(f"r{r}_{nm}_down_w", pack.bf16_cols(wd, r, rk))
             log(nm)
         head0 = (torch.randn(154880 // TP, D, generator=g) / math.sqrt(D)).to(bf)
         rec("head_r0", head0)

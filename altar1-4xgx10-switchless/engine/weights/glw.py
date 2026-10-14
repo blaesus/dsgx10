@@ -23,7 +23,7 @@ ALIGN = 4096
 GLOBAL = 0xFFFFFFFF
 TP, D, VOCAB = 4, 6144, 154880
 N_LAYERS, MTP = 78, 78
-DENSE_INTER, SHARED_INTER, N_EXPERTS, EXPERT_INTER = 12288, 2048, 256, 2048
+DENSE_INTER, SHARED_INTER, N_EXPERTS, EXPERT_INTER = 12288, 2048, 168, 2048
 
 # glw.h enums
 F32, BF16, F8, U8, U32 = 1, 2, 3, 4, 5
@@ -33,7 +33,7 @@ REPLICATED, ROWS, COLS, RECUT, GENERATED, RESERVED = 1, 2, 3, 4, 5, 6
 KIND_NAME = {1: "replicated", 2: "rows", 3: "cols", 4: "recut", 5: "generated", 6: "reserved"}
 NATURAL, T64, T128, EXPERT_POOL = 0, 1, 2, 3
 LAYOUT_NAME = {0: "natural", 1: "T64", 2: "T128", 3: "expert-pool"}
-FMT_NVFP4, FMT_S3, FMT_NONE = 0, 1, 0xFFFFFFFF
+FMT_NVFP4, FMT_S3_RETIRED, FMT_INT4, FMT_BF16, FMT_NONE = 0, 1, 2, 3, 0xFFFFFFFF  # glw.h ExpertFmt; 1 (S3) refused
 LOSSY, RESERVED_FLAG, SCALE, INTERLEAVED = 1, 2, 4, 8
 
 # Header: magic, version, header_bytes, rank, world, n_tensors, toc_entry_bytes, toc_offset, data_offset,
@@ -46,7 +46,10 @@ HDR_BYTES, ENT_BYTES = 4096, 512
 assert HDR.size <= HDR_BYTES and ENT.size == ENT_BYTES - 24, (HDR.size, ENT.size)
 
 # experts/experts.h: NVFP4 block 2304 B per 8 rows x 512 k; S3 1792 B; MatDesc 64 B
-Q4_BLK, S3_BLK, BLK_K, MATDESC_BYTES = 2304, 1792, 512, 64
+# experts/experts.h: blocks of 8 rows x BLK_K_OF[fmt] k: NVFP4 2304 B, INT4 2368 B (x 512 k), BF16 2048 B (x 128 k); MatDesc 64 B
+Q4_BLK, I4_BLK, B16_BLK, BLK_K, MATDESC_BYTES = 2304, 2368, 2048, 512, 64
+BLK_OF = {FMT_NVFP4: Q4_BLK, FMT_INT4: I4_BLK, FMT_BF16: B16_BLK}
+BLK_K_OF = {FMT_NVFP4: 512, FMT_INT4: 512, FMT_BF16: 128}
 
 
 def align_up(x, a=ALIGN):
@@ -331,14 +334,22 @@ def mtp_unit(ck):
     return Unit("MTP extras", "MTP eh_proj, norms", srcs, outs, build)
 
 
-def expert_fmt(gate=FMT_NVFP4, up=FMT_NVFP4, down=FMT_NVFP4):
-    """An expert entry's format tag: one nibble a matrix (gx::Fmt: 0 NVFP4, 1 S3), gate | up << 4 | down << 8."""
+def expert_fmt(gate=FMT_INT4, up=None, down=None):
+    """An expert entry's format tag: one nibble a matrix (gx::Fmt: 0 NVFP4, 2 INT4, 3 BF16), gate | up << 4 | down << 8.
+    A layer is single-format (altar-1: INT4 on 4-76, BF16 on 3, 77, 78), so up and down default to gate's."""
+    up = gate if up is None else up
+    down = gate if down is None else down
+    for f in (gate, up, down):
+        if f not in BLK_OF:
+            raise ValueError(f"expert format {f}: not NVFP4 (0), INT4 (2) or BF16 (3)")
     return gate | up << 4 | down << 8
 
 
 def mat_bytes(fmt, n, k):
-    """experts.h mat_bytes: [N/8][K/512] blocks of 2304 (NVFP4) or 1792 (S3) bytes."""
-    return (n // 8) * (k // BLK_K) * (Q4_BLK if fmt == FMT_NVFP4 else S3_BLK)
+    """experts.h mat_bytes: [N/8][K/BLK_K_OF[fmt]] blocks of BLK_OF[fmt] bytes; an unknown format is an error."""
+    if fmt not in BLK_OF:
+        raise ValueError(f"expert format {fmt}: not NVFP4 (0), INT4 (2) or BF16 (3)")
+    return (n // 8) * (k // BLK_K_OF[fmt]) * BLK_OF[fmt]
 
 
 def expert_entry_bytes(tag):
@@ -346,23 +357,31 @@ def expert_entry_bytes(tag):
     return mat_bytes(tag & 15, i, D) + mat_bytes(tag >> 4 & 15, i, D) + mat_bytes(tag >> 8 & 15, D, i)
 
 
+def layer_expert_fmt(L):
+    """altar-1's routed-expert format of a MoE layer (experts.h Fmt): BF16 on layers 3, 77 and the MTP layer 78 (as
+    shipped), INT4 on 4-76 (compressed-tensors pack-quantized, group 32)."""
+    if not 3 <= L <= MTP:
+        raise ValueError(f"layer {L} has no routed experts")
+    return FMT_BF16 if L in (3, 77, MTP) else FMT_INT4
+
+
 def reserved_unit(L):
     """A MoE layer's routed experts: the descriptor table, then one entry per expert (gate, up, down blocks back to
-    back), reserved until an expert fill writes them. Every matrix size is a multiple of 4 KiB in either format, so
-    the 256 expert entries lie back to back: the layer's pool starts at expert 0's entry and MatDesc::off is
-    relative to it (docs/layout.md § 6)."""
+    back), reserved until an expert fill writes them. Every matrix size is a multiple of 4 KiB in each format, so
+    the 168 expert entries lie back to back: the layer's pool starts at expert 0's entry and MatDesc::off is
+    relative to it (docs/layout.md § 6). The layer's format is layer_expert_fmt(L)."""
     ln = f"layers.{L}.experts."
     i = EXPERT_INTER // TP
 
     def outs(r):
-        tag = expert_fmt()
+        tag = expert_fmt(layer_expert_fmt(L))
         o = [Out(ln + "desc", U8, (N_EXPERTS, 3, MATDESC_BYTES), L, NATURAL, RESERVED, RESERVED_FLAG, (0, 0),
-                 [f"layers.{L}.mlp.experts.{{e}}.*_proj.weight_scale_2"], "gx::MatDesc [256][gate, up, down]", tag,
+                 [f"layers.{L}.mlp.experts.{{e}}.*_proj.weight_scale_2"], "gx::MatDesc [168][gate, up, down]", tag,
                  N_EXPERTS * 3 * MATDESC_BYTES)]
         for e in range(N_EXPERTS):
             o.append(Out(ln + str(e), U8, (expert_entry_bytes(tag),), L, EXPERT_POOL, RESERVED, RESERVED_FLAG, (0, 0),
                          [f"layers.{L}.mlp.experts.{e}.{{gate,up,down}}_proj"],
-                         f"gate, up rows / down cols [{i * r},+{i}); 8x512 blocks", tag, expert_entry_bytes(tag)))
+                         f"gate, up rows / down cols [{i * r},+{i}); 8x{BLK_K_OF[layer_expert_fmt(L)]} blocks", tag, expert_entry_bytes(tag)))
         return o
     return Unit(f"layer {L} routed experts (reserved)", "routed experts (reserved)", [], outs, lambda S, r: {})
 
