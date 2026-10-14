@@ -27,9 +27,11 @@ foreach(d comm attn experts weights model)
 endforeach()
 W
 cmake -S "$TOP/wrap" -B "$TOP/build" -DGLM_ENGINE="$ENGINE" > /dev/null
-cmake --build "$TOP/build" -j4 --target glm_run glw_load glw_kcheck > /dev/null
+nice -n 19 cmake --build "$TOP/build" -j4 --target glm_run glw_load glw_kcheck > /dev/null
 cp "$TOP/build/model/glm_run" "$TOP/build/weights/glw_load" "$TOP/build/weights/glw_kcheck" "$BIN/"
-h=$(cat ./*.h ./*.cu tools/*.cu tools/*.h tools/*.py ../attn/*.h ../attn/*.cu ../experts/*.h ../experts/*.cu ../comm/*.h ../comm/*.cu ../comm/*.cpp \
+h=$(cat ./*.h ./*.cu tools/*.cu tools/*.h tools/*.py ../attn/*.h ../attn/*.cu ../experts/*.h ../experts/*.cuh ../experts/*.cu ../comm/*.h ../comm/*.cu ../comm/*.cpp \
   ../weights/*.h ../weights/*.cpp | sha256sum | cut -c1-16)
-echo "sources sha256 $h, built $(date '+%F %T %z')" > "$BIN/SOURCES"
+c=$(git -C "$ENGINE" rev-parse --short HEAD 2> /dev/null || echo unknown)
+d=$(git -C "$ENGINE" status --porcelain -- . 2> /dev/null | wc -l)
+echo "sources sha256 $h, commit $c ($d paths changed since), built $(date '+%F %T %z')" > "$BIN/SOURCES"
 cat "$BIN/SOURCES"

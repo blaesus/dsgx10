@@ -6,7 +6,7 @@
 // Modes:
 //   bench     decode steps as graphs at --rows (default 1,2,4,6,8,16) at context --ctx: GPU ms a step, wall ms, host
 //             ms a launch; the floor; then one profiled eager step a row count (ms per kernel class, per layer class)
-//   l2pf      the paced L2 prefetch off and on, A/B and B/A, at --rows
+//   l2pf      the paced L2 prefetch off and on, --ab-rounds interleaved rounds (off on / on off) at --rows
 //   ab        the speed levers --ab-base MASK (default none) against --ab MASK (default all; Tune bits, hex), A/B/B/A
 //             at --rows, --ab-rounds (10) rounds of 12 steps each, A B then B A: GPU ms a step (the medians, the ratio
 //             of each round's pair) and whether the outputs are the same bits
@@ -312,24 +312,40 @@ void l2pf_ab(Model& m, comm::Ring& ring) {
     std::vector<int32_t> tok(R);
     for (int r = 0; r < R; ++r) tok[r] = synth_token(A.seed, r);
     const Batch b = one_session(R, A.ctx, tok.data(), 0, sp);
-    double ms[2][2] = {};
-    for (int order = 0; order < 2; ++order)
-      for (int k = 0; k < 2; ++k) {
-        const bool on = (k ^ order) != 0;
-        m.set_l2pf(on);
+    // --ab-rounds rounds (default 10), off then on in even rounds and on then off in odd ones; a block: 3 warm steps
+    // (set_l2pf drops the graphs), then 12 steps, the median of the last 8; per round the ratio on / off
+    const int rounds = A.ab_rounds, per = 12, keep = 8;
+    std::vector<double> ms[2], ratio;
+    for (int round = 0; round < rounds; ++round) {
+      double blk[2] = {};
+      for (int q = 0; q < 2; ++q) {
+        const int on = (q ^ round) & 1;
+        m.set_l2pf(on != 0);
         for (int i = 0; i < 3; ++i) m.wait(m.launch(b));
         ring.barrier();
-        std::vector<uint64_t> ns(A.steps);
-        for (int i = 0; i < A.steps; ++i) ns[i] = m.launch(b);
+        std::vector<uint64_t> ns(per);
+        for (int i = 0; i < per; ++i) ns[i] = m.launch(b);
         m.wait(ns.back());
         std::vector<double> g;
-        for (int i = std::max(0, A.steps - 4); i < A.steps; ++i) g.push_back(m.gpu_ms(ns[i]));
+        for (int i = per - keep; i < per; ++i) g.push_back(m.gpu_ms(ns[i]));
         std::sort(g.begin(), g.end());
-        ms[order][on] = g[g.size() / 2];
+        blk[on] = (g[keep / 2 - 1] + g[keep / 2]) / 2;
+        ms[on].push_back(blk[on]);
         ring.barrier();
       }
-    record(rk, "l2pf\trows %d\toff %.3f / %.3f ms\ton %.3f / %.3f ms\t(A/B, B/A)\tgain %.2f %%", R, ms[0][0], ms[1][0],
-           ms[0][1], ms[1][1], 100.0 * (1.0 - (ms[0][1] + ms[1][1]) / (ms[0][0] + ms[1][0])));
+      ratio.push_back(blk[1] / blk[0]);
+    }
+    auto med = [](std::vector<double> v) {
+      std::sort(v.begin(), v.end());
+      return v.size() % 2 ? v[v.size() / 2] : (v[v.size() / 2 - 1] + v[v.size() / 2]) / 2;
+    };
+    double lo = 1e9, hi = 0;
+    for (double r : ratio) lo = std::min(lo, r), hi = std::max(hi, r);
+    std::string each;
+    for (double r : ratio) each += (each.empty() ? "" : " ") + std::to_string(r).substr(0, 6);
+    record(rk, "l2pf\trows %d\toff %.3f ms\ton %.3f ms\t(medians of %d rounds, off on / on off)\ton/off median %.4f "
+           "(%.4f .. %.4f)\tgain %.2f %%\tratios %s", R, med(ms[0]), med(ms[1]), rounds, med(ratio), lo, hi,
+           100.0 * (1.0 - med(ratio)), each.c_str());
   }
   m.set_l2pf(true);
 }
