@@ -8,12 +8,13 @@
 //   --slots N (4: sessions a decode step, B2), --slice N (64: time-slicing's turns, B1), --chunk N (8192: rows a
 //   prefill chunk), --splits N (16: sparse attention's split-K at every row count, so that a session's tokens do
 //   not depend on the others in its steps), --name NAME (altar-1).
-// The cache pool (paged, docs/serving.md): pages of --page N positions (1024); every rank offers its MemAvailable
-//   (--pool-basis avail, the default: CUDA's allocations reclaim the page cache, which free device memory leaves
-//   out; --pool-basis free: the smaller of free device memory and MemAvailable, glm53's rule) after the weights and
-//   the prefill buffers, less --margin-gib (8 on rank
-//   0, --worker-margin-gib 8 on the others: the fleet's memory rule keeps 8 GiB available on every box), and all
-//   take the smallest offer, at most --kv-gib (default: no cap). The memory guard: after the weights and the prefill
+// The cache pool (paged, docs/serving.md): pages of --page N positions (1024); every rank offers, after the weights
+//   and the prefill buffers, the smaller of its free device memory less --device-margin-gib (1) and its MemAvailable
+//   less --margin-gib (8 on rank 0, --worker-margin-gib 8 on the others: the fleet's memory rule keeps 8 GiB
+//   available on every box), and all take the smallest offer, at most --kv-gib (default: no cap). Free device memory
+//   binds: CUDA on GB10 allocates free pages only and does not reclaim the page cache (a pool sized from MemAvailable
+//   on 2026-10-14 13:33 ran rank 0 out of memory: docs/serving.md § 3), so the rank file's own cache is dropped
+//   before the load and other files' cache (another engine's) caps the pool. The memory guard: after the weights and the prefill
 //   buffers every rank reports its MemAvailable, and all ranks stop when one has less than --min-free-gib (8) plus
 //   one page; the MemAvailable after the pool is logged too. A 256k session (262,144 positions) is 23.6 GiB a rank.
 // The disk tier: --disk-gib N (32; 0: none) in --disk-dir (the fleet's RANK<r>_SPILL), files rank<r>[.tag].spill
@@ -112,7 +113,7 @@ struct Args {
   std::string disk_dir, disk_tag;
   int step_timeout = 120;
   int index_scratch_mib = 512;  // the prefill indexer's score scratch (Options::index_scratch)
-  bool pool_free = false;  // --pool-basis free: the pool from min(free device memory, MemAvailable), not MemAvailable
+  double device_margin_gib = 1;  // free device memory the pool leaves (CUDA's own allocations after the pool)
   bool spec = true;
   int spec_drafts = 3, spec_force = 0;
   bool spec_oracle = false;
@@ -169,7 +170,7 @@ int main(int argc, char** argv) {
     else if (s == "--margin-gib") a.margin_gib = std::atof(val().c_str());
     else if (s == "--worker-margin-gib") a.worker_margin_gib = std::atof(val().c_str());
     else if (s == "--min-free-gib") a.min_free_gib = std::atof(val().c_str());
-    else if (s == "--pool-basis") { const std::string v = val(); if (v != "free" && v != "avail") die("--pool-basis free|avail"); a.pool_free = v == "free"; }
+    else if (s == "--device-margin-gib") a.device_margin_gib = std::atof(val().c_str());
     else if (s == "--disk-gib") a.disk_gib = std::atof(val().c_str());
     else if (s == "--disk-margin-gib") a.disk_margin_gib = std::atof(val().c_str());
     else if (s == "--disk-rank0-gib") a.disk_rank0_gib = std::atof(val().c_str());
@@ -256,16 +257,18 @@ int main(int argc, char** argv) {
     ring.allgather_host(mine, all, sizeof mine);
     const double need = a.min_free_gib + (double)pos_bytes0 * a.page / kGiB;
     bool ok = true;
-    for (const auto& r : all) ok = ok && r[1] >= need;
+    const double need_dev = a.device_margin_gib + (double)pos_bytes0 * a.page / kGiB;  // CUDA: free pages only
+    for (const auto& r : all) ok = ok && r[1] >= need && r[0] >= need_dev;
     if (rk == 0)
       std::printf("memory after the weights and the prefill buffers (chunk %d, index scratch %d MiB), free device / "
-                  "MemAvailable, ranks 0-3: %.2f / %.2f, %.2f / %.2f, %.2f / %.2f, %.2f / %.2f GiB; the guard: %.2f GiB "
-                  "(--min-free-gib %.1f and a page)\n",
+                  "MemAvailable, ranks 0-3: %.2f / %.2f, %.2f / %.2f, %.2f / %.2f, %.2f / %.2f GiB; the guard: %.2f / "
+                  "%.2f GiB (--device-margin-gib %.1f, --min-free-gib %.1f, each and a page)\n",
                   a.chunk, a.index_scratch_mib, all[0][0], all[0][1], all[1][0], all[1][1], all[2][0], all[2][1],
-                  all[3][0], all[3][1], need, a.min_free_gib);
+                  all[3][0], all[3][1], need_dev, need, a.device_margin_gib, a.min_free_gib);
     if (!ok)
-      die("rank %d: the memory guard: a rank has less than %.2f GiB available after the weights (MemAvailable, ranks "
-          "0-3: %.2f %.2f %.2f %.2f GiB)", rk, need, all[0][1], all[1][1], all[2][1], all[3][1]);
+      die("rank %d: the memory guard: a rank has less than %.2f GiB available or %.2f GiB free device memory after "
+          "the weights (free device / MemAvailable, ranks 0-3: %.2f / %.2f, %.2f / %.2f, %.2f / %.2f, %.2f / %.2f GiB)",
+          rk, need, need_dev, all[0][0], all[0][1], all[1][0], all[1][1], all[2][0], all[2][1], all[3][0], all[3][1]);
   }
 
   // 2. the disk tier first (its staging is pinned host memory), with the kept sessions of a planned stop
@@ -318,8 +321,8 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
   const size_t avail = meminfo("MemAvailable"), total = meminfo("MemTotal");
   const size_t margin = (size_t)(std::max(rk == 0 ? a.margin_gib : a.worker_margin_gib, a.min_free_gib) * kGiB);
-  const size_t basis = a.pool_free ? std::min(dfree, avail) : avail;  // MemAvailable: CUDA reclaims page cache (§ 3)
-  const size_t offer = basis > margin ? basis - margin : 0;
+  const size_t dmargin = (size_t)(a.device_margin_gib * kGiB);
+  const size_t offer = std::min(dfree > dmargin ? dfree - dmargin : 0, avail > margin ? avail - margin : 0);
   const double wgib = m.weight_bytes() / kGiB;
   const double mine[6] = {(double)offer, dfree / kGiB, avail / kGiB, wgib, file_gib, (double)m.file_expert_layers()};
   double all[4][6];
@@ -348,8 +351,8 @@ int main(int argc, char** argv) {
                 "available host memory before it, ranks 0-3:",
                 pages, a.page, pages * a.page, pages * (double)page_bytes / kGiB, pos_bytes);
     for (const auto& r : all) std::printf(" %.2f / %.2f", r[1], r[2]);
-    std::printf(" GiB; the offer: %s less margins of %.1f (rank 0) and %.1f GiB\n",
-                a.pool_free ? "min(free device, MemAvailable)" : "MemAvailable", a.margin_gib, a.worker_margin_gib);
+    std::printf(" GiB; the offer: min(free device less %.1f, MemAvailable less %.1f (rank 0) / %.1f GiB)\n",
+                a.device_margin_gib, a.margin_gib, a.worker_margin_gib);
     std::printf("weights: %s, %.2f GiB a rank bound (%d MoE layers' experts from the file); the file at its reserved "
                 "size: %.2f GiB; MemTotal %.2f GiB\n",
                 wpath.c_str(), wgib, m.file_expert_layers(), file_gib, total / kGiB);
