@@ -69,11 +69,23 @@ static_assert(sizeof(MatDesc) == 64, "MatDesc is 64 B");
 // [N/128][K/128]. altar-1's shared experts are BF16 and run outside these kernels (attn's BF16 GEMV / GEMM),
 // so for altar-1 every pointer is null: decode and prefill then run no shared expert, and ys is an input
 // (the shared expert's f32 output) that k_down only forwards into a posted collective's buffer.
+//
+// A BF16 shared expert fused into the decode kernels (altar-1's, DecodeCfg-independent; moe_decode only, never
+// moe_prefill): bgu the interleaved gate/up [1024][6144] (rows 2i gate, 2i + 1 up) and bd the down [6144][512],
+// both in attn's kBF16T lane order ([N/8][K/64][2 halves][32 lanes][8 values], byte for byte the BF16 expert
+// block's order). k_up computes its h exactly as attn's gemv(kSwiGLU, split-K 4) does (each 8-row tile's K in four
+// parts of 1536 k, each part one MMA chain in k order, the parts added in part order, the same SwiGLU epilogue)
+// and k_down its ys as gemv(kF32, split-K 1) (one MMA chain over the 512 k): the same bits as the two GEMVs.
+// ys stays its own f32 partial (the all-reduce's second contribution, y = bf16(bf16(sum yr) + bf16(sum ys))).
 struct SharedW {
   const uint8_t *g = nullptr, *u = nullptr, *d = nullptr;
   const float *gs = nullptr, *us = nullptr, *ds = nullptr;
+  const uint8_t *bgu = nullptr, *bd = nullptr;  // the BF16 shared expert (decode only)
   bool fused() const { return g != nullptr; }
+  bool bf16() const { return bgu != nullptr; }
 };
+constexpr int kShTiles = 2 * kI / 8;  // the BF16 shared gate/up's 8-row tiles (128)
+constexpr int kShParts = 4;           // its split-K (attn's gemv at splitk 4)
 
 // One MoE layer's weights on a rank.
 struct LayerW {
@@ -103,6 +115,9 @@ struct DecodeCfg {
   int up_ctas_per_sm = 0;  // 0: as many as fit
   bool pdl = true;
   bool dyn = true;         // k_up claims tasks past the first wave from a counter (load balance)
+  // k_up (WK > 1 variants): load the next routed task's first blocks under the current task's epilogue (after its
+  // partials' barrier) instead of at its start; the same loads, order and MMAs, so the same bits
+  bool xpf = true;
   int parts = 3;           // bench: 1 up only, 2 down only, 3 both
   // Fused routing: with logits (the router GEMV's f32 [M][168]) and bias set, each CTA of both kernels routes the
   // rows itself (route()'s code, the same bits) and idx / w are not read (may be null): no route() launch between

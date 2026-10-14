@@ -115,8 +115,16 @@ enum Tune : uint32_t {
   kTunePfOverlap = 1u << 7,
   // prefill: sparse_attn's pipelined unsplit kernel (attn's k_attn_pf; off: k_attn at one split; the same bits)
   kTunePfAttn = 1u << 8,
+  // decode: the BF16 shared expert inside the routed expert kernels (gx::SharedW::bgu, bd; its gate/up tasks in k_up,
+  // its down in k_down, ys written there), not two GEMV launches before them; the GEMVs' bits (docs/engine.md,
+  // "Tuning"). Needs kBF16T shared weights (the converter's form); row-major ones keep the GEMVs.
+  kTuneShFused = 1u << 9,
+  // decode: the routed gate/up kernel loads its next task's first blocks under the current task's epilogue
+  // (gx::DecodeCfg::xpf; the same bits)
+  kTuneUpXpf = 1u << 10,
   kTuneDefault =
-      kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter | kTunePfOverlap | kTunePfAttn,
+      kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter | kTunePfOverlap | kTunePfAttn |
+      kTuneShFused | kTuneUpXpf,
   kTuneAll = 0xffffffffu,
 };
 

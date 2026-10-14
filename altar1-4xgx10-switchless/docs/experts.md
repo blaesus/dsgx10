@@ -19,6 +19,7 @@ calls, is [engine/weights/int4_pack.py](../engine/weights/int4_pack.py).
 8. [Measurements](#8-measurements)
 9. [Runs](#9-runs)
 10. [Failures and what is left](#10-failures-and-what-is-left)
+11. [Tuning: the fused BF16 shared expert and k_up's cross-task prefetch](#11-tuning-the-fused-bf16-shared-expert-and-k_ups-cross-task-prefetch)
 
 ## 1. What is unchanged
 
@@ -52,7 +53,8 @@ calls, is [engine/weights/int4_pack.py](../engine/weights/int4_pack.py).
 **The shared expert.** altar-1's shared expert is BF16 (gate, up, down), so it no longer rides the routed kernels as
 GLM-5.3's FP8 one did. It runs through attn's BF16 GEMV (`glm::gemv(false, …)`: gate/up interleaved with the
 SwiGLU epilogue, then down to f32 partials), and its f32 output is the `ys` the routed step forwards (§ 8.3). The
-fused FP8 path stays in the kernels, tested with an NVFP4 layer (`t-q4`), for a later fused BF16 version.
+fused FP8 path stays in the kernels, tested with an NVFP4 layer (`t-q4`). Since the tuning of § 11 the BF16 shared
+expert is fused into `k_up`/`k_down` by default (bit-identical to the GEMVs; `ys` still a separate f32 partial).
 
 ## 3. Formats and the layout the converter emits
 
@@ -230,7 +232,7 @@ TFLOPS count T × 8 × 3 × 512 × 6144 MACs × 2 (job C).
 The GEMV needs split-K 4 on gate/up (only 1024 rows: 128 tiles on 48 SMs) to reach the floor; down is ~27 µs at
 any split. The cost a token is ~6.4 ms over 75 MoE layers (a decode step at 1 row: 85.7 µs shared + 201 µs
 routed per INT4 layer). Fusing it into `k_up`/`k_down` as glm53 fused its FP8 one would save the two launches and the
-separate down pass, not bytes.
+separate down pass, not bytes: done in § 11.
 
 ## 9. Runs
 
@@ -262,9 +264,79 @@ experts 0–2, rank 1), `real/l4r0` (layer 4, 0–3 and 167, rank 0), `real/l40r
   rows and 95.7–95.9 % at 6 but 87.4–88.5 % at 1 row; a different split per row count would break batch invariance.
   Options: (a) make wk1 the default (decode = prefill bit for bit, glm53 decision 11 reversed; −2 to −4 % at 1 row,
   +7 % at 16); (b) give wk6 a deeper prefetch or 512-k sub-blocks so INT4's two blocks a warp pipeline; (c) leave it.
-  (b) keeps the bits; not tried.
+  (b) keeps the bits; **done in § 11** as a cross-task prefetch: 96–97 % at 1 row, 99.6–100.3 % at 2–16 rows.
 - **torch.topk's order** differs from the engine's (§ 5); the set agrees on CUDA. Whether the reference's sum of the
   eight scores follows the returned order is A1's to settle (glm53's tree came from DeepSeek's).
-- **Not done here:** the BF16 shared expert fused into the routed kernels; a 256-row prefill tile for BF16 layers
+- **Not done here:** ~~the BF16 shared expert fused into the routed kernels~~ (§ 11); a 256-row prefill tile for BF16 layers
   (halves the weight re-reads); kcheck on a real converted rank file (A2's files); the A0(b) `micro/` GEMV
   prototypes were replaced by benching the engine kernels themselves, which is what ships.
+
+## 11. Tuning: the fused BF16 shared expert and k_up's cross-task prefetch
+
+Written 2026-10-14 (commits 2c4f6f7, c3cb8c6 and its revert c9bc785, d701398, 5b85463). Both changes keep every bit;
+the step-level A/Bs, the model checks and the contract placement of `ys` are in [engine.md § 9](engine.md#9-tuning-the-fused-shared-expert-and-the-routed-gateups-prefetch).
+
+**The fused BF16 shared expert.** `SharedW` gains `bgu` (gate/up interleaved, [1024][6144] kBF16T) and `bd`
+(down, [6144][512] kBF16T) and `bf16()`; `kShTiles` 128 (8-row tiles of gate/up), `kShParts` 4 (attn's GEMV
+split-K on gate/up). kBF16T's lane order is the BF16 expert block's, so the kernels reuse their fragment code.
+`k_up<F, NT, WK, P, R16, SHB, XPF>` puts the shared tasks first in its queue (BT = WK / gcd(WK, 4) tiles a task,
+BU = 4 / gcd parts a warp, 24 chunks a part, 8 in flight), adds the parts in part order with `__fadd_rn` and applies
+the GEMV's SwiGLU epilogue, writing the shared row of h; `k_down<F, NT, P, R16, SHB>` runs one MMA chain over the
+shared down strip's 512 k into `ys` (posted with `yr` when the collective is posted). Both prefetch the shared
+weights into L2 before `griddepcontrol.wait`. `SHB` false compiles to the earlier kernels; the host chooses it from
+`LayerW::sh.bf16()` and dies on an FP8 and a BF16 shared expert together.
+
+**k_up's cross-task prefetch** (`DecodeCfg::xpf`, default true; the template's `XPF_`, only for WK > 1). After a
+routed task's partials' barrier each warp loads the next queued task's first P blocks into the registers the next
+task would load first, so the epilogue and the next task's first loads overlap. The same blocks, MMA order and
+reduction: the bits do not move. It is § 10's option (b).
+
+**Registers** (`-Xptxas -v`, sm_121a, decode.cu at 5b85463, the INT4 wk6 p2 default; no spills unless noted):
+
+| Kernel | plain | + fused shared | + prefetch | both |
+|---|---:|---:|---:|---:|
+| `k_up<INT4, 1, 6, 2>`, 1–8 rows | 132 | 168 (8 B spill) | 233 | **231** |
+| `k_up<INT4, 1, 6, 2>`, 9–16 rows (R16) | 132 | 207 | 248 | 248 |
+| `k_up<BF16, 1, 6, 2>`, 1–8 rows | 158 | 168 (8 B spill) | 168 | 202 |
+| `k_down<INT4, 2, 1>` | 155 | 218 | | |
+
+The first fused version held the shared weights in registers across the routed tasks: 223 registers on the default
+k_up even with the shared expert off; an L2 prefetch replaced it. A `__launch_bounds__` minimum-blocks argument and
+an extra `Params` field also changed the unfused code; both were removed so `SHB` false matches the earlier kernel.
+
+**Bench** (`bench_experts --shfused i4|b16`, run.sh step `shf-<fmt>`: the fused h, ys and yr against the GEMVs
+and the unfused step for every up and down variant and two shared copies, 26 of 26 identical at 1–16 rows; time
+A = route + GEMVs + experts, B = route + fused experts, A B B A; rank 0, job 12:24, sources `857b6ab9e50ff0a2`,
+commit 2c4f6f7):
+
+| Rows | INT4 A | INT4 B | BF16 A | BF16 B |
+|---:|---|---|---|---|
+| 1 | 283.4 / 278.7 µs | 277.6 / 276.7 | 742.3 / 741.7 | 734.5 / 731.7 |
+| 2 | 457.6 / 458.0 | 460.6 / 458.0 | 1360.1 / 1354.5 | 1346.1 / 1345.2 |
+| 4 | 795.7 / 798.2 | 798.5 / 799.5 | 2518.0 / 2518.6 | 2515.0 / 2513.2 |
+| 6 | 1111.6 / 1091.8 | 1114.2 / 1100.4 | 3548.7 / 3529.4 | 3531.9 / 3528.6 |
+| 16 | 2279.4 / 2283.8 | 2246.4 / 2246.9 | 7413.4 / 7419.3 | 7416.0 / 7411.4 |
+
+**Failure: 4 chunks in flight at 9–16 rows** (c3cb8c6): 138 registers instead of 207 (two CTAs an SM), slower:
+9 rows B 1503.8 / 1501.0 and 1508.9 / 1515.3 µs against 1472.7 / 1471.5 and 1472.1 / 1475.9 with 8 chunks; 16 rows
+2279.9 / 2279.4 and 2280.3 / 2282.1 against 2227.6 / 2226.7 and 2230.8 / 2230.7 (two binaries, A B B A, rank 0,
+job ~12:58). Reverted in c9bc785.
+
+**The prefetch** (`bench_experts --decode --ups 0,0,0,0 --xpfs 0,1,1,0`: the decode step, route + k_up + k_down,
+in one process; rank 0, job ~13:20, sources `e4268f937f5f0169`, commit 5b85463; µs and % of 235 GB/s):
+
+| Rows | INT4 off | INT4 on | BF16 off | BF16 on |
+|---:|---|---|---|---|
+| 1 | 199.7 / 199.3 (93.0, 93.2) | 192.9 / 191.2 (96.3, 97.1) | 653.8 / 654.4 (98.3, 98.2) | 655.5 / 653.2 (98.0, 98.4) |
+| 2 | 382.6 / 385.3 (94.9, 94.2) | 367.4 / 367.7 (98.8, 98.8) | 1269.7 / 1268.5 | 1269.4 / 1269.8 |
+| 4 | 733.1 / 731.3 (95.2, 95.4) | 697.4 / 697.6 (100.1, 100.0) | 2444.1 / 2430.1 | 2435.7 / 2432.6 |
+| 6 | 1031.0 / 1028.9 (95.8, 96.0) | 987.0 / 985.6 (100.1, 100.3) | 3437.7 / 3439.2 | 3443.7 / 3446.6 |
+| 16 | 2325.6 / 2317.1 (90.4, 90.8) | 2102.8 / 2112.0 (100.0, 99.6) | 7506.7 / 7496.8 (96.9, 97.0) | 7285.1 / 7280.2 (99.9, 99.9) |
+
+The trial build with the prefetch unconditional (d701398, sources `5c033306f18dc1ba`) against 2c4f6f7, two
+binaries A B B A, agreed (INT4 1 row 200.8 / 200.2 → 191.0 / 193.9 µs; 16 rows 2312 / 2331 → 2115 / 2103).
+`test_experts` t-i4, t-b16, t-q4 and t-eq pass on both builds (0 failures: decode against the contract values,
+every variant, wk1 = prefill, INT4 = BF16 on the dequantised matrices, batch invariance, determinism).
+
+**Left.** One CTA an SM for the default INT4 k_up; a `__launch_bounds__(192, 2)` build (≤ 170 registers) was not
+tried. The fused shared expert at 1 row costs ~76 µs a layer against 80.3 µs of bytes: no further room there.
