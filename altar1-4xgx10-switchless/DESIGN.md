@@ -126,7 +126,7 @@ configuration has to get right instead:
 | # | What | Cost | Decides |
 |---|---|---|---|
 | A0 | The INT4 unpacking and dequantisation checked against compressed-tensors on ≥ 3 real tensors; INT4-g32 and BF16-expert decode GEMV prototypes in `micro/` at 1, 6, 16 rows on expert and o_proj shapes | CPU; one ≤ 10-min ring window | the contract's weight expression (decision 2); whether the floor is reachable (risk 1) |
-| A1 | The CPU reference on altar-1 (168 experts, dequantised INT4, BF16 the rest) on rank 3: two short layer checks against transformers, then the four golden sequences in two orders, the MTP teacher-forced | hours of CPU at nice 19 | level-2 golden data, the order variance, level-3 numbers against GLM-5.3's golden |
+| A1 | The CPU reference on altar-1 (168 experts, dequantised INT4, BF16 the rest) on rank 2: two short layer checks against transformers, then the four golden sequences in two orders, the MTP teacher-forced | hours of CPU at nice 19 | level-2 golden data, the order variance, level-3 numbers against GLM-5.3's golden |
 | A2 | The conversion on rank 3 with a byte-for-byte verification against the shards and a second conversion of two layers | ~2 h of CPU, 492 GB peak | the artefact |
 | A3 | Kernel bake-offs: INT4 decode and prefill variants, the BF16 expert kernel, the BF16 shared expert through the GEMV and fused | ring windows | the kernels |
 | A4 | Exact byte-saving levers after the step runs: `kBF16X` on the BF16 reads, the NVFP4 drafter, the fused shared expert; A/B in both orders | ring windows | decisions 3 and 5's levers |
@@ -148,7 +148,7 @@ From [reuse § 9](docs/reuse.md#9-build-plan); effort relative to glm53's own mi
 | A7 | MTP drafts | tokens identical with and without drafts; acceptance and tok/s on real text |
 | A8 | End to end and ship: service, refhashes, benches, the exact levers | within 2× the reference's order variance on all four sets; plain decode through the front-end ≥ ~21 tok/s |
 
-Critical path: the download → A2 → A4; A0 → A3e → A4. A1 beside A2–A3 on rank 3's CPU; A5 and A7 after A4; A8 last.
+Critical path: the download → A2 → A4; A0 → A3e → A4. A1 beside A2–A3 on rank 2's CPU; A5 and A7 after A4; A8 last.
 
 Status on 2026-10-14, evening: A0–A8 done on the four installed rank files, each with its rows in
 [experiments.md](docs/experiments.md): the engine within the reference's two-order variance on all four golden sets,
