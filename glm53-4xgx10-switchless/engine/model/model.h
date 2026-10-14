@@ -246,6 +246,8 @@ class Model {
   void set_l2pf(bool on);
   // Set the speed levers (Tune bits; each set's captured graphs are kept).
   void set_tune(uint32_t bits);
+  // Replay steps as CUDA graphs or run them eager (Options::graphs; the same bits: run.sh check, refhash).
+  void set_graphs(bool on);
 
   struct Impl;
 

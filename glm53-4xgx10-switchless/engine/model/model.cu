@@ -666,6 +666,10 @@ void Model::set_tune(uint32_t bits) {
   drain();
   d_->opt.tune = bits;
 }
+void Model::set_graphs(bool on) {
+  drain();
+  d_->opt.graphs = on;
+}
 double Model::step_bytes(double experts, bool with_mtp) const {
   using namespace ::glm;
   auto fp8 = [](int N, int K, int rs, int ks) { return (double)N * K + (double)(N / rs) * (K / ks) * 4; };

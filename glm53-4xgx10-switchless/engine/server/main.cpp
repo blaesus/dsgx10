@@ -22,7 +22,8 @@
 //   same tokens). The model's Options::drafts is K (0 with --no-spec: no MTP work at all). --spec-force N (tests):
 //   N drafts every step whatever the gate says; --spec-oracle (tests): a request identical to an earlier one (prompt,
 //   sampling, max_new) takes that one's tokens as its drafts, about one in four changed.
-// --step-timeout S (120): the watchdog's limit for one step or chunk.
+// --step-timeout S (120): the watchdog's limit for one step or chunk. --index-scratch-mib N (512): the prefill
+// indexer's score scratch (smaller: less memory beside the 101.4 GiB rank files, G8).
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -89,6 +90,7 @@ struct Args {
   double disk_gib = 32, keep_gib = 0, keep_days = 7;
   std::string disk_dir, disk_tag;
   int step_timeout = 120;
+  int index_scratch_mib = 512;  // the prefill indexer's score scratch (Options::index_scratch)
   bool spec = true;
   int spec_drafts = 3, spec_force = 0;
   bool spec_oracle = false;
@@ -150,6 +152,7 @@ int main(int argc, char** argv) {
     else if (s == "--keep-gib") a.keep_gib = std::atof(val().c_str());
     else if (s == "--keep-days") a.keep_days = std::atof(val().c_str());
     else if (s == "--step-timeout") a.step_timeout = std::stoi(val());
+    else if (s == "--index-scratch-mib") a.index_scratch_mib = std::stoi(val());
     else if (s == "--no-spec") a.spec = false;
     else if (s == "--spec-drafts") a.spec_drafts = std::stoi(val());
     else if (s == "--spec-force") a.spec_force = std::stoi(val());
@@ -192,6 +195,7 @@ int main(int argc, char** argv) {
   model::Options mo;
   mo.max_ctx = a.max_ctx, mo.page = a.page, mo.slots = 1, mo.prefill_rows = a.chunk, mo.attn_splits = a.splits;
   mo.drafts = a.spec_drafts;
+  mo.index_scratch = (size_t)a.index_scratch_mib << 20;
   model::Model m(rk, mo);
   std::unique_ptr<glw::WeightFile> wf;
   model::SynthOptions so;

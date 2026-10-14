@@ -24,6 +24,7 @@
 # layer 78's output against PREFIX.l78.bf16 on rank 0. spec: speculative against plain decoding (G7) on the golden
 # prompts SEQS at SESS sessions, KS (k drafts; -1 the gate, -3 the oracle), GEN tokens, both orders, bit for bit;
 # max_ctx SPECCTX, SLOTS slots. Both on the real rank files (WEIGHTS) with --fill-experts.
+# g8: the filled rank files end to end (G8; g8_job.sh sets it up): tf and refhash over GOLD's SEQS (below).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 DATA_NAME=${DATA_NAME:-glm53-model}  # the data tree under ~/dsgb10-data (install.sh, run4.sh read it too)
@@ -92,6 +93,13 @@ for s in "${steps[@]}"; do
       cmd=("$BIN/glm_run" --weights "$WEIGHTS" --fill-experts --out "$OUT" $T --max-ctx "${SPECCTX:-8192}" --slots
         "${SLOTS:-6}" --drafts 5 --splits 16 --gold "$GOLD" --seqs "${SEQS:-short,python}" --sess "${SESS:-1}" --ks
         "${KS:-1,2,3,4,5,-1}" --steps "${GEN:-64}" $EXTRA spec) ;;
+    g8)  # G8: the real rank files, every routed expert from the file (no --fill-experts): G8MODES (default tf via VIA
+      # over GOLD's SEQS, their first TFMAX tokens, 0 all, the layers DUMP dumped; then refhash on the same prompts,
+      # GEN tokens, graphs twice and eager once), dumps and refhash tokens into DATA/g8/G8TAG
+      cmd=("$BIN/glm_run" --weights "$WEIGHTS" --out "$OUT" $T --max-ctx "${G8CTX:-8192}" --chunk "${G8CHUNK:-2048}"
+        --index-scratch-mib "${G8SCRATCH:-128}" --gold "$GOLD"
+        --seqs "${SEQS:-short,python}" --tf-max "${TFMAX:-0}" --via "${VIA:-prefill}" --dump-layers "${DUMP:-77}"
+        --steps "${GEN:-64}" --dir "$DATA/g8/${G8TAG:-run}" $EXTRA ${G8MODES:-tf refhash refhash eager refhash}) ;;
     *) echo "unknown step $s"; rc=2; continue ;;
   esac
   if [ "$s" = weights ]; then weights_step "$BIN" 2>&1 | tee -a "$LOG"

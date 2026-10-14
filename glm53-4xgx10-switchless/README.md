@@ -44,6 +44,14 @@ the 87 GiB budget) and the KL bake-off that confirms their code. [Resuming](#res
   the service started on the ring, lending and reclaiming against the DeepSeek service; the CPU reference with golden data over 38k tokens
   ([docs/reference.md](docs/reference.md)). Every experiment is indexed in
   [docs/experiments.md](docs/experiments.md).
+- **End to end on real weights (G8, 2026-10-14, partial):** with every routed expert in the rank files (NVIDIA's
+  NVFP4), the engine agrees with the CPU reference within the reference's own order variance on all four golden
+  sets (argmax 0.93 / 0.89 / 0.83 / 0.70 on short / python / prose / agentic's first 8k, against 0.93 / 0.90 /
+  0.84 / 0.72 between the reference's two orders; KL ≤ 1.8× that variance): DESIGN decision 3's 2× criterion
+  is met. The refhashes are pinned and bit-stable (graphs, eager, two processes, four ranks). Through glmfront,
+  with drafts off, it decodes 22–23 tok/s at one session and 33 at two, and the text reads as GLM-5.3. The draft
+  configurations through the front-end were not run: the work was paused
+  ([docs/engine.md](docs/engine.md#end-to-end-on-real-weights-g8-2026-10-14)).
 - **The expert code is in the kernels (E1, 2026-10-14):** the two-subset 3-bit code for gate/up with NVFP4 down
   (3.83 bits a weight) decodes at 89–95 % of bandwidth, bit-exact to its definition, with the packer and the
   loader's checks ([docs/experts.md](docs/experts.md) § 13, [docs/quantiser.md](docs/quantiser.md)).
@@ -76,7 +84,9 @@ State on 2026-10-14 (branch `glm53`, not pushed):
   ~8 h of CPU, 87.12 GiB a rank); (2) whether the non-expert weights may go to NVFP4 (~7 ms of the 43.6 ms step;
   the user chose to keep FP8 for now, [DESIGN decision 2](DESIGN.md)).
 - **Partial work with resume points:** the reference's covariance pass (layer 3) and resumable KL tracks on rank 2
-  ([reference.md](docs/reference.md) "How to resume"); G8's end-to-end runs ([engine.md](docs/engine.md), G8).
+  ([reference.md](docs/reference.md) "How to resume"); G8's end-to-end runs ([engine.md](docs/engine.md), G8): the
+  drafts through the front-end on real text are left, `engine/server/tests/g8_job.sh k1` (k2, k3, gate) with
+  `FRONT=<a glmfront build>`, one ring job of ~6 min each, compared with `g8_front.py compare`.
 - **Scratch that may be deleted:** rank 0 `/data/scratch/glm53-master` (37 GB of BF16 expert samples for layers 3
   and 40, refetched in an hour), `~/dsgb10-data/glm53-*` on every rank (synthetic weights, dumps, traces; 29 GB on
   rank 0), rank 2 `~/glm53-ref/` (the venv, 38k golden set, qcache: keep if resuming within weeks).

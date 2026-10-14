@@ -13,6 +13,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 FLEET=${FLEET:-$HERE/../../fleet/homelab.conf}
 . "$HERE/../../../ds41f-4xgx10-switchless/engine/server/fleet.sh"
 fleet_load "$FLEET" || exit 2
+# a ring job is preemptible: under memory pressure (earlyoom on every box) it goes first, not the long CPU passes
+# beside it (the reference, the converter); the workers' ranks get the same below
+echo 1000 > /proc/self/oom_score_adj
 BIN=$1
 shift
 NAME=$(basename "$BIN")
@@ -39,7 +42,7 @@ r=1
 for w in "${FLEET_WORKERS[@]}"; do
   # pkill in a call of its own: the launch's command line names the binary's path, which the pattern matches
   ssh -o BatchMode=yes "$w" "pkill -f '$PAT'"
-  ssh -o BatchMode=yes "$w" "cat > $RD/fleet.conf; setsid nohup timeout 600 $(pre $r "$RD") $RD/$NAME --rank $r $* > $RD/logs/$NAME.$r.log 2>&1 < /dev/null &" < "$FLEET"
+  ssh -o BatchMode=yes "$w" "cat > $RD/fleet.conf; echo 1000 > /proc/self/oom_score_adj; setsid nohup timeout 600 $(pre $r "$RD") $RD/$NAME --rank $r $* > $RD/logs/$NAME.$r.log 2>&1 < /dev/null &" < "$FLEET"
   r=$((r + 1))
 done
 timeout 600 $(pre 0 "$LRD") "$LRD/$NAME" --rank 0 "$@" 2>&1 | tee "$LRD/logs/$NAME.0.log" &
