@@ -41,6 +41,7 @@ The contract, as implemented here (each line cites the model.md section it follo
 import argparse
 import json
 import os
+import shutil
 import struct
 import sys
 import threading
@@ -122,6 +123,22 @@ class Ckpt:
         for i, r in enumerate(ids):
             ov[i] = np.frombuffer(os.pread(fd, width, start + int(r) * width), dtype=np.uint8)
         return out
+
+    def slab(self, name, r0, r1):
+        """Rows r0..r1-1 of a 2-D BF16 tensor, one pread, page cache dropped after."""
+        fd, base, e = self.entry(name)
+        assert e["dtype"] == "BF16"
+        width = e["shape"][1] * 2
+        off = base + e["data_offsets"][0] + r0 * width
+        buf = bytearray((r1 - r0) * width)
+        mv, got = memoryview(buf), 0
+        while got < len(buf):
+            k = os.preadv(fd, [mv[got:]], off + got)
+            if k <= 0:
+                raise IOError(f"short read of {name}")
+            got += k
+        os.posix_fadvise(fd, off, len(buf), os.POSIX_FADV_DONTNEED)
+        return torch.frombuffer(buf, dtype=BF16).view(r1 - r0, e["shape"][1])
 
     def has(self, name):
         return name in self.map
@@ -467,7 +484,62 @@ class FormatExperts:
         return requantise(self.fmt, *w)
 
 
-def moe(x, W, l, pool, src=None):
+# The quantiser's formats from qprep.py's cache (tracks mode, --qcache). A format name, optionally with the
+# suffix "/sub": the format only on --sub-experts, nvfp4_rtn (NVIDIA's recipe) on the others.
+#   s3x2gu_nvfp4d  gate and up S3x2 (e2m1sub3x2_g16), down nvfp4_rtn (its own amax)
+#   s3x2           all three S3x2
+#   k3, k4         all three trellis K3 / K4 (exllamav3's code, data-free; dequantised f32, scale 1)
+QFORMATS = {"s3x2gu_nvfp4d": ("e2m1sub3x2_g16", "e2m1sub3x2_g16", "nvfp4"),
+            "s3x2": ("e2m1sub3x2_g16",) * 3, "k3": ("trellis_k3",) * 3, "k4": ("trellis_k4",) * 3}
+
+
+class CachedFormatExperts:
+    """The master's experts in one of QFORMATS, read from qprep.py's cache; nvfp4_rtn for experts outside `only`."""
+
+    def __init__(self, master, qcache, l, fmt, only=None):
+        self.m, self.l, self.only = master, l, only
+        self.parts = QFORMATS[fmt]
+        self.root = os.path.join(os.path.expanduser(qcache), f"L{l}")
+
+    def load(self, e):
+        if self.only is not None and e not in self.only:
+            return ("master", self.m.load(e))
+        out = []
+        need_master = "nvfp4" in self.parts
+        bf = self.m.load(e) if need_master else None
+        for i, (m, f) in enumerate(zip(("gate", "up", "down"), self.parts)):
+            if f == "nvfp4":
+                out.append(("nvfp4", bf[i]))
+            elif f.startswith("e2m1"):
+                z = np.load(os.path.join(self.root, f, f"{e}.{m}.npz"))
+                out.append(("s3", torch.from_numpy(z["v2"]), torch.from_numpy(z["sc8"]), float(z["s2"])))
+            else:
+                out.append(("f32", torch.from_numpy(np.load(os.path.join(self.root, f, f"{e}.{m}.npy")))))
+        return ("cached", out)
+
+    def prepare(self, raw):
+        kind, data = raw
+        if kind == "master":
+            return requantise("nvfp4_rtn", *data)
+        fm = quant_formats()
+        res = []
+        for t in data:
+            if t[0] == "nvfp4":
+                pk = fm.nvfp4_rtn(t[1].to(F32))
+                res.append(nvfp4_dequant(torch.from_numpy(pk["weight"]),
+                                         torch.from_numpy(pk["weight_scale"]).view(torch.float8_e4m3fn),
+                                         float(pk["weight_scale_2"])))
+            elif t[0] == "s3":     # (E2M1 level x e4m3 group scale), exact in f32; s2 applied after the GEMM
+                v2, sc8, s2 = t[1], t[2], t[3]
+                R = v2.shape[0]
+                w = ((v2.to(F32) / 2).view(R, -1, 16) * sc8.view(torch.float8_e4m3fn).to(F32).unsqueeze(-1)).view(R, -1)
+                res.append((w, s2))
+            else:
+                res.append((t[1], 1.0))
+        return ("scaled", *res)
+
+
+def moe(x, W, l, pool, src=None, hook=None):
     """Routed experts + shared expert. Returns (out bf16, routing record, calibration sums)."""
     N = x.shape[0]
     logits = F.linear(x.to(F32), W("mlp.gate.weight").to(F32))
@@ -510,6 +582,8 @@ def moe(x, W, l, pool, src=None):
             g, u, d = wts
             h = silu_mul(linear(xe, g), linear(xe, u))
             y = out_linear(h, d)
+        if hook is not None:
+            hook(e, xe)
         we = w[r, k]
         acc.index_add_(0, r, y.to(F32) * we[:, None])
         cnt[e] = len(r)
@@ -613,7 +687,7 @@ class Run:
         return sets
 
     # -- one decoder layer over all sequences
-    def layer(self, l, h, prev, seqs, src=None, quant=None, cache=None):
+    def layer(self, l, h, prev, seqs, src=None, quant=None, cache=None, hook=None):
         W = LayerW(self.ck, l, quant, cache)
         t0 = time.time()
         x = rms_norm(h, W("input_layernorm.weight"), 1e-5)
@@ -635,7 +709,7 @@ class Run:
         if l < 3:
             m = dense_mlp(x, W)
         else:
-            m, route, calib = moe(x, W, l, self.pool, src)
+            m, route, calib = moe(x, W, l, self.pool, src, hook)
         h = add_residual(h, m)
         del m, x
         return h, topk, saved, route, calib, t_att, time.time() - t0
@@ -712,12 +786,16 @@ class Run:
         t_pass = time.time()
         if isinstance(nxt, int):
             for l in range(nxt, last):
-                h, topk, saved, route, calib, t_att, t_all = self.layer(l, h, prev, self.seqs, None)
+                hook = self.cov_hook(l) if a.cov_out and l in a.cov_layers else None
+                h, topk, saved, route, calib, t_att, t_all = self.layer(l, h, prev, self.seqs, None, hook=hook)
                 prev = topk
                 self.write_layer(l, h, saved, route, calib, {"attention_s": t_att, "layer_s": t_all})
                 self.save_state(l + 1, h=h)
                 log(f"layer {l:2d} {'full' if self.full[l] else 'shared'} {t_all:7.1f} s (attention {t_att:6.1f} s)"
                     f"  rss {rss_gib():.1f} GiB")
+                if a.cov_out and l >= max(a.cov_layers):
+                    log(f"covariances done (layers {a.cov_layers}); stopping after layer {l}")
+                    return
             nxt = "head"
             hn = rms_norm(h, self.ck.get("model.norm.weight"), 1e-5)
             self.save_state("head", hfinal=hn)
@@ -738,6 +816,34 @@ class Run:
             self.run_mtp()
             self.save_state("done")
         log(f"pass done ({time.time() - t_pass:.0f} s this invocation)")
+
+    def cov_hook(self, l):
+        """Experiment 3b: per routed expert of layer l, the second moments of its inputs over the rows routed to
+        it: gate/up input x (the post-attention RMSNorm output) and down input h = silu(x Wg^T) * (x Wu^T) with
+        the BF16 master's weights (bf16 GEMMs, as the reference). Saved for quant/run.py --cov as
+        layer{l}_expert{e}.pt: {'gate_up': f16 [6144, 6144], 'down': f16 [2048, 2048], 'count': rows,
+        'scale': {'gate_up': s, 'down': s}}, each matrix the f32 mean x x^T (f32 GEMM) divided by its largest
+        diagonal entry s (run.py's ratio does not depend on the scale)."""
+        a = self.args
+        m = MasterExperts(os.path.expanduser(a.master), l)
+        d = os.path.expanduser(a.cov_out)
+        os.makedirs(d, exist_ok=True)
+
+        def norm16(S):
+            s = float(S.diagonal().max())
+            return (S / s).to(torch.float16), s
+
+        def hook(e, xe):
+            g, u, _ = m.load(e)
+            xf = xe.to(F32)
+            hm = silu_mul(linear(xe, g), linear(xe, u)).to(F32)
+            n = xe.shape[0]
+            sx, kx = norm16(xf.T @ xf / n)
+            sh, kh = norm16(hm.T @ hm / n)
+            path = os.path.join(d, f"layer{l}_expert{e}.pt")
+            torch.save({"gate_up": sx, "down": sh, "count": n, "scale": {"gate_up": kx, "down": kh}}, path + ".tmp")
+            os.replace(path + ".tmp", path)
+        return hook
 
     def run_mtp_from(self):
         """Experiment 5: replay the MTP layer over a finished run's final hidden states (its state/hfinal.pt),
@@ -776,75 +882,213 @@ class Run:
         refs = ["master"] + [r for r in a.track_ref if r in quant]
         log(f"master layers {sorted(have)}; tracks {[(n, sorted(l)) for n, _, l in tracks]}")
 
+        sub = {int(x) for x in a.sub_experts.split(",") if x}
+
         def source(fmt, lay, l):
             if l < 3 or l not in have:
                 return None
             m = MasterExperts(mroot, l)
-            return FormatExperts(m, fmt) if l in lay else m
+            if l not in lay:
+                return m
+            base, _, only = fmt.partition("/")
+            if base in QFORMATS:
+                return CachedFormatExperts(m, a.qcache, l, base, sub if only == "sub" else None)
+            assert not only, fmt
+            return FormatExperts(m, fmt)
 
-        h0 = self.ck.rows("model.embed_tokens.weight", self.ids.tolist())
-        H = {n: h0 for n, _, _ in tracks}
-        prev = {n: {} for n, _, _ in tracks}
-        report = {"tracks": [n for n, _, _ in tracks], "master_layers": sorted(have), "layers": {}, "final": {}}
-        for l in range(a.layers if a.layers is not None else NL):
-            routes, t0, cache = {}, time.time(), {}
+        def signature(n, fmt, lay, l):
+            """The weights a track uses at layer l. Two tracks entering layer l with the same state object and the
+            same signature leave it with the same state: it is computed once and shared (never mutated)."""
+            return (repr(quant[n]), fmt if l in lay else None)
+
+        names = [n for n, _, _ in tracks]
+        kind = {n: ("ne" if n.startswith("ne:") else "fmt" if f else "master") for n, f, _ in tracks}
+        lays = {n: frozenset(y) for n, _, y in tracks}
+
+        def applies(r, n):
+            """A reference is compared with the master-relative tracks of its own kind and layer set."""
+            if r == n:
+                return False
+            if r == "master":
+                return True
+            return kind[r] == kind[n] and (kind[r] == "ne" or lays[r] == lays[n])
+        pairs = [(r, n) for r in refs for n in names if applies(r, n)
+                 and not (n in refs and r != "master" and names.index(n) < names.index(r))]
+
+        # Disk-backed states (RSS stays near one track's working set): state/tracks/L<next>/s<k>.pt holds one
+        # distinct state {"H": residual stream bf16 [N, 6144], "prev": the index sets}, and index.json maps
+        # every track to its state, with the report so far. Tracks that enter a layer with the same state and use
+        # the same weights there share the output state: computed once. A kill resumes at the last whole layer.
+        sroot = os.path.join(self.state, "tracks")
+        os.makedirs(sroot, exist_ok=True)
+        tid = {"tracks": [(n, f, sorted(y)) for n, f, y in tracks], "refs": refs, "combine": COMBINE,
+               "tokens": [s["name"] for s in self.seqs], "N": self.N, "sub": sorted(sub), "qcache": a.qcache}
+        cur = os.path.join(sroot, "current.json")
+
+        def sfile(l, k):
+            return os.path.join(sroot, f"L{l}", f"s{k}.pt")
+
+        if os.path.exists(cur):
+            with open(cur) as f:
+                st = json.load(f)
+            assert st["id"] == json.loads(json.dumps(tid)), "state/tracks is from a different track set: new --out-dir"
+            first, smap, report = st["next"], st["map"], st["report"]
+            report["layers"] = {int(k): v for k, v in report["layers"].items()}
+            log(f"resuming tracks at layer {first}")
+        else:
+            report = {"tracks": names, "master_layers": sorted(have), "layers": {}, "final": {}}
+            os.makedirs(os.path.join(sroot, "L0"), exist_ok=True)
+            torch.save({"H": self.ck.rows("model.embed_tokens.weight", self.ids.tolist()), "prev": {}}, sfile(0, 0))
+            first, smap = 0, {n: 0 for n in names}
+        last = a.layers if a.layers is not None else NL
+        for l in range(first, last):
+            t0 = time.time()
+            os.makedirs(os.path.join(sroot, f"L{l + 1}"), exist_ok=True)
+            done, nmap, routes = {}, {}, {}
             for n, fmt, lay in tracks:
-                H[n], prev[n], _, routes[n], _, _, _ = self.layer(l, H[n], prev[n], self.seqs,
-                                                                   source(fmt, lay, l) if fmt else source(None, set(), l),
-                                                                   quant[n], cache)
-            del cache
+                key = (smap[n], signature(n, fmt, lay, l))
+                if key not in done:
+                    st = torch.load(sfile(l, smap[n]), weights_only=False)
+                    h, pv, _, rt, _, _, _ = self.layer(l, st["H"], st["prev"], self.seqs,
+                                                       source(fmt, lay, l) if fmt else source(None, set(), l),
+                                                       quant[n], None)
+                    del st
+                    k = len(done)
+                    torch.save({"H": h, "prev": pv}, sfile(l + 1, k))
+                    routes[k] = None if rt is None else rt["route_idx"]
+                    done[key] = k
+                    del h, pv, rt
+                nmap[n] = done[key]
+            km = nmap["master"]
+            hm = torch.load(sfile(l + 1, km), weights_only=False)["H"].to(F32)
+            rel_k = {}
+            for k in set(nmap.values()):
+                hk = hm if k == km else torch.load(sfile(l + 1, k), weights_only=False)["H"].to(F32)
+                rel_k[k] = ((hk - hm).norm(dim=1) / hm.norm(dim=1)).numpy()
+                del hk
+            del hm
             rl = {}
-            hm = H["master"].to(F32)
-            for n, _, _ in tracks[1:]:
-                rel = ((H[n].to(F32) - hm).norm(dim=1) / hm.norm(dim=1)).numpy()
-                r = {"hidden_rel_median": float(np.median(rel)), "hidden_rel_max": float(rel.max())}
-                if routes[n] is not None:
-                    same = (np.sort(routes[n]["route_idx"], 1) == np.sort(routes["master"]["route_idx"], 1)).all(1)
-                    r["route_sets_equal"] = float(same.mean())
+            for n in names[1:]:
+                k = nmap[n]
+                r = {"hidden_rel_median": float(np.median(rel_k[k])), "hidden_rel_max": float(rel_k[k].max())}
+                if routes[k] is not None:
+                    r["route_sets_equal"] = float((np.sort(routes[k], 1) == np.sort(routes[km], 1)).all(1).mean())
                 rl[n] = r
             report["layers"][l] = rl
-            log(f"layer {l:2d} {time.time() - t0:6.1f} s  " + "  ".join(
-                f"{n}: rel {v['hidden_rel_median']:.2e} routes {v.get('route_sets_equal', 1):.4f}" for n, v in rl.items()))
+            log(f"layer {l:2d} {time.time() - t0:6.1f} s, {len(done)} distinct  " + "  ".join(
+                f"{n}: rel {v['hidden_rel_median']:.2e} routes {v.get('route_sets_equal', 1):.4f}" for n, v in rl.items())
+                + f"  rss {rss_gib():.1f} GiB")
             with open(os.path.join(self.out, "tracks.json"), "w") as f:
                 json.dump(report, f, indent=1)
-        # the head on every track, KL(master || track) per row
-        Wn, Wh = self.ck.get("model.norm.weight"), self.ck.get("lm_head.weight").to(F32)
-        hn = {n: rms_norm(H[n], Wn, 1e-5) for n, _, _ in tracks}
-        names = [n for n, _, _ in tracks]
-        pairs = [(r, n) for r in refs for n in names if n != r and not (n in refs and names.index(n) < names.index(r))]
-        kl = {p: np.empty(self.N, np.float64) for p in pairs}
-        same = {p: np.empty(self.N, bool) for p in pairs}
-        dmax = {p: np.empty(self.N, np.float64) for p in pairs}
-        am_master = np.empty(self.N, np.int64)
-        B = 128
-        for i in range(0, self.N, B):
-            lg = {n: F.linear(hn[n][i:i + B].to(F32), Wh).double() for n in names}
-            lp = {n: torch.log_softmax(v, -1) for n, v in lg.items()}
-            am_master[i:i + B] = lp["master"].argmax(-1).numpy()
-            for r, n in pairs:
-                kl[(r, n)][i:i + B] = (lp[r].exp() * (lp[r] - lp[n])).sum(-1).numpy()
-                same[(r, n)][i:i + B] = (lp[n].argmax(-1) == lp[r].argmax(-1)).numpy()
-                dmax[(r, n)][i:i + B] = (lg[n] - lg[r]).abs().max(-1).values.numpy()
-            del lg, lp
+            with open(cur + ".tmp", "w") as f:
+                json.dump({"id": tid, "next": l + 1, "map": nmap, "report": report}, f)
+            os.replace(cur + ".tmp", cur)
+            shutil.rmtree(os.path.join(sroot, f"L{l}"), ignore_errors=True)
+            smap = nmap
+        self.tracks_head(names, refs, pairs, smap, report, lambda k: sfile(last, k))
+
+    def tracks_head(self, names, refs, pairs, smap, report, sfile):
+        """The head on every distinct final state, streamed over row blocks and vocabulary slabs (RSS stays small):
+        f32 logits (as head_outputs), and per row in f64 with online rescaling: each state's logsumexp and
+        argmax; per pair (r, n) KL(r || n) = sum p_r (z_r - z_n) - lse_r + lse_n, the top-1 agreement and the
+        largest |z_n - z_r|."""
+        t0 = time.time()
+        Wn = self.ck.get("model.norm.weight")
+        ks = sorted(set(smap.values()))
+        hdir = os.path.join(self.state, "tracks", "hn")
+        os.makedirs(hdir, exist_ok=True)
+        for k in ks:                       # the normed final states, raw bf16 on disk, read a row block at a time
+            x = rms_norm(torch.load(sfile(k), weights_only=False)["H"], Wn, 1e-5).contiguous()
+            x.view(torch.int16).numpy().tofile(os.path.join(hdir, f"s{k}.bin"))
+            del x
+
+        class Rows:
+            def __init__(self, k):
+                self.path = os.path.join(hdir, f"s{k}.bin")
+
+            def __getitem__(self, sl):
+                w = D_ * 2
+                with open(self.path, "rb") as f:
+                    f.seek(sl.start * w)
+                    buf = bytearray(f.read((sl.stop - sl.start) * w))
+                return torch.frombuffer(buf, dtype=BF16).view(sl.stop - sl.start, D_)
+        D_ = D
+        hn = {k: Rows(k) for k in ks}
+        N, B, C = self.N, 1024, 8192
+        lse = {k: np.empty(N) for k in ks}
+        amx = {k: np.empty(N, np.int64) for k in ks}
+        kl = {p: np.empty(N) for p in pairs}
+        dmax = {p: np.empty(N) for p in pairs}
+        kp = {p: (smap[p[0]], smap[p[1]]) for p in pairs}
+        rk = sorted({smap[r] for r in refs})
+        for i0 in range(0, N, B):
+            i1 = min(N, i0 + B)
+            m = {k: torch.full((i1 - i0,), -float("inf"), dtype=torch.float64) for k in ks}
+            e = {k: torch.zeros(i1 - i0, dtype=torch.float64) for k in ks}
+            am = {k: torch.zeros(i1 - i0, dtype=torch.int64) for k in ks}
+            A = {p: torch.zeros(i1 - i0, dtype=torch.float64) for p in pairs}
+            DM = {p: torch.zeros(i1 - i0, dtype=torch.float64) for p in pairs}
+            xb = {k: hn[k][slice(i0, i1)] for k in ks}                                     # bf16 row blocks
+            for v0 in range(0, VOCAB, C):
+                v1 = min(VOCAB, v0 + C)
+                Wc = self.ck.slab("lm_head.weight", v0, v1).to(F32)
+
+                def update(k, z):
+                    cm, ci = z.max(-1)
+                    am[k] = torch.where(cm > m[k], ci + v0, am[k])     # first index of the maximum overall
+                    mn = torch.maximum(m[k], cm)
+                    sc = torch.exp(m[k] - mn)
+                    e[k] = e[k] * sc + torch.exp(z - mn[:, None]).sum(-1)
+                    m[k] = mn
+                    return sc
+
+                zr = {k: F.linear(xb[k].to(F32), Wc).double() for k in rk}
+                scr = {k: update(k, zr[k]) for k in rk}
+                for p in pairs:
+                    A[p] = A[p] * scr[kp[p][0]]
+                for k in ks:
+                    z = zr[k] if k in zr else F.linear(xb[k].to(F32), Wc).double()
+                    if k not in zr:
+                        update(k, z)
+                    for p in pairs:
+                        a_, b_ = kp[p]
+                        if b_ == k:
+                            A[p] = A[p] + (torch.exp(zr[a_] - m[a_][:, None]) * (zr[a_] - z)).sum(-1)
+                            DM[p] = torch.maximum(DM[p], (z - zr[a_]).abs().max(-1).values)
+                    del z
+                del zr, Wc
+            for k in ks:
+                lse[k][i0:i1] = (m[k] + e[k].log()).numpy()
+                amx[k][i0:i1] = am[k].numpy()
+            for p in pairs:
+                a_, b_ = kp[p]
+                kl[p][i0:i1] = (A[p] / e[a_]).numpy() - lse[a_][i0:i1] + lse[b_][i0:i1]
+                dmax[p][i0:i1] = DM[p].numpy()
+            log(f"head rows {i1}/{N}  rss {rss_gib():.1f} GiB")
         ids = self.ids.numpy()
-        for r, n in pairs:
+        tag = lambda x: x.replace("@", "_at_").replace(",", "-").replace(":", "_").replace("/", "_")
+        for p in pairs:
+            r, n = p
+            a_, b_ = kp[p]
+            same = amx[a_] == amx[b_]
             res = {}
             for sq in self.seqs:
-                o, m = sq["off"], sq["n"]
-                res[sq["name"]] = {"kl_mean": float(kl[(r, n)][o:o + m].mean()),
-                                   "kl_p99": float(np.percentile(kl[(r, n)][o:o + m], 99)),
-                                   "kl_max": float(kl[(r, n)][o:o + m].max()),
-                                   "top1_agree": float(same[(r, n)][o:o + m].mean()),
-                                   "max_abs_dlogit": float(dmax[(r, n)][o:o + m].max()),
-                                   "mean_max_abs_dlogit": float(dmax[(r, n)][o:o + m].mean())}
+                o, c = sq["off"], sq["n"]
+                res[sq["name"]] = {"kl_mean": float(kl[p][o:o + c].mean()),
+                                   "kl_p99": float(np.percentile(kl[p][o:o + c], 99)),
+                                   "kl_max": float(kl[p][o:o + c].max()),
+                                   "top1_agree": float(same[o:o + c].mean()),
+                                   "max_abs_dlogit": float(dmax[p][o:o + c].max()),
+                                   "mean_max_abs_dlogit": float(dmax[p][o:o + c].mean())}
             report["final"][f"{n} vs {r}"] = res
-            tag = lambda x: x.replace("@", "_at_").replace(",", "-").replace(":", "_")
-            np.save(os.path.join(self.out, f"kl_{tag(n)}_vs_{tag(r)}.npy"), kl[(r, n)])
+            np.save(os.path.join(self.out, f"kl_{tag(n)}_vs_{tag(r)}.npy"), kl[p])
+        amm = amx[smap["master"]]
         report["final"]["master_top1_vs_next"] = {
-            sq["name"]: float((am_master[sq["off"]:sq["off"] + sq["n"] - 1] == ids[sq["off"] + 1:sq["off"] + sq["n"]]).mean())
+            sq["name"]: float((amm[sq["off"]:sq["off"] + sq["n"] - 1] == ids[sq["off"] + 1:sq["off"] + sq["n"]]).mean())
             for sq in self.seqs}
         with open(os.path.join(self.out, "tracks.json"), "w") as f:
             json.dump(report, f, indent=1)
+        log(f"head {time.time() - t0:.0f} s")
         log("tracks final " + json.dumps(report["final"]))
 
     def run_mtp(self, hn=None, src=None):
@@ -929,6 +1173,12 @@ def main():
     ap.add_argument("--track-ref", action="append", default=[],
                     help="tracks mode: another track to compare every track against, besides the master (e.g. ne:fp8)")
     ap.add_argument("--master", default=None, help="fetch_master.py's directory of BF16 master experts")
+    ap.add_argument("--qcache", default=None, help="tracks mode: qprep.py's cache of the quantiser's formats")
+    ap.add_argument("--sub-experts", default="0,51,102,153,204,255",
+                    help="tracks mode: the experts a FORMAT/sub track quantises (the quantiser's trellis sample)")
+    ap.add_argument("--cov-out", default=None, help="experiment 3b: write per-expert input covariances here "
+                    "(with --master; the pass stops after the last --cov-layers layer)")
+    ap.add_argument("--cov-layers", type=int, nargs="+", default=[3, 40])
     ap.add_argument("--combine", choices=("f32", "bf16"), default="f32",
                     help="f32: sublayer outputs summed in f32 and rounded once with the residual (the contract, TP=4 "
                          "engine order); bf16: transformers' per-GEMM rounding")

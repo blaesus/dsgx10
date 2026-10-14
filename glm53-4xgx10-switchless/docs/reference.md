@@ -19,6 +19,7 @@ unless marked *estimate*.
 7. [The golden files](#7-the-golden-files)
 8. [Open questions](#8-open-questions)
 9. [Record](#9-record)
+10. [Follow-ups (2026-10-14)](#10-follow-ups-2026-10-14)
 
 ## 1. Files and how to run it
 
@@ -29,6 +30,9 @@ unless marked *estimate*.
 | [`ref/check_layer.py`](../ref/check_layer.py) | one decoder layer of `glmref.py` against transformers 5.15's `GlmMoeDsaDecoderLayer` on random weights |
 | [`ref/summarize.py`](../ref/summarize.py) | top-1 and log-probability per sequence, expert-usage skew, MTP acceptance, index-set ties, timing |
 | [`ref/cmp_runs.py`](../ref/cmp_runs.py) | two runs on a shared sequence: argmax agreement, \|Δ log p\|, KL on the sampled full logits, per-layer routing and hidden-state agreement |
+| [`ref/check_nvfp4_rtn.py`](../ref/check_nvfp4_rtn.py) | `quant/formats.py`'s `nvfp4_rtn` on the BF16 master's experts against NVIDIA's NVFP4 bytes (codes, block scales, `weight_scale_2`) |
+| [`ref/qprep.py`](../ref/qprep.py) | repacks the master's experts into the quantiser's formats once (S3×2, trellis K3/K4) into a cache the tracks read, and checks every packed tensor's SHA-256 against the quantiser's recorded hashes (§ 10.3) |
+| `glmref.py` modes (2026-10-14) | `--mtp-from RUN --mtp-experts {bf16,nvfp4_rtn}`: rerun only the MTP layer on a finished pass's final hidden states (experiment 5); `--track FORMAT@LAYERS`, `--track ne:{fp8,o4,oqk4,oqks4}`, `--track-ref TRACK`, `--master DIR`, `--qcache DIR`, `--sub-experts LIST`: carry several precision tracks through one resumable, disk-backed pass and compare their logits (experiment 3, § 10.3–10.4); `--cov-out DIR --cov-layers L…`: per-expert input covariances (experiment 3b, § 10.6) |
 | [`ref/text/`](../ref/text) | the two public-domain prose excerpts |
 | [`ref/tokens/`](../ref/tokens) | the four sequences, and the two diagnostic ones (`--diagnostic`, § 6.3): conversation, rendered text, token ids, `SHA256SUMS` |
 
@@ -48,13 +52,22 @@ python3 -m venv ~/glm53-ref/venv
 python3 ref/make_tokens.py --ckpt CKPT --ds-transcript ds41f-4xgx10-switchless/golden/long.messages.json \
     --out-dir ref/tokens --diagnostic --check-transformers --rename NAME=REPLACEMENT ...
 
-# a pass, detached, at nice 19 on 8 threads (resumable: rerun the same command after a preemption)
-cd ref && OMP_NUM_THREADS=8 setsid nohup nice -n 19 ionice -c3 ~/glm53-ref/venv/bin/python glmref.py \
-    --ckpt ~/hf/glm53-nvfp4 --out-dir ~/glm53-ref/golden/all \
+# a pass, detached, pinned to cores 10-19, at most 6 threads, nice 19 (resumable: rerun the same command
+# after a preemption). See "Pinning" below.
+cd ref && OMP_NUM_THREADS=6 setsid nohup taskset -c 10-19 nice -n 19 ionice -c3 ~/glm53-ref/venv/bin/python glmref.py \
+    --threads 6 --ckpt ~/hf/glm53-nvfp4 --out-dir ~/glm53-ref/golden/all-f32 \
     --tokens tokens/short.tokens.json tokens/prose.tokens.json tokens/python.tokens.json tokens/agentic.tokens.json \
-    > ~/glm53-ref/logs/all.log 2>&1 < /dev/null &
-~/glm53-ref/venv/bin/python summarize.py ~/glm53-ref/golden/all --tokenizer ~/hf/glm53-nvfp4/tokenizer.json
+    > ~/glm53-ref/logs/all-f32.log 2>&1 < /dev/null &
+~/glm53-ref/venv/bin/python summarize.py ~/glm53-ref/golden/all-f32 --tokenizer ~/hf/glm53-nvfp4/tokenizer.json
 ```
+
+**Pinning (from 2026-10-14 01:10).** Unpinned at 8 threads, glmref.py ran at ~600 % CPU on cores 5–9. The
+decode tuner measured that this slows rank 2's GPU kernels by 8–16 % and costs the ring 2–4 ms a decode step:
+cores 5–8 are the ring proxies' cores, and the memory is shared with the GPU. Every run on rank 2 now goes under
+`taskset -c 10-19`, with at most 6 threads, at nice 19. The `all-f32` pass was started unpinned on 8 threads
+and re-pinned while running (`taskset -acp 10-19` on all 26 threads of the process, at layer 15, 01:07); it kept
+its 8 threads. The `all`, `short*` and `doc` runs before it were unpinned on 8 threads. Pinning and thread count
+change no output bit (§ 10.1).
 
 `--layers N` stops after N layers (a wiring test: 5 layers of the short sequence take 17 s). The copy took
 ~22 min (433 GB, 59 files; sizes verified file by file against the source).
@@ -269,7 +282,7 @@ generates itself it should be higher (*not measured*: that needs generated conti
 
 ## 7. The golden files
 
-On rank 2 under `~/glm53-ref/golden/<run>/` (`short`, `all`), each with `manifest.json` (sequences and
+On rank 2 under `~/glm53-ref/golden/<run>/` (`all-f32`, `all`, `short*`), each with `manifest.json` (sequences and
 offsets, the file list with shapes and meanings) and `SHA256SUMS` over every file outside `state/`. Rows are
 all sequences concatenated; `P` is the sample rows (`sample_rows.npy`: every position of a sequence under 1,024
 tokens; otherwise every 256th, the first and last 32, and 2047–2049).
@@ -293,6 +306,7 @@ Hashes (sha256):
 
 | Run | `SHA256SUMS` | `final/argmax.npy` | `mtp/argmax.npy` | size |
 |---|---|---|---|---|
+| `all-f32` (`--combine f32`, the level-2 golden set, § 10.2) | `6c49dd8d37340e46…` (615 files, `summary.json` included) | `2f7e85cac6b2e082…` | `35f0e80e1a7ed06c…` | 5.3 GB (+ 0.9 GB `state/`) |
 | `all` (`--combine bf16`) | `e00d675bb0977b0b…` (615 files, `summary.json` included) | `2d1b224461894d78…` | `a9c633da1d6ddbaf…` | 5.3 GB (+ 0.9 GB `state/`) |
 | `short-f32` (`--combine f32`, the contract) | `bbe5659360b937d9…` (482 files) | `f601866e90b71abb…` | `204e542354ad21e2…` | 1.5 GB |
 | `short-bf16-rerun` | `8a3a458415675ea4…` (482 files) | `412635696e9385ec…` | `c1fecf73db931f3e…` | 1.5 GB |
@@ -301,13 +315,12 @@ Hashes (sha256):
 
 ## 8. Open questions
 
-1. **The 38k golden set is in transformers' rounding order, not the contract's.** It was already running when
-   the f32 combine became a contract item, and was not restarted. A `--combine f32` pass of the four sequences
-   makes the level-2 golden set. It should take ~2 h 10 min (*estimate*: the f32 o_proj and down projections
-   took `short` from 447 to 517 s). Until then `short-f32` is the only contract-order data.
-2. **The first `short` run's divergence at layer 42** (§ 6.5): nondeterminism, or a read racing the end of the
-   copy? Two later runs agree bit for bit. Rerun `short` a few times; if a run ever differs, find the first
-   differing tensor.
+1. ~~**The 38k golden set is in transformers' rounding order.**~~ Resolved 2026-10-14: `all-f32` (§ 10.2) is
+   the contract-order golden set (12,733 s, not the ~2 h 10 min estimated: the pass was re-pinned to fewer, slower
+   cores mid-run).
+2. **The first `short` run's divergence at layer 42** (§ 6.5): seven later passes over those rows agree bit for
+   bit, and no op in the reference varies with threads, cores or the deterministic flag (§ 10.1). Most likely a
+   transient bad read just after the copy; it cannot be proven now.
 3. **An independent stack** (the bar for G1a and G1b): the reference's logits have not been compared with vLLM
    or SGLang serving this checkpoint (prompt logprobs on `ref/tokens`), nor with logits from the BF16 master. The
    document test (§ 6.3) is the evidence so far.
@@ -335,3 +348,293 @@ from before the option count as `bf16`.
 - 2026-10-13/14: the document diagnostic (`doc`, `docchat`); the copy verified against the revision's LFS
   SHA-256s (52 of 52 files). No GPU was used anywhere; rank 0 ran only tokenising, header reads and the API
   lookup.
+- 2026-10-14: determinism checks (§ 10.1); the `all-f32` pass 00:36–04:09 (12,733 s), re-pinned to cores
+  10–19 at layer 15; from then on every run pinned to 10–19, 6 threads, nice 19. The MTP NVFP4 replay (§ 10.5),
+  the full `nvfp4_rtn` byte check (all 256 experts of layers 3 and 40 equal), and the S3×2 and trellis repack
+  (every hash equal to the quantiser's). The 8-track pass (04:18) was killed by earlyoom at layer 55 during a
+  GPU job's weight load (08:28); tracks mode made resumable and disk-backed. The covariance pass was started
+  (09:00) and stopped after layer 2 to make room for a GPU job; the repack was stopped at 09:30 (§ 10.8). Work
+  paused at the user's request; nothing of this experiment runs on rank 2.
+
+## 10. Follow-ups (2026-10-14)
+
+### 10.1 Determinism
+
+- **Three more `short` passes in the contract order** (`short-f32-2`, `short-f32-3`, and `short-f32-det` with
+  `torch.use_deterministic_algorithms(True)`) are byte-identical to `short-f32` in every `.npy`/`.npz` file.
+  The deterministic flag is now always on in `glmref.py` and changed no byte.
+- **The ops, one by one** (a scratch test on rank 2: bf16 and f32 `F.linear` at 7, 300 and 4,096 rows, bf16
+  `matmul`, f32 softmax, `index_add_`, f32 sums and means, `topk`): bit-identical across 1, 2, 4 and 8 threads,
+  and across the Cortex-X925 cores (5–9, 15–19) and the Cortex-A725 cores (0–4, 10–14).
+- **The `all-f32` pass** changed thread placement mid-run (unpinned, then pinned to 10–19 at layer 15, § 1), and
+  its `short` rows are still bit-identical to `short-f32`'s in every saved tensor (`cmp_runs.py`: argmax, log p,
+  full logits, routes and hidden states all equal).
+
+So nothing in the reference is nondeterministic on this CPU: not thread count, core type, batch, or the
+deterministic flag. The first `short` run's divergence at layer 42 (§ 6.5) remains the only one seen in eight
+passes over those rows. A transient bad read of layer 42's weights, minutes after the copy finished, is the
+likely cause. Not proven: nothing from that read was kept.
+
+### 10.2 The contract-order golden set (`all-f32`)
+
+`--combine f32`, the four sequences (37,993 rows), 00:36–04:09: **12,733 s**. The layers took a median of 162 s
+(~96 s a layer before the re-pinning at layer 15, 140–215 s after). The head took 129 s, the MTP layer 139 s,
+and the MTP stage 284 s. Peak logged RSS 5.8 GiB. This is now **the level-2 golden set**; `all` stays as
+the transformers-order record.
+
+| Run | `SHA256SUMS` | `final/argmax.npy` | `mtp/argmax.npy` | size |
+|---|---|---|---|---|
+| `all-f32` | `6c49dd8d37340e46…` (615 files, `summary.json` included) | `2f7e85cac6b2e082…` | `35f0e80e1a7ed06c…` | 5.3 GB (+ 0.9 GB `state/`) |
+
+| Sequence | top-1 (`all-f32`) | top-1 (`all`, bf16) | mean log p (f32) | MTP draft == token t+2 | MTP draft == main argmax at t+1 | where the main model is right |
+|---|---:|---:|---:|---:|---:|---:|
+| `short` | 0.807 | 0.793 | −1.287 | 0.737 | 0.796 | 0.872 |
+| `prose` | 0.511 | 0.501 | −2.616 | 0.489 | 0.587 | 0.790 |
+| `python` | 0.695 | 0.689 | −1.587 | 0.654 | 0.688 | 0.829 |
+| `agentic` | 0.488 | 0.482 | −3.436 | 0.484 | 0.454 | 0.719 |
+| all, weighted by tokens | | | | | 0.511 | |
+
+**The two orders over the whole set** (`cmp_runs.py all all-f32`):
+
+| Sequence | argmax equal | KL(bf16 ‖ f32) at the sample rows, mean / max | max \|Δ logit\| | \|Δ log p(next)\| mean |
+|---|---:|---|---:|---:|
+| `short` | 0.935 | 0.052 / 2.0 | 8.0 | 0.17 |
+| `prose` | 0.844 | 0.070 / 0.74 | 5.7 | 0.40 |
+| `python` | 0.898 | 0.41 / 8.3 | 13.1 | 0.26 |
+| `agentic` | 0.755 | 0.32 / 12.3 | 14.8 | 0.61 |
+
+On long sequences the rounding order alone moves a quarter of `agentic`'s argmaxes. The f32 order scores a
+little higher on all four sequences (0.6–1.4 points of top-1), which is suggestive but within what one order
+change can move. The expert-usage figures of § 6.6 hold in the f32 order (top-64 share mean 0.461, range
+0.364–0.608; agentic's own top-64 0.480, the others' 0.346).
+
+**The engine's tolerance.** These are two correct implementations of the same model. An engine in the contract
+order should match `all-f32` far more tightly than this, but the table is the scale of what any order
+difference produces.
+
+### 10.3 Precision tracks (experiment 3): the method, the anchors, and what exists
+
+**Status (2026-10-14, paused).** No full-depth track result exists yet. The first 8-track pass (04:18–08:28, short
+and python) was killed at layer 55 of 78 by earlyoom (`--prefer python`), when a GPU job loaded the 101 GiB rank
+files on rank 2 and available memory dipped. Tracks mode then could not resume, so the run has per-layer
+evidence through layer 54 and no logits. Tracks mode has since been made resumable and disk-backed (below). The
+merged 18-track pass is designed (§ 10.7) and not run.
+
+**How tracks mode works.** `glmref.py --track …` carries one copy of the residual stream per precision variant
+through the pass, layer by layer, in the contract's f32 combine order.
+- **Sharing.** Tracks that enter a layer with the same state and use the same weights in it share the output:
+  it is computed once. So a track that differs only at layer 40 costs nothing before layer 40.
+- **Per layer.** It logs every track's hidden-state difference from the master track (relative L2, median and
+  max over rows), and the share of rows whose routed expert set equals the master's.
+- **At the end.** `model.norm` and the head run on every distinct final state. Per sequence and per pair, it
+  reports KL(reference ‖ track) over the full vocabulary, top-1 agreement, and the largest |Δ logit|.
+- **Which pairs.** The master is compared with every track. A `--track-ref` is compared with the tracks of its
+  own kind (expert formats at the same layers, or non-expert presets).
+- **States on disk.** Each distinct state (the bf16 residual stream and the index sets) is a file under
+  `OUT/state/tracks/L<next>/`, and `current.json` maps every track to its state. RSS stays near one track's
+  working set: 1.2 GiB on `short`. A killed run resumes at the last whole layer.
+- **The head is streamed** over 1,024-row blocks and 8,192-row vocabulary slabs of `lm_head`. Logits are f32;
+  logsumexp, argmax and the KL sum are accumulated in f64 with online rescaling:
+  KL = Σ p_r (z_r − z_n) − lse_r + lse_n.
+- **Checked against the old in-memory head.** On a 5-layer `short` smoke test, `nvfp4_rtn@3` vs master gives KL
+  4.52e-5 against 4.5e-5 before, and `ne:fp8` vs master 2.85e-4, top-1 0.969, against 2.8e-4 and 0.969.
+- **Not yet tested:** a kill followed by a resume. The test (`--layers 3`, then `--layers 5` in the same out
+  dir, compared byte for byte with a straight `--layers 5`) was cut by the pause.
+
+**The tracks.**
+
+*The master track:*
+- Experts: the BF16 master's where `--master` holds the layer, NVIDIA's NVFP4 everywhere else. Only layers 3 and
+  40 are fetched (`~/glm53-master` on rank 2, 1,536 tensors, 38.66 GB).
+- Non-expert weights as NVIDIA ships them: BF16 attention, indexer and shared experts; per-tensor FP8 dense
+  MLPs in layers 0–2.
+
+*A format track,* `FORMAT@L`:
+- The master's experts in FORMAT at layers L. `nvfp4_rtn` is NVIDIA's recipe, recomputed.
+- `s3x2gu_nvfp4d`: gate and up in S3×2, the E2M1-subset 3-bit code with subsets {0.5, 2, 4, 6} and
+  {0.5, 1.5, 3, 6}, group 16, e4m3 scales; down in `nvfp4_rtn`. 3.83 bpw.
+- `s3x2`: all three projections in S3×2. 3.5 bpw.
+- `k3`, `k4`: trellis K3 or K4 on all three, exllamav3's code, data-free.
+- The suffix `/sub` puts the format only on `--sub-experts`, which default to the quantiser's trellis sample
+  0, 51, 102, 153, 204, 255. The other 250 experts get `nvfp4_rtn`, the same mixing for every format.
+- These six carry 3.0 % (layer 3) and 3.7 % (layer 40) of the routing mass on `short`+`python`, and 2.2 % and
+  3.0 % over the whole golden set (uniform: 2.3 %). 16 % and 27 % of rows route to at least one of them.
+
+*A non-expert track,* `ne:NAME`: the master's experts, with the non-expert linears quantised by a preset.
+- `ne:fp8` is DESIGN decision 2: zai's FP8 for `q_a`, `q_b`, `kv_a`, `kv_b`, `o_proj`, the indexer's `wq_b` and
+  `wk`, and the shared expert's gate, up and down.
+- `ne:o4` puts `o_proj` at NVFP4; `ne:oqk4` adds `q_b` and `kv_b`; `ne:oqks4` adds the shared expert.
+- In every preset, layers 0–2's dense MLPs stay NVIDIA's per-tensor FP8. The routers, norms, the indexer's
+  `weights_proj`, the embedding and the head stay as shipped.
+
+**How the weights are computed.**
+- **zai's FP8, recomputed.** Per 128×128 block, scale = amax · f32(1/448), codes = e4m3(w / scale). The scale
+  rule was checked against zai's release (zai-org/GLM-5.3 at c5087a76, HTTP range reads): `weight_scale_inv` is
+  equal on all six tensors read (layers 10 and 40: `o_proj`, the shared expert's `down_proj`, `q_b_proj`).
+  NVFP4 for a non-expert tensor is `nvfp4_rtn` with a per-tensor amax: the shared expert's gate and up each get
+  their own, unlike the routed experts' shared amax.
+- **Dequantised non-expert weights are f32** (code × scale, rounded once), and that linear runs as an f32 GEMM
+  with one rounding to bf16.
+- **Routed experts.**
+  - NVFP4 and S3×2 are held as the exact f32 product of a 4- or 3-bit E2M1 value and an e4m3 block scale, with
+    the per-tensor scale applied after the GEMM. This is the kernel's order, and it is how the reference runs
+    the checkpoint's NVFP4.
+  - The quantiser's own S3×2 dequantiser rounds e4m3 · s2 first. The two agree within one f32 rounding
+    (asserted on every tensor in `qprep.py`).
+  - Trellis weights are the f32 output of `trellis.dequantise`, with a scale of 1.
+
+**`nvfp4_rtn` against NVIDIA's bytes.** `check_nvfp4_rtn.py` checked all 256 experts of layers 3 and 40 (gate,
+up and down). Every byte is equal:
+
+| Layer | packed codes | e4m3 block scales | `weight_scale_2` |
+|---|---|---|---|
+| 3 | 4,831,838,208 of 4,831,838,208 | 603,979,776 of 603,979,776 | 768 of 768 |
+| 40 | 4,831,838,208 of 4,831,838,208 | 603,979,776 of 603,979,776 | 768 of 768 |
+
+So the `nvfp4_rtn` tracks are exactly NVIDIA's shipped quantisation at those layers. The master track against
+them measures what NVIDIA's NVFP4 costs.
+
+**Repack provenance** (`qprep.py` into `~/glm53-ref/qcache` on rank 2, 21 GB; `provenance.jsonl` there). The
+packing calls `quant/run.py`'s own `make_formats` and `phash`, and every packed tensor's SHA-256 is compared with
+the hashes recorded in the quantiser's results (`/data/scratch/glm53-quant/results-*.jsonl` on rank 0, copied to
+`~/glm53-ref/quant-results`):
+
+| Layer | Format | Tensors packed | Equal to the quantiser's SHA-256 | No recorded hash |
+|---|---|--:|--:|--:|
+| 3 | S3×2 (`e2m1sub3x2_g16`) | 768 (all 256 experts) | **768** | 0 |
+| 40 | S3×2 | 768 | **558** | 210 (experts the quantiser's layer-40 run did not reach) |
+| 3 | trellis K4 | 18 (the six experts) | **18** | 0 |
+| 3 | trellis K3 | 15 of 18 (expert 255 not yet) | **15** | 0 |
+| 40 | trellis K4, K3 | 0 of 36 | | |
+
+No tensor disagreed. The bytes do not depend on the torch version (2.14.1 here, 2.11 in the quantiser's run).
+A trellis tensor took ~133 s at 2 threads.
+
+**Partial evidence from the killed run** (`golden/tracks/tracks.json`, layers 0–54, `short`+`python`, hidden
+state relative to the master track, median over rows, / share of rows with the master's routed set):
+
+| Track | after L3 | after L4 | after L39 | after L40 | after L41 | after L54 |
+|---|---|---|---|---|---|---|
+| `nvfp4_rtn@3` | 0.0023 / 1.00 | 0.0035 / 0.93 | 0.141 / 0.39 | 0.143 / 0.37 | 0.144 / 0.35 | 0.168 / 0.19 |
+| `nvfp4_rtn@40` | 0 | 0 | 0 | 0.034 / 1.00 | 0.033 / 0.79 | 0.082 / 0.45 |
+| `nvfp4_rtn@3,40` | 0.0023 / 1.00 | 0.0035 / 0.93 | 0.141 / 0.39 | 0.147 / 0.37 | 0.147 / 0.35 | 0.171 / 0.19 |
+| `ne:fp8` | 0.0077 / 0.84 | 0.011 / 0.80 | 0.179 / 0.29 | 0.180 / 0.27 | 0.179 / 0.27 | 0.202 / 0.14 |
+| `ne:o4` | 0.0097 / 0.81 | 0.015 / 0.74 | 0.232 / 0.20 | 0.234 / 0.18 | 0.232 / 0.18 | 0.252 / 0.09 |
+| `ne:oqk4` | 0.011 / 0.77 | 0.017 / 0.71 | 0.297 / 0.13 | 0.297 / 0.12 | 0.294 / 0.12 | 0.307 / 0.06 |
+| `ne:oqks4` | 0.015 / 0.77 | 0.021 / 0.67 | 0.312 / 0.12 | 0.312 / 0.11 | 0.308 / 0.11 | 0.322 / 0.05 |
+
+- **Divergence grows through the stack.** A difference at one layer (0.2 % after layer 3) grows to ~15 % by
+  layer 40, as § 6.4's rounding-order difference did. By the middle of the stack, most rows route differently.
+  So per-layer hidden-state numbers rank variants but cannot set tolerances; the final KL and top-1 must.
+- **The non-expert presets order as expected:** `fp8` < `o4` < `oqk4` < `oqks4`. Even `ne:fp8` (zai's FP8)
+  moves the state more than `nvfp4_rtn` at layer 3, because it changes every layer.
+
+**5-layer smoke test** (`short`, the stack cut after layer 4, so these are not model-quality numbers; they check
+the wiring and give the order):
+
+| Track | vs | KL mean | top-1 | max \|Δ logit\| |
+|---|---|--:|--:|--:|
+| `nvfp4_rtn@3` | master | 4.5e-5 | 0.986 | 0.19 |
+| `s3x2gu_nvfp4d@3` | master | 7.4e-5 | 0.986 | 0.46 |
+| `s3x2@3` | master | 3.1e-4 | 0.983 | 0.67 |
+| `s3x2/sub@3` | master | 4.5e-5 | 0.986 | 0.19 |
+| `s3x2gu_nvfp4d@3` | `nvfp4_rtn@3` | 6.3e-5 | 0.979 | 0.34 |
+| `s3x2@3` | `nvfp4_rtn@3` | 3.1e-4 | 0.979 | 0.67 |
+| `s3x2/sub@3` | `nvfp4_rtn@3` | 2.8e-6 | 0.993 | 0.11 |
+| `ne:fp8` | master | 2.8e-4 | 0.969 | 0.59 |
+| `ne:o4` | master | 4.0e-4 | 0.966 | 0.50 |
+| `ne:o4` | `ne:fp8` | 3.2e-4 | 0.973 | 0.57 |
+
+### 10.4 Non-expert precision tracks
+
+Designed and wired (`ne:fp8`, `ne:o4`, `ne:oqk4`, `ne:oqks4`; § 10.3), with partial evidence only: the
+per-layer table above through layer 54 and the 5-layer smoke test. The full-depth KL, top-1 and max |Δ logit|
+on `short` and `python` come from the merged pass (§ 10.7). No decision is drawn: DESIGN decision 2 (FP8
+non-experts) stands.
+
+### 10.5 The MTP layer's experts at NVFP4 (experiment 5)
+
+The checkpoint ships the MTP layer (78) in BF16. `--mtp-from all-f32 --mtp-experts nvfp4_rtn` reruns only that
+layer on `all-f32`'s final hidden states, with its 256 routed experts requantised by NVIDIA's recipe
+(`nvfp4_rtn`, gate and up sharing one amax) and everything else as shipped; 372 s, pinned, 6 threads
+(`golden/mtp-nvfp4`, `final/` a symlink to `all-f32`'s). Acceptance is the draft against the main model's
+argmax at t+1, as in § 6.7; KL and |Δ logit| are over the MTP layer's sample rows.
+
+| Sequence | rows | drafts equal (BF16 vs NVFP4) | acceptance, BF16 experts | NVFP4 experts | Δ | KL(BF16 ‖ NVFP4) mean / max | max \|Δ logit\| |
+|---|---:|---:|---:|---:|---:|---|---:|
+| `short` | 290 | 0.993 | 0.7966 | 0.7966 | +0.0000 | 2.0e-3 / 0.049 | 1.31 |
+| `prose` | 4,761 | 0.978 | 0.5869 | 0.5848 | −0.0021 | 4.1e-3 / 0.035 | 1.31 |
+| `python` | 6,105 | 0.985 | 0.6883 | 0.6875 | −0.0008 | 4.1e-3 / 0.035 | 1.47 |
+| `agentic` | 26,833 | 0.977 | 0.4544 | 0.4546 | +0.0001 | 3.4e-3 / 0.035 | 1.31 |
+
+NVFP4 experts change about 2 % of the drafts, and the acceptance moves by at most 0.2 points (`prose`), with
+no consistent sign. On this evidence the MTP layer's experts can be stored at NVFP4 like the main layers'. The
+attention and shared expert of layer 78 stayed BF16 here.
+
+### 10.6 Per-expert input covariances (experiment 3b): format, and where the pass stopped
+
+`glmref.py --cov-out DIR --cov-layers 3 40 --master ~/glm53-master` runs the normal pass (the `all-f32` order,
+the four golden sequences) and stops after the last covariance layer.
+- **What is collected.** At each of those layers, for every routed expert, over the rows routed to it:
+  - the gate/up input x (the post-attention RMSNorm output);
+  - the down input h = silu(x W_gᵀ) ⊙ (x W_uᵀ), with the BF16 master's weights in bf16 GEMMs, as the reference
+    computes it.
+- **The file:** `DIR/layer{L}_expert{E}.pt`, as `quant/run.py --cov` reads it:
+  `{'gate_up': f16 [6144, 6144], 'down': f16 [2048, 2048], 'count': rows, 'scale': {'gate_up': s, 'down': s}}`.
+  Each matrix is the f32 mean of x xᵀ (an f32 GEMM), divided by its largest diagonal entry s, so the true
+  second moment is the matrix × `scale`. run.py's ratio √(tr(EΣEᵀ)/tr(WΣWᵀ)) does not depend on the scale.
+  An expert no row routes to gets no file (none is expected: every expert is used in every layer of the golden
+  set, § 6.6).
+- **Size** (*estimate*): 84 MB an expert, **43 GB** for 512 experts. They are to be copied to
+  `/data/scratch/glm53-quant/cov/` on rank 0 (agreed cap 60 GB).
+- **Where it stopped.** The first run (09:00–09:08, 6 threads) was stopped to make room for a GPU job, after
+  layer 2: `golden/cov-pass/state/progress.json` is `{"next": 3}`. No covariance has been written yet.
+- **Memory.** On the full golden set this pass holds ~6 GiB (the 26.8k-row `agentic` attention). That is above
+  the 3 GB cap that holds while GPU jobs on real weights are possible, so it needs an exclusive window. It
+  could instead be split per sequence, since the reference is batch-invariant (§ 6.5): `short`, `prose` and
+  `python` each fit, and their accumulators can be summed by count. `agentic` alone does not fit without a
+  head-group-chunked attention.
+
+### 10.7 The planned merged tracks pass (18 tracks, `short` + `python`)
+
+```
+--master ~/glm53-master --qcache ~/glm53-ref/qcache
+--track nvfp4_rtn@3 --track nvfp4_rtn@40 --track nvfp4_rtn@3,40
+--track s3x2gu_nvfp4d@3 --track s3x2gu_nvfp4d@40 --track s3x2gu_nvfp4d@3,40
+--track s3x2@3 --track s3x2@40 --track s3x2@3,40
+--track s3x2gu_nvfp4d/sub@3,40 --track s3x2/sub@3,40 --track k4/sub@3,40 --track k3/sub@3,40
+--track ne:fp8 --track ne:o4 --track ne:oqk4 --track ne:oqks4
+--track-ref nvfp4_rtn@3 --track-ref nvfp4_rtn@40 --track-ref nvfp4_rtn@3,40 --track-ref ne:fp8
+```
+
+- **Comparisons.** Every track against the master. Every expert track also against `nvfp4_rtn` at the same
+  layers: the `/sub` tracks against `nvfp4_rtn@3,40`, which they equal outside the six experts. The `ne:` tracks
+  also against `ne:fp8`.
+- **The six-expert tracks run at layers 3 and 40 together only** (agreed). They need the trellis repack of layer
+  40 to finish first.
+- **Cost.** About 1,140 track-layers after sharing (5 distinct states in layers 0–2, 13 in layers 3–39, 18
+  from layer 40). That is ~11 h at 6 threads beside nothing else (~35 s a track-layer, measured in the killed
+  run).
+- **Fallback.** If the resume ever fails, three ~4 h passes give the same table: the expert tracks at 3 and
+  3,40; at 40; and the `ne:` tracks.
+
+### 10.8 How to resume (after the 2026-10-14 pause)
+
+All on rank 2. Every command is pinned to cores 10–19, nice 19, from `~/glm53-ref/code`, with
+`OMP_NUM_THREADS` equal to `--threads`. **A CPU pass may hold at most 3 GB RSS while GPU jobs on real weights are
+possible.** When a fill holds cores 10–19, use ≤ 4 threads. Anything bigger needs an exclusive window.
+
+1. **Finish the repack.** Rerun `~/glm53-ref/qprep.sh` (2 threads). It skips every tensor already in
+   `~/glm53-ref/qcache` and appends to `provenance.jsonl`. Left to do: layer 3 trellis K3 expert 255 (3
+   tensors), and layer 40 trellis K4 and K3 (36 tensors), ~1.5 h. ~0.5 GB RSS.
+2. **The resume test.** Run a 7-track smoke on `short` with `--layers 3` and then `--layers 5` in one out dir,
+   and compare `tracks.json` and `kl_*.npy` byte for byte with a straight `--layers 5`.
+3. **The covariance pass** (exclusive window, ~6 GiB, ~2.5 h). Rerun `~/glm53-ref/covpass.sh`. It resumes at
+   layer 3 from `golden/cov-pass/state/`, and after a kill it reruns itself up to 8 times. It writes to
+   `~/glm53-ref/cov/`. Then:
+   `rsync -a --bwlimit=600000 ~/glm53-ref/cov/ rank0:/data/scratch/glm53-quant/cov/`, check the sizes, and
+   delete the rank-2 copy.
+4. **The merged tracks pass** (§ 10.7, ≤ 3 GB, resumable):
+   `glmref.py --threads 6 --ckpt ~/hf/glm53-nvfp4 --out-dir ~/glm53-ref/golden/tracks18 <the § 10.7 flags>
+   --tokens tokens/short.tokens.json tokens/python.tokens.json`, in a retry loop like `covpass.sh`'s. It
+   resumes from `golden/tracks18/state/tracks/current.json`.
