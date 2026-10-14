@@ -310,12 +310,15 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     gemv(xn_, kDim, R, kDim, &s, 1, GemvOut::kF32, 4, st, P);
     if ((flags & kFlagDump) && l == kMtpLayer) dump_rows(sink, l, "router", pos, R, gl, (size_t)gx::kE * 4);
     // the BF16 shared expert through the GEMV (experts.md § 8.3): gate/up interleaved with the SwiGLU epilogue
-    // (h = bf16(bf16(silu(g)) * u)) at split-K 4, then down to f32 partials in ys, which the routed step forwards
-    // (posted) or the all-reduce takes beside yr: y = bf16(bf16(sum routed) + bf16(sum shared)) as before
+    // (h = bf16(bf16(silu(g)) * u)) at split-K 4, then down to f32 partials in ys. Decision 8 (the default): k_down
+    // adds ys into yr's f32 sum after the routed experts and one all-reduce takes yr (posted or not), rounded once.
+    // kTuneMoeBf16Combine (the old order, output-changing): ys the all-reduce's second partial (forwarded when
+    // posted), y = bf16(bf16(sum routed) + bf16(sum shared))
     float* ys = yr + (size_t)R * kDim;
+    const bool c8 = !tune(kTuneMoeBf16Combine);
     // kTuneShFused: the same two GEMVs' work inside the routed kernels (gx::SharedW::bgu, bd: their K split, MMA
     // order and epilogues, so the same h and ys bits), its gate/up tasks ahead of the routed ones in k_up and its down
-    // in k_down, which writes ys (posted or not); ys stays the all-reduce's second partial
+    // in k_down, which computes ys (into yr's sum, or as the second partial)
     gx::LayerW moe = w.moe;
     if (tune(kTuneShFused) && w.sh_gate_up.fmt == WFmt::kBF16T && w.sh_down.fmt == WFmt::kBF16T) {
       moe.sh.bgu = static_cast<const uint8_t*>(w.sh_gate_up.w);
@@ -331,6 +334,7 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     dc.pdl = P;
     dc.up = opt.moe_up;
     dc.xpf = tune(kTuneUpXpf);
+    dc.ysum = c8;
     if (tune(kTuneRoute)) dc.logits = gl, dc.bias = w.router_bias;
     else gx::route(gl, w.router_bias, R, ridx, rw, st, P);
     const bool post = tune(kTunePost);
@@ -338,8 +342,13 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     gx::moe_decode(moe, reinterpret_cast<const __nv_bfloat16*>(xn_), ridx, rw, R, moe_ws, yr, ys, st, dc);
     mark(kKMlp, l);
     l2pf(1, l + 1, R);
-    if (post) comm::glm::allreduce2_add_norm_posted(ch, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
-    else comm::glm::allreduce2_add_norm(ch, yr, ys, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
+    if (c8) {
+      if (post) comm::glm::allreduce_add_norm_posted(ch, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
+      else comm::glm::allreduce_add_norm(ch, yr, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
+    } else {
+      if (post) comm::glm::allreduce2_add_norm_posted(ch, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
+      else comm::glm::allreduce2_add_norm(ch, yr, ys, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
+    }
   }
   mark(kKAr2, l);
   if (flags & kFlagDump) dump_rows(sink, l, "hidden", pos, R, h_, kEmbRow);

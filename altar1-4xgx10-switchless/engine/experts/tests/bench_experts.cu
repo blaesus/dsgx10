@@ -420,16 +420,40 @@ static void bench_shfused(const std::string& fname, const std::string& rows_s) {
           size_t dh = 0, dys = 0, dyr = 0;
           for (size_t i = 0; i < ha.size(); ++i) dh += ha[i] != hb[i];
           for (size_t i = 0; i < n; ++i) dys += a[i] != b[i], dyr += c[i] != d[i];
+          // ysum (decision 8): yr = fl(the routed sum + ys), fused and unfused, against the plain f32 add on the host
+          // of the unfused step's yr and the GEMV's ys (b, d above)
+          std::vector<uint32_t> e(n), f(n), g(n);
+          for (size_t i = 0; i < n; ++i) {
+            float x, y;
+            std::memcpy(&x, &d[i], 4), std::memcpy(&y, &b[i], 4);
+            const float z = x + y;
+            std::memcpy(&e[i], &z, 4);
+          }
+          DecodeCfg cs = cf;
+          cs.ysum = true;
+          CUDA_CHECK(cudaMemset(yr, 0xFF, n * 4));
+          CUDA_CHECK(cudaMemset(ys, 0xFF, n * 4));
+          dec(s, 0, true, cs, yr, ys);
+          CUDA_CHECK(cudaDeviceSynchronize());
+          CUDA_CHECK(cudaMemcpy(f.data(), yr, n * 4, cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemset(yr0, 0xFF, n * 4));
+          dec(s, 0, false, cs, yr0, ys0);  // ys0: the GEMV's output from above
+          CUDA_CHECK(cudaDeviceSynchronize());
+          CUDA_CHECK(cudaMemcpy(g.data(), yr0, n * 4, cudaMemcpyDeviceToHost));
+          size_t dsf = 0, dsu = 0;
+          for (size_t i = 0; i < n; ++i) dsf += f[i] != e[i], dsu += g[i] != e[i];
           ++cases;
-          if (dh || dys || dyr) {
+          if (dh || dys || dyr || dsf || dsu) {
             ++bad;
-            result("SHFUSED\t%s\trows %d\tstep %d\tup %s\tdown %s\tFAIL: h %zu, ys %zu, yr %zu of %zu differ", fname.c_str(), M, s,
-                   decode_up_name(u), decode_down_name(dv), dh, dys, dyr, n);
+            result("SHFUSED\t%s\trows %d\tstep %d\tup %s\tdown %s\tFAIL: h %zu, ys %zu, yr %zu, ysum fused %zu, ysum "
+                   "unfused %zu of %zu differ", fname.c_str(), M, s, decode_up_name(u), decode_down_name(dv), dh, dys, dyr,
+                   dsf, dsu, n);
           }
         }
     g_fail += bad;
-    result("SHFUSED\t%s\trows %d\tbits\t%s: fused h, ys and yr = the GEMVs' and the unfused step's in %d of %d cases (every up "
-           "and down variant, two shared copies)", fname.c_str(), M, bad ? "FAIL" : "PASS", cases - bad, cases);
+    result("SHFUSED\t%s\trows %d\tbits\t%s: fused h, ys and yr = the GEMVs' and the unfused step's, and ysum's yr (fused "
+           "and unfused) = the plain f32 add of the GEMV's ys into the unfused yr, in %d of %d cases (every up and down "
+           "variant, two shared copies)", fname.c_str(), M, bad ? "FAIL" : "PASS", cases - bad, cases);
     // (2) time, default variants, A B B A
     const DecodeCfg cf;
     auto tA = [&] { return time_graph(NS, [&](int s, cudaStream_t st) { rt(s, st); gemvs(s, st, ys); dec(s, st, false, cf, yr, ys); }); };

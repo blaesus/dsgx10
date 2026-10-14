@@ -48,6 +48,7 @@ struct Params {
   float* ys;         // fused shared: written; else read (forwarded when posting)
   int* ctr;          // k_up's task queue (null: static order); zero between launches
   bool post;         // k_down: yr, ys into ch's send buffer, posted (DecodeCfg::post)
+  bool ysum;         // k_down: yr += ys in f32 after the routed experts, yr alone the output (DecodeCfg::ysum)
   comm::DevChannel ch;
 };
 
@@ -456,7 +457,7 @@ __global__ void __launch_bounds__(128) k_down(Params a) {
   if (a.post) {
     seq = comm::next_seq(a.ch);
     yr = reinterpret_cast<float*>(comm::send_buf(a.ch, seq));
-    ys = yr + (size_t)M * kH;
+    if (!a.ysum) ys = yr + (size_t)M * kH;  // ysum: a fused shared expert's ys stays in a.ys (read back below)
   }
   if (a.sh) {
     const __nv_bfloat16* h0 = a.h + ((size_t)kShSlot * M + r0) * kI + 16 * t;
@@ -513,7 +514,7 @@ __global__ void __launch_bounds__(128) k_down(Params a) {
       if (g < M) *reinterpret_cast<float2*>(ys + (size_t)g * kH + ch) = make_float2(acc[0], acc[1]);
       if (R16 && g + 8 < M) *reinterpret_cast<float2*>(ys + (size_t)(g + 8) * kH + ch) = make_float2(acc[2], acc[3]);
     }
-  } else if (a.post) {  // the shared expert ran outside (its f32 output in a.ys): forward the warp's columns
+  } else if (a.post && !a.ysum) {  // the shared expert ran outside (its f32 output in a.ys): forward the warp's columns
 #pragma unroll
     for (int i = 0; i < NT; ++i) {
       const int ch = 8 * (s0 + i) + 2 * t;
@@ -563,13 +564,28 @@ __global__ void __launch_bounds__(128) k_down(Params a) {
       }
     }
   }
+  // ysum (glm53 decision 8): the shared expert's partial joins the routed experts' f32 sum after them, one add
+  // a value, yr = fl(sum routed + ys); ys is this thread's own write above (fused) or the shared GEMV's output
+  if (a.ysum)
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+      const int ch = 8 * (s0 + i) + 2 * t;
+      if (g < M) {
+        const float2 v = *reinterpret_cast<const float2*>(a.ys + (size_t)g * kH + ch);
+        acc[i][0] = __fadd_rn(acc[i][0], v.x), acc[i][1] = __fadd_rn(acc[i][1], v.y);
+      }
+      if (R16 && g + 8 < M) {
+        const float2 v = *reinterpret_cast<const float2*>(a.ys + (size_t)(g + 8) * kH + ch);
+        acc[i][2] = __fadd_rn(acc[i][2], v.x), acc[i][3] = __fadd_rn(acc[i][3], v.y);
+      }
+    }
 #pragma unroll
   for (int i = 0; i < NT; ++i) {
     const int ch = 8 * (s0 + i) + 2 * t;
     if (g < M) *reinterpret_cast<float2*>(yr + (size_t)g * kH + ch) = make_float2(acc[i][0], acc[i][1]);
     if (R16 && g + 8 < M) *reinterpret_cast<float2*>(yr + (size_t)(g + 8) * kH + ch) = make_float2(acc[i][2], acc[i][3]);
   }
-  if (a.post) comm::post_grid(a.ch, seq, (uint32_t)((size_t)2 * M * kH * 4));
+  if (a.post) comm::post_grid(a.ch, seq, (uint32_t)((size_t)(a.ysum ? 1 : 2) * M * kH * 4));
 }
 
 __global__ void k_finalize(const float* __restrict__ R, const float* __restrict__ S, int n, __nv_bfloat16* __restrict__ out) {
@@ -694,13 +710,14 @@ void moe_decode(const LayerW& L, const __nv_bfloat16* x, const int* idx, const f
   if (M < 1 || M > kMaxRows) die("moe_decode: M=%d", M);
   if (!cfg.logits != !cfg.bias || (!cfg.logits && (!idx || !w))) die("moe_decode: idx and w, or logits and bias");
   Params p{x, L.sh.fused(), M, idx, w, cfg.logits, cfg.bias, L, reinterpret_cast<__nv_bfloat16*>(ws), yr, ys,
-           cfg.dyn ? reinterpret_cast<int*>(static_cast<uint8_t*>(ws) + kWsH) : nullptr, cfg.post != nullptr, {}};
+           cfg.dyn ? reinterpret_cast<int*>(static_cast<uint8_t*>(ws) + kWsH) : nullptr, cfg.post != nullptr, cfg.ysum, {}};
+  if (cfg.ysum && (cfg.parts & 2) && !ys) die("moe_decode: ysum needs ys (the shared expert's output, or its scratch)");
   if (L.sh.fused() && L.sh.bf16()) die("moe_decode: an FP8 and a BF16 shared expert");
   if (L.sh.bf16() && (!L.sh.bd || (!cfg.post && (cfg.parts & 2) && !ys)))
     die("moe_decode: the BF16 shared expert needs its down and ys");
   if (cfg.post) {
     p.ch = *cfg.post;
-    if ((size_t)2 * M * kH * 4 > p.ch.cap) die("moe_decode: %d rows' two partials exceed the channel (%u B)", M, p.ch.cap);
+    if ((size_t)(cfg.ysum ? 1 : 2) * M * kH * 4 > p.ch.cap) die("moe_decode: %d rows' two partials exceed the channel (%u B)", M, p.ch.cap);
     if (!(cfg.parts & 2)) die("moe_decode: posted outputs need the down kernel");
   }
   if (!L.sh.fused() && !L.sh.bf16() && (cfg.parts & 2) && cfg.post && !ys) die("moe_decode: posting without a fused shared expert needs its output in ys");
