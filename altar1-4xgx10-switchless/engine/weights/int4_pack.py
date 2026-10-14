@@ -204,6 +204,29 @@ def expert_descs(slices, entry_off):
     return b"".join(out)
 
 
+def untile(packed, fmt, N, K):
+    """The inverse of pack, vectorised: INT4 -> (wp uint8 [N][K/2], s uint16 [N][K/32], zp uint32 [N/8][K/32]) with
+    the zero-point words rebuilt (row 8 r + i at bits 4 i); BF16 -> w uint16 [N][K]. The verifier's un-tiling."""
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    if fmt == FMT_INT4:
+        B, N8 = K // 512, N // 8
+        b = packed.reshape(N8, B, 2368)
+        wp = b[:, :, :2048].reshape(N8, B, 4, 8, 4, 2, 8).transpose(0, 3, 1, 2, 5, 4, 6).reshape(N, K // 2)
+        s = b[:, :, 2048:2304].copy().view("<u2").reshape(N8, B, 8, 2, 8).transpose(0, 2, 1, 4, 3).reshape(N, K // GROUP)
+        zb = b[:, :, 2304:].reshape(N8, B, 8, 2, 4)
+        z = np.stack([zb & 15, zb >> 4], axis=-1).reshape(N8, B, 8, 2, 8)  # [N8, B, g, h, j]
+        z = z.transpose(0, 2, 1, 4, 3).reshape(N8, 8, K // GROUP).astype(np.uint32)  # [N8, g, c]
+        zp = np.zeros((N8, K // GROUP), np.uint32)
+        for g in range(8):
+            zp |= z[:, g] << np.uint32(4 * g)
+        return np.ascontiguousarray(wp), np.ascontiguousarray(s.astype(np.uint16)), zp
+    if fmt == FMT_BF16:
+        B, N8 = K // 128, N // 8
+        x = packed.view("<u2").reshape(N8, B, 2, 2, 8, 4, 8)  # n8, b, q, half, g, t, i
+        return np.ascontiguousarray(x.transpose(0, 4, 1, 2, 5, 3, 6).reshape(N, K).astype(np.uint16))
+    raise ValueError(f"untile: format {fmt}")
+
+
 # ---- independent readers (per element, a port of layout.h read_i4 / read_b16) ---------------------------------------
 
 def read_packed(packed, fmt, K, n, k):
@@ -260,6 +283,12 @@ def selftest():
                 bad += int(np.count_nonzero(vs != want))  # a slice's values are the full tensor's
                 pk = entry[moff[m]:moff[m] + mat_bytes(fmt, sl[m]["N"], sl[m]["K"])]
                 N, K = sl[m]["N"], sl[m]["K"]
+                u = untile(pk, fmt, N, K)  # lossless: the inverse gives the canonical slice back
+                if fmt == FMT_INT4:
+                    bad += int(np.count_nonzero(u[0] != sl[m]["wp"]) + np.count_nonzero(u[1] != sl[m]["s"]) +
+                               np.count_nonzero(u[2] != sl[m]["zp"]))
+                else:
+                    bad += int(np.count_nonzero(u != sl[m]["w"]))
                 pts = [(0, 0), (N - 1, K - 1), (7, 31), (8, 32), (N // 2 + 3, K // 2 + 17)] + \
                       [(int(rng.integers(N)), int(rng.integers(K))) for _ in range(3000)]
                 for n, k in pts:
@@ -292,9 +321,9 @@ ST_DT = {"I32": np.int32, "BF16": np.uint16, "I64": np.int64, "F32": np.float32}
 class Shards:
     """The checkpoint's tensors by name through model.safetensors.index.json, read with pread (no mmap)."""
 
-    def __init__(self, d):
+    def __init__(self, d, index=None):
         self.d = d
-        with open(os.path.join(d, "model.safetensors.index.json")) as f:
+        with open(index or os.path.join(d, "model.safetensors.index.json")) as f:
             self.where = json.load(f)["weight_map"]
         self.hdr = {}
 
@@ -349,7 +378,7 @@ def write_matrix(out, prefix, sl):
 
 
 def dump(args):
-    S = Shards(args.ckpt)
+    S = Shards(args.ckpt, args.index)
     os.makedirs(args.out, exist_ok=True)
     lines = []
     for e in [int(x) for x in args.experts.split(",")]:
@@ -383,6 +412,7 @@ def main():
     sub.add_parser("selftest")
     d = sub.add_parser("dump")
     d.add_argument("--ckpt", required=True)
+    d.add_argument("--index", help="model.safetensors.index.json (default: in --ckpt)")
     d.add_argument("--layer", type=int, required=True)
     d.add_argument("--experts", default="0")
     d.add_argument("--rank", type=int, default=0)
