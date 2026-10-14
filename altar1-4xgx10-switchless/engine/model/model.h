@@ -165,6 +165,10 @@ struct Options {
   int moe_up = 0;
   int attn_splits = 0;   // sparse attention's split-K at decode (0: 16 up to 2 rows, 8 above)
   size_t index_scratch = 512ull << 20;  // the prefill indexer's score scratch, bytes
+  // diagnostics (docs/engine.md § 11): prefill writes layer dump_ops_layer's intermediate tensors, every rank its own,
+  // as raw files dump_ops_dir/r<rank>.<name>.bin (one chunk of one piece only; reads, never changes, a value)
+  int dump_ops_layer = -1;
+  std::string dump_ops_dir;
 };
 
 // Synthetic weights (no file): every tensor in altar-1's formats and the kernels' layouts (per layer as a rank file

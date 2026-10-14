@@ -14,6 +14,7 @@
 // computes (prefill_chunk below); the same bits.
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <vector>
 
@@ -223,6 +224,25 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
     if (ov) after(st, rec(cs));
   };
 
+  // --dump-ops (docs/engine.md § 11): layer opt.dump_ops_layer's intermediates, every rank its own raw files; the
+  // stream synchronised before each copy, nothing else changes
+  int dump_l = opt.dump_ops_layer;
+  if (dump_l >= 0 && (opt.dump_ops_dir.empty() || P != 1 || a != 0)) {
+    std::fprintf(stderr, "rank %d: --dump-ops needs a directory, one piece and one chunk from position 0: skipped\n", rank);
+    dump_l = -1;
+  }
+  if (dump_l >= 0) std::filesystem::create_directories(opt.dump_ops_dir);
+  auto DO = [&](int l, const char* name, const void* dev, size_t bytes) {
+    if (l != dump_l) return;
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    std::vector<uint8_t> hb(bytes);
+    CUDA_CHECK(cudaMemcpy(hb.data(), dev, bytes, cudaMemcpyDeviceToHost));
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/r%d.%s.bin", opt.dump_ops_dir.c_str(), rank, name);
+    FILE* f = std::fopen(path, "wb");
+    if (!f || std::fwrite(hb.data(), 1, bytes, f) != bytes) die("dump-ops: cannot write %s", path);
+    std::fclose(f);
+  };
   const bool G = tune(kTunePfGemm);
   // a projection over a piece's rows: one GEMM (INT4 through p.wscratch, the stream's order keeping its uses apart)
   auto PJ = [&](const uint16_t* x, int ldx, int m, int K, const GemvSeg* s, int n, GemvOut o, int sk) {
@@ -239,23 +259,29 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
       uint16_t* xg = p.xg + (size_t)r0 * kRanks * xr;
       float* iw = p.iw + (size_t)r0 * kIdxHeads;
       uint16_t* iq = p.iq + (size_t)r0 * kIdxHeads * kIdxDim;
+      DO(l, "h_in", p.h, (size_t)M * kEmbRow);
+      DO(l, "xn_in", p.xn, (size_t)M * kEmbRow);
       {
         const GemvSeg s = w.xproj.seg(xg + (size_t)rank * xr, kRanks * xr);
         PJ(p.xn + (size_t)r0 * kDim, kDim, m, kDim, &s, 1, GemvOut::kBF16, 4);
       }
       if (full) index_weights(p.xn + (size_t)r0 * kDim, m, w.wproj, kIdxHeadsRank, iw + kIdxHeadsRank * rank, kIdxHeads, st);
       short_coll([&](cudaStream_t s) { comm::glm::allgather_xproj(ch, xg, iw, m, full, s); });
+      DO(l, "xg", xg, (size_t)M * kRanks * xr * 2);
       PrepArgs pa;
       pa.xg = xg, pa.xrows = xr, pa.pos = p.pos + r0, pa.slot = p.slot + r0, pa.rope = rope, pa.q_norm = w.q_norm;
       pa.kv_norm = w.kv_norm;
       if (full) pa.k_norm_w = w.k_norm_w, pa.k_norm_b = w.k_norm_b, pa.ik = ik_of(l);
       pa.qr = p.qr + (size_t)r0 * kQLora, pa.kv = kv_of(l);
       attn_prep(pa, m, st);
+      DO(l, "qr", p.qr, (size_t)M * kQLora * 2);
+      DO(l, "kv", kv_of(l).kv + (size_t)sl * kv_of(l).slot_stride * kLat, (size_t)M * kLat * 2);
       {
         const GemvSeg s[2] = {w.q_b.seg(p.q + (size_t)r0 * kOProjK, kOProjK),
                               w.iq_b.seg(iq + (size_t)rank * kIdxHeadsRank * kIdxDim, kIdxHeads * kIdxDim)};
         PJ(p.qr + (size_t)r0 * kQLora, kQLora, m, kQLora, s, full ? 2 : 1, GemvOut::kBF16, 1);
       }
+      DO(l, "q", p.q, (size_t)M * kOProjK * 2);
       if (full) short_coll([&](cudaStream_t s) { comm::glm::allgather_idxq(ch, iq, m, s); });
       flush();  // the piece before's sublayer end (the layer before's last piece's), behind this piece's short ones
       if (full) {
@@ -266,6 +292,7 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
                        p.slot + s0, n, rope, ik_of(l), 0, 0, IdxScratch{p.scores, idx_ld, p.work},
                        p.topk + (size_t)s0 * kTopK, nullptr, st);
         }
+        DO(l, "topk", p.topk, (size_t)M * kTopK * 4);  // rows at positions >= 2048 only are written
       }
       uint16_t* qlat = p.qlat + (size_t)r0 * kHeads * kKvLora;
       uint16_t* u = p.u + (size_t)r0 * kHeads * kKvLora;
@@ -274,20 +301,26 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
         s.group_rows = kKvLora, s.x_group = kQkDim;
         PJ(p.q + (size_t)r0 * kOProjK, kOProjK, m, kNope, &s, 1, GemvOut::kBF16, 1);
       }
+      DO(l, "qlat", qlat, (size_t)M * kHeads * kKvLora * 2);
       if (!tune(kTunePfAttn)) sparse_attn_config(0);
       sparse_attn(qlat, p.q + (size_t)r0 * kOProjK, p.pos + r0, p.slot + r0, rope, kv_of(l), p.topk + (size_t)r0 * kTopK,
                   m, 1, AttnScratch{}, u, st);
       sparse_attn_config(-1);
+      DO(l, "u", u, (size_t)M * kHeads * kKvLora * 2);
       {
         GemvSeg s = w.w_uv.seg(p.o + (size_t)r0 * kOProjK, kOProjK);
         s.group_rows = kVDim, s.x_group = kKvLora;
         PJ(u, kHeads * kKvLora, m, kKvLora, &s, 1, GemvOut::kBF16, 1);
+        DO(l, "o", p.o, (size_t)M * kOProjK * 2);
         const GemvSeg d = w.o_proj.seg(p.part + (size_t)r0 * kDim, kDim);
         PJ(p.o + (size_t)r0 * kOProjK, kOProjK, m, kOProjK, &d, 1, GemvOut::kF32, 1);
       }
+      DO(l, "attn_part", p.part, (size_t)M * kDim * 4);
       deferred.push_back(end_of(j, p.part, nullptr, w.ffn_norm));
     }
     flush();
+    DO(l, "h_attn", p.h, (size_t)M * kEmbRow);
+    DO(l, "xn_mlp", p.xn, (size_t)M * kEmbRow);
     for (int j = 0; j < P; ++j) {  // the MLP or the MoE
       const int r0 = pcs[j].r0, m = pcs[j].m;
       const uint16_t* x = p.xn + (size_t)r0 * kDim;
@@ -297,7 +330,9 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
         const GemvSeg s = w.gate_up.seg(p.hm + (size_t)r0 * kDenseInterRank, kDenseInterRank);
         PJ(x, kDim, m, kDim, &s, 1, GemvOut::kSwiGLU, 1);
         const GemvSeg d = w.down.seg(p.part + (size_t)r0 * kDim, kDim);
+        DO(l, "hm", p.hm, (size_t)M * kDenseInterRank * 2);
         PJ(p.hm + (size_t)r0 * kDenseInterRank, kDenseInterRank, m, kDenseInterRank, &d, 1, GemvOut::kF32, 1);
+        DO(l, "mlp_part", p.part, (size_t)M * kDim * 4);
         e = end_of(j, p.part, nullptr, next_norm);
       } else {
         float* gl = p.gl + (size_t)r0 * gx::kE;
@@ -328,6 +363,11 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
       }
       if (ov && j + 1 == P) deferred.push_back(e);  // behind the next layer's first short collectives
       else e();
+    }
+    if (l == dump_l) {
+      flush();
+      DO(l, "h_out", p.h, (size_t)M * kEmbRow);
+      DO(l, "xn_out", p.xn, (size_t)M * kEmbRow);
     }
     if (flags & kFlagDump) {
       flush();

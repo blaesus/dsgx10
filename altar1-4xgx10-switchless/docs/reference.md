@@ -80,9 +80,10 @@ bits 4i), s = `weight_scale` (BF16 [N, K/32]), viewed [N, K/32, 32]; and asserts
 
 | File | What |
 |---|---|
-| [`ref/glmref.py`](../ref/glmref.py) | the reference (§ 1–2) |
+| [`ref/glmref.py`](../ref/glmref.py) | the reference (§ 1–2); `--dump-ops DIR` writes one layer's intermediates of the first sequence, `--attn absorbed` computes the attention in the engine's absorbed form (a prototype, off by default; [engine.md § 11](engine.md#11-layer-0-against-the-contract-a9)) |
 | [`ref/passes.sh`](../ref/passes.sh) | the passes in order (`a1a-bf16`, `a1a-f32`, `all-f32`, `all`, `mtp-nvfp4`), each resumable and retried after a kill; a finished pass is skipped |
 | [`ref/check_int4.py`](../ref/check_int4.py) | `int4_dequant` against compressed-tensors' `PackedQuantizationCompressor.decompress` with the checkpoint's scheme, bit for bit, on named tensors or all experts of a layer |
+| [`ref/cmp_ops.py`](../ref/cmp_ops.py) | one layer op by op: the engine's `--dump-ops` against `glmref.py --dump-ops` (expanded and `--attn absorbed`), each op on the engine's own inputs, the attention's variants ([engine.md § 11](engine.md#11-layer-0-against-the-contract-a9)) |
 | [`ref/check_layer.py`](../ref/check_layer.py) | one real layer against transformers' GlmMoeDsa modules + compressed-tensors (§ 4.3) |
 | [`ref/check_router.py`](../ref/check_router.py) | DESIGN decision 10: the kept router rows and biases against the parent's (§ 4.4) |
 | [`ref/check_tokens.py`](../ref/check_tokens.py) | the token files re-rendered with altar-1's template (§ 4.1) |

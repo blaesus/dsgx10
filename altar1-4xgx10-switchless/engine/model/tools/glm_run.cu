@@ -1416,6 +1416,8 @@ int main(int argc, char** argv) {
     else if (a == "--kmax") A.kmax = std::stoi(nx());
     else if (a == "--block") A.block = std::stoi(nx());
     else if (a == "--tf-max") A.tf_max = std::stoi(nx());
+    else if (a == "--dump-ops") A.mo.dump_ops_dir = expand(nx());
+    else if (a == "--dump-ops-layer") A.mo.dump_ops_layer = std::stoi(nx());
     else if (a == "--index-scratch-mib") A.mo.index_scratch = (size_t)std::stoi(nx()) << 20;
     else if (a == "--min-free-mib") A.min_free_mib = std::stoi(nx());
     else if (a == "--spec-samp") A.spec_samp = std::stoi(nx());
