@@ -1,37 +1,41 @@
 #!/bin/bash
 # The server's tests on the ring, one job of a few minutes (docs/serving.md, "Tests"): the four ranks in serve mode
-# on the fleet's rank files with synthetic routed experts (WEIGHTS: more glm53_rank options, default --fill-experts;
-# "--synthetic" for no files), a pool small enough for the eviction test and a disk tier of its own (tag "test");
-# serve_test.py, batch_test.py, glmfront on 127.0.0.1:PORT (18894) in front of the engine and front_test.py; then
-# a planned stop (SIGTERM, kept sessions) and a start, and serve_test.py --kept; then the drafts' check (spec):
-# spec_test.py's requests recorded from a server started with --no-spec, then compared, bit for bit, on one with
-# --spec-force 3 --spec-oracle (every step verifies drafts; a second pass's drafts from the first pass's tokens)
-# and on one with the gate. The other phases run with drafts on (the
-# default). Through the DeepSeek engine's
-# ring.sh, from the repo root (a preempted run, exit 76, is run again):
-#   OWNER=glm53-server ds41f-4xgx10-switchless/engine/server/ring.sh glm53-4xgx10-switchless/engine/server/tests/ring_job.sh
-# BIN: the engine (~/dsgb10-data/glm53-server/bin/glm53_rank, install.sh); FRONT: glmfront (frontend/target/release);
-# OUT: results (~/dsgb10-data/glm53-server/results.tsv); PHASES: main batch front kept spec (all by default).
-# SERVER_DATA: another data tree than ~/dsgb10-data/glm53-server (BIN, OUT, the state and key files).
+# (WEIGHTS: the weights' altar1_rank options, default --synthetic: every weight synthetic in the real formats, A4's
+# pools; "" for the fleet's rank files, "--fill-experts" for rank files whose expert pools are not filled), a pool
+# small enough for the eviction test and a disk tier of its own (tag "test", on rank 0 too: --disk-rank0-gib 8 with
+# a free-space margin of 8 GiB); serve_test.py, batch_test.py, altarfront on 127.0.0.1:PORT (18895) in front of the
+# engine and front_test.py; then a planned stop (SIGTERM, kept sessions) and a start, and serve_test.py --kept; then
+# the drafts' check (spec): spec_test.py's requests recorded from a server started with --no-spec, then compared, bit
+# for bit, on servers with --spec-drafts k --spec-force k --spec-oracle for every k of SPEC_KS (1 2 3: every step
+# verifies k drafts; a second pass's drafts from the first pass's tokens) and on one with the gate (k up to 3). The
+# other phases run with drafts on (the default). Prefill in chunks of 2,048 rows with 128 MiB of index scratch (the
+# fleet's memory rule). Through the DeepSeek engine's ring.sh, from the repo root (a preempted run, exit 76, is run
+# again):
+#   OWNER=altar1-serve ds41f-4xgx10-switchless/engine/server/ring.sh altar1-4xgx10-switchless/engine/server/tests/ring_job.sh
+# BIN: the engine (~/dsgb10-data/altar1-serve/bin/altar1_rank, install.sh); FRONT: altarfront
+# (~/dsgb10-data/altar1-serve/bin/altarfront); OUT: results (~/dsgb10-data/altar1-serve/results.tsv); PHASES: main
+# batch front kept spec (all by default; two jobs keep each under ten minutes: "main batch front kept", then "spec").
+# SERVER_DATA: another data tree than ~/dsgb10-data/altar1-serve (BIN, OUT, the state and key files).
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 T=$HERE/tests
 . "$HERE/ranks.sh"
-DATA=${SERVER_DATA:-$HOME/dsgb10-data/glm53-server}
+DATA=${SERVER_DATA:-$HOME/dsgb10-data/altar1-serve}
 BIN=${BIN:-$DATA/bin/$NAME}
-FRONT=${FRONT:-$HERE/../../frontend/target/release/glmfront}
+FRONT=${FRONT:-$DATA/bin/altarfront}
 OUT=${OUT:-$DATA/results.tsv}
-PORT=${PORT:-18894}
+PORT=${PORT:-18895}
 PHASES=${PHASES:-main batch front kept spec}
-WEIGHTS=${WEIGHTS:---fill-experts}
-SOCK=/tmp/glm53-test.$$.sock
+SPEC_KS=${SPEC_KS:-1 2 3}
+WEIGHTS=${WEIGHTS---synthetic}
+SOCK=/tmp/altar1-test.$$.sock
 STATE=$DATA/serve_state.json
 KEY=$DATA/test-key
-BASE_ARGS="--mode serve $WEIGHTS --socket $SOCK --kv-gib 1.2 --disk-gib 8 --disk-tag test --keep-gib 4 --slots 4 --slice 16 ${EXTRA:-}"
+BASE_ARGS="--mode serve $WEIGHTS --socket $SOCK --kv-gib 1.2 --disk-gib 8 --disk-rank0-gib 8 --disk-margin-gib 8 --disk-tag test --keep-gib 4 --slots 4 --slice 16 --chunk 2048 --index-scratch-mib 128 ${EXTRA:-}"
 ARGS=$BASE_ARGS
 mkdir -p "$DATA"
 [ -s "$KEY" ] || (umask 077 && head -c 24 /dev/urandom | base64 > "$KEY")
-SRC=$(cat "$DATA/bin/SOURCES" 2> /dev/null)
+SRC=$(cat "$(dirname "$BIN")/SOURCES" 2> /dev/null)
 echo "RUN	$(date '+%F %T %z')	$SRC	$ARGS" >> "$OUT"
 R0= FE=
 cleanup() {
@@ -105,13 +109,15 @@ for p in $PHASES; do
       start || { cleanup; exit 1; }
       grep -E "^drafts" "$LRD/logs/$NAME.0.log" | tail -n 1
       step spec_record python3 "$T/spec_test.py" --socket "$SOCK" --record "$DATA/spec_ref.json"
-      stop
-      ARGS="$BASE_ARGS --spec-force 3 --spec-oracle"
-      start || { cleanup; exit 1; }
-      grep -E "^drafts" "$LRD/logs/$NAME.0.log" | tail -n 1
-      step spec_forced python3 "$T/spec_test.py" --socket "$SOCK" --compare "$DATA/spec_ref.json" --repeat 2 \
-        --save "$DATA/spec_forced.json"
-      grep -E "^serve: req .*drafts" "$LRD/logs/$NAME.0.log" | tail -n 8
+      for k in $SPEC_KS; do
+        stop
+        ARGS="$BASE_ARGS --spec-drafts $k --spec-force $k --spec-oracle"
+        start || { cleanup; exit 1; }
+        grep -E "^drafts" "$LRD/logs/$NAME.0.log" | tail -n 1
+        step spec_forced_k$k python3 "$T/spec_test.py" --socket "$SOCK" --compare "$DATA/spec_ref.json" --repeat 2 \
+          --save "$DATA/spec_forced_k$k.json"
+        grep -E "^serve: (req .*drafts|run of)" "$LRD/logs/$NAME.0.log" | tail -n 8
+      done
       stop
       ARGS=$BASE_ARGS
       start || { cleanup; exit 1; }

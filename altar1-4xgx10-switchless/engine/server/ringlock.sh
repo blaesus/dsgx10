@@ -2,7 +2,7 @@
 # ringlock.sh (its docs/engine.md, "Borrowing the ring") on the same lock, the fleet's RING_LOCK, which the DeepSeek
 # service, its jobs, this configuration's service and its jobs all take: one ring, one lock. What differs: the
 # fleet file is this configuration's (the same boxes, its own directories), and a preempted job's ranks are
-# stopped by both engines' names (dsgb10_rank, glm53_rank).
+# stopped by every engine's name (dsgb10_rank, glm53_rank, altar1_rank).
 # Every job on the ring holds rank 0's ring lock (the fleet file's RING_LOCK; RING_LOCK in the
 # environment: a test's own); ring.owner says whose it is. The service holds it while
 # it serves and lends it to a job that waits for it, once no request has come for a while. A job that
@@ -121,7 +121,7 @@ ring_want_drop() {
 # Preemption: a job on a lent ring is stopped as soon as requests wait for the service (its supervisor
 # holds ring.reclaim): TERM to the job's process group, its ranks stopped on every box, KILL after
 # PREEMPT_GRACE s (10), and the job exits 76, to be run again later. PREEMPT=0: it runs to its end.
-RING_RANKS='^(dsgb10_rank|glm53_rank)$'  # both engines' ranks
+RING_RANKS='^(dsgb10_rank|glm53_rank|altar1_rank)$'  # every engine's ranks on this ring
 ring_reap() {  # shell text: wait up to $1 s for the ranks to exit by themselves, then pkill, 10 s more, then kill -9
   echo "for i in \$(seq $((2 * $1))); do pgrep '$RING_RANKS' > /dev/null || exit 0; sleep 0.5; done; pkill '$RING_RANKS'; for i in \$(seq 20); do pgrep '$RING_RANKS' > /dev/null || exit 0; sleep 0.5; done; pkill -9 '$RING_RANKS'"
 }

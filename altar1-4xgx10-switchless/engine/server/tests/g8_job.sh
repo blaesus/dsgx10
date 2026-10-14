@@ -1,20 +1,20 @@
 #!/bin/bash
 # G8 (docs/engine.md, "End to end on real weights"): the four ranks in serve mode on the fleet's rank files with
-# every routed expert filled, glmfront on 127.0.0.1:PORT (18894) in front, and g8_front.py's requests (the four
+# every routed expert filled, altarfront on 127.0.0.1:PORT (18895) in front, and g8_front.py's requests (the four
 # golden conversations, greedy and seeded, up to MAX new tokens; then two sessions at once). One server
 # configuration a job (each start loads 101.4 GiB a rank, ~70 s):
-#   OWNER=glm53-g8 ds41f-4xgx10-switchless/engine/server/ring.sh glm53-4xgx10-switchless/engine/server/tests/g8_job.sh CFG
+#   OWNER=altar1-g8 ds41f-4xgx10-switchless/engine/server/ring.sh altar1-4xgx10-switchless/engine/server/tests/g8_job.sh CFG
 # CFG: plain (--no-spec), k1, k2, k3 (--spec-force K: K drafts every step), gate (the default: drafts by the gate).
 # Memory: the pool capped at KVGIB (2) with margins of 1 GiB, prefill chunks of CHUNK (2048) rows, no disk tier.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 T=$HERE/tests
 . "$HERE/ranks.sh"
-D=$HOME/dsgb10-data/glm53-g8
+D=$HOME/dsgb10-data/altar1-g8
 BIN=${BIN:-$D/server/bin/$NAME}
-FRONT=${FRONT:-$HERE/../../frontend/target/release/glmfront}
+FRONT=${FRONT:-$HERE/../../frontend/target/release/altarfront}
 REF=$HERE/../../ref/tokens
-PORT=${PORT:-18894}
+PORT=${PORT:-18895}
 CFG=${1:?plain, k1, k2, k3 or gate}
 case $CFG in
   plain) SPEC="--no-spec" ;;
@@ -23,14 +23,14 @@ case $CFG in
   *) echo "unknown configuration $CFG"; exit 2 ;;
 esac
 STAMP=$(date +%H%M%S)
-SOCK=/tmp/glm53-g8.$$.sock
+SOCK=/tmp/altar1-g8.$$.sock
 KEY=$D/front-key
 DUMP=$D/front/$CFG.$STAMP
 OUTJ=$D/front/$CFG.$STAMP.json
 ARGS="--mode serve --socket $SOCK --max-ctx ${MAXCTX:-8192} --chunk ${CHUNK:-2048} --kv-gib ${KVGIB:-2} --margin-gib ${MARGIN:-0.25}
   --worker-margin-gib 1 --disk-gib 0 --slots 4 --index-scratch-mib 128 $SPEC ${EXTRA:-}"
 export TIMEOUT=${TIMEOUT:-600}
-[ -x "$FRONT" ] || { echo "no glmfront at $FRONT (FRONT=...: a worktree has no frontend build)"; exit 2; }
+[ -x "$FRONT" ] || { echo "no altarfront at $FRONT (FRONT=...: a worktree has no frontend build)"; exit 2; }
 mkdir -p "$DUMP"
 [ -s "$KEY" ] || (umask 077 && head -c 24 /dev/urandom | base64 > "$KEY")
 echo "g8 $CFG $(date '+%F %T %z') $(cat "$D/server/bin/SOURCES" 2> /dev/null) args: $ARGS"
@@ -72,7 +72,7 @@ rc=$?
 kill "$FE"
 wait "$FE" 2> /dev/null
 FE=
-echo "--- glmfront"
+echo "--- altarfront"
 grep -E "^req " "$D/front/$CFG.$STAMP.front.log" | tail -n 20
 kill -TERM "$R0"
 for ((i = 0; i < 120; i++)); do kill -0 "$R0" 2> /dev/null || break; sleep 0.5; done

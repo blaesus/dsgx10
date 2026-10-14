@@ -35,7 +35,7 @@ def main():
     e = Engine(a.socket)
     print('engine: %s, version %d, context %d, vocab %d, eos %d, sessions %d' % (e.name, e.version, e.max_ctx, e.vocab,
                                                                                  e.eos, e.max_sess), flush=True)
-    check(e.version == 2 and e.vocab == VOCAB and e.eos in STOP_IDS and e.name == 'glm-5.3', 'HELLO: version 2, vocab 154856, eos a stop id, glm-5.3')
+    check(e.version == 2 and e.vocab == VOCAB and e.eos in STOP_IDS and e.name == 'altar-1', 'HELLO: version 2, vocab 154856, eos a stop id, altar-1')
     A = 0xA000
     if a.kept:
         st = json.load(open(a.state))

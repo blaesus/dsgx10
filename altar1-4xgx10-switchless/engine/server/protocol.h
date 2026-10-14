@@ -9,7 +9,7 @@
 namespace fe {
 
 constexpr uint32_t kVersion = 2;
-constexpr const char* kDefaultSocket = "/tmp/dsgb10-glm53-engine.sock";
+constexpr const char* kDefaultSocket = "/tmp/dsgb10-altar1-engine.sock";
 
 enum MsgType : uint16_t {
   // front-end -> rank 0
