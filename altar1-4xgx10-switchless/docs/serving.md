@@ -60,7 +60,12 @@ The rank files are 76.6 GiB a rank (82,411,745,280 B on disk), against glm53's 1
   stop when one has less than `--min-free-gib` (8) plus one page**: the pool could not then be had without going under
   the fleet's 8 GiB.
 - **Margins 8 GiB on every rank** (glm53: 4 on rank 0, 2 on the workers; the margin is at least `--min-free-gib`): the
-  pool is min over ranks of (min(free device, MemAvailable) − 8 GiB), capped by `--kv-gib`. Rank 0 logs the free device
+  pool is min over ranks of min(free device − `--device-margin-gib` (1), MemAvailable − 8 GiB), capped by `--kv-gib`.
+  Free device memory binds, not MemAvailable: see "the page cache" below.
+- **The rank file's page cache is dropped before the load** (`posix_fadvise(DONTNEED)`; the loader reads with
+  O_DIRECT, so a copy or an earlier `cat` left up to 24 GiB of it cached on ranks 1 and 2), and **before the pool every
+  rank touches anonymous memory** up to what the pool wants, staying above the 8 GiB margin, and lets it go
+  (`--no-reclaim`: not), so the kernel reclaims other files' page cache that CUDA will not take. Rank 0 logs the free device
   memory and MemAvailable **after** the pool too, and whether a session of `--max-ctx` positions fits.
 - **Every launcher with `oom_score_adj` 1000**: `ranks.sh` (run4.sh, the tests), `g8_job.sh`, and now the service's
   ranks (glm53's service left them at the supervisor's 0); the supervisor and the front-end keep 0.
@@ -76,12 +81,32 @@ scratch 128 MiB; free device / MemAvailable, GiB):
 | 12:11 main, after weights and buffers | 56.05 / 88.32 | 89.73 / 92.26 | 70.58 / 88.31 | 54.97 / 88.43 |
 | 12:11 main, after a 1.2 GiB pool | 54.69 / 87.13 | 88.54 / 91.06 | 69.42 / 87.16 | 53.69 / 87.31 |
 
-**The pool with the real files, estimated**: the real files bind 54.5 GiB more than these synthetic weights, so
-MemAvailable after the load would be ~33.8 / 37.8 / 33.8 / 33.9 GiB at these settings, a pool of ~25.8 GiB
-(the smallest rank less 8): **273 pages, one 256k session (256 pages) fits**, with ~1.6 GiB to spare. Rank 2's
-reference pass (7.1 GB RSS at 12:28) is already inside its figure; anything more there and the session no longer fits
-(the pool then caps the context: HELLO's `max_context` is the pool's positions). The real figure is § 6's real-file
-job.
+**With the real files** (main job 15:40, commit af3d5d4; free device / MemAvailable after the weights and the
+buffers, GiB):
+
+| Job (2026-10-14) | rank 0 | rank 1 | rank 2 | rank 3 |
+|---|---|---|---|---|
+| 15:40 main, after weights and buffers | 2.02 / 33.44 | 34.02 / 36.97 | 23.03 / 33.21 | 35.21 / 36.82 |
+
+MemAvailable is as estimated from the synthetic run (33–37 GiB; less 8: a 25 GiB pool, a 256k session's 23.59 GiB
+fits), but **free device memory on rank 0 is 1.2–7.4 GiB** across the day's jobs (1.24 at 14:35, 7.38 at 16:34) and
+rank 2's 16–26: CUDA on GB10 allocates free pages only and does not reclaim the page cache, and rank 0's cache holds
+the DeepSeek service's Engram shards (two files of 23.60 GiB, read at each of its starts), rank 2's the CPU
+reference's files. **The page cache, measured three ways:**
+
+1. **A pool sized from MemAvailable** (d3bc4e5, 13:33): rank 0 offered 25.7 GiB with 6.3 GiB free; the pool's
+   allocation failed in the driver (`NV_ERR_NO_MEMORY`), rank 0 hung, and the kernel's OOM killer took `altar1_rank`
+   at 13:38:39 (its `oom_score_adj` 1000), at the moment the whole session on rank 0 was interrupted (§ 8). Reverted:
+   the pool takes the smaller of free device and MemAvailable (694c448).
+2. **Touching only the shortfall** (14ebc35: anonymous memory for want − free): 0.50 GiB at 15:24 and 0.25 at 15:40
+   reclaimed nothing; free device fell by what was touched (2.54 → 2.04, 2.00 → 1.74 GiB): the kernel hands out its
+   free pages first and reclaims the cache only below its watermarks.
+3. **Touching all the pool wants** (742c581): 9.00 GiB at 16:42 (g8 job, `--kv-gib 8`) took rank 0 from 3.62 to
+   10.39 GiB free; the pool got its 86 pages (7.93 GiB), the tokens the same as plain decode's (`g8_front.py
+   compare`). The service's uncapped pool: § 7.
+
+The tests keep their own `--kv-gib` caps (1.2 GiB in `ring_job.sh`, 2 in `g8_job.sh`); with rank 0's free device
+low they got less (8 pages at 15:40, 4 at 15:45, 11 at 15:24), which § 8's k = 2 failures came from.
 
 ## 4. The disk tier and kept sessions
 
@@ -111,13 +136,55 @@ split-K 16, the spec jobs of 12:16 and 12:25 (server sources 2d4c15173bd3e49c, c
 | k 2 forced | 23 | 78.60 (76.29–81.51) | 1.40 | 17.8 |
 | k 3 forced | 23 | 91.47 (85.80–95.37) | 1.46 | 15.9 |
 
-Fit: **c(k) = 52.40 + 13.04 k ms** (residuals ≤ 0.12 ms); the default `--spec-cost` is now **52.4,13.0** (glm53:
+Fit: **c(k) = 52.40 + 13.04 k ms** (residuals ≤ 0.12 ms), the default until the real fit below (glm53:
 44.5,15.5, GPU time of glm_run's verify steps). These are server wall times a step, host synchronisation of the
 one-step-at-a-time verify loop included (the plain loop queues a step ahead: 47.45 ms against glm_run's 46.27 GPU
 ms, A4); the k = 0 intercept (52.4) matches the gate's measured k = 0 steps (51.92). A draft pays when accepted
 more often than drow / c ≈ 13.0 / 52.4 = 25 % (glm53: 35 %). With every MTP draft rejected the gate costs **9.4 %**
 against plain (51.92 / 47.45; glm53 9–13 %). On real files the routed rows read real experts, so the fit is
-repeated there (§ 8).
+repeated there.
+
+**On the real files** (server commit af3d5d4, sources fe90f03ad5242f43: decision 8's combine and residual rounding;
+the spec jobs of 15:45, 15:55 and 16:02):
+
+| Server | one-session runs | step ms (median of medians; range) | tokens a step | tok/s |
+|---|---:|---:|---:|---:|
+| plain (`--no-spec`) | 36 | 46.13 (44.88–47.38) | 0.98 | 21.2 |
+| gate, k ≤ 3 (cost 52.4,13.0) | 12 | 63.30 (52.09–67.28) | 1.56 | 24.6 |
+| k 1 forced | 24 | 63.30 (60.02–67.69) | 1.68 | 26.5 |
+| k 2 forced | 46 | 78.62 (72.11–81.92) | 2.02 | 25.7 |
+| k 3 forced | 24 | 91.77 (79.94–95.84) | 2.21 | 24.0 |
+
+Fit: **c(k) = 49.43 + 14.23 k ms** (residuals ≤ 0.72 ms); **the default `--spec-cost` is now 49.4,14.2** (commit
+42691b8). These runs are `spec_test.py`'s short requests (40 tokens), so the tokens a step are not real text's.
+
+**Real text through altarfront** (`tests/g8_job.sh` CFG, then `g8_front.py compare plain CFG`; four prompts of
+glm53's G8 — `short` 291 tokens, `prose` 4,762, `python` 6,106, `agentic` 4,265 with tools — 512 tokens each,
+greedy then seeded (temperature 1, seed 7), then two pairs at once; server commit 42691b8, sources 6df4c61ee1ce3bfd,
+altarfront 7a8aab4, a 2 GiB pool, jobs 16:12–16:38):
+
+| Server | single decode tok/s, greedy: short / prose / python / agentic (mean) | seeded (mean) | pair python + prose, together | pair short + agentic, together | drafts accepted (rate) | tokens a step |
+|---|---|---|---:|---:|---:|---:|
+| plain (16:12) | 21.6 / 21.3 / 20.9 / 20.7 (**21.1**) | 21.9 / 21.1 / 20.9 / 21.0 (21.2) | 30.8 | 24.1 | — | 1 |
+| k 1 (16:17) | 28.0 / 28.9 / 28.5 / 26.3 (**27.9**, +32 %) | 26.0 / 28.2 / 27.2 / 25.3 (26.7) | 39.1 | 30.0 | 1,449 of 1,825 (0.794) | 1.80 |
+| k 2 (16:23) | 28.9 / 31.5 / 29.9 / 29.4 (**29.9**, +42 %) | 25.2 / 30.2 / 27.0 / 23.0 (26.4) | **41.0** | 30.8 | 1,846 of 2,860 (0.645) | 2.29 |
+| k 3 (16:29) | 26.9 / 30.7 / 29.9 / 30.3 (**29.5**, +39 %) | 22.6 / 29.6 / 26.2 / 21.2 (24.9) | 39.9 | 28.8 | 2,017 of 3,776 (0.534) | 2.60 |
+| gate, k ≤ 3, 49.4,14.2 (16:34) | 28.4 / 28.5 / 29.8 / 28.9 (**28.9**, +37 %) | 26.5 / 27.9 / 27.2 / 24.6 (26.6) | 38.7 | 30.1 | 1,561 of 2,062 (0.757) | 1.91 |
+
+**Every configuration gave the same token ids as plain decode** on all 12 requests (`compare: all the same`, four
+times; again at 16:42 for k 2 with an 8 GiB pool). Acceptance and tokens a step are over the eight single requests
+(3,280 tokens). The one-draft acceptance on generated text is **0.794** (greedy 0.846: short 0.778, prose 0.893,
+python 0.872, agentic 0.840; seeded 0.746), against **0.492** teacher-forced on the prompts' own text
+(reference.md § 6.1, the bar): the model's own continuations are far easier to draft than the given text. Forced
+k = 2 is the fastest here (+42 % single greedy, +33 % for the python + prose pair); the gate, with the real fit,
+stays near k = 1's choice (1.91 tokens a step) and gives up 3 % of k = 2's single-session speed on this text; it is
+the default because it closes on text where drafts miss (synthetic: 9.4 % behind plain with every draft rejected, not
+the 40 % of k = 2 forced). The `short + agentic` pair is bound by `short`'s 512 tokens (agentic stops at 93).
+
+Before the decision-8 merge (a44ead0, the bf16 combine; jobs 14:53–15:28) the same runs gave plain 21.3, k 1 28.0,
+k 2 29.5, k 3 28.0, gate 29.3 tok/s single greedy, acceptance 0.774 / 0.620 / 0.502 / 0.719, all the same ids as
+that commit's plain; its gate pair was not comparable (rank 0's free device gave an 11-page pool, so the pair's
+sessions were evicted and prefilled again).
 
 ## 6. Tests and results
 
@@ -149,7 +216,20 @@ PHASES=spec SPEC_KS="1 2" OWNER=altar1-serve ds41f-4xgx10-switchless/engine/serv
 263 checks, 0 failures, in three ring jobs (12:11–12:13:30; 12:16–12:24; 12:25–12:30:50). Throughput on these
 synthetic weights is not a result (the oracle's acceptance is made up; the router routes noise).
 
-**Real rank files**: pending (§ 8).
+**Real rank files** (`WEIGHTS=""`: the fleet's rank files, 82,411,745,280 B each; rank 0's test tier 4 GiB; the
+servers ready 45–50 s after the start, the load from page-cache-dropped files):
+
+| Phase | Final commit af3d5d4 (sources fe90f03ad5242f43) | Checks | Earlier commits | Checks |
+|---|---|---:|---|---:|
+| main, batch, front, kept | 15:40 job: serve 15:42:42, batch 15:43:16, front 15:44:15, kept 15:45:11, **passed** (pool 8 pages: rank 0's free device) | 30 | 14:17 (694c448), passed | 30 |
+| spec record + k 1 forced (MTP, then oracle drafts) | 15:45 job, **passed** | 1 + 52 | 14:22 (694c448), passed | 53 |
+| k 2 forced | 15:45 job: **failed** (a 4-page pool: § 8); 15:55 job **passed** | 1 + 52 | 14:35 (694c448) **failed** (§ 8); 14:38 (a44ead0) passed | 53 |
+| k 3 forced, the gate | 16:02 job, **passed** | 1 + 52 + 26 | 14:44 (a44ead0), passed | 79 |
+
+On af3d5d4: **268 checks passed, 2 failed** (the 15:45 k = 2 phase, a pool too small for its 2,050-token fork; the
+same phase passed at 15:55). Real decode at one session: ~21 tok/s plain (46.13 ms a step, § 5). The real-text runs
+of § 5 add 5 × 12 requests compared by ids (all the same). The kept-sessions phase (planned stop, start, the turn
+from disk at its full prefix) is the stop/start test.
 
 ## 7. The service
 
@@ -170,15 +250,31 @@ engine/server/service.sh start | stop [--forget] | status | restart | forget
 
 ## 8. Failures and what remains
 
-**Failures.** The first install from a clean tree failed (12:10): `install.sh`'s new commit line ended in a `grep -q`
-that fails on a clean tree under `set -e`; fixed in c418d3c (`|| true`) and rebuilt from that commit.
+**Failures** (2026-10-14):
 
-**What remains** (all wait for the real rank files and the converter's loader on `altar1`: the runner's loader is
-glm53's and rejects the layouts 4 and 5):
-- the four test phases and the spec phase on the real files (`WEIGHTS=""`), the post-load MemAvailable and the real
-  pool (one 256k session or not);
-- the drafts on real text through altarfront (`tests/g8_job.sh` plain, k1, k2, k3, gate; `g8_front.py compare`):
-  acceptance and tok/s against plain decode, and the cost fit repeated on real routing;
-- the service's first start beside the DeepSeek service (start, a request, a reclaim by a DeepSeek request, an
-  altar-1 request while DeepSeek holds the ring, stop);
-- rank 0's disk tier (the user's to free space), the NVFP4 drafter (decision 5's lever).
+1. **12:10, install**: `install.sh`'s new commit line ended in a `grep -q` that fails on a clean tree under `set -e`;
+   fixed in c418d3c (`|| true`) and rebuilt from that commit.
+2. **13:24, the first real start: no pool.** Rank 0 had 6.31 GiB of free device memory against 32.93 of MemAvailable
+   (offers 0 / 2.96 / 6.01 / 25.74 GiB); the job stopped with "no memory for the cache pool". Cause: other files'
+   page cache (§ 3) and the rank file's own on ranks 1 and 2 (dropped before the load since d3bc4e5).
+3. **13:33, a pool sized from MemAvailable (d3bc4e5): rank 0 ran out of memory.** The pool's allocation failed in
+   the driver (`NVRM: … NV_ERR_NO_MEMORY`), rank 0 hung, and at 13:38:39 the kernel's OOM killer killed `altar1_rank`
+   (`oom_score_adj` 1000). At the same second the whole session on rank 0 was interrupted (a journald watchdog
+   failure; the DeepSeek service's supervisor died and was restarted by hand). Most likely this job's memory pressure
+   caused it. Reverted in 694c448 (free device binds; `--device-margin-gib` 1; the guard checks free device too).
+4. **14:35, k = 2 forced on real files: the server died** ("model: row 2: position 1023, slot 0, session 0") with a
+   one-page pool (rank 0's free device 1.24 GiB): the model's row check was one short (pos + passes < pool, while the
+   last position written is pos + passes − 1). Fixed in 14ebc35 (`pos + max(passes, 1) <= pool`); the rerun at 14:38
+   passed.
+5. **15:24 and 15:40, the reclaim reclaimed nothing**: it touched only want − free (0.50, 0.25 GiB) and free device
+   fell by that (§ 3). Fixed in 742c581 (touch all the pool wants).
+6. **15:45, k = 2 forced on real files: 2 checks failed**: rank 0's free device gave a 4-page pool and the fork test's
+   2,050-token prompt did not fit beside the other sessions ("does not fit the KV pool (4096 positions)"); an
+   environment failure, not a bit mismatch. The rerun at 15:55 passed.
+
+**What remains:**
+- rank 0's free device memory: the tests' pools are capped and the reclaim (742c581) runs before every pool; a test
+  job's own `--kv-gib` could be raised once the service's uncapped start (§ 7) shows what rank 0 reliably gets;
+- rank 0's disk tier and with it kept sessions in the service (the user's to free space on rank 0's data disk);
+- the gate's choice on real text (k = 2 forced is 3 % faster on § 5's prompts; the gate is kept for text where drafts
+  miss), the NVFP4 drafter (decision 5's lever).
