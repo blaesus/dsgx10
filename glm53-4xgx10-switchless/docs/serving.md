@@ -177,8 +177,34 @@ engine/server/service.sh start | stop [--forget] | status | restart | forget
   ring back, its engine stopped with its sessions kept, as soon as the ring is reclaimed or once it has had no
   request for `GLM53_YIELD_IDLE_S`. Meanwhile `glmfront` holds requests (`GLM53_HOLD_S` each), and they bring
   the engine back through a want.
-- **Not tested on the ring yet**: only its refusals (port 8888, 0.0.0.0, a bad command) and `status` were run.
-  Its first start belongs in a supervised window.
+- **First supervised start (2026-10-14, G6b)**, on the engine built from 94ecdd5 (sources sha256
+  d79152856ea93a98), default settings, the rank files with `--fill-experts`, the DeepSeek service serving in
+  production (its `DSGB10_YIELD_IDLE_S` 120 s) and idle; about 4 minutes of ring time, every step as designed, no
+  fix needed:
+  - **Start.** `service.sh start` at 01:07:41: glmfront up, the want registered at 01:07:42; the DeepSeek service,
+    idle for more than 120 s, lent the ring at once (its engine stopped in 3 s), the ring was ours at 01:07:48,
+    the four ranks ready 8 s after their start (rank 0's file from /data, ranks 1–3's from their home
+    directories; a pool of 575 pages, 52.99 GiB a rank), serving at 01:08:01: 20 s from `start`. A 17-token
+    request with 64 tokens out: 3.1 s (prefill 339 ms, decode 23.0 tok/s).
+  - **Reclaim by the DeepSeek service.** One DeepSeek request (32 tokens at most) at 01:08:25.9: its supervisor
+    took the reclaim flag at 01:08:27, this supervisor saw it at 01:08:28 (its 2 s poll) and gave the ring back,
+    rank 0 out at 01:08:29 and ranks 1–3 with it, the lock free and the DeepSeek service's at 01:08:31. **The GLM
+    engine was off the ring 3 s after the flag (5 s after the request).** The DeepSeek request completed in
+    51.9 s, 44 s of it the DeepSeek engine's own start.
+  - **A GLM request while the DeepSeek service holds the ring** (01:09:30): glmfront held it, the supervisor
+    registered a want (“1 requests wait”) at once, the DeepSeek service lent the ring once it had had no request
+    for its 120 s (01:11:18, 120 s after its engine was ready), the ring was ours at 01:11:22, the engine ready in
+    10 s and the request answered at 01:11:38: **128 s of waiting, set by the DeepSeek service's idle time**, not by
+    this service. A ring job that queued meanwhile (01:10:59) waited behind this service's older want.
+  - **Stop.** `service.sh stop` at 01:11:47 returned in 3 s (rank 0 out at 01:11:49, the front-end saved its
+    session table); no `glm53_rank` on any rank; the lock files as before (ring.lock, ring.reclaim untouched,
+    ring.owner rewritten by the next owner); the queued ring job took the ring at 01:11:51, and the DeepSeek
+    service stayed lent to it (a request reclaims it, as above).
+  - **Seen, not fixed.** Nothing was kept across the stops ("kept sessions: none"): rank 0's disk tier offers 0
+    pages while /data has 33 GB free (§ 4.3, § 7). While it holds the ring this service does not yield to a ring
+    job that waits: it gives the ring back only when reclaimed or after `GLM53_YIELD_IDLE_S` (600 s) without a
+    request, so a waiting job can wait up to that long; set `GLM53_YIELD_IDLE_S` lower for a window shared with
+    jobs.
 
 ## 6. Tests and results
 
@@ -208,8 +234,8 @@ both all passed; [experiments.md](experiments.md) lists them.
   `cache_pos_bytes`, so neither changes the server.
 - **MTP (G7)**: drafts in the decode steps (B3). The MTP layer's pending row is not moved with a session's pages,
   so the server runs with no drafts today.
-- **The service on the ring**: its first supervised start, a lend and a reclaim with the DeepSeek service, a
-  planned stop with kept sessions.
+- **The service on the ring**: started, lent, reclaimed and stopped (§ 5.2, 2026-10-14); a planned stop with
+  kept sessions waits for rank 0's disk tier.
 - **pi against the test port** with the real experts (G6's acceptance test, once the rank files are filled).
 - **Rank 0's disk**: the spill directory needs room for a disk tier worth having.
 - Spills on demand are synchronous: a request that needs pages waits for the evicted session's write (~100 ms a
