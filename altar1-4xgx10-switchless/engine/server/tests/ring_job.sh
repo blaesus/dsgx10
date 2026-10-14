@@ -130,4 +130,5 @@ stop
 echo "--- rank 0 log (serve lines)"
 grep -E "^serve: (req|run|session|pool|kept)" "$LRD/logs/$NAME.0.log" | tail -n 60
 ranks_tails 3
+cp "$LRD/logs/$NAME.0.log" "$DATA/rank0.$(date +%Y%m%d-%H%M%S).log" 2> /dev/null  # the whole job's rank 0 log
 exit $RC
