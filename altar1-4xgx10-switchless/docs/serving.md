@@ -60,7 +60,9 @@ The rank files are 76.6 GiB a rank (82,411,745,280 B on disk), against glm53's 1
   stop when one has less than `--min-free-gib` (8) plus one page**: the pool could not then be had without going under
   the fleet's 8 GiB.
 - **Margins 8 GiB on every rank** (glm53: 4 on rank 0, 2 on the workers; the margin is at least `--min-free-gib`): the
-  pool is min over ranks of min(free device − `--device-margin-gib` (1), MemAvailable − 8 GiB), capped by `--kv-gib`.
+  pool is min over ranks of min(free device − `--device-margin-gib` (1), MemAvailable − 8 − 1 GiB), capped by
+  `--kv-gib`: the second 1 GiB is for what CUDA allocates after the pool (graphs, spec buffers, ~0.7 GiB; without it
+  the service's start at 16:55 left rank 2 at 7.36 GiB, 9d10f8a).
   Free device memory binds, not MemAvailable: see "the page cache" below.
 - **The rank file's page cache is dropped before the load** (`posix_fadvise(DONTNEED)`; the loader reads with
   O_DIRECT, so a copy or an earlier `cat` left up to 24 GiB of it cached on ranks 1 and 2), and **before the pool every
@@ -103,7 +105,12 @@ reference's files. **The page cache, measured three ways:**
    free pages first and reclaims the cache only below its watermarks.
 3. **Touching all the pool wants** (742c581): 9.00 GiB at 16:42 (g8 job, `--kv-gib 8`) took rank 0 from 3.62 to
    10.39 GiB free; the pool got its 86 pages (7.93 GiB), the tokens the same as plain decode's (`g8_front.py
-   compare`). The service's uncapped pool: § 7.
+   compare`). Uncapped (§ 7 and the 16:57 job) it touched 26.00–27.00 GiB on rank 0 and took it from 9–15 to
+27.3–27.7 GiB free; **the pool is then bound by rank 2's MemAvailable** (30.35–32.55 GiB while the CPU reference
+runs there): **231 pages (236,544 positions, 21.29 GiB) at 9d10f8a, 16:57**, every rank at ≥ 8.55 GiB of MemAvailable
+after it (6.57 / 13.14, 12.42 / 15.41, 5.50 / 8.55, 14.90 / 15.31 GiB free device / MemAvailable). **One 256k session
+(256 pages) fits only when every rank has ≥ 32.6 GiB available before the pool**, i.e. without the reference's ~3 GiB; until then HELLO's
+`max_context` is the pool's positions.
 
 The tests keep their own `--kv-gib` caps (1.2 GiB in `ring_job.sh`, 2 in `g8_job.sh`); with rank 0's free device
 low they got less (8 pages at 15:40, 4 at 15:45, 11 at 15:24), which § 8's k = 2 failures came from.
@@ -246,7 +253,24 @@ engine/server/install.sh                                     # altar1_rank (-j4)
 engine/server/service.sh start | stop [--forget] | status | restart | forget
 ```
 
-**First start on the ring** (glm53's G6b protocol): pending the real files (§ 8).
+**First start on the ring** (A6b, glm53's G6b protocol: `tests/handover.sh`, run on rank 0 outside `ring.sh`;
+2026-10-14 16:49–16:57, server commit 742c581, the real files; the DeepSeek service had restarted at 16:48:50):
+
+| Time | Event |
+|---|---|
+| 16:49:02 | `service.sh start`: supervisor, altarfront on 127.0.0.1:18895; the want registered, requests held |
+| 16:51:37 | the DeepSeek service lends the ring after 120 s without a request (its idle time when a service waits) |
+| 16:51:40 → 16:52:38 | the ring is altar-1's; engine started 16:51:46, serving at 16:52:38 (**58 s**: load, page-cache drop, reclaim of 26.00 GiB on rank 0 and 22.75 on rank 2); pool **246 pages (251,904 positions, 22.67 GiB)**, rank 2 bound; a 256k session did NOT fit |
+| 16:52:42 → :45 | an altar-1 request, 64 tokens: **3.01 s** |
+| 16:52:45 | a DeepSeek request: altar-1 gives the ring back at 16:52:46 (rank 0 exited 16:52:48), the DeepSeek engine starts 16:52:49, ready 16:53:36; its answer after **51.6 s** |
+| 16:53:45 | an altar-1 request while the DeepSeek service holds the ring: it waits for that service's 120 s idle, the lend at 16:55:37, altar-1's ring at 16:55:41, serving at 16:56:34 (53 s); the answer after **172.7 s** (decode 34.9 tok/s, 40 of 46 drafts accepted) |
+| 16:56:38 → :42 | `service.sh stop`: **3.6 s**, no `altar1_rank` left |
+
+The second start's pool was 266 pages (24.52 GiB: a 256k session fitted, context 262,139) but left rank 2 at 7.36
+GiB of MemAvailable after it, and the first start's ranks showed rank 2 at 7 GiB in `status`: under the fleet's 8.
+Fixed in 9d10f8a (§ 3: the pool leaves 1 GiB more of MemAvailable); checked uncapped at 16:57 (a g8 job with
+`--kv-gib 1000 --max-ctx 262144`, the gate: 231 pages, every rank ≥ 8.55 GiB, the ids the same as plain decode's).
+The disk tier was 0 pages (rank 0's `--disk-rank0-gib` 0), so no sessions were kept across the stop.
 
 ## 8. Failures and what remains
 
@@ -271,10 +295,12 @@ engine/server/service.sh start | stop [--forget] | status | restart | forget
 6. **15:45, k = 2 forced on real files: 2 checks failed**: rank 0's free device gave a 4-page pool and the fork test's
    2,050-token prompt did not fit beside the other sessions ("does not fit the KV pool (4096 positions)"); an
    environment failure, not a bit mismatch. The rerun at 15:55 passed.
+7. **16:52 and 16:55, the service's starts left rank 2 under 8 GiB** of MemAvailable (7 GiB in `status`, 7.36 after
+   the second pool): the offer kept 8 GiB but CUDA allocates ~0.7 GiB more after the pool. Fixed in 9d10f8a (§ 3).
 
 **What remains:**
-- rank 0's free device memory: the tests' pools are capped and the reclaim (742c581) runs before every pool; a test
-  job's own `--kv-gib` could be raised once the service's uncapped start (§ 7) shows what rank 0 reliably gets;
+- one 256k session in the service: rank 2's MemAvailable binds while the CPU reference runs there (§ 3); the
+  service's start with 9d10f8a's margin is checked by a ring job (16:57), not by a second service start;
 - rank 0's disk tier and with it kept sessions in the service (the user's to free space on rank 0's data disk);
 - the gate's choice on real text (k = 2 forced is 3 % faster on § 5's prompts; the gate is kept for text where drafts
   miss), the NVFP4 drafter (decision 5's lever).
