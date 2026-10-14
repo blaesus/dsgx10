@@ -388,6 +388,14 @@ const std::vector<ACase>& altar_cases() {
   };
   return cs;
 }
+// the cases in order, or reversed with BENCH_REVERSE=1 (an A/B in both orders: every BF16 case before its BF16T twin,
+// then after it)
+std::vector<ACase> altar_order() {
+  std::vector<ACase> v = altar_cases();
+  const char* e = std::getenv("BENCH_REVERSE");
+  if (e && *e == '1') std::reverse(v.begin(), v.end());
+  return v;
+}
 size_t acase_bytes(const ACase& c) {
   size_t b = 0;
   for (auto [f, n] : c.seg) b += weight_bytes(f, n, c.K);
@@ -415,7 +423,7 @@ void bench_agemv(bool sweep) {
   Dev<uint16_t> x(16 * 16384);
   fill(x.p, x.n * 2, 7, 1);
   Dev<uint8_t> y(16 * 40000 * 4);
-  for (const auto& c : altar_cases()) {
+  for (const auto& c : altar_order()) {
     const size_t per = acase_bytes(c);
     int N = 0;
     for (auto& s : c.seg) N += s.second;
@@ -484,7 +492,7 @@ void bench_apgemm(bool rsweep) {
   Dev<uint8_t> y((size_t)2600 * kVocabRank * 2);  // the largest output: the head at 2,600 rows (bf16)
   const size_t scratch_elems = (size_t)kDim * kOProjK;
   Dev<uint16_t> scratch(scratch_elems);
-  for (const auto& c : altar_cases()) {
+  for (const auto& c : altar_order()) {
     const size_t per = acase_bytes(c);
     int N = 0;
     bool int4 = false;

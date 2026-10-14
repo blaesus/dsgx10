@@ -6,6 +6,7 @@ altar-1 serves two formats here (docs/attention.md § 2):
 
 * BF16 (q_a, kv_a, the indexer's wk/wq_b/weights_proj, the dense MLPs, and q_b/kv_b/o_proj of layers 0-3, 77, 78):
   row-major [N][K] bf16, re-cut by rows or columns. bf16 values are numpy uint16 bit patterns here.
+  Optionally (kBF16T, bf16_tiles) in the GEMV's lane order: same values, contiguous 1 KB warp chunks.
 * INT4 (q_b, kv_b, o_proj of layers 4-76): compressed-tensors `pack-quantized`, group 32 along K, asymmetric.
   Canonical (the checkpoint): weight_packed I32 [N][K/8] (k = 8j + i at bits 4i of word j), weight_scale BF16
   [N][K/32], weight_zero_point I32 [N/8][K/32] (row n = 8j + i at bits 4i of word j). Stored nibbles carry +8
@@ -171,6 +172,20 @@ def bf16_gate_up(gate, up, r, inter):
     out = np.empty((2 * inter, gate.shape[1]), np.uint16)
     out[0::2], out[1::2] = gate[a:a + inter], up[a:a + inter]
     return out
+
+
+def bf16_tiles(w):
+    """kBF16T: a BF16 [N][K] matrix (any of the above) in the GEMV's lane order, [N/8][K/64][32 lanes][16 values]:
+    lane 4g + t of tile i, chunk j holds row 8i + g, k = 64j + 16t .. + 15. The same values as the row-major form
+    (the kernels give the same outputs bit for bit); each warp's 64-k chunk is one contiguous 1 KB."""
+    N, K = w.shape
+    assert N % 8 == 0 and K % 64 == 0, (N, K)
+    return np.ascontiguousarray(w.reshape(N // 8, 8, K // 64, 4, 16).transpose(0, 2, 1, 3, 4)).reshape(N, K)
+
+
+def bf16_untile(t, N, K):
+    """the inverse of bf16_tiles"""
+    return np.ascontiguousarray(t.reshape(N // 8, K // 64, 8, 4, 16).transpose(0, 2, 1, 3, 4)).reshape(N, K)
 
 
 def int4_q_b(qb, r):

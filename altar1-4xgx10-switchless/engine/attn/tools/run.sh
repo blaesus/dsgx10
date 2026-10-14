@@ -26,8 +26,8 @@ for s in $STEPS; do
   echo "== $s $(date '+%T')"
   LOG=${OUT%.tsv}.$s.log
   case $s in
-    memcheck) timeout -s TERM 420 $MC "$BIN/attn_tests" "$DATA/s300" --only ADCBFP > "$LOG" 2>&1 ;;
-    memcheck-b) timeout -s TERM 300 $MC "$BIN/attn_tests" "$DATA/s300b" --only ACBP > "$LOG" 2>&1 ;;
+    memcheck) timeout -s TERM 420 $MC "$BIN/attn_tests" "$DATA/s300" --only ADTCBFP > "$LOG" 2>&1 ;;
+    memcheck-b) timeout -s TERM 300 $MC "$BIN/attn_tests" "$DATA/s300b" --only ATCBP > "$LOG" 2>&1 ;;
     memcheck-e) timeout -s TERM 300 $MC "$BIN/attn_tests" "$DATA/s4600" --only E > "$LOG" 2>&1 ;;
     test300) timeout -s TERM 240 "$BIN/attn_tests" "$DATA/s300" > "$LOG" 2>&1 ;;
     test300b) timeout -s TERM 240 "$BIN/attn_tests" "$DATA/s300b" > "$LOG" 2>&1 ;;
