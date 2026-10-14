@@ -345,6 +345,7 @@ def indep(files, ck_dir, cache):
     t0 = time.time()
     rope = None
     rtn_cache = {}
+    s3_skipped = 0
     for L in sorted(groups):
         full = L >= 0 and f"model.layers.{L}.self_attn.indexer.wk.weight" in ck
         for n in groups[L]:
@@ -353,6 +354,9 @@ def indep(files, ck_dir, cache):
                 if e["kind"] == glw.RESERVED:
                     continue
                 if re.match(r"layers\.\d+\.experts\.", n):
+                    if e["fmt"] != glw.expert_fmt():
+                        s3_skipped += 1  # S3 entries: glw_kcheck --blocks and glw_expert_fill_test check those
+                        continue
                     if n.endswith(".desc") or int(n.split(".")[-1]) in EXPERT_SAMPLE:
                         why = check_expert(fd, e, ed, r, ck, rtn_cache)
                         checked += 1
@@ -397,6 +401,8 @@ def indep(files, ck_dir, cache):
             print(f"CROSS-RANK {n}: replicated but CRCs differ")
     for _, _, _, fd in per:
         os.close(fd)
+    if s3_skipped:
+        print(f"  {s3_skipped} expert entries not in NVFP4 left to glw_kcheck --blocks and glw_expert_fill_test")
     print(f"independent check: {checked} tensor checks over {len(files)} files (ranks {ranks}), {bad} bad; "
           f"cross-rank: {xbad} bad ({time.time() - t0:.0f} s)")
     return bad + xbad
