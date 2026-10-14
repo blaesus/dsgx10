@@ -1,0 +1,455 @@
+use altarfront::tokenizer::Tokenizer;
+use std::io::BufRead;
+use std::time::Instant;
+
+const DEFAULT_TOKENIZER: &str = "/data/hf/hub/models--nvidia--GLM-5.3-NVFP4/snapshots/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf/tokenizer.json";
+
+fn usage() -> ! {
+    eprintln!(
+        "usage:
+  altarfront serve [options]                             the OpenAI-compatible server
+      --listen ADDR             127.0.0.1:18890; repeat it for more (loopback or specific addresses;
+                                never 0.0.0.0 or ::)
+      --engine-socket PATH      /tmp/dsgb10-altar1-engine.sock
+      --api-key-file PATH       require this bearer key (the file's content, trimmed)
+      --model-name NAME         altar-1
+      --max-tokens N            default and cap for max_tokens: 32768
+      --effort E                the template's reasoning effort when a request names none: max
+                                (the template's default), high or low
+      --clear-thinking          clear_thinking when a request does not set it (the template's
+                                default is false: past reasoning is kept, so turns render append-only)
+      --temperature T --top-p P sampling defaults: 1.0 and 0.95 (the model card's settings)
+      --no-loop-guard           do not stop repetition loops
+      --dump-dir DIR            write each request, prompt and ids to DIR, and at its end the output's
+                                ids (N.out.json; debugging and bench traces)
+      --hold-s N                while the engine is down (the ring lent, or a restart), a request
+                                waits this long (600), then is answered 503 with Retry-After: 60
+      --admin-socket PATH       commands from service.sh (mode 600): status, hold IDLE_S, release
+      --table-file PATH         the session table, saved here at a stop and taken back at the next
+                                start (mode 600, in a directory of mode 700; it holds the
+                                conversations' text), so that the engine's kept sessions are found again
+      --table-days N            sessions unused for longer are not kept: 7
+  altarfront admin --socket PATH <command>               one command to a server's admin socket; prints
+                                                      the answer (docs/engine.md, \"Launch and stop\")
+  altarfront mock-engine [options]                       a rank-0 stand-in (docs/protocol.md)
+      --socket PATH             /tmp/dsgb10-altar1-engine.sock
+      --delay-ms N              per generated token: 5
+      --prefill-tps N           simulated prefill tokens/s: 20000
+      --max-context N           1048576
+  altarfront tokcheck <cases.jsonl>                      compare against reference ids ({{\"text\",\"ids\"}} per line)
+  altarfront enccheck <cases.jsonl>                     compare the template port with altar-1's jinja template's ids and the
+                                                      parser with vLLM's rules (tools/gen_encoding_cases.py)
+  altarfront tokenize <file>                             print ids of a file's text
+  altarfront tokbench <file>                             tokenisation throughput
+  every command that tokenises takes --tokenizer PATH ({DEFAULT_TOKENIZER})"
+    );
+    std::process::exit(2)
+}
+
+fn parse_opt<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
+    match opt(args, name) {
+        None => default,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("bad value for {name}: {v}");
+            std::process::exit(2)
+        }),
+    }
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime")
+}
+
+fn serve(args: &[String]) {
+    use altarfront::server::{router, App, ServerConfig};
+    let mut listen: Vec<std::net::SocketAddr> = opts(args, "--listen")
+        .iter()
+        .map(|v| {
+            v.parse().unwrap_or_else(|_| {
+                eprintln!("bad value for --listen: {v}");
+                std::process::exit(2)
+            })
+        })
+        .collect();
+    if listen.is_empty() {
+        listen.push("127.0.0.1:18890".parse().unwrap());
+    }
+    for a in &listen {
+        if unspecified(a.ip()) {
+            eprintln!("refusing to listen on {a}: bind to loopback or specific addresses");
+            std::process::exit(2);
+        }
+    }
+    let api_key = opt(args, "--api-key-file").map(|p| {
+        let k = std::fs::read_to_string(&p).unwrap_or_else(|e| {
+            eprintln!("{p}: {e}");
+            std::process::exit(1)
+        });
+        let k = k.trim().to_string();
+        if k.is_empty() {
+            eprintln!("{p} is empty");
+            std::process::exit(1);
+        }
+        k
+    });
+    if api_key.is_none() {
+        eprintln!("warning: no --api-key-file, requests are not authenticated");
+    }
+    let cfg = ServerConfig {
+        model_name: opt(args, "--model-name").unwrap_or_else(|| "altar-1".into()),
+        api_key,
+        max_tokens_cap: parse_opt(args, "--max-tokens", 32768u32),
+        default_effort: {
+            let e = opt(args, "--effort").unwrap_or_else(|| "max".into());
+            if !["max", "high", "low"].contains(&e.as_str()) {
+                eprintln!("bad value for --effort: {e} (max, high or low)");
+                std::process::exit(2);
+            }
+            e
+        },
+        clear_thinking: args.iter().any(|a| a == "--clear-thinking"),
+        default_temperature: parse_opt(args, "--temperature", 1.0f32),
+        default_top_p: parse_opt(args, "--top-p", 0.95f32),
+        loop_guard: if args.iter().any(|a| a == "--no-loop-guard") { None } else { Some(Default::default()) },
+        tokenize_threads: parse_opt(args, "--tokenize-threads", 8usize).max(1),
+        dump_dir: opt(args, "--dump-dir").map(Into::into),
+        hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
+    };
+    let admin = opt(args, "--admin-socket");
+    let table = opt(args, "--table-file").map(std::path::PathBuf::from);
+    let table_age_s = (parse_opt(args, "--table-days", 7f64) * 86400.0) as u64;
+    let tok = std::sync::Arc::new(load_tokenizer(args));
+    let socket = opt(args, "--engine-socket").unwrap_or_else(|| altarfront::protocol::DEFAULT_SOCKET.into());
+    runtime().block_on(async move {
+        let engine = altarfront::engine::EngineClient::start(socket.into());
+        let app = App::new(cfg, tok, engine);
+        if let Some(t) = &table {
+            eprintln!("{}", app.load_sessions(t, table_age_s));
+        }
+        let saver = app.clone();
+        if let Some(path) = admin {
+            let (gate, engine) = (app.gate.clone(), app.engine.clone());
+            tokio::spawn(async move {
+                if let Err(e) = altarfront::gate::admin(gate, engine, path.clone().into()).await {
+                    eprintln!("admin socket {path}: {e}");
+                    std::process::exit(1);
+                }
+            });
+        }
+        // every address bound before any is served: one that cannot be bound stops the start
+        let mut listeners = Vec::new();
+        for a in &listen {
+            listeners.push(tokio::net::TcpListener::bind(a).await.unwrap_or_else(|e| {
+                eprintln!("cannot listen on {a}: {e}");
+                std::process::exit(1)
+            }));
+        }
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let gate = app.gate.clone();
+        tokio::spawn(async move {
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            eprintln!("shutting down");
+            gate.close(); // requests waiting at the gate are answered now, not at the hold limit
+            let _ = stop_tx.send(true);
+        });
+        let routes = router(app);
+        let mut servers = tokio::task::JoinSet::new();
+        for (a, l) in listen.iter().zip(listeners) {
+            eprintln!("serving on http://{a}/v1");
+            let mut stop = stop_rx.clone();
+            let shutdown = async move {
+                let _ = stop.wait_for(|s| *s).await;
+            };
+            servers.spawn(std::future::IntoFuture::into_future(axum::serve(l, routes.clone()).with_graceful_shutdown(shutdown)));
+        }
+        while let Some(r) = servers.join_next().await {
+            r.expect("server task").expect("server");
+        }
+        if let Some(t) = &table {
+            eprintln!("{}", saver.save_sessions(t, table_age_s));
+        }
+    });
+}
+
+/// 0.0.0.0, ::, and :: with 0.0.0.0 mapped into it: every address of the box
+fn unspecified(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_unspecified()),
+    }
+}
+
+/// One command to a server's admin socket (gate.rs); prints the one-line answer. Exit 2 when there
+/// is no answer.
+fn admin(args: &[String]) {
+    use std::io::{Read, Write};
+    let sock = opt(args, "--socket").unwrap_or_else(|| usage());
+    let mut words = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == "--socket" {
+            i += 2;
+            continue;
+        }
+        words.push(args[i].as_str());
+        i += 1;
+    }
+    if words.is_empty() {
+        usage();
+    }
+    let fail = |e: std::io::Error| -> ! {
+        eprintln!("{sock}: {e}");
+        std::process::exit(2)
+    };
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap_or_else(|e| fail(e));
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap_or_else(|e| fail(e));
+    writeln!(s, "{}", words.join(" ")).unwrap_or_else(|e| fail(e));
+    let mut reply = String::new();
+    s.read_to_string(&mut reply).unwrap_or_else(|e| fail(e));
+    if reply.trim().is_empty() {
+        eprintln!("{sock}: no answer");
+        std::process::exit(2);
+    }
+    print!("{reply}");
+}
+
+fn mock_engine(args: &[String]) {
+    let cfg = altarfront::mock::MockConfig {
+        socket: opt(args, "--socket").unwrap_or_else(|| altarfront::protocol::DEFAULT_SOCKET.into()).into(),
+        tok: std::sync::Arc::new(load_tokenizer(args)),
+        delay: std::time::Duration::from_millis(parse_opt(args, "--delay-ms", 5u64)),
+        prefill_tok_per_s: parse_opt(args, "--prefill-tps", 20000f64),
+        max_context: parse_opt(args, "--max-context", 1048576u32),
+    };
+    if let Err(e) = runtime().block_on(altarfront::mock::run(cfg)) {
+        eprintln!("mock engine: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn opt(args: &[String], name: &str) -> Option<String> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Every value of a repeatable option.
+fn opts(args: &[String], name: &str) -> Vec<String> {
+    args.iter().enumerate().filter(|(_, a)| *a == name).filter_map(|(i, _)| args.get(i + 1).cloned()).collect()
+}
+
+fn load_tokenizer(args: &[String]) -> Tokenizer {
+    let path = opt(args, "--tokenizer").unwrap_or_else(|| DEFAULT_TOKENIZER.to_string());
+    let t0 = Instant::now();
+    let tok = Tokenizer::from_file(&path).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1)
+    });
+    eprintln!("tokenizer loaded in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+    tok
+}
+
+fn tokcheck(args: &[String]) {
+    let path = args.get(2).unwrap_or_else(|| usage());
+    let tok = load_tokenizer(args);
+    let f = std::fs::File::open(path).unwrap_or_else(|e| {
+        eprintln!("{path}: {e}");
+        std::process::exit(1)
+    });
+    let (mut n, mut bad, mut bad_decode, mut bytes, mut toks) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut secs = 0f64;
+    for line in std::io::BufReader::new(f).lines() {
+        let line = line.unwrap();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(&line).expect("bad json line");
+        let text = v["text"].as_str().expect("text");
+        let want: Vec<u32> = v["ids"].as_array().expect("ids").iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let t0 = Instant::now();
+        let got = tok.encode(text);
+        secs += t0.elapsed().as_secs_f64();
+        n += 1;
+        bytes += text.len();
+        toks += want.len();
+        if got != want {
+            bad += 1;
+            if bad <= 10 {
+                let k = got.iter().zip(want.iter()).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
+                let lo = k.saturating_sub(3);
+                eprintln!(
+                    "MISMATCH case {n} ({} bytes): first diff at token {k}\n  text: {:?}\n  want[{lo}..]: {:?}\n  got [{lo}..]: {:?}",
+                    text.len(),
+                    text.chars().take(200).collect::<String>(),
+                    &want[lo..(k + 4).min(want.len())],
+                    &got[lo..(k + 4).min(got.len())]
+                );
+            }
+        }
+        if tok.decode(&want) != text {
+            bad_decode += 1;
+            if bad_decode <= 5 {
+                eprintln!("DECODE MISMATCH case {n}: {:?}", text.chars().take(120).collect::<String>());
+            }
+        }
+    }
+    println!(
+        "{n} cases, {bad} encode mismatches, {bad_decode} decode mismatches; {toks} tokens, {:.1} MB in {:.2} s = {:.2} M tok/s",
+        bytes as f64 / 1e6,
+        secs,
+        toks as f64 / secs / 1e6
+    );
+    if bad > 0 || bad_decode > 0 {
+        std::process::exit(1);
+    }
+}
+
+/// Compare encoding.rs with the jinja template's rendering and vLLM's parse rules
+/// (tools/gen_encoding_cases.py).
+fn enccheck(args: &[String]) {
+    use altarfront::encoding::{parse_completion, render, Delta, RenderOptions, StreamParser, ToolSchemas};
+    use serde_json::Value;
+    let path = args.get(2).unwrap_or_else(|| usage());
+    let tok = load_tokenizer(args);
+    let f = std::fs::File::open(path).unwrap_or_else(|e| {
+        eprintln!("{path}: {e}");
+        std::process::exit(1)
+    });
+    let (mut n_render, mut n_err, mut n_parse, mut toks, mut bad) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut n_glm = 0usize; // cases GLM-5.3's template renders differently (gen_encoding_cases.py --glm53-template)
+    let mut rng = 0x9E3779B97F4A7C15u64;
+    let mut report = |name: &str, what: String| {
+        bad += 1;
+        if bad <= 12 {
+            eprintln!("MISMATCH {name}: {what}");
+        }
+    };
+    let t0 = Instant::now();
+    for line in std::io::BufReader::new(f).lines() {
+        let line = line.unwrap();
+        let c: Value = serde_json::from_str(&line).expect("bad json line");
+        let name = c["name"].as_str().unwrap_or("?").to_string();
+        match c["kind"].as_str() {
+            Some("render") => {
+                n_render += 1;
+                n_glm += c.get("glm53_differs").and_then(Value::as_bool).unwrap_or(false) as usize;
+                let msgs = c["messages"].as_array().cloned().unwrap_or_default();
+                let kw = c["kwargs"].as_object();
+                let o = RenderOptions {
+                    tools: c.get("tools"),
+                    reasoning_effort: kw.and_then(|k| k.get("reasoning_effort")),
+                    clear_thinking: kw.and_then(|k| k.get("clear_thinking")),
+                    add_generation_prompt: c["add_generation_prompt"].as_bool().unwrap_or(false),
+                };
+                match (render(&msgs, &o), c.get("text")) {
+                    (Ok(p), Some(Value::String(want))) => {
+                        let want_ids: Vec<u32> = c["ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+                        let ids = tok.encode(&p);
+                        toks += ids.len();
+                        if &p != want {
+                            let k = p.chars().zip(want.chars()).position(|(a, b)| a != b).unwrap_or(p.chars().count().min(want.chars().count()));
+                            let at = |s: &str| s.chars().skip(k.saturating_sub(30)).take(80).collect::<String>();
+                            report(&name, format!("text differs at char {k}:\n  want {:?}\n  got  {:?}", at(want), at(&p)));
+                        } else if ids != want_ids {
+                            report(&name, "same text, different ids".into());
+                        }
+                    }
+                    (Err(e), Some(Value::String(_))) => report(&name, format!("port raised {e:?}, the template did not")),
+                    (Ok(p), None) => report(&name, format!("the template raised {}, port gave {:?}", c["error"], p.chars().take(80).collect::<String>())),
+                    (Err(_), None) => n_err += 1,
+                    _ => {}
+                }
+            }
+            Some("parse") => {
+                n_parse += 1;
+                let text = c["text"].as_str().unwrap();
+                let tools = c.get("tools").and_then(Value::as_array).map(|t| ToolSchemas::from_tools(t));
+                let thinking = c["thinking"].as_bool().unwrap_or(true);
+                let m = parse_completion(text, thinking, tools.clone());
+                let w = &c["result"];
+                let calls: Vec<(String, String)> = w["tool_calls"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| (t[0].as_str().unwrap().to_string(), t[1].as_str().unwrap().to_string()))
+                    .collect();
+                if m.content != w["content"].as_str().unwrap() || m.reasoning_content != w["reasoning"].as_str().unwrap() || m.tool_calls != calls {
+                    report(&name, format!("parse differs: got {m:?}\n  want {w}"));
+                }
+                // fed in random pieces, the streaming parser must agree with the whole
+                let chars: Vec<char> = text.chars().collect();
+                let mut p = StreamParser::new(thinking, tools);
+                let mut out = Vec::new();
+                let mut i = 0;
+                while i < chars.len() {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let k = 1 + (rng % 9) as usize;
+                    let piece: String = chars[i..(i + k).min(chars.len())].iter().collect();
+                    p.push(&piece, &mut out);
+                    i += k;
+                }
+                p.finish(&mut out);
+                let (mut r, mut ct, mut cs) = (String::new(), String::new(), Vec::new());
+                for d in out {
+                    match d {
+                        Delta::Reasoning(s) => r.push_str(&s),
+                        Delta::Content(s) => ct.push_str(&s),
+                        Delta::ToolCall(_, n, a) => cs.push((n, a)),
+                    }
+                }
+                if r != m.reasoning_content || ct != m.content || cs != m.tool_calls {
+                    report(&name, format!("stream differs: reasoning {r:?} content {ct:?} calls {cs:?}\n  want {m:?}"));
+                }
+            }
+            _ => panic!("unknown case kind"),
+        }
+    }
+    println!(
+        "{n_render} render cases ({n_err} raise in both; {toks} tokens; {n_glm} that GLM-5.3's template renders differently), {n_parse} parse cases (each also streamed): {bad} mismatches in {:.2} s",
+        t0.elapsed().as_secs_f64()
+    );
+    if bad > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("tokcheck") => tokcheck(&args),
+        Some("enccheck") => enccheck(&args),
+        Some("serve") => serve(&args),
+        Some("mock-engine") => mock_engine(&args),
+        Some("admin") => admin(&args),
+        Some("tokenize") => {
+            let path = args.get(2).unwrap_or_else(|| usage());
+            let tok = load_tokenizer(&args);
+            let text = std::fs::read_to_string(path).expect("read");
+            println!("{:?}", tok.encode(&text));
+        }
+        Some("tokbench") => {
+            let path = args.get(2).unwrap_or_else(|| usage());
+            let tok = load_tokenizer(&args);
+            let text = std::fs::read_to_string(path).expect("read");
+            let reference = tok.encode(&text);
+            for threads in [1usize, 4, 16] {
+                let t0 = Instant::now();
+                let ids = tok.encode_parallel(&text, threads);
+                let s = t0.elapsed().as_secs_f64();
+                println!(
+                    "threads {threads}: {} tokens from {:.1} MB in {:.3} s = {:.2} M tok/s{}",
+                    ids.len(),
+                    text.len() as f64 / 1e6,
+                    s,
+                    ids.len() as f64 / s / 1e6,
+                    if ids == reference { "" } else { "  (DIFFERS from the single-pass encoding)" }
+                );
+            }
+        }
+        _ => usage(),
+    }
+}
