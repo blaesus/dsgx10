@@ -36,9 +36,13 @@ configuration has to get right instead:
 2. **The non-expert weights are BF16 and stay BF16** (they are the model), so a decode token reads 8.55 GB a rank,
    **36.4 ms at the floor** against glm53's 34.2 (its non-experts were FP8). Every exact byte-saving lever (lossless
    BF16 coding, the fused shared expert) is measured, none assumed.
-3. **Exactness for a model that is already quantised**: the engine must compute the dequantised weight exactly as the
-   model's own library does (`(q − z) · s` is not representable in BF16 in general; the rounding point is the
-   contract, [model.md](docs/model.md)), and its quality is measured against the parent, GLM-5.3, whose golden data
+3. **The BF16 tensors are not GLM-5.3's** ([model.md](docs/model.md), 2026-10-14): they are dequantised from zai's FP8
+   release with AWQ's per-channel smoothing folded into the norms, the router and the expert input columns, so nothing
+   of glm53's rank files carries over, and level 3 compares a different model with its parent.
+4. **Exactness for a model that is already quantised**: the engine must compute the dequantised weight exactly as the
+   model's own library does (the weight is one round-to-nearest-even of `(q − z) · s`, the nibbles stored offset by 8;
+   43 % of the products are inexact in BF16, so the rounding point is the contract, verified exhaustively,
+   [model.md](docs/model.md)), and its quality is measured against the parent, GLM-5.3, whose golden data
    this fleet already has.
 
 ## Budgets that drive the design
