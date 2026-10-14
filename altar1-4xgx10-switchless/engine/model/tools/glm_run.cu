@@ -1,7 +1,8 @@
 // The model's driver on the ring (docs/engine.md, "The driver"): every rank runs it with the same arguments
 // (run4.sh); rank 0 prints and writes.
 //   glm_run [options] mode...
-// Weights: --weights PATH (a rank file; "%d" in PATH is the rank; "fleet": the fleet file's RANK<r>_WEIGHTS) or --synthetic [--pools N] [--s3] [--seed S].
+// Weights: --weights PATH (a rank file; "%d" in PATH is the rank; "fleet": the fleet file's RANK<r>_WEIGHTS) or --synthetic
+// [--pools N INT4 expert pools] [--bf16-pools N] [--rowmajor: BF16 projections row-major, not kBF16T] [--seed S].
 // Modes:
 //   bench     decode steps as graphs at --rows (default 1,2,4,6,8,16) at context --ctx: GPU ms a step, wall ms, host
 //             ms a launch; the floor; then one profiled eager step a row count (ms per kernel class, per layer class)
@@ -106,8 +107,8 @@ std::vector<int32_t> ring_tokens(comm::Ring& ring, const std::string& path) {
 struct Args {
   int rank = -1;
   std::string fleet, weights, out, tag, dir, tokens, sample_rows, via = "prefill";
-  bool synthetic = false, s3 = false, fill_experts = false;
-  int pools = 16;
+  bool synthetic = false, rowmajor = false, fill_experts = false;
+  int pools = 4, bf16_pools = 1;
   uint64_t seed = 1;
   int ctx = 4096, steps = 32, prompt = 0;
   float temp = 0.f, top_p = 1.f;
@@ -162,7 +163,7 @@ Batch one_session(int R, int pos0, const int32_t* tok, int slot, const Sampling&
 }
 
 // expected distinct experts of R rows routed independently and uniformly (synthetic weights route about so)
-double union_of(int R) { return 256.0 * (1.0 - std::pow(1.0 - 8.0 / 256.0, R)); }
+double union_of(int R) { return gx::kE * (1.0 - std::pow(1.0 - (double)gx::kTopK / gx::kE, R)); }
 
 // ---- bench ------------------------------------------------------------------------------------------------------
 
@@ -886,8 +887,8 @@ struct L78Sink : Sink {
       const float* lg = static_cast<const float*>(data);
       for (int r = 0; r < R; ++r) {
         if (pos[r] != 0) continue;
-        const float* l = lg + (size_t)r * 256;
-        std::vector<int> id(256);
+        const float* l = lg + (size_t)r * gx::kE;
+        std::vector<int> id(gx::kE);
         std::iota(id.begin(), id.end(), 0);
         std::partial_sort(id.begin(), id.begin() + 12, id.end(), [&](int a, int b) { return l[a] > l[b]; });
         first += " router0:";
@@ -1336,7 +1337,8 @@ int main(int argc, char** argv) {
     else if (a == "--synthetic") A.synthetic = true;
     else if (a == "--fill-experts") A.fill_experts = true;
     else if (a == "--pools") A.pools = std::stoi(nx());
-    else if (a == "--s3") A.s3 = true;
+    else if (a == "--rowmajor") A.rowmajor = true;
+    else if (a == "--bf16-pools") A.bf16_pools = std::stoi(nx());
     else if (a == "--seed") A.seed = std::stoull(nx());
     else if (a == "--ctx") A.ctx = std::stoi(nx());
     else if (a == "--max-ctx") A.mo.max_ctx = std::stoi(nx());
@@ -1398,38 +1400,9 @@ int main(int argc, char** argv) {
   const int rk = ring.rank();
   if (rk == 0 && !A.out.empty() && !(g_out = std::fopen(A.out.c_str(), "a"))) die("cannot append to %s", A.out.c_str());
   if (A.tag.empty()) A.tag = "glm_run";
-  const double t0 = now_s();
-  Model m(rk, A.mo);
-  std::unique_ptr<glw::WeightFile> wf;
-  if (A.synthetic) {
-    SynthOptions so;
-    so.seed = A.seed, so.expert_pools = A.pools, so.s3 = A.s3;
-    m.bind_synthetic(so, ring);
-  } else {
-    if (A.weights.empty()) die("glm_run: --weights PATH or --synthetic");
-    char path[1024];
-    if (A.weights == "fleet")  // the fleet file's RANK<r>_WEIGHTS
-      std::snprintf(path, sizeof path, "%s", comm::fleet_path(comm::fleet(A.fleet).rank[rk].weights, rk).c_str());
-    else
-      std::snprintf(path, sizeof path, A.weights.c_str(), rk);
-    wf = std::make_unique<glw::WeightFile>(path, rk, kRanks);
-    wf->load();
-    SynthOptions so;
-    so.seed = A.seed, so.expert_pools = A.pools, so.s3 = A.s3;
-    m.bind(*wf, ring, A.fill_experts ? &so : nullptr);
-  }
-  size_t fr = 0, tot = 0;
-  CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
-  record(rk, "tune\t%08x\tprefill pieces %d comm blocks %d", m.options().tune, m.options().prefill_pieces,
-         m.options().prefill_comm_blocks);
-  record(rk, "start\t%s weights (%d MoE layers' routed experts from the file) %.2f GB\tmax_ctx %d slots %d drafts %d l2pf %d\tbound in %.1f s\tfree %.1f GB",
-         A.synthetic ? "synthetic" : "file", m.file_expert_layers(), m.weight_bytes() / 1e9, m.options().max_ctx, m.options().slots,
-         m.options().drafts, (int)m.options().l2pf, now_s() - t0, fr / 1e9);
-  if (!A.synthetic && A.min_free_mib > 0) {
-    // the real rank files leave little memory (101.4 GiB of weights a rank, G8): the prefill buffers now, then every
-    // rank's free device memory and MemAvailable; below --min-free-mib on any rank every rank stops here, rather
-    // than the box thrashing later (unified memory: the host's pages and the device's are the same)
-    m.prefill_init();
+  // every rank's free device memory and MemAvailable (recorded; the job's evidence for the fleet's memory rule)
+  auto memory = [&](const char* when, bool guard) {
+    size_t fr = 0, tot = 0;
     CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
     int64_t mine[2] = {(int64_t)fr, 0}, all[8];
     if (FILE* f = std::fopen("/proc/meminfo", "r")) {
@@ -1449,12 +1422,44 @@ int main(int argc, char** argv) {
       s += b;
       ok &= all[2 * r + 1] >= (int64_t)A.min_free_mib << 20;  // MemAvailable: what earlyoom (-m 3: ~3.7 GiB) watches
     }
-    std::printf("rank %d: free device / MemAvailable after the weights and the prefill buffers (chunk %d, index scratch "
-                "%zu MiB): %s\n", rk, A.mo.prefill_rows, A.mo.index_scratch >> 20, s.c_str());
-    std::fflush(stdout);
-    record(rk, "memory\tchunk %d index scratch %zu MiB\t%s", A.mo.prefill_rows, A.mo.index_scratch >> 20, s.c_str());
-    if (!ok) die("glm_run: a rank has less than %d MiB available after the weights and the prefill buffers (%s)", A.min_free_mib, s.c_str());
+    record(rk, "memory\t%s\tchunk %d index scratch %zu MiB\tfree device / MemAvailable: %s", when, A.mo.prefill_rows,
+           A.mo.index_scratch >> 20, s.c_str());
+    if (guard && !ok && A.min_free_mib > 0)
+      die("glm_run: a rank has less than %d MiB available %s (%s)", A.min_free_mib, when, s.c_str());
+  };
+  memory("before the load", false);
+  const double t0 = now_s();
+  Model m(rk, A.mo);
+  std::unique_ptr<glw::WeightFile> wf;
+  if (A.synthetic) {
+    SynthOptions so;
+    so.seed = A.seed, so.expert_pools = A.pools, so.bf16_pools = A.bf16_pools, so.bf16_rowmajor = A.rowmajor;
+    m.bind_synthetic(so, ring);
+  } else {
+    if (A.weights.empty()) die("glm_run: --weights PATH or --synthetic");
+    char path[1024];
+    if (A.weights == "fleet")  // the fleet file's RANK<r>_WEIGHTS
+      std::snprintf(path, sizeof path, "%s", comm::fleet_path(comm::fleet(A.fleet).rank[rk].weights, rk).c_str());
+    else
+      std::snprintf(path, sizeof path, A.weights.c_str(), rk);
+    wf = std::make_unique<glw::WeightFile>(path, rk, kRanks);
+    wf->load();
+    SynthOptions so;
+    so.seed = A.seed, so.expert_pools = A.pools, so.bf16_pools = A.bf16_pools, so.bf16_rowmajor = A.rowmajor;
+    m.bind(*wf, ring, A.fill_experts ? &so : nullptr);
   }
+  size_t fr = 0, tot = 0;
+  CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
+  record(rk, "tune\t%08x\tprefill pieces %d comm blocks %d", m.options().tune, m.options().prefill_pieces,
+         m.options().prefill_comm_blocks);
+  record(rk, "start\t%s weights (%d MoE layers' routed experts from the file) %.2f GB\tmax_ctx %d slots %d drafts %d l2pf %d\tbound in %.1f s\tfree %.1f GB",
+         A.synthetic ? "synthetic" : "file", m.file_expert_layers(), m.weight_bytes() / 1e9, m.options().max_ctx, m.options().slots,
+         m.options().drafts, (int)m.options().l2pf, now_s() - t0, fr / 1e9);
+  // the prefill buffers now, then every rank's free device memory and MemAvailable: below --min-free-mib (4.5 GiB) on
+  // any rank every rank stops here, rather than a box thrashing later (unified memory: the host's pages and the
+  // device's are the same; glm53 G8, serving.md § 5.1)
+  m.prefill_init();
+  memory("after the weights and the prefill buffers", true);
   for (const std::string& mode : A.modes) {
     ring.barrier();
     if (mode == "bench") bench(m, ring);

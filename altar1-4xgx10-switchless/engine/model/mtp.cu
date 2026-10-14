@@ -21,7 +21,7 @@ void Model::Impl::mtp_project(int n, const uint16_t* e, const uint16_t* hid, uin
   ::glm::rmsnorm(hid, kDim, mtp.hnorm, ::glm::kNormEps, kDim, x12 + kDim, kEhK, n, st, P);
   {  // this rank's 1536 rows of eh_proj into its block of out
     ::glm::GemvSeg s;
-    s.w = mtp.eh.w, s.s = mtp.eh.s, s.n = kEhRows, s.y = out + (size_t)rank * kEhRows, s.ldy = kDim;
+    s = mtp.eh.seg(out + (size_t)rank * kEhRows, kDim);  // BF16
     detail::pf_proj(tune(kTunePfGemm), x12, kEhK, n, kEhK, &s, 1, ::glm::GemvOut::kBF16, 1, st, P);
   }
   const size_t ld = (size_t)kDim * 2, rb = (size_t)kEhRows * 2;
@@ -32,8 +32,8 @@ void Model::Impl::mtp_project(int n, const uint16_t* e, const uint16_t* hid, uin
 void Model::Impl::mtp_top1(int n, const uint16_t* xn_rows) {
   const bool P = pdl();
   ::glm::GemvSeg s;
-  s.w = head, s.n = kVocabRank, s.y = logits, s.ldy = kVocabRank;
-  ::glm::gemv(false, xn_rows, kDim, n, kDim, &s, 1, ::glm::GemvOut::kF32, 1, st, P);
+  s = head.seg(logits, kVocabRank);
+  ::glm::gemv(xn_rows, kDim, n, kDim, &s, 1, ::glm::GemvOut::kF32, 1, st, P);
   ops::local_top1(logits, n, rank * kVocabRank, m_cand, st, P);
   comm::glm::topk_exchange(ch, m_cand, m_best, n, 1, st, P);
 }
@@ -57,8 +57,8 @@ void Model::Impl::drafts(int R, int nsess, int passes, uint32_t flags, Sink* sin
   layer(kMtpLayer, R, m_pos, in_d->slot, m_h, m_xn, m_topk, mtp.head_norm, true, sink, flags);
   if (flags & (kFlagMtpLogits | kFlagMtpAll)) {  // eager: every row's head (the golden format's mtp/ rows)
     ::glm::GemvSeg s;
-    s.w = head, s.n = kVocabRank, s.y = logits, s.ldy = kVocabRank;
-    ::glm::gemv(false, m_xn, kDim, R, kDim, &s, 1, ::glm::GemvOut::kF32, 1, st, P);
+    s = head.seg(logits, kVocabRank);
+    ::glm::gemv(m_xn, kDim, R, kDim, &s, 1, ::glm::GemvOut::kF32, 1, st, P);
     if (flags & kFlagMtpLogits) gather_logits(sink, logits, m_pos, R, true);
     if (flags & kFlagMtpAll) {
       ops::local_top1(logits, R, rank * kVocabRank, m_cand, st, P);

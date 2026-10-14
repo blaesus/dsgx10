@@ -26,7 +26,7 @@ const char* kclass_name(int c) {
   static const char* n[kKClasses] = {"embed",   "x-projection", "xproj all-gather", "attn_prep", "q_b + wq_b",
                                      "idxq all-gather", "index_select", "W_UK", "sparse_attn", "W_UV",
                                      "o_proj", "all-reduce 1 (+norm)", "MLP / MoE", "all-reduce 2 (+norm)", "head",
-                                     "sample", "MTP draft passes"};
+                                     "sample", "MTP draft passes", "shared expert"};
   return c >= 0 && c < kKClasses ? n[c] : "?";
 }
 
@@ -148,16 +148,23 @@ Model::Impl::~Impl() {
 void Model::Impl::bind_common(comm::Ring& ring) {
   ch = ring.dev();
   if (ch.cap < kChannelCap) die("model: the ring's channel holds %u B a rank (at least %zu)", ch.cap, kChannelCap);
+  // every projection bound with a format (attn refuses kNone), and BF16 wherever the kernels take no INT4
+  auto ok = [](const Proj& p, bool int4_ok) {
+    return p.w && (p.fmt == ::glm::WFmt::kBF16 || p.fmt == ::glm::WFmt::kBF16T || (int4_ok && p.fmt == ::glm::WFmt::kINT4));
+  };
   for (int l = 0; l < kCacheLayers; ++l) {
     const LayerW& w = lw[l];
-    if (!w.attn_norm || !w.xproj.w || !w.q_b.w || !w.w_uk.w || !w.w_uv.w || !w.o_proj.w || !w.ffn_norm)
-      die("model: layer %d's attention weights are missing", l);
-    if (full_layer(l) && (!w.iq_b.w || !w.wproj || !w.k_norm_w)) die("model: layer %d's indexer weights are missing", l);
-    if (dense_layer(l) ? !w.gate_up.w || !w.down.w : !w.router || !w.moe.pool || !w.moe.desc || !w.moe.sh.g)
+    if (!w.attn_norm || !ok(w.xproj, false) || !ok(w.q_b, true) || !ok(w.w_uk, false) || !ok(w.w_uv, true) ||
+        !ok(w.o_proj, true) || !w.ffn_norm)
+      die("model: layer %d's attention weights are missing or not BF16 / INT4", l);
+    if (full_layer(l) && (!ok(w.iq_b, false) || !w.wproj || !w.k_norm_w)) die("model: layer %d's indexer weights are missing", l);
+    if (dense_layer(l) ? !ok(w.gate_up, false) || !ok(w.down, false)
+                       : !w.router || !w.moe.pool || !w.moe.desc || !ok(w.sh_gate_up, false) || !ok(w.sh_down, false) ||
+                             w.moe.sh.fused() || !gx::fmt_known(w.moe.fmt) || w.exp_bytes <= 0)
       die("model: layer %d's MLP weights are missing", l);
   }
-  if (!embed || !head || !norm_w || !rope) die("model: the global weights are missing");
-  if (opt.drafts && (!mtp.eh.w || !mtp.enorm || !mtp.hnorm || !mtp.head_norm)) die("model: the MTP weights are missing");
+  if (!embed || !ok(head, false) || !norm_w || !rope) die("model: the global weights are missing");
+  if (opt.drafts && (!ok(mtp.eh, false) || !mtp.enorm || !mtp.hnorm || !mtp.head_norm)) die("model: the MTP weights are missing");
   ring.barrier();
   bound = true;
 }
@@ -181,33 +188,22 @@ void Model::Impl::mark(int cls, int layer) {
 void Model::Impl::l2pf(int w, int l, int R) {
   if (!sc || !l2pf_on || prof || l >= kLayers) return;
   const LayerW& L = lw[l];
-  auto fp8 = [](const Fp8W& x, int N, int K, int rs, int ks) -> std::pair<size_t, size_t> {
-    return {x.w ? (size_t)N * K : 0, x.s ? (size_t)(N / rs) * (K / ks) * 4 : 0};
-  };
   const bool full = full_layer(l);
-  const int xr = full ? ::glm::kXRows : ::glm::kXRowsShared;
+  // each projection one range of its format's bytes (an INT4 tile carries its scales and zero points; no scale tables)
   PfTarget t[kPfTargets] = {};
   auto set = [&](int i, int j, const void* p, size_t n) { t[i].p[j] = p, t[i].n[j] = n; };
-  auto a = fp8(L.xproj, xr, kDim, 16, 128);
-  set(kPfXproj, 0, L.xproj.w, a.first), set(kPfXproj, 1, L.xproj.s, a.second);
-  a = fp8(L.q_b, ::glm::kOProjK, ::glm::kQLora, 128, 128);
-  set(kPfQb, 0, L.q_b.w, a.first), set(kPfQb, 1, L.q_b.s, a.second);
-  if (full) {
-    a = fp8(L.iq_b, 1024, ::glm::kQLora, 128, 128);
-    set(kPfQb, 2, L.iq_b.w, a.first), set(kPfQb, 3, L.iq_b.s, a.second);
-  }
-  a = fp8(L.w_uk, ::glm::kHeads * ::glm::kKvLora, ::glm::kNope, 128, 64);
-  set(kPfUk, 0, L.w_uk.w, a.first), set(kPfUk, 1, L.w_uk.s, a.second);
-  a = fp8(L.w_uv, ::glm::kOProjK, ::glm::kKvLora, 64, 128);
-  set(kPfUv, 0, L.w_uv.w, a.first), set(kPfUv, 1, L.w_uv.s, a.second);
-  a = fp8(L.o_proj, kDim, ::glm::kOProjK, 128, 128);
-  set(kPfOproj, 0, L.o_proj.w, a.first), set(kPfOproj, 1, L.o_proj.s, a.second);
+  auto proj = [&](int i, int j, const Proj& w) { set(i, j, w.w, w.bytes()); };
+  proj(kPfXproj, 0, L.xproj);
+  proj(kPfQb, 0, L.q_b);
+  if (full) proj(kPfQb, 1, L.iq_b);
+  proj(kPfUk, 0, L.w_uk);
+  proj(kPfUv, 0, L.w_uv);
+  proj(kPfOproj, 0, L.o_proj);
   if (dense_layer(l)) {
-    a = fp8(L.gate_up, 2 * ::glm::kDenseInterRank, kDim, 128, 128);
-    set(kPfFfn0, 0, L.gate_up.w, a.first), set(kPfFfn0, 1, L.gate_up.s, a.second);
-  } else {
+    proj(kPfFfn0, 0, L.gate_up);
+  } else {  // the step's order: router, the shared expert's gate/up and down, then the routed experts
     set(kPfFfn0, 0, L.router, (size_t)gx::kE * kDim * 2);
-    set(kPfFfn1, 0, L.moe.sh.g, (size_t)gx::kI * kDim), set(kPfFfn1, 1, L.moe.sh.u, (size_t)gx::kI * kDim);
+    proj(kPfFfn1, 0, L.sh_gate_up), proj(kPfFfn1, 1, L.sh_down);
   }
   const int r = std::min(R, 8);
   const float us = w == 1   ? (dense_layer(l) || l == 0 ? 18.f : 24.f) + 5.f * (r - 1)  // the FFN all-reduce before layer l
@@ -237,15 +233,14 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
   const bool full = full_layer(l), P = pdl();
   const int xr = full ? kXRows : kXRowsShared;
   // the x-projection: this rank's rows into its block of xg [R][4][xr]; the indexer's head weights beside it
-  {
-    GemvSeg s;
-    s.w = w.xproj.w, s.s = w.xproj.s, s.n = xr, s.rs = 16, s.ks = 128, s.y = xg + (size_t)rank * xr, s.ldy = kRanks * xr;
+  {  // BF16 (kBF16T as the converter writes it), split-K 4; GemvIw takes BF16 (attention.md § 8 item 2)
+    const GemvSeg s = w.xproj.seg(xg + (size_t)rank * xr, kRanks * xr);
     if (full && tune(kTuneIw)) {
       GemvIw g;
       g.wproj = w.wproj, g.nh = kIdxHeadsRank, g.w = iw + kIdxHeadsRank * rank, g.ldw = kIdxHeads;
-      gemv(true, xn_, kDim, R, kDim, &s, 1, GemvOut::kBF16, 4, st, P, &g);
+      gemv(xn_, kDim, R, kDim, &s, 1, GemvOut::kBF16, 4, st, P, &g);
     } else {
-      gemv(true, xn_, kDim, R, kDim, &s, 1, GemvOut::kBF16, 4, st, P);
+      gemv(xn_, kDim, R, kDim, &s, 1, GemvOut::kBF16, 4, st, P);
       if (full) index_weights(xn_, R, w.wproj, kIdxHeadsRank, iw + kIdxHeadsRank * rank, kIdxHeads, st, P);
     }
   }
@@ -262,12 +257,10 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
   }
   mark(kKPrep, l);
   const bool idx = full && index_on;
-  {
-    GemvSeg s[2];
-    s[0].w = w.q_b.w, s[0].s = w.q_b.s, s[0].n = kOProjK, s[0].y = q, s[0].ldy = kOProjK;
-    s[1].w = w.iq_b.w, s[1].s = w.iq_b.s, s[1].n = kIdxHeadsRank * kIdxDim, s[1].y = iq + (size_t)rank * kIdxHeadsRank * kIdxDim,
-    s[1].ldy = kIdxHeads * kIdxDim;
-    gemv(true, qr, kQLora, R, kQLora, s, idx ? 2 : 1, GemvOut::kBF16, 1, st, P);
+  {  // q_b (INT4 on 4-76, else BF16) and wq_b (BF16) in one call, a launch a format family
+    const GemvSeg s[2] = {w.q_b.seg(q, kOProjK),
+                          w.iq_b.seg(iq + (size_t)rank * kIdxHeadsRank * kIdxDim, kIdxHeads * kIdxDim)};
+    gemv(qr, kQLora, R, kQLora, s, idx ? 2 : 1, GemvOut::kBF16, 1, st, P);
   }
   mark(kKQb, l);
   if (idx) {
@@ -278,10 +271,9 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     mark(kKIndex, l);
   }
   {  // absorbed W_UK: head h's q_nope (192) -> q_lat (512)
-    GemvSeg s;
-    s.w = w.w_uk.w, s.s = w.w_uk.s, s.n = kHeads * kKvLora, s.rs = 128, s.ks = 64, s.y = qlat, s.ldy = kHeads * kKvLora;
+    GemvSeg s = w.w_uk.seg(qlat, kHeads * kKvLora);  // BF16 (an INT4 layer's: the exact dequantisation)
     s.group_rows = kKvLora, s.x_group = kQkDim;
-    gemv(true, q, kOProjK, R, kNope, &s, 1, GemvOut::kBF16, 1, st, P);
+    gemv(q, kOProjK, R, kNope, &s, 1, GemvOut::kBF16, 1, st, P);
   }
   mark(kKUk, l);
   l2pf(3, l, R);
@@ -289,47 +281,49 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
   sparse_attn(qlat, q, pos, slot, rope, kv_of(l), topk_, R, splits, AttnScratch{att_o, att_ml, kMaxSplits}, u, st, P);
   mark(kKAttn, l);
   {  // absorbed W_UV: head h's latent (512) -> v (256)
-    GemvSeg s;
-    s.w = w.w_uv.w, s.s = w.w_uv.s, s.n = kOProjK, s.rs = 64, s.ks = 128, s.y = o, s.ldy = kOProjK;
+    GemvSeg s = w.w_uv.seg(o, kOProjK);  // INT4 on 4-76, else BF16
     s.group_rows = kVDim, s.x_group = kKvLora;
-    gemv(true, u, kHeads * kKvLora, R, kKvLora, &s, 1, GemvOut::kBF16, 1, st, P);
+    gemv(u, kHeads * kKvLora, R, kKvLora, &s, 1, GemvOut::kBF16, 1, st, P);
   }
   mark(kKUv, l);
-  const bool op = tune(kTuneOproj);
-  if (op) {
-    oproj_post(o, R, w.o_proj, ch, st, P);
-  } else {
-    GemvSeg s;
-    s.w = w.o_proj.w, s.s = w.o_proj.s, s.n = kDim, s.y = part, s.ldy = kDim;
-    gemv(true, o, kOProjK, R, kOProjK, &s, 1, GemvOut::kF32, 1, st, P);
+  {  // o_proj's f32 partials (INT4 on 4-76, else BF16); glm53's posting variant (oproj.cu, FP8-only) is gone
+    const GemvSeg s = w.o_proj.seg(part, kDim);
+    gemv(o, kOProjK, R, kOProjK, &s, 1, GemvOut::kF32, 1, st, P);
   }
   mark(kKOproj, l);
   l2pf(4, l, R);
   const int ars = tune(kTuneArRow) ? 1 : 0;  // the fused all-reduces' blocks: one a row, or the default slices
-  if (op) comm::glm::allreduce_add_norm_posted(ch, R, h_, h_, w.ffn_norm, kNormEps, xn_, st, P, ars);
-  else comm::glm::allreduce_add_norm(ch, part, R, h_, h_, w.ffn_norm, kNormEps, xn_, st, P, ars);
+  comm::glm::allreduce_add_norm(ch, part, R, h_, h_, w.ffn_norm, kNormEps, xn_, st, P, ars);
   mark(kKAr1, l);
   if ((flags & kFlagDump) && l == kMtpLayer) dump_rows(sink, l, "attn", pos, R, h_, kEmbRow);  // mtpgold's diagnostics
   if (dense_layer(l)) {
-    GemvSeg s;
-    s.w = w.gate_up.w, s.s = w.gate_up.s, s.n = 2 * kDenseInterRank, s.y = hm, s.ldy = kDenseInterRank;
-    gemv(true, xn_, kDim, R, kDim, &s, 1, GemvOut::kSwiGLU, 1, st, P);
-    GemvSeg d;
-    d.w = w.down.w, d.s = w.down.s, d.n = kDim, d.y = part, d.ldy = kDim;
-    gemv(true, hm, kDenseInterRank, R, kDenseInterRank, &d, 1, GemvOut::kF32, 1, st, P);
+    const GemvSeg s = w.gate_up.seg(hm, kDenseInterRank);
+    gemv(xn_, kDim, R, kDim, &s, 1, GemvOut::kSwiGLU, 1, st, P);
+    const GemvSeg d = w.down.seg(part, kDim);
+    gemv(hm, kDenseInterRank, R, kDenseInterRank, &d, 1, GemvOut::kF32, 1, st, P);
     mark(kKMlp, l);
     l2pf(1, l + 1, R);
     comm::glm::allreduce_add_norm(ch, part, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
   } else {
     GemvSeg s;  // the router's logits: fp32 products of bf16 values, f32 sums
-    s.w = w.router, s.n = gx::kE, s.y = gl, s.ldy = gx::kE;
-    gemv(false, xn_, kDim, R, kDim, &s, 1, GemvOut::kF32, 4, st, P);
+    s.fmt = WFmt::kBF16, s.w = w.router, s.n = gx::kE, s.y = gl, s.ldy = gx::kE;
+    gemv(xn_, kDim, R, kDim, &s, 1, GemvOut::kF32, 4, st, P);
     if ((flags & kFlagDump) && l == kMtpLayer) dump_rows(sink, l, "router", pos, R, gl, (size_t)gx::kE * 4);
+    // the BF16 shared expert through the GEMV (experts.md § 8.3): gate/up interleaved with the SwiGLU epilogue
+    // (h = bf16(bf16(silu(g)) * u)) at split-K 4, then down to f32 partials in ys, which the routed step forwards
+    // (posted) or the all-reduce takes beside yr: y = bf16(bf16(sum routed) + bf16(sum shared)) as before
+    float* ys = yr + (size_t)R * kDim;
+    {
+      const GemvSeg g = w.sh_gate_up.seg(hm, kSharedInterRank);
+      gemv(xn_, kDim, R, kDim, &g, 1, GemvOut::kSwiGLU, 4, st, P);
+      const GemvSeg d = w.sh_down.seg(ys, kDim);
+      gemv(hm, kSharedInterRank, R, kSharedInterRank, &d, 1, GemvOut::kF32, 1, st, P);
+    }
+    mark(kKShared, l);
     gx::DecodeCfg dc;
     dc.pdl = P;
     if (tune(kTuneRoute)) dc.logits = gl, dc.bias = w.router_bias;
     else gx::route(gl, w.router_bias, R, ridx, rw, st, P);
-    float* ys = yr + (size_t)R * kDim;
     const bool post = tune(kTunePost);
     if (post) dc.post = &ch;
     gx::moe_decode(w.moe, reinterpret_cast<const __nv_bfloat16*>(xn_), ridx, rw, R, moe_ws, yr, ys, st, dc);
@@ -382,8 +376,8 @@ void Model::Impl::forward(int R, uint32_t flags, Sink* sink) {
   if (forked) join(sc), forked = false;
   {  // the vocabulary-split head on the final normed rows: f32 logits (the reference's golden form)
     ::glm::GemvSeg s;
-    s.w = head, s.n = kVocabRank, s.y = logits, s.ldy = kVocabRank;
-    ::glm::gemv(false, xn, kDim, R, kDim, &s, 1, GemvOut::kF32, 1, st, P);
+    s = head.seg(logits, kVocabRank);
+    ::glm::gemv(xn, kDim, R, kDim, &s, 1, GemvOut::kF32, 1, st, P);
   }
   mark(kKHead, -1);
   if (flags & kFlagDump) dump_rows(sink, -1, "final", pos, R, xn, kEmbRow);
@@ -672,18 +666,20 @@ void Model::set_graphs(bool on) {
 }
 double Model::step_bytes(double experts, bool with_mtp) const {
   using namespace ::glm;
-  auto fp8 = [](int N, int K, int rs, int ks) { return (double)N * K + (double)(N / rs) * (K / ks) * 4; };
+  // every bound weight in its own format's bytes (Proj::bytes: weight_bytes of BF16 / kBF16T / INT4), the routed
+  // experts at the layer's format; per layer as attention.md § 2 (36.50 / 31.82 MB INT4 full / shared attention,
+  // 87.20 / 82.51 MB BF16), the dense MLPs, the shared experts and the head
+  const Impl& I = *d_;
   double b = 0;
   for (int l = 0; l < (with_mtp ? kCacheLayers : kLayers); ++l) {
-    const bool full = full_layer(l);
-    b += fp8(full ? kXRows : kXRowsShared, kDim, 16, 128) + fp8(kOProjK, kQLora, 128, 128) +
-         fp8(kHeads * kKvLora, kNope, 128, 64) + fp8(kOProjK, kKvLora, 64, 128) + fp8(kDim, kOProjK, 128, 128);
-    if (full) b += fp8(kIdxHeadsRank * kIdxDim, kQLora, 128, 128) + (double)kIdxHeadsRank * kDim * 2;
-    if (dense_layer(l)) b += fp8(2 * kDenseInterRank, kDim, 128, 128) + fp8(kDim, kDenseInterRank, 128, 128);
-    else b += (double)gx::kE * kDim * 2 + 2 * fp8(gx::kI, gx::kH, 128, 128) + fp8(gx::kH, gx::kI, 128, 128) + experts * d_->exp_bytes;
+    const LayerW& w = I.lw[l];
+    b += w.xproj.bytes() + w.q_b.bytes() + w.w_uk.bytes() + w.w_uv.bytes() + w.o_proj.bytes();
+    if (full_layer(l)) b += w.iq_b.bytes() + (double)kIdxHeadsRank * kDim * 2;
+    if (dense_layer(l)) b += w.gate_up.bytes() + w.down.bytes();
+    else b += (double)gx::kE * kDim * 2 + w.sh_gate_up.bytes() + w.sh_down.bytes() + experts * w.exp_bytes;
   }
-  b += (double)kVocabRank * kDim * 2 * (with_mtp ? 2 : 1);  // the head (and the draft's)
-  if (with_mtp) b += fp8(kEhRows, kEhK, 128, 128);
+  b += (double)I.head.bytes() * (with_mtp ? 2 : 1);  // the head (and the draft's)
+  if (with_mtp) b += I.mtp.eh.bytes();
   return b;
 }
 

@@ -1,5 +1,5 @@
-// The TP=4 forward of GLM-5.3 on one rank (docs/engine.md): the layer runner over the kernels of engine/attn and
-// engine/experts and the collectives of engine/comm. Every rank holds a Model and makes the same calls in the
+// The TP=4 forward of altar-1 (GLM-5.3 with 168 routed experts, INT4 and BF16 weights) on one rank (docs/engine.md):
+// the layer runner over the kernels of engine/attn and engine/experts and the collectives of engine/comm. Every rank holds a Model and makes the same calls in the
 // same order; the residual stream, the routing, the index choices and the sampled tokens are bit-identical on
 // all four (the collectives sum in rank order).
 //
@@ -105,9 +105,10 @@ enum Tune : uint32_t {
   kTuneRoute = 1u << 0,  // the routing inside the expert kernels (no route() launch)
   kTunePost = 1u << 1,   // the experts' down kernel posts its partials to the ring itself (the all-reduce: consumer half)
   kTuneIw = 1u << 2,     // full layers: the indexer's head weights in the x-projection's launch (attn's GemvIw)
-  kTuneOproj = 1u << 3,  // o_proj posts its partials to the ring itself (oproj.cu): measured neutral, off by default
+  // 1u << 3 was glm53's kTuneOproj (o_proj posting its FP8 partials, oproj.cu): FP8-only, removed; the bit is ignored
+  kTuneOprojRemoved = 1u << 3,
   kTuneArRow = 1u << 4,  // the fused all-reduces with one block a row (comm::glm slices = 1)
-  kTunePfGemm = 1u << 5,    // prefill: the FP8 projections as attn's gemm(), not 16-row GEMV launches (prefill.cu)
+  kTunePfGemm = 1u << 5,    // prefill: the projections as attn's gemm() (INT4 through a BF16 scratch), not 16-row GEMVs
   kTunePfRouter = 1u << 6,  // prefill: the BF16 router as attn's gemm_bf16(), not 16-row GEMV launches
   // prefill: a chunk's rows in Options::prefill_pieces pieces, each piece's collectives on a stream of their own
   // while the next piece computes (prefill.cu, docs/engine.md "Prefill overlap")
@@ -142,18 +143,21 @@ struct Options {
   size_t index_scratch = 512ull << 20;  // the prefill indexer's score scratch, bytes
 };
 
-// Synthetic weights (no file): every tensor in the kernels' layouts with hashed contents, scaled so a forward
-// stays finite. expert_pools distinct routed-expert pools (NVFP4 or the S3 code), layer l using pool l % n.
+// Synthetic weights (no file): every tensor in altar-1's formats and the kernels' layouts (per layer as a rank file
+// binds them: INT4 tiles for q_b, W_UV, o_proj and INT4 routed experts on layers 4-76, BF16 elsewhere) with hashed
+// contents, scaled so a forward stays finite. expert_pools distinct INT4 routed-expert pools of 168 experts (0.92 GB
+// each), bf16_pools BF16 ones (3.17 GB each, layers 3, 77, 78), a layer using pool i % n of its format's.
 struct SynthOptions {
   uint64_t seed = 1;
-  int expert_pools = 16;
-  bool s3 = false;  // the E2M1-subset 3-bit code instead of NVFP4
+  int expert_pools = 4;
+  int bf16_pools = 1;
+  bool bf16_rowmajor = false;  // the BF16 projections row-major instead of kBF16T (the converter's default)
 };
 
 // Per-kernel-class timing of one eager step (Model::profile).
 enum KClass : int {
   kKEmbed, kKXproj, kKAgX, kKPrep, kKQb, kKAgQ, kKIndex, kKUk, kKAttn, kKUv, kKOproj, kKAr1, kKMlp, kKAr2,
-  kKHead, kKSample, kKMtp, kKClasses
+  kKHead, kKSample, kKMtp, kKShared, kKClasses  // kKShared: the BF16 shared expert's two GEMVs (kKMlp: the rest)
 };
 const char* kclass_name(int c);
 struct Profile {

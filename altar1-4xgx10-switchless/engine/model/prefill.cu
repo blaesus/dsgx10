@@ -30,6 +30,7 @@ struct Model::Impl::Pre {
   int cap = 0;  // rows a chunk (a multiple of 16)
   int32_t *tok = nullptr, *pos = nullptr, *slot = nullptr, *mpos = nullptr, *mslot = nullptr;
   uint16_t *emb, *eb, *h, *xn, *xg, *qr, *q, *iq, *qlat, *u, *o, *hm;
+  uint16_t* wscratch = nullptr;  // the INT4 projections dequantised for the GEMM (kInt4ScratchElems bf16, 50.3 MB)
   float *iw, *part, *yr, *ys, *qa, *qb, *gl, *rw;
   int *ridx, *topk;
   float* scores = nullptr;
@@ -70,7 +71,8 @@ void Model::Impl::prefill_alloc() {
   p.qlat = dalloc<uint16_t>(M * kHeads * kKvLora);  // the MTP fill's eh_proj output too
   p.u = dalloc<uint16_t>(M * kHeads * kKvLora);     // and its normed input
   p.o = dalloc<uint16_t>(M * kOProjK);
-  p.hm = dalloc<uint16_t>(M * kDenseInterRank);
+  p.hm = dalloc<uint16_t>(M * kDenseInterRank);  // the shared expert's h too (512 a row)
+  p.wscratch = dalloc<uint16_t>(kInt4ScratchElems);
   p.part = dalloc<float>(M * kDim);  // the MTP fill's [M][12288] bf16 input too
   p.yr = dalloc<float>(M * kDim), p.ys = dalloc<float>(M * kDim);
   p.qa = dalloc<float>(M / kRanks * kDim), p.qb = dalloc<float>(M / kRanks * kDim);
@@ -98,20 +100,19 @@ void rows16(int M, F f) {
 
 // impl.h
 void detail::pf_proj(bool use_gemm, const uint16_t* x, int ldx, int M, int K, const GemvSeg* segs, int nseg, GemvOut out,
-             int splitk, cudaStream_t st, bool pdl) {
-  if (use_gemm && M > kMaxRows) {
-    // glm53's binding is FP8 throughout; attn's gemm() now takes each segment's format (altar1: the runner passes
-    // BF16/INT4 and a scratch for INT4, docs/attention.md § 8)
-    GemvSeg s[::glm::kMaxSegs];
-    for (int i = 0; i < nseg; ++i) s[i] = segs[i], s[i].fmt = s[i].fmt == ::glm::WFmt::kNone ? ::glm::WFmt::kFP8 : s[i].fmt;
-    ::glm::gemm(x, ldx, M, K, s, nseg, out, splitk, st, pdl);
+             int splitk, cudaStream_t st, bool pdl, uint16_t* scratch, size_t scratch_elems) {
+  for (int i = 0; i < nseg; ++i)  // every segment carries its format; altar-1 binds no FP8 weight
+    if (segs[i].fmt != ::glm::WFmt::kBF16 && segs[i].fmt != ::glm::WFmt::kBF16T && segs[i].fmt != ::glm::WFmt::kINT4)
+      die("pf_proj: segment %d of format %d (BF16, kBF16T or INT4 only)", i, (int)segs[i].fmt);
+  if (use_gemm && M > kMaxRows) {  // INT4 segments through the scratch (attn's gemm() refuses them without one)
+    ::glm::gemm(x, ldx, M, K, segs, nseg, out, splitk, st, pdl, scratch, scratch_elems);
     return;
   }
   const size_t es = out == GemvOut::kF32 ? 4 : 2;
   for (int r0 = 0; r0 < M; r0 += kMaxRows) {
     GemvSeg s[::glm::kMaxSegs];
     for (int i = 0; i < nseg; ++i) s[i] = segs[i], s[i].y = static_cast<char*>(segs[i].y) + (size_t)r0 * segs[i].ldy * es;
-    ::glm::gemv(true, x + (size_t)r0 * ldx, ldx, std::min(kMaxRows, M - r0), K, s, nseg, out, splitk, st, pdl);
+    ::glm::gemv(x + (size_t)r0 * ldx, ldx, std::min(kMaxRows, M - r0), K, s, nseg, out, splitk, st, pdl);
   }
 }
 
@@ -212,6 +213,10 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
   };
 
   const bool G = tune(kTunePfGemm);
+  // a projection over a piece's rows: one GEMM (INT4 through p.wscratch, the stream's order keeping its uses apart)
+  auto PJ = [&](const uint16_t* x, int ldx, int m, int K, const GemvSeg* s, int n, GemvOut o, int sk) {
+    pf_proj(G, x, ldx, m, K, s, n, o, sk, st, false, p.wscratch, kInt4ScratchElems);
+  };
   for (int l = 0; l < kLayers; ++l) {
     const detail::LayerW& w = lw[l];
     const bool full = full_indexer(l);
@@ -224,10 +229,8 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
       float* iw = p.iw + (size_t)r0 * kIdxHeads;
       uint16_t* iq = p.iq + (size_t)r0 * kIdxHeads * kIdxDim;
       {
-        GemvSeg s;
-        s.w = w.xproj.w, s.s = w.xproj.s, s.n = xr, s.rs = 16, s.ks = 128;
-        s.y = xg + (size_t)rank * xr, s.ldy = kRanks * xr;
-        pf_proj(G, p.xn + (size_t)r0 * kDim, kDim, m, kDim, &s, 1, GemvOut::kBF16, 4, st, false);
+        const GemvSeg s = w.xproj.seg(xg + (size_t)rank * xr, kRanks * xr);
+        PJ(p.xn + (size_t)r0 * kDim, kDim, m, kDim, &s, 1, GemvOut::kBF16, 4);
       }
       if (full) index_weights(p.xn + (size_t)r0 * kDim, m, w.wproj, kIdxHeadsRank, iw + kIdxHeadsRank * rank, kIdxHeads, st);
       short_coll([&](cudaStream_t s) { comm::glm::allgather_xproj(ch, xg, iw, m, full, s); });
@@ -238,11 +241,9 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
       pa.qr = p.qr + (size_t)r0 * kQLora, pa.kv = kv_of(l);
       attn_prep(pa, m, st);
       {
-        GemvSeg s[2];
-        s[0].w = w.q_b.w, s[0].s = w.q_b.s, s[0].n = kOProjK, s[0].y = p.q + (size_t)r0 * kOProjK, s[0].ldy = kOProjK;
-        s[1].w = w.iq_b.w, s[1].s = w.iq_b.s, s[1].n = kIdxHeadsRank * kIdxDim, s[1].ldy = kIdxHeads * kIdxDim;
-        s[1].y = iq + (size_t)rank * kIdxHeadsRank * kIdxDim;
-        pf_proj(G, p.qr + (size_t)r0 * kQLora, kQLora, m, kQLora, s, full ? 2 : 1, GemvOut::kBF16, 1, st, false);
+        const GemvSeg s[2] = {w.q_b.seg(p.q + (size_t)r0 * kOProjK, kOProjK),
+                              w.iq_b.seg(iq + (size_t)rank * kIdxHeadsRank * kIdxDim, kIdxHeads * kIdxDim)};
+        PJ(p.qr + (size_t)r0 * kQLora, kQLora, m, kQLora, s, full ? 2 : 1, GemvOut::kBF16, 1);
       }
       if (full) short_coll([&](cudaStream_t s) { comm::glm::allgather_idxq(ch, iq, m, s); });
       flush();  // the piece before's sublayer end (the layer before's last piece's), behind this piece's short ones
@@ -258,23 +259,20 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
       uint16_t* qlat = p.qlat + (size_t)r0 * kHeads * kKvLora;
       uint16_t* u = p.u + (size_t)r0 * kHeads * kKvLora;
       {
-        GemvSeg s;
-        s.w = w.w_uk.w, s.s = w.w_uk.s, s.n = kHeads * kKvLora, s.rs = 128, s.ks = 64;
-        s.y = qlat, s.ldy = kHeads * kKvLora, s.group_rows = kKvLora, s.x_group = kQkDim;
-        pf_proj(G, p.q + (size_t)r0 * kOProjK, kOProjK, m, kNope, &s, 1, GemvOut::kBF16, 1, st, false);
+        GemvSeg s = w.w_uk.seg(qlat, kHeads * kKvLora);
+        s.group_rows = kKvLora, s.x_group = kQkDim;
+        PJ(p.q + (size_t)r0 * kOProjK, kOProjK, m, kNope, &s, 1, GemvOut::kBF16, 1);
       }
       if (!tune(kTunePfAttn)) sparse_attn_config(0);
       sparse_attn(qlat, p.q + (size_t)r0 * kOProjK, p.pos + r0, p.slot + r0, rope, kv_of(l), p.topk + (size_t)r0 * kTopK,
                   m, 1, AttnScratch{}, u, st);
       sparse_attn_config(-1);
       {
-        GemvSeg s;
-        s.w = w.w_uv.w, s.s = w.w_uv.s, s.n = kOProjK, s.rs = 64, s.ks = 128;
-        s.y = p.o + (size_t)r0 * kOProjK, s.ldy = kOProjK, s.group_rows = kVDim, s.x_group = kKvLora;
-        pf_proj(G, u, kHeads * kKvLora, m, kKvLora, &s, 1, GemvOut::kBF16, 1, st, false);
-        GemvSeg d;
-        d.w = w.o_proj.w, d.s = w.o_proj.s, d.n = kDim, d.y = p.part + (size_t)r0 * kDim, d.ldy = kDim;
-        pf_proj(G, p.o + (size_t)r0 * kOProjK, kOProjK, m, kOProjK, &d, 1, GemvOut::kF32, 1, st, false);
+        GemvSeg s = w.w_uv.seg(p.o + (size_t)r0 * kOProjK, kOProjK);
+        s.group_rows = kVDim, s.x_group = kKvLora;
+        PJ(u, kHeads * kKvLora, m, kKvLora, &s, 1, GemvOut::kBF16, 1);
+        const GemvSeg d = w.o_proj.seg(p.part + (size_t)r0 * kDim, kDim);
+        PJ(p.o + (size_t)r0 * kOProjK, kOProjK, m, kOProjK, &d, 1, GemvOut::kF32, 1);
       }
       deferred.push_back(end_of(j, p.part, nullptr, w.ffn_norm));
     }
@@ -285,27 +283,30 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
       after(st, done[j]);  // the piece's normed rows
       std::function<void()> e;
       if (dense_layer(l)) {
-        GemvSeg s;
-        s.w = w.gate_up.w, s.s = w.gate_up.s, s.n = 2 * kDenseInterRank;
-        s.y = p.hm + (size_t)r0 * kDenseInterRank, s.ldy = kDenseInterRank;
-        pf_proj(G, x, kDim, m, kDim, &s, 1, GemvOut::kSwiGLU, 1, st, false);
-        GemvSeg d;
-        d.w = w.down.w, d.s = w.down.s, d.n = kDim, d.y = p.part + (size_t)r0 * kDim, d.ldy = kDim;
-        pf_proj(G, p.hm + (size_t)r0 * kDenseInterRank, kDenseInterRank, m, kDenseInterRank, &d, 1, GemvOut::kF32, 1,
-                st, false);
+        const GemvSeg s = w.gate_up.seg(p.hm + (size_t)r0 * kDenseInterRank, kDenseInterRank);
+        PJ(x, kDim, m, kDim, &s, 1, GemvOut::kSwiGLU, 1);
+        const GemvSeg d = w.down.seg(p.part + (size_t)r0 * kDim, kDim);
+        PJ(p.hm + (size_t)r0 * kDenseInterRank, kDenseInterRank, m, kDenseInterRank, &d, 1, GemvOut::kF32, 1);
         e = end_of(j, p.part, nullptr, next_norm);
       } else {
         float* gl = p.gl + (size_t)r0 * gx::kE;
         if (m > kMaxRows && tune(kTunePfRouter)) {
           GemvSeg s;
-          s.w = w.router, s.n = gx::kE, s.y = gl, s.ldy = gx::kE;
+          s.fmt = WFmt::kBF16, s.w = w.router, s.n = gx::kE, s.y = gl, s.ldy = gx::kE;
           gemm_bf16(x, kDim, m, kDim, &s, 1, GemvOut::kF32, 4, st);
         } else {
           rows16(m, [&](int q0, int n) {
             GemvSeg s;
-            s.w = w.router, s.n = gx::kE, s.y = gl + (size_t)q0 * gx::kE, s.ldy = gx::kE;
-            gemv(false, x + (size_t)q0 * kDim, kDim, n, kDim, &s, 1, GemvOut::kF32, 4, st);
+            s.fmt = WFmt::kBF16, s.w = w.router, s.n = gx::kE, s.y = gl + (size_t)q0 * gx::kE, s.ldy = gx::kE;
+            gemv(x + (size_t)q0 * kDim, kDim, n, kDim, &s, 1, GemvOut::kF32, 4, st);
           });
+        }
+        {  // the BF16 shared expert (decode's GEMVs' bits, split-K 4 / 1): h into p.hm, its f32 partials into p.ys
+          uint16_t* hs = p.hm + (size_t)r0 * kSharedInterRank;
+          const GemvSeg g = w.sh_gate_up.seg(hs, kSharedInterRank);
+          PJ(x, kDim, m, kDim, &g, 1, GemvOut::kSwiGLU, 4);
+          const GemvSeg d = w.sh_down.seg(p.ys + (size_t)r0 * kDim, kDim);
+          PJ(hs, kSharedInterRank, m, kSharedInterRank, &d, 1, GemvOut::kF32, 1);
         }
         int* ridx = p.ridx + (size_t)r0 * gx::kTopK;
         float* rw = p.rw + (size_t)r0 * gx::kTopK;
@@ -330,8 +331,8 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
   if (flags & kFlagLogits)
     rows16(M, [&](int r0, int n) {
       GemvSeg s;
-      s.w = head, s.n = kVocabRank, s.y = logits, s.ldy = kVocabRank;
-      gemv(false, p.xn + (size_t)r0 * kDim, kDim, n, kDim, &s, 1, GemvOut::kF32, 1, st);
+      s = head.seg(logits, kVocabRank);
+      gemv(p.xn + (size_t)r0 * kDim, kDim, n, kDim, &s, 1, GemvOut::kF32, 1, st);
       gather_logits(sink, logits, p.pos + r0, n, false);
     });
   if (opt.drafts) mtp_fill(sl, a, M);
@@ -364,9 +365,7 @@ void Model::Impl::mtp_fill(int sl, int a, int M) {
     const detail::LayerW& w = lw[kMtpLayer];
     rmsnorm(mx, kDim, w.attn_norm, kNormEps, kDim, mxn, kDim, n, st);
     {
-      GemvSeg s;
-      s.w = w.xproj.w, s.s = w.xproj.s, s.n = kXRows, s.rs = 16, s.ks = 128;
-      s.y = p.xg + (size_t)rank * kXRows, s.ldy = kRanks * kXRows;
+      const GemvSeg s = w.xproj.seg(p.xg + (size_t)rank * kXRows, kRanks * kXRows);
       pf_proj(tune(kTunePfGemm), mxn, kDim, n, kDim, &s, 1, GemvOut::kBF16, 4, st, false);
     }
     index_weights(mxn, n, w.wproj, kIdxHeadsRank, p.iw + kIdxHeadsRank * rank, kIdxHeads, st);
@@ -406,8 +405,8 @@ uint64_t Model::Impl::prefill(int sl, int a, int M, const int32_t* tokens, const
     ops::step_in(in_h, in_ctr, fb, in_d, st, false);
     CUDA_CHECK(cudaMemcpyAsync(xn, pre->xn + (size_t)((M - 1) % pre->cap) * kDim, kEmbRow, cudaMemcpyDeviceToDevice, st));
     ::glm::GemvSeg s;
-    s.w = head, s.n = kVocabRank, s.y = logits, s.ldy = kVocabRank;
-    ::glm::gemv(false, xn, kDim, 1, kDim, &s, 1, GemvOut::kF32, 1, st);
+    s = head.seg(logits, kVocabRank);
+    ::glm::gemv(xn, kDim, 1, kDim, &s, 1, GemvOut::kF32, 1, st);
     ops::sample(ch, logits, rank * kVocabRank, in_d, out_h, fb, samp_ctr, st, opt.drafts == 0, 1, ctl_h);
     if (opt.drafts) {
       drafts(1, 0, nullptr);
