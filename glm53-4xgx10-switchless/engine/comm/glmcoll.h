@@ -53,6 +53,8 @@ static_assert(kXRows * 2 % 16 == 0 && kXRowsShared * 2 % 16 == 0 && kLogitsBf16R
 // (stream order or PDL guarantees it in a step's graph).
 void allreduce_hidden(const DevChannel& ch, const float* part, int R, float* out_f32, uint16_t* out_bf16,
                       cudaStream_t st, bool pdl = false, int slices = 0);
+// slices (these and the add-norm variants below): 0 the default (8), 8, 16 or 32 column slices a row; 1 (the norm
+// variants only) one block of 768 threads a row, no barrier between blocks: the same bits.
 void allreduce_add_norm(const DevChannel& ch, const float* part, int R, const uint16_t* res, uint16_t* res_out,
                         const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st, bool pdl = false, int slices = 0);
 // The MoE layer's: two partials (the routed experts' yr and the shared expert's ys, experts.h moe_decode), each
@@ -61,6 +63,14 @@ void allreduce_add_norm(const DevChannel& ch, const float* part, int R, const ui
 void allreduce2_add_norm(const DevChannel& ch, const float* part, const float* part2, int R, const uint16_t* res,
                          uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st,
                          bool pdl = false, int slices = 0);
+// allreduce_add_norm's consumer half: the producer kernel (the model's o_proj, oproj.cu) wrote this rank's partial
+// into the send buffer of the collective about to run and posted it; the same bits as allreduce_add_norm.
+void allreduce_add_norm_posted(const DevChannel& ch, int R, const uint16_t* res, uint16_t* res_out, const uint16_t* w,
+                               float eps, uint16_t* xn, cudaStream_t st, bool pdl = false, int slices = 0);
+// allreduce2_add_norm's consumer half: the producer (experts.h moe_decode with DecodeCfg::post) wrote both partials into the send
+// buffer of the collective about to run (part rows, then part2 rows) and posted them; the same bits as above.
+void allreduce2_add_norm_posted(const DevChannel& ch, int R, const uint16_t* res, uint16_t* res_out, const uint16_t* w,
+                                float eps, uint16_t* xn, cudaStream_t st, bool pdl = false, int slices = 0);
 
 // ---- (b) all-gathers by rows ---------------------------------------------------------------------------------
 // Segment g: this rank's rows of rb bytes at in + r ld_in (r < rows); rank k's row r lands at

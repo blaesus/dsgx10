@@ -164,6 +164,11 @@ its own with a `[d]` pattern.
   work, as DeepSeek's fused kernels do; (3) merge the MLP down all-reduce with the next layer's x-projection
   all-gather (the x-projection needs the normed h, so this needs the x-projection replicated or a
   reduce-scatter + local norm + all-gather of x-projection outputs: three-way design, G4).
+- Done 2026-10-14 ([engine.md](engine.md#closing-the-decode-gap-2026-10-14)): the consumer halves
+  `allreduce_add_norm_posted` / `allreduce2_add_norm_posted` (the producer posts from its epilogue: the experts'
+  `k_down`, the model's `oproj_post`), and `slices = 1` for the add-norm variants: one block of 768 threads a row,
+  rmsnorm's statistic in shared memory, no barrier between blocks, the same bits (`coll_tests` covers it at 1–16
+  rows, with and without PDL, both variants). In the step it gave ~1 % at one row.
 - `allreduce_hidden` reads host memory with too few threads (10 µs slower than the generic kernel at 16 rows):
   two 16-byte items a thread, or more blocks per row group.
 - The fused all-reduce's ~3 µs barrier: compute the row statistic redundantly per block from all columns of

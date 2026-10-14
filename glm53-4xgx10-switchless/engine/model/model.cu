@@ -231,8 +231,14 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
   {
     GemvSeg s;
     s.w = w.xproj.w, s.s = w.xproj.s, s.n = xr, s.rs = 16, s.ks = 128, s.y = xg + (size_t)rank * xr, s.ldy = kRanks * xr;
-    gemv(true, xn_, kDim, R, kDim, &s, 1, GemvOut::kBF16, 4, st, P);
-    if (full) index_weights(xn_, R, w.wproj, kIdxHeadsRank, iw + kIdxHeadsRank * rank, kIdxHeads, st, P);
+    if (full && tune(kTuneIw)) {
+      GemvIw g;
+      g.wproj = w.wproj, g.nh = kIdxHeadsRank, g.w = iw + kIdxHeadsRank * rank, g.ldw = kIdxHeads;
+      gemv(true, xn_, kDim, R, kDim, &s, 1, GemvOut::kBF16, 4, st, P, &g);
+    } else {
+      gemv(true, xn_, kDim, R, kDim, &s, 1, GemvOut::kBF16, 4, st, P);
+      if (full) index_weights(xn_, R, w.wproj, kIdxHeadsRank, iw + kIdxHeadsRank * rank, kIdxHeads, st, P);
+    }
   }
   mark(kKXproj, l);
   l2pf(2, l, R);
@@ -280,14 +286,19 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     gemv(true, u, kHeads * kKvLora, R, kKvLora, &s, 1, GemvOut::kBF16, 1, st, P);
   }
   mark(kKUv, l);
-  {
+  const bool op = tune(kTuneOproj);
+  if (op) {
+    oproj_post(o, R, w.o_proj, ch, st, P);
+  } else {
     GemvSeg s;
     s.w = w.o_proj.w, s.s = w.o_proj.s, s.n = kDim, s.y = part, s.ldy = kDim;
     gemv(true, o, kOProjK, R, kOProjK, &s, 1, GemvOut::kF32, 1, st, P);
   }
   mark(kKOproj, l);
   l2pf(4, l, R);
-  comm::glm::allreduce_add_norm(ch, part, R, h_, h_, w.ffn_norm, kNormEps, xn_, st, P);
+  const int ars = tune(kTuneArRow) ? 1 : 0;  // the fused all-reduces' blocks: one a row, or the default slices
+  if (op) comm::glm::allreduce_add_norm_posted(ch, R, h_, h_, w.ffn_norm, kNormEps, xn_, st, P, ars);
+  else comm::glm::allreduce_add_norm(ch, part, R, h_, h_, w.ffn_norm, kNormEps, xn_, st, P, ars);
   mark(kKAr1, l);
   if (dense_layer(l)) {
     GemvSeg s;
@@ -298,19 +309,23 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     gemv(true, hm, kDenseInterRank, R, kDenseInterRank, &d, 1, GemvOut::kF32, 1, st, P);
     mark(kKMlp, l);
     l2pf(1, l + 1, R);
-    comm::glm::allreduce_add_norm(ch, part, R, h_, h_, next_norm, kNormEps, xn_, st, P);
+    comm::glm::allreduce_add_norm(ch, part, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
   } else {
     GemvSeg s;  // the router's logits: fp32 products of bf16 values, f32 sums
     s.w = w.router, s.n = gx::kE, s.y = gl, s.ldy = gx::kE;
     gemv(false, xn_, kDim, R, kDim, &s, 1, GemvOut::kF32, 4, st, P);
-    gx::route(gl, w.router_bias, R, ridx, rw, st, P);
     gx::DecodeCfg dc;
     dc.pdl = P;
+    if (tune(kTuneRoute)) dc.logits = gl, dc.bias = w.router_bias;
+    else gx::route(gl, w.router_bias, R, ridx, rw, st, P);
     float* ys = yr + (size_t)R * kDim;
+    const bool post = tune(kTunePost);
+    if (post) dc.post = &ch;
     gx::moe_decode(w.moe, reinterpret_cast<const __nv_bfloat16*>(xn_), ridx, rw, R, moe_ws, yr, ys, st, dc);
     mark(kKMlp, l);
     l2pf(1, l + 1, R);
-    comm::glm::allreduce2_add_norm(ch, yr, ys, R, h_, h_, next_norm, kNormEps, xn_, st, P);
+    if (post) comm::glm::allreduce2_add_norm_posted(ch, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
+    else comm::glm::allreduce2_add_norm(ch, yr, ys, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
   }
   mark(kKAr2, l);
   if (flags & kFlagDump) dump_rows(sink, l, "hidden", pos, R, h_, kEmbRow);
@@ -368,7 +383,7 @@ void Model::Impl::forward(int R, uint32_t flags, Sink* sink) {
 }
 
 cudaGraphExec_t Model::Impl::graph(int R) {
-  const auto it = graphs.find(R);
+  const auto it = graphs.find(gkey(R));
   if (it != graphs.end()) return it->second;
   cudaGraph_t g;
   CUDA_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
@@ -377,7 +392,7 @@ cudaGraphExec_t Model::Impl::graph(int R) {
   cudaGraphExec_t e;
   CUDA_CHECK(cudaGraphInstantiate(&e, g, 0));
   CUDA_CHECK(cudaGraphDestroy(g));
-  graphs.emplace(R, e);
+  graphs.emplace(gkey(R), e);
   return e;
 }
 
@@ -414,11 +429,11 @@ uint64_t Model::Impl::launch(const Batch& b, Sink* sink) {
   for (int r = 0; r < R; ++r) pend_pos[b.slot[r]] = -1;  // a step's draft pass completes the MTP row before it
   const int slot_ev = (int)(n % ops::kOutSlots);
   CUDA_CHECK(cudaEventRecord(ev_beg[slot_ev], st));
-  if (opt.graphs && !b.flags && !prof && warm[R]) {
+  if (opt.graphs && !b.flags && !prof && warm[gkey(R)]) {
     CUDA_CHECK(cudaGraphLaunch(graph(R), st));
   } else {
     forward(R, b.flags, sink);
-    warm[R] = true;  // the kernels' one-time setup has run outside a capture
+    warm[gkey(R)] = true;  // the kernels' one-time setup has run outside a capture
   }
   CUDA_CHECK(cudaEventRecord(ev_end[slot_ev], st));
   host_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - h0).count();
@@ -630,6 +645,10 @@ void Model::set_l2pf(bool on) {
   drain();
   for (auto& g : d_->graphs) CUDA_CHECK(cudaGraphExecDestroy(g.second));
   d_->graphs.clear();
+}
+void Model::set_tune(uint32_t bits) {
+  drain();
+  d_->opt.tune = bits;
 }
 double Model::step_bytes(double experts, bool with_mtp) const {
   using namespace ::glm;

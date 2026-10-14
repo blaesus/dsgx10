@@ -3,25 +3,31 @@
 # runs, so a preempted job (ring.sh exit 76) is resumed by starting it again. One job, through the DeepSeek engine's
 # ring.sh, from the repo root:
 #   OWNER=glm53-model ds41f-4xgx10-switchless/engine/server/ring.sh glm53-4xgx10-switchless/engine/model/run.sh [step...]
-# Steps (synthetic weights in the real layouts): check, bench, mtp (bench with one draft), l2pf, prefill, refhash.
+# Steps (synthetic weights in the real layouts): check, bench, mtp (bench with one draft), l2pf, prefill, refhash,
+# ab (the speed levers ABBASE, default none, against AB, default all, A/B/B/A at ABROWS: time and output bits),
+# trace (graph steps at TROWS, default 1,6, under nsys on every rank: run/nsys/glm_run.<rank>.nsys-rep).
 # Binaries: BIN (default ~/dsgb10-data/glm53-model/bin, installed by install.sh with the sources' hash); results:
 # OUT (TSV; the log beside it). EXTRA: more glm_run options for every step.
 # weights: every rank loads its fleet rank file to the GPU with the CRCs checked (glw_load --verify-crc), and rank 0
 # runs glw_kcheck --gpu on layers 0, 3, 10, 78 of its file (the GEMVs on the file's bytes against a double reference).
 # tf-prefill, tf-decode: the real rank files (WEIGHTS, "%d" the rank; each box its own copy) with synthetic routed
 # experts while the pools are not filled, teacher-forced over the golden run's sequence (GOLDEN, SEQ, TOKENS), dumps
-# into DATA/tf/SEQ-{prefill,decode}; compare with tools/compare_golden.py.
+# into DATA/tf/SEQ-{prefill,decode}TFTAG; compare with tools/compare_golden.py. tfsyn-prefill, tfsyn-decode: the same on
+# synthetic weights (DATA/tf/syn-SEQ-...TFTAG).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-BIN=${BIN:-$HOME/dsgb10-data/glm53-model/bin}
-OUT=${OUT:-$HOME/dsgb10-data/glm53-model/results.tsv}
+DATA_NAME=${DATA_NAME:-glm53-model}  # the data tree under ~/dsgb10-data (install.sh, run4.sh read it too)
+export DATA_NAME
+BIN=${BIN:-$HOME/dsgb10-data/$DATA_NAME/bin}
+OUT=${OUT:-$HOME/dsgb10-data/$DATA_NAME/results.tsv}
 LOG=${OUT%.tsv}.log
 EXTRA=${EXTRA:-}
-DATA=$HOME/dsgb10-data/glm53-model
+DATA=$HOME/dsgb10-data/$DATA_NAME
 WEIGHTS=${WEIGHTS:-fleet}
 SEQ=${SEQ:-short}
-TOKENS=${TOKENS:-$DATA/$SEQ.tokens.json}
-ROWS=${ROWS:-$DATA/${SEQ}_rows.npy}
+GDATA=$HOME/dsgb10-data/glm53-model  # the golden run's tokens and rows
+TOKENS=${TOKENS:-$GDATA/$SEQ.tokens.json}
+ROWS=${ROWS:-$GDATA/${SEQ}_rows.npy}
 mkdir -p "$(dirname "$OUT")"
 SRC=$(cat "$BIN/SOURCES" 2> /dev/null)
 echo "RUN	$(date '+%F %T %z')	$SRC" >> "$OUT"
@@ -55,14 +61,21 @@ for s in "${steps[@]}"; do
     mtp) cmd=($G $T --max-ctx 8192 --ctx 4096 --drafts 1 --rows 1,2,4 $EXTRA bench) ;;
     l2pf) cmd=($G $T --max-ctx 8192 --ctx 4096 --rows 1,6,16 $EXTRA l2pf) ;;
     prefill) cmd=($G $T --max-ctx 16384 --ctx 0 --chunk 8192 $EXTRA prefill) ;;
+    ab) cmd=($G $T --max-ctx 8192 --ctx 4096 --rows ${ABROWS:-1,2,4,6,16} --ab ${AB:-ffffffff} --ab-base ${ABBASE:-0} $EXTRA ab) ;;
+    trace) cmd=($G $T --max-ctx 8192 --ctx 4096 --rows ${TROWS:-1,6} $EXTRA trace) ;;
     weights) cmd=() ;;
     tf-prefill | tf-decode)
       cmd=("$BIN/glm_run" --weights "$WEIGHTS" --fill-experts --out "$OUT" $T --max-ctx 4096 --tokens "$TOKENS"
-        --sample-rows "$ROWS" --dump-layers 0,1,2,3,4,77 --via "${s#tf-}" --dir "$DATA/tf/$SEQ-${s#tf-}" $EXTRA tf) ;;
+        --sample-rows "$ROWS" --dump-layers 0,1,2,3,4,77 --via "${s#tf-}" --dir "$DATA/tf/$SEQ-${s#tf-}${TFTAG:-}" $EXTRA tf) ;;
+    tfsyn-prefill | tfsyn-decode)  # the same on synthetic weights
+      cmd=($G $T --max-ctx 4096 --tokens "$TOKENS" --sample-rows "$ROWS" --dump-layers 0,1,2,3,4,77 --via "${s#tfsyn-}"
+        --dir "$DATA/tf/syn-$SEQ-${s#tfsyn-}${TFTAG:-}" $EXTRA tf) ;;
     refhash) cmd=($G $T --max-ctx 4096 --steps 64 $EXTRA refhash) ;;
     *) echo "unknown step $s"; rc=2; continue ;;
   esac
-  if [ "$s" = weights ]; then weights_step "$BIN" 2>&1 | tee -a "$LOG"; else "$HERE/run4.sh" "${cmd[@]}" 2>&1 | tee -a "$LOG"; fi
+  if [ "$s" = weights ]; then weights_step "$BIN" 2>&1 | tee -a "$LOG"
+  elif [ "$s" = trace ]; then NSYS=1 "$HERE/run4.sh" "${cmd[@]}" 2>&1 | tee -a "$LOG"
+  else "$HERE/run4.sh" "${cmd[@]}" 2>&1 | tee -a "$LOG"; fi
   r=${PIPESTATUS[0]}
   if [ "$r" = 0 ]; then
     echo "DONE	$s	$SRC" >> "$OUT"

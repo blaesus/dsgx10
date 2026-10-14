@@ -1,12 +1,12 @@
 #!/bin/bash
 # Build the ring tests (CPU only, -j4) and install them with the sources' hash for run.sh.
-#   install.sh [bin dir]     (default ~/dsgb10-data/glm53-comm/bin)
+#   install.sh [bin dir]     (default $TOP/bin; TOP, the build area, default ~/dsgb10-data/glm53-comm)
 # Builds through an out-of-tree wrapper project holding the engine's top-level flags, comm/ and attn/ (coll_tests
 # checks the fused norm against attn's rmsnorm), so a half-written sibling directory cannot stop the build.
 set -eu
 cd "$(dirname "$0")"
 ENGINE=$(cd .. && pwd)
-TOP=$HOME/dsgb10-data/glm53-comm
+TOP=${TOP:-$HOME/dsgb10-data/glm53-comm}  # the build area
 BIN=${1:-$TOP/bin}
 mkdir -p "$TOP/wrap" "$BIN"
 sed -n '/^set(CMAKE_CUDA_FLAGS/p' "$ENGINE/CMakeLists.txt" > "$TOP/wrap/flags.cmake"

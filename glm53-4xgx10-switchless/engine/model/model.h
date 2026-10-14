@@ -80,7 +80,21 @@ struct Sink {
   virtual void logits(const int32_t* pos, int R, const float* full, bool mtp) {}  // [R][kVocab] f32
 };
 
+// The decode step's exact speed levers (docs/engine.md, "Closing the decode gap"): each changes how the step runs,
+// never what it computes (the same bits; glm_run's ab mode checks it). Options::tune, Model::set_tune.
+enum Tune : uint32_t {
+  kTuneNone = 0,
+  kTuneRoute = 1u << 0,  // the routing inside the expert kernels (no route() launch)
+  kTunePost = 1u << 1,   // the experts' down kernel posts its partials to the ring itself (the all-reduce: consumer half)
+  kTuneIw = 1u << 2,     // full layers: the indexer's head weights in the x-projection's launch (attn's GemvIw)
+  kTuneOproj = 1u << 3,  // o_proj posts its partials to the ring itself (oproj.cu): measured neutral, off by default
+  kTuneArRow = 1u << 4,  // the fused all-reduces with one block a row (comm::glm slices = 1)
+  kTuneDefault = kTuneRoute | kTunePost | kTuneIw | kTuneArRow,
+  kTuneAll = 0xffffffffu,
+};
+
 struct Options {
+  uint32_t tune = kTuneDefault;  // the levers on (Tune bits)
   int max_ctx = 65536;   // positions a slot's caches hold (<= the RoPE table's 1,048,576)
   int slots = 1;         // session slots: each one a whole cache of max_ctx positions
   // Positions from one slot's caches to the next (0: max_ctx, a whole cache a slot). With page < max_ctx the caches
@@ -193,6 +207,8 @@ class Model {
   double step_bytes(double experts, bool with_mtp = false) const;
   // Turn the paced L2 prefetch on or off (drops the captured graphs; Options::l2pf must have made its stream).
   void set_l2pf(bool on);
+  // Set the speed levers (Tune bits; each set's captured graphs are kept).
+  void set_tune(uint32_t bits);
 
   struct Impl;
 

@@ -7,6 +7,10 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+namespace comm {
+struct DevChannel;
+}
+
 namespace gx {
 
 // ---- shapes (per rank at TP=4) ----------------------------------------------------------------------------
@@ -66,7 +70,8 @@ void route(const float* logits, const float* bias, int M, int* idx, float* w, cu
 
 // ---- decode -------------------------------------------------------------------------------------------------
 // The expert step for M <= 16 rows: x bf16 [M][6144] (the post-attention-normed input), idx/w from route().
-// ws: decode_ws_bytes(), zeroed once before the first call (its task counters reset themselves).
+// ws: decode_ws_bytes(), zeroed once before the first call (its task counters reset themselves). With
+// DecodeCfg::logits, the routing runs inside the kernels and idx, w are ignored.
 // Writes yr = sum over the rows' experts in expert-id order of w * down(h) and ys = the shared expert's
 // output, both f32 [M][6144] partial sums of this rank (the ring all-reduces them), and h's in ws.
 struct DecodeCfg {
@@ -76,6 +81,15 @@ struct DecodeCfg {
   bool pdl = true;
   bool dyn = true;         // k_up claims tasks past the first wave from a counter (load balance)
   int parts = 3;           // bench: 1 up only, 2 down only, 3 both
+  // Fused routing: with logits (the router GEMV's f32 [M][256]) and bias set, each CTA of both kernels routes the
+  // rows itself (route()'s code, the same bits) and idx / w are not read (may be null): no route() launch between
+  // the router GEMV and the experts.
+  const float* logits = nullptr;
+  const float* bias = nullptr;
+  // Posted outputs: with a ring channel, k_down writes yr and ys into the send buffer of the channel's next
+  // collective (yr's M rows, then ys's) instead of the yr / ys arguments, and posts it from its epilogue, the
+  // producer half of comm::glm::allreduce2_add_norm (its consumer half: allreduce2_add_norm_posted). The same bits.
+  const comm::DevChannel* post = nullptr;
 };
 size_t decode_ws_bytes();
 void moe_decode(const LayerW& L, const __nv_bfloat16* x, const int* idx, const float* w, int M, void* ws, float* yr,

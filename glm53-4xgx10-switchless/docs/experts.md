@@ -121,6 +121,16 @@ order, P slots in flight: acc = fmaf(s2 · fmt_k · w_row, c, acc) into `yr`, wi
 did not pick the expert. A row's bits therefore do not depend on the other rows (tested: 16 rows together
 equal each row alone).
 
+**Fused routing and posted outputs** (2026-10-14, the decode-gap pass, [engine.md](engine.md#closing-the-decode-gap-2026-10-14)):
+- `DecodeCfg::logits`, `bias`: both kernels route the rows themselves from the router GEMV's logits (a warp a
+  row, `route_warp`, the body `k_route` now calls too: the same bits), so no `route()` launch sits between the
+  router and the experts. `k_down` reads the logits before its PDL wait, as it read `idx` before: they are
+  complete once `k_up`'s CTAs have triggered (each past its own wait on the router GEMV).
+- `DecodeCfg::post` (a ring channel): `k_down` writes `yr` and `ys` into the send buffer of the channel's next
+  collective (M rows of `yr`, then M of `ys`: `allreduce2_add_norm`'s layout) and posts it from its epilogue
+  (`comm::post_grid`, every block); the all-reduce kernel is then only the consumer half
+  (`comm::glm::allreduce2_add_norm_posted`). The same values travel, so the same bits.
+
 **Variants** (`DecodeCfg`): up {nt1 wk6 p2 (default), nt1 wk4 p2, nt1 wk4 p1, nt2 wk4 p1, nt1 wk2 p2,
 nt2 wk2 p1}; down {nt2 p1 (default), nt1 p2, nt1 p3, nt2 p2, nt1 p4}.
 

@@ -14,39 +14,7 @@ __global__ void __launch_bounds__(128) k_route(const float* __restrict__ logits,
   pdl_launch_dependents();
   pdl_wait();
   if (row >= M) return;
-  float s[8], key[8];
-#pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    s[j] = route_sigmoid(__ldcg(logits + (size_t)row * kE + lane + 32 * j));
-    key[j] = s[j] + __ldg(bias + lane + 32 * j);
-  }
-  float picked[kTopK];
-  int ids[kTopK];
-#pragma unroll
-  for (int k = 0; k < kTopK; ++k) {
-    float bv = -INFINITY;
-    int bj = 0;
-#pragma unroll
-    for (int j = 0; j < 8; ++j)
-      if (key[j] > bv) bv = key[j], bj = j;
-    int be = bv == -INFINITY ? 1 << 30 : lane + 32 * bj;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-      const int oe = __shfl_xor_sync(0xffffffffu, be, o);
-      if (ov > bv || (ov == bv && oe < be)) bv = ov, be = oe;
-    }
-    ids[k] = be;
-    float sv = 0.f;
-#pragma unroll
-    for (int j = 0; j < 8; ++j)
-      if (lane + 32 * j == be) sv = s[j], key[j] = -INFINITY;
-    picked[k] = __shfl_sync(0xffffffffu, sv, be & 31);
-  }
-  const float sum = route_sum8(picked) + 1e-20f;
-#pragma unroll
-  for (int k = 0; k < kTopK; ++k)
-    if (lane == k) idx[row * kTopK + k] = ids[k], wout[row * kTopK + k] = picked[k] / sum * kRouteScale;
+  route_warp(logits + (size_t)row * kE, bias, lane, idx + row * kTopK, wout + row * kTopK);
 }
 
 }  // namespace
