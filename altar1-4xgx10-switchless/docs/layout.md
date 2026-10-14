@@ -231,7 +231,7 @@ manifest hash. Every conversion described here read model-00011 either before 10
 | `glw_rank_test` | all ok on every file: refused as the three other ranks |
 | Second conversion | layers 4 (INT4) and 77 (BF16) for rank 3 converted and filled again into a separate file: 364 entries, 4,243,810,624 B, every entry's SHA-256 equal to the installed rank3.glw's |
 | Tamper (test files) | six flipped bytes (embedding, a kBF16T dense down, xproj, INT4 q_b, dequantised W_UK^T, a descriptor) all caught; an earlier six (two expert entries among them) also |
-| `glw_kcheck --rank 0` (host binding) | **expert side 0 bad**: 38,304 matrices (36,792 INT4, 1,512 BF16), sizes by tag, contiguity, every descriptor. 1,175 bad on the non-expert entries: kcheck still binds glm53's attention (FP8 T64 with scale entries) and has not been ported to the INT4 tile and kBF16T. That port is the runner's (§ 9) |
+| `glw_kcheck --rank 0` (host binding) | **expert side 0 bad**: 38,304 matrices (36,792 INT4, 1,512 BF16), sizes by tag, contiguity, every descriptor. 1,175 bad on the non-expert entries: kcheck still checks glm53's attention (FP8 T64 with scale entries) and has not been ported to the INT4 tile and kBF16T (§ 9) |
 
 `glw_kcheck --gpu` was not run. Its attention half expects glm53's FP8 entries, so a ring job now would test the
 port, not the files. The expert agent's own device tests cover the expert blocks (experts.md § 7).
@@ -323,13 +323,15 @@ renamed into place, and only then is the staged copy deleted.
 
 ## 9. What remains
 
-- **The runner's binding**:
-  - `engine/model/bind.cu` and `glw_kcheck`'s non-expert half still expect glm53's FP8 entries (T64 tiles with
-    `.scale` entries);
-  - they must bind int4-tile (q_b, W_UV, o_proj of 4–76), bf16-tile (`WFmt::kBF16T`) and the natural router;
-  - then `glw_kcheck --gpu` in a ring job.
-
-  The expert half of kcheck passes (§ 6).
+- **Binding on the device.** The runner (A4, merged into `altar1` as `7a8aab4`, after these files were cut)
+  binds by layout value: 4 is an INT4 projection, 5 is kBF16T (un-tiled into a copy for the index weights, which it
+  reads row-major), and natural is row-major BF16. These are this file format's numbers. It has not yet opened
+  these files on the GPU. What is left:
+  - a ring job that binds the four installed files and runs a step;
+  - `glw_kcheck`'s non-expert half, which still checks glm53's FP8 entries (its expert half passes, § 6);
+  - then `glw_kcheck --gpu`.
+  - `bind.cu` names the two layouts by value; it could use `glw::Layout::Int4Tile` and `Bf16Tile` from this
+    branch's `glw.h`.
 - `tests/expert_fill_test.cu` needs canonical dumps that `experts_fill.py` no longer writes; `verify.py --indep`
   covers the same comparison for every expert of every layer.
 - **A merge conflict to expect.** The expert agent's branch also edited `glw.py` (168 experts,
