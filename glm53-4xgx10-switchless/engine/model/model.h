@@ -12,8 +12,15 @@
 // Prefill runs a prompt's positions [a, a + M) of one slot in chunks of up to 8192 rows through the same layers
 // with the kernels' prefill paths; it leaves the state the decode steps would have left, up to summation order.
 // The MTP layer (78) keeps its own cache: prefill fills it for the prompt (no MoE), and each decode step's draft
-// pass (the MTP layer for each row: token after it, the row's final hidden) writes the row's entry and drafts one
-// token; further passes chain on the MTP's own hidden (Options::drafts).
+// pass 1 (the MTP layer for each row: the token after it, the row's final hidden) writes the row's entry; the
+// session's chain starts at its last row (a verify step: its last accepted row) and drafts Batch::passes tokens,
+// pass k > 1 at the next position on the MTP's own hidden (docs/engine.md, "Drafts").
+//
+// Speculative decoding (G7): a verify step (Batch::spec) feeds a session's token and its drafts as consecutive rows;
+// each row is sampled as in any step (the same bits, Options::attn_splits fixed), and the drafts are accepted as long
+// as each equals the sample of the row before it (SampleOut::accepted). The tokens emitted are those samples, so
+// decoding with drafts emits the tokens decoding without them emits, greedy or sampled; the rows past the accepted
+// ones leave cache entries past the session's history, which the next step writes again before any row reads them.
 #pragma once
 #include <cstdint>
 #include <memory>
@@ -27,7 +34,7 @@
 namespace glm::model {
 
 inline constexpr int kTopLogprobs = 20;  // top logprobs a row, at most
-inline constexpr int kMaxDrafts = 4;     // chained MTP draft passes a step, at most
+inline constexpr int kMaxDrafts = 5;     // MTP draft passes a step (and drafts a verify step a session), at most
 inline constexpr int kMaxPages = 65536;  // Options::slots with paged caches (Options::page), at most
 
 // How a session's rows are sampled; every rank must pass the same.
@@ -50,11 +57,16 @@ struct SampleOut {
   uint32_t seq;   // the step's number + 1, written last
   int32_t rows;
   int32_t n_top;  // the most top logprobs of any session's
-  int32_t drafts;  // MTP draft passes run (Options::drafts)
+  int32_t drafts;  // MTP draft passes run (Batch::passes)
   SampleRow row[kMaxRows];
   int32_t top_id[kMaxRows][kTopLogprobs];
   float top_lp[kMaxRows][kTopLogprobs];
-  int32_t draft[kMaxRows][kMaxDrafts];  // pass k's greedy draft for row r (the token after position pos[r] + k + 1)
+  // Session s's chain starts at its row c = (its first row) + accepted[s]: row c's sample is the token after position
+  // pos[c] (the bonus of a verify step), and draft[s][k], pass k + 1's greedy token, drafts position pos[c] + k + 2.
+  int32_t draft[kMaxSess][kMaxDrafts];
+  // Session s's drafts accepted (Batch::spec: its rows after the first while each equals the row before it's sample),
+  // or its rows - 1 (a plain step: every row's input is given); with no draft passes, -1.
+  int32_t accepted[kMaxSess];
   uint32_t ctl;  // rank 0's control word as the step's sampler read it (Model::set_ctl), the same on every rank
 };
 
@@ -65,6 +77,12 @@ struct Batch {
   int32_t tokens[kMaxRows] = {}, pos[kMaxRows] = {}, slot[kMaxRows] = {}, sess[kMaxRows] = {};
   Sampling sp[kMaxSess];
   uint32_t flags = 0;
+  // 1: a verify step: each session's rows after its first feed the drafts of the step before, accepted while each
+  // equals the sample of the row before it (SampleOut::accepted); the chain starts at the last accepted row.
+  int spec = 0;
+  // MTP draft passes after the sample, -1: Options::drafts; 0 .. Options::drafts (0: no MTP work: the MTP cache
+  // entries of the step's rows are not written). One CUDA graph per (rows, sessions, passes).
+  int passes = -1;
 };
 enum : uint32_t {
   kFlagLogits = 1,  // eager: all-gather the f32 logits; rank 0 hands them to Sink::logits
@@ -111,7 +129,8 @@ struct Options {
   bool graphs = true;    // replay steps as one CUDA graph per row count (eager steps: flags, profile)
   bool pdl = true;       // programmatic dependent launch between the step's kernels
   bool l2pf = true;      // the paced L2 prefetch of the next weights during collectives and attention
-  int drafts = 0;        // MTP draft passes after each step's sample, 0..kMaxDrafts (0: no MTP work at all)
+  int drafts = 0;        // MTP draft passes after each step's sample, 0..kMaxDrafts (0: no MTP work at all); a
+                         // step may run fewer (Batch::passes)
   int prefill_rows = 8192;  // rows a prefill chunk, at most (<= kMaxChunk)
   int prefill_pieces = 2;   // kTunePfOverlap: pieces a chunk (1-8), each of a multiple of 64 rows (2: measured best)
   int prefill_min_piece = 512;  // kTunePfOverlap: rows of a piece at least (chunks of fewer than twice that: one piece)
@@ -173,6 +192,13 @@ class Model {
                    Sink* sink = nullptr);
   // Forget slot's MTP pending row (a new sequence in the slot).
   void reset_slot(int slot);
+  // The MTP layer teacher-forced (checks against the golden mtp/ data; eager, nothing published): rows [pos0, pos0 +
+  // R) of slot (R <= 16), row r fed the main model's final normed hidden hid[r] (bf16 [R][6144]) and the token after
+  // it, next[r]; writes the rows' MTP cache entries. draft1[r]: row r's pass-1 greedy draft (the token after
+  // next[r]); chain[k] (k < passes - 1): passes 2.. chained from the last row. passes: 1 .. Options::drafts. With a
+  // sink, rank 0 hands it pass 1's layer-78 output rows (Sink::tensor, L = 78, "hidden").
+  void mtp_forced(int slot, int pos0, int R, const int32_t* next, const uint16_t* hid, int passes, int32_t* draft1,
+                  int32_t* chain, Sink* sink = nullptr);
 
   // ---- serving (engine/server, docs/serving.md) ----
   // Rank 0's control word: every step's sampler reads it when it runs and hands it to every rank (SampleOut::ctl),

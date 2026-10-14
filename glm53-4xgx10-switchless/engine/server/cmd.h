@@ -1,7 +1,8 @@
 // Rank 0's commands to every rank (docs/serving.md): what the server (serve.cpp) tells the other ranks, and the
-// parts every rank runs alike: prefill chunks, the decode loop over 1..16 sessions, the cache pool's moves, the
-// disk tier's spills and reads, a planned stop's kept sessions. The DeepSeek engine's cmd.h re-specialised: no
-// window snapshots, no Engram, no drafts (G7); a session is a run of pages of the paged cache (Options::page).
+// parts every rank runs alike: prefill chunks, the decode loop over 1..16 sessions (plain, or speculative with the
+// MTP layer's drafts: spec_loop), the cache pool's moves, the disk tier's spills and reads, a planned stop's kept
+// sessions. The DeepSeek engine's cmd.h re-specialised: no window snapshots, no Engram; a session is a run of pages
+// of the paged cache (Options::page).
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -11,6 +12,7 @@
 
 #include "comm/ring.h"
 #include "model/model.h"
+#include "model/spec.h"
 #include "server/disk.h"
 
 namespace srv {
@@ -38,6 +40,7 @@ struct Op {
 };
 constexpr int kMaxOps = 16;
 constexpr int kMaxStop = 32;
+constexpr int kMaxOracle = 512;
 
 enum : int32_t {
   kCmdStop = 0,     // leave the command loop
@@ -49,6 +52,7 @@ enum : int32_t {
   kCmdKeep = 6,     // a planned stop: the disk tier synced and indexed with generation gen (Disk::keep)
 };
 enum : uint32_t { kPfSample = 1 };
+enum : uint32_t { kBatchSpec = 1 };  // kCmdBatch's flags: spec_loop (the BatchEntry's drafts and gates)
 struct Cmd {
   int32_t op = kCmdStop;
   int32_t slot = 0, pos0 = 0, rows = 0;
@@ -88,17 +92,50 @@ struct BatchEntry {
   int32_t n_stop = 0;
   int32_t stop[kMaxStop] = {};
   model::Sampling sp{};
+  // spec_loop: the drafts of tok_0's successors (the step that sampled tok_0 drafted them) and the session's gate
+  int32_t n_draft = 0;
+  int32_t draft[model::kMaxDrafts] = {};
+  model::SpecGate gate;
+  // tests (--spec-oracle): tok_1, tok_2, ... as an earlier identical request gave them; spec_loop's drafts are these
+  // (about one in four changed), so verify steps accept drafts whatever the MTP's quality
+  int32_t n_oracle = 0;
+  int32_t oracle[kMaxOracle] = {};
 };
 struct BatchEnd {
   int sampled = 0;  // tokens sampled: tok_1 .. tok_sampled
   int fed = 0;      // positions pos0 .. pos0 + fed - 1 hold the KV of tok_0 .. tok_{fed-1} now
   uint32_t why = kEndStop;
+  // spec_loop: the drafts after tok_sampled (none when the run's last step emitted past what it kept) and the gate
+  int32_t n_draft = 0;
+  int32_t draft[model::kMaxDrafts] = {};
+  model::SpecGate gate;
+  long steps = 0, verified = 0, accepted = 0;  // spec_loop: verify steps the entry was in, drafts fed, accepted
 };
 using OnBatch = std::function<void(int k, const model::SampleOut& o, int row)>;  // entry k's next token: o.row[row]
 std::vector<BatchEnd> batch_loop(model::Model& m, const std::vector<BatchEntry>& e, Watchdog& wd, const OnBatch& on,
                                  std::vector<double>* step_t = nullptr);
 
+// Speculative decoding (docs/serving.md, "Drafts"; docs/engine.md): the same entries, ends and callbacks, but one
+// verify step at a time (Batch::spec): entry k feeds tok_0 and the k_j drafts its gate chooses (SpecGate over
+// cost) as consecutive rows, and emits the samples of its rows up to the first draft that differs from the sample
+// before it (the accepted ones and the bonus), so the tokens are batch_loop's, bit for bit. The step drafts the
+// next drafts (Batch::passes: the most any gate may want, kmax). Positions written stay below each entry's limit:
+// rows at pos .. pos + k_j and the chained draft passes' MTP entries up to pos + k_j + passes - 1.
+struct SpecConf;
+std::vector<BatchEnd> spec_loop(model::Model& m, const std::vector<BatchEntry>& e, Watchdog& wd, const OnBatch& on,
+                                const SpecConf& sc, std::vector<double>* step_t = nullptr);
+
 // Ranks 1-3: run rank 0's commands until kCmdStop.
 void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, Disk* disk, uint64_t run_id);
+
+// The speculative decoding the server runs (main.cpp; every rank the same): kmax drafts a session at most (0: off,
+// --no-spec), the gate's cost model.
+struct SpecConf {
+  int kmax = 0;
+  model::SpecCost cost;
+  int force = 0;  // > 0 (tests, --spec-force): every step feeds min(force, drafts there are), whatever the gate says
+  bool oracle = false;  // tests (--spec-oracle): BatchEntry::oracle's drafts where an earlier request left them
+};
+extern SpecConf g_spec;
 
 }  // namespace srv

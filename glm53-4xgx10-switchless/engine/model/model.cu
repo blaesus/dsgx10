@@ -94,7 +94,16 @@ Model::Impl::Impl(int r, const Options& opts) : rank(r), opt(opts) {
   m_topk = dalloc<int>((size_t)R * ::glm::kTopK);
   m_cand = dalloc<comm::glm::Cand>(R);
   m_best = dalloc<comm::glm::Cand>(R);
-  m_draft = dalloc<int32_t>((size_t)kMaxDrafts * R);
+  m_draft = dalloc<int32_t>((size_t)kMaxDrafts * kMaxSess);
+  m_all = dalloc<comm::glm::Cand>(R);
+  m_sel = dalloc<int32_t>(kMaxSess);
+  m_acc = dalloc<int32_t>(kMaxSess);
+  c_h = dalloc<uint16_t>((size_t)kMaxSess * kDim);
+  c_xn = dalloc<uint16_t>((size_t)kMaxSess * kDim);
+  c_topk = dalloc<int>((size_t)kMaxSess * ::glm::kTopK);
+  c_tok = dalloc<int32_t>(kMaxSess);
+  c_pos = dalloc<int32_t>(kMaxSess);
+  c_slot = dalloc<int32_t>(kMaxSess);
 
   in_h = halloc<ops::StepIn>(ops::kInSlots);
   in_d = dalloc<ops::StepIn>(1);
@@ -300,6 +309,7 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
   if (op) comm::glm::allreduce_add_norm_posted(ch, R, h_, h_, w.ffn_norm, kNormEps, xn_, st, P, ars);
   else comm::glm::allreduce_add_norm(ch, part, R, h_, h_, w.ffn_norm, kNormEps, xn_, st, P, ars);
   mark(kKAr1, l);
+  if ((flags & kFlagDump) && l == kMtpLayer) dump_rows(sink, l, "attn", pos, R, h_, kEmbRow);  // mtpgold's diagnostics
   if (dense_layer(l)) {
     GemvSeg s;
     s.w = w.gate_up.w, s.s = w.gate_up.s, s.n = 2 * kDenseInterRank, s.y = hm, s.ldy = kDenseInterRank;
@@ -314,6 +324,7 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     GemvSeg s;  // the router's logits: fp32 products of bf16 values, f32 sums
     s.w = w.router, s.n = gx::kE, s.y = gl, s.ldy = gx::kE;
     gemv(false, xn_, kDim, R, kDim, &s, 1, GemvOut::kF32, 4, st, P);
+    if ((flags & kFlagDump) && l == kMtpLayer) dump_rows(sink, l, "router", pos, R, gl, (size_t)gx::kE * 4);
     gx::DecodeCfg dc;
     dc.pdl = P;
     if (tune(kTuneRoute)) dc.logits = gl, dc.bias = w.router_bias;
@@ -377,9 +388,9 @@ void Model::Impl::forward(int R, uint32_t flags, Sink* sink) {
   mark(kKHead, -1);
   if (flags & kFlagDump) dump_rows(sink, -1, "final", pos, R, xn, kEmbRow);
   if (flags & kFlagLogits) gather_logits(sink, logits, pos, R, false);
-  ops::sample(ch, logits, rank * kVocabRank, in_d, out_h, fb, samp_ctr, st, opt.drafts == 0, R, ctl_h);
+  ops::sample(ch, logits, rank * kVocabRank, in_d, out_h, fb, samp_ctr, st, step_passes == 0, R, ctl_h);
   mark(kKSample, -1);
-  if (opt.drafts) drafts(R, flags, sink);
+  if (step_passes) drafts(R, step_nsess, step_passes, flags, sink, true);
 }
 
 cudaGraphExec_t Model::Impl::graph(int R) {
@@ -399,19 +410,24 @@ cudaGraphExec_t Model::Impl::graph(int R) {
 uint64_t Model::Impl::launch(const Batch& b, Sink* sink) {
   if (!bound) die("model: step before bind");
   const int R = b.R;
-  if (R < 1 || R > kMaxRows || b.nsess < 1 || b.nsess > kMaxSess) die("model: a step of %d rows, %d sessions", R, b.nsess);
+  const int passes = b.passes < 0 ? opt.drafts : b.passes;
+  if (R < 1 || R > kMaxRows || b.nsess < 1 || b.nsess > kMaxSess || passes > opt.drafts || (b.spec && !passes))
+    die("model: a step of %d rows, %d sessions, %d draft passes%s (Options::drafts %d)", R, b.nsess, passes,
+        b.spec ? ", verifying" : "", opt.drafts);
+  // a verify step samples each row as a one-row step would: the split-K may not follow the row count
+  if (b.spec && !opt.attn_splits) die("model: a verify step needs a fixed split-K (Options::attn_splits, --splits)");
   for (int r = 0; r < R; ++r) {
     const bool same = r > 0 && b.sess[r] == b.sess[r - 1];
-    bool ok = b.pos[r] >= 0 && b.pos[r] < opt.max_ctx && b.slot[r] >= 0 && b.slot[r] < opt.slots &&
-              (size_t)b.slot[r] * stride + b.pos[r] + opt.drafts < pool_positions() && b.sess[r] >= 0 &&
-              b.sess[r] < b.nsess;
+    // the chain of the session's last row writes MTP entries up to passes - 1 positions past it
+    bool ok = b.pos[r] >= 0 && b.pos[r] + passes < opt.max_ctx && b.slot[r] >= 0 && b.slot[r] < opt.slots &&
+              (size_t)b.slot[r] * stride + b.pos[r] + passes < pool_positions() && b.sess[r] >= 0 &&
+              b.sess[r] < b.nsess && (r > 0 || b.sess[r] == 0) && (r + 1 < R || b.sess[r] == b.nsess - 1);
     if (r > 0 && !same) ok &= b.sess[r] == b.sess[r - 1] + 1;
     if (same) ok &= b.slot[r] == b.slot[r - 1] && b.pos[r] == b.pos[r - 1] + 1;
     for (int q = 0; q < r; ++q) ok &= b.sess[q] == b.sess[r] || b.slot[q] != b.slot[r];
-    if (opt.drafts > 1 && same) ok = false;  // chained passes would write over the next row's MTP entry (G7)
-    if (opt.drafts && b.pos[r] + opt.drafts >= opt.max_ctx) ok = false;
     if (!ok) die("model: row %d: position %d, slot %d, session %d", r, b.pos[r], b.slot[r], b.sess[r]);
   }
+  step_nsess = b.nsess, step_passes = passes;
   const uint64_t n = n_steps;
   if (n >= (uint64_t)ops::kInSlots) wait(n - ops::kInSlots);  // its StepIn slot has been read
   const auto h0 = std::chrono::steady_clock::now();
@@ -425,7 +441,7 @@ uint64_t Model::Impl::launch(const Batch& b, Sink* sink) {
     const Sampling& s = b.sp[std::min(k, b.nsess - 1)];
     in.samp[k] = ops::StepSamp{s.seed, s.temperature, s.top_p, s.top_k, s.n_top};
   }
-  in.rows = R, in.nsess = b.nsess, in.step = (uint32_t)n;
+  in.rows = R, in.nsess = b.nsess, in.step = (uint32_t)n, in.spec = b.spec ? 1 : 0;
   for (int r = 0; r < R; ++r) pend_pos[b.slot[r]] = -1;  // a step's draft pass completes the MTP row before it
   const int slot_ev = (int)(n % ops::kOutSlots);
   CUDA_CHECK(cudaEventRecord(ev_beg[slot_ev], st));

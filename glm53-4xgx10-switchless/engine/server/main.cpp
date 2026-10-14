@@ -16,6 +16,12 @@
 //   (--disk-tag T); each rank offers its directory's free space less 32 GiB, and all take the smallest offer.
 // Kept sessions: --keep-gib N (0): a planned stop (SIGTERM) keeps up to N GiB of sessions for the next start, none
 //   unused for --keep-days (7).
+// Drafts (speculative decoding with the MTP layer, docs/serving.md "Drafts"): on by default, up to --spec-drafts K
+//   (3, at most 5) a session a step, as many as its gate's acceptance pays for under --spec-cost C1,DROW (ms: a
+//   step's first row with draft pass 1, each row more with its pass; default 44.5,15.5); --no-spec: plain decoding (the
+//   same tokens). The model's Options::drafts is K (0 with --no-spec: no MTP work at all). --spec-force N (tests):
+//   N drafts every step whatever the gate says; --spec-oracle (tests): a request identical to an earlier one (prompt,
+//   sampling, max_new) takes that one's tokens as its drafts, about one in four changed.
 // --step-timeout S (120): the watchdog's limit for one step or chunk.
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -83,6 +89,10 @@ struct Args {
   double disk_gib = 32, keep_gib = 0, keep_days = 7;
   std::string disk_dir, disk_tag;
   int step_timeout = 120;
+  bool spec = true;
+  int spec_drafts = 3, spec_force = 0;
+  bool spec_oracle = false;
+  float spec_c1 = 44.5f, spec_drow = 15.5f;
 };
 
 // What a kept session's caches depend on: this binary's bytes, the weights (path, size, time), the synthetic
@@ -140,6 +150,15 @@ int main(int argc, char** argv) {
     else if (s == "--keep-gib") a.keep_gib = std::atof(val().c_str());
     else if (s == "--keep-days") a.keep_days = std::atof(val().c_str());
     else if (s == "--step-timeout") a.step_timeout = std::stoi(val());
+    else if (s == "--no-spec") a.spec = false;
+    else if (s == "--spec-drafts") a.spec_drafts = std::stoi(val());
+    else if (s == "--spec-force") a.spec_force = std::stoi(val());
+    else if (s == "--spec-oracle") a.spec_oracle = true;
+    else if (s == "--spec-cost") {
+      const std::string v = val();
+      if (std::sscanf(v.c_str(), "%f,%f", &a.spec_c1, &a.spec_drow) != 2 || !(a.spec_c1 > 0) || !(a.spec_drow > 0))
+        die("--spec-cost C1,DROW (ms, both > 0)");
+    }
     else die("unknown option %s (the header of engine/server/main.cpp lists them)", s.c_str());
   }
   if (a.mode != "serve") die("glm53_rank: --mode serve");
@@ -148,6 +167,12 @@ int main(int argc, char** argv) {
   if (a.disk_tag.size() > 32 || a.disk_tag.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos)
     die("--disk-tag: at most 32 of a-z, 0-9, _ and -");
   if (a.keep_gib < 0 || !(a.keep_days > 0)) die("--keep-gib must be >= 0 and --keep-days > 0");
+  if (a.spec_drafts < 1 || a.spec_drafts > model::kMaxDrafts) die("--spec-drafts: 1 .. %d", model::kMaxDrafts);
+  if (!a.spec) a.spec_drafts = 0;
+  if (a.spec && a.splits == 0) die("--splits 0 (split-K by row count) with drafts: verify steps need a fixed split-K");
+  if (a.spec_force < 0 || a.spec_force > a.spec_drafts) die("--spec-force: 0 .. --spec-drafts");
+  g_spec.kmax = a.spec_drafts, g_spec.cost.c1 = a.spec_c1, g_spec.cost.drow = a.spec_drow, g_spec.force = a.spec_force;
+  g_spec.oracle = a.spec_oracle && a.spec;
   const double t0 = now_s();
   CUDA_CHECK(cudaSetDevice(0));
   CUDA_CHECK(cudaFree(nullptr));
@@ -166,6 +191,7 @@ int main(int argc, char** argv) {
   // 1. the model: a pool of one page for now (resized below), the weights, the prefill buffers
   model::Options mo;
   mo.max_ctx = a.max_ctx, mo.page = a.page, mo.slots = 1, mo.prefill_rows = a.chunk, mo.attn_splits = a.splits;
+  mo.drafts = a.spec_drafts;
   model::Model m(rk, mo);
   std::unique_ptr<glw::WeightFile> wf;
   model::SynthOptions so;
@@ -237,8 +263,8 @@ int main(int argc, char** argv) {
   const size_t margin = (size_t)((rk == 0 ? a.margin_gib : a.worker_margin_gib) * kGiB);
   const size_t offer = std::min(dfree, avail) > margin ? std::min(dfree, avail) - margin : 0;
   const double wgib = m.weight_bytes() / kGiB;
-  const double mine[5] = {(double)offer, dfree / kGiB, avail / kGiB, wgib, file_gib};
-  double all[4][5];
+  const double mine[6] = {(double)offer, dfree / kGiB, avail / kGiB, wgib, file_gib, (double)m.file_expert_layers()};
+  double all[4][6];
   ring.allgather_host(mine, all, sizeof mine);
   size_t pool = (size_t)std::min(a.kv_gib * kGiB, 1e18);
   for (const auto& r : all) pool = std::min(pool, (size_t)r[0]);
@@ -255,6 +281,16 @@ int main(int argc, char** argv) {
     std::printf("weights: %s, %.2f GiB a rank bound (%d MoE layers' experts from the file); the file at its reserved "
                 "size: %.2f GiB; MemTotal %.2f GiB\n",
                 wpath.c_str(), wgib, m.file_expert_layers(), file_gib, total / kGiB);
+    for (const auto& r : all)
+      if (r[5] != all[0][5])  // a rank file filled and another not: the layer's experts differ by rank
+        std::printf("weights: WARNING: the ranks' files differ in MoE layers with their experts from the file (ranks 0-3: "
+                    "%.0f %.0f %.0f %.0f): the text is wrong\n", all[0][5], all[1][5], all[2][5], all[3][5]);
+    std::printf("drafts: %s\n", a.spec ? ("up to " + std::to_string(a.spec_drafts) + " a session a step" +
+                                           (a.spec_force ? ", forced to " + std::to_string(a.spec_force) : std::string()) +
+                                           (a.spec_oracle ? ", oracle drafts for repeated requests" : "") +
+                                           ", gate cost " +
+                                           std::to_string(a.spec_c1) + " + " + std::to_string(a.spec_drow) + " ms a row").c_str()
+                                        : "off (--no-spec)");
   }
   ring.barrier();
   pin_self(15);

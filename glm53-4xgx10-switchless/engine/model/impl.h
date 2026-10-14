@@ -129,10 +129,17 @@ struct Model::Impl {
   void* moe_ws = nullptr;
   // the MTP's draft passes (decode)
   uint16_t *m_x12, *m_xg, *m_h, *m_xn;  // [R][12288], eh_proj gathered [R][4][1536], residual, normed
-  int32_t *m_tok, *m_pos;               // the pass's tokens and positions
-  int* m_topk;                          // the MTP layer's top-2048 (shared by the chained passes)
+  int32_t *m_tok, *m_pos;               // pass 1's tokens and positions, a row each
+  int* m_topk;                          // pass 1's top-2048, a row each
   comm::glm::Cand *m_cand, *m_best;     // local top-1 and the exchanged draft, per row
-  int32_t* m_draft;                     // [kMaxDrafts][kMaxRows]
+  comm::glm::Cand* m_all;               // Model::mtp_forced: pass 1's draft of every row
+  int32_t* m_draft;                     // [kMaxDrafts][kMaxSess]
+  int32_t *m_sel, *m_acc;               // per session: its chain row, its accepted drafts (ops::mtp_tokens)
+  // the chain, a row a session (ops::mtp_select): hidden (the MTP's output), normed rows, top-2048 (pass 1's,
+  // shared), tokens, positions, slots
+  uint16_t *c_h, *c_xn;
+  int* c_topk;
+  int32_t *c_tok, *c_pos, *c_slot;
 
   // step inputs and results
   ops::StepIn *in_h, *in_d;
@@ -143,9 +150,15 @@ struct Model::Impl {
   uint64_t n_steps = 0, n_done = 0;
   double host_us = 0;  // the last launch's host time, without waiting for a free input slot
   cudaEvent_t ev_beg[ops::kOutSlots], ev_end[ops::kOutSlots], ev_pf[2];
-  std::map<uint64_t, cudaGraphExec_t> graphs;  // by (tune, rows): a lever set's graphs are kept across set_tune
+  // by (tune, passes, sessions, rows): a lever set's graphs are kept across set_tune; the sessions count only with
+  // draft passes (the chain's rows)
+  std::map<uint64_t, cudaGraphExec_t> graphs;
   std::map<uint64_t, bool> warm;
-  uint64_t gkey(int R) const { return (uint64_t)opt.tune << 8 | (uint64_t)R; }
+  int step_nsess = 1, step_passes = 0;  // the step being launched (its graph's key)
+  uint64_t gkey(int R) const {
+    return (uint64_t)opt.tune << 32 | (uint64_t)step_passes << 16 | (uint64_t)(step_passes ? step_nsess : 0) << 8 |
+           (uint64_t)R;
+  }
 
   // side streams: l2pf (sc); events for fork/join
   cudaStream_t sc = nullptr;
@@ -209,8 +222,12 @@ struct Model::Impl {
 
   // ---- the MTP layer (mtp.cu) ----
   // the draft passes of a step's rows after its sample (decode): pass 1 at each row's position with the token
-  // after it, the next passes chained
+  // after it (every row's MTP cache entry), the head at each session's chain row, the next passes chained on it; then
+  // the step published. drafts(R, flags, sink): prefill's one-row step (one session, Options::drafts passes).
   void drafts(int R, uint32_t flags, Sink* sink);
+  void drafts(int R, int nsess, int passes, uint32_t flags, Sink* sink, bool publish);
+  // the head on n normed rows, its greedy top-1 exchanged into m_best
+  void mtp_top1(int n, const uint16_t* xn_rows);
   // the MTP layer's input for n rows: x = eh_proj([enorm(e) | hnorm(hid)]) all-gathered into out [n][6144] (x12
   // [n][12288] scratch); e, hid [n][6144] bf16. Decode (n <= 16: a GEMV) or prefill (pf_proj).
   void mtp_project(int n, const uint16_t* e, const uint16_t* hid, uint16_t* x12, uint16_t* out);

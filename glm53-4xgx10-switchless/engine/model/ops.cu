@@ -57,14 +57,41 @@ __global__ void k_embed_pick(const uint16_t* ebuf, const int32_t* tokens, const 
   pdl_go();
 }
 
-__global__ void k_mtp_tokens(const StepIn* in, const int32_t* fb, int R, int32_t* tok, int32_t* pos) {
+__global__ void k_mtp_tokens(const StepIn* in, const int32_t* fb, int R, int32_t* tok, int32_t* pos, int32_t* sel,
+                             int32_t* acc) {
   pdl_wait();
-  const int r = threadIdx.x;
-  if (r < R) {
-    const bool cont = r + 1 < R && in->slot[r + 1] == in->slot[r] && in->pos[r + 1] == in->pos[r] + 1;
-    tok[r] = cont ? in->tokens[r + 1] : fb[r];
-    pos[r] = in->pos[r];
+  if (threadIdx.x == 0) {  // at most 16 rows: one thread, session by session
+    const bool spec = in->spec != 0;
+    for (int b = 0; b < R;) {
+      const int s = in->sess[b];
+      int e = b + 1;
+      while (e < R && in->sess[e] == s) ++e;
+      int a = 0;
+      if (spec)
+        while (b + a + 1 < e && fb[b + a] == in->tokens[b + a + 1]) ++a;
+      else
+        a = e - b - 1;
+      sel[s] = b + a, acc[s] = a;
+      for (int r = b; r < e; ++r) tok[r] = r < b + a ? in->tokens[r + 1] : fb[r], pos[r] = in->pos[r];
+      b = e;
+    }
   }
+  pdl_go();
+}
+
+// one block a session: its chain row's hidden, normed hidden and top-2048
+__global__ void k_mtp_select(const StepIn* in, const int32_t* sel, const int32_t* pos, const uint16_t* h, const uint16_t* xn,
+                             const int* topk, uint16_t* ch, uint16_t* cxn, int* ctopk, int32_t* cpos, int32_t* cslot) {
+  pdl_wait();
+  const int s = blockIdx.x, r = sel[s], p = pos[r];
+  const uint4* hi = reinterpret_cast<const uint4*>(h + (size_t)r * kDim);
+  const uint4* xi = reinterpret_cast<const uint4*>(xn + (size_t)r * kDim);
+  uint4* ho = reinterpret_cast<uint4*>(ch + (size_t)s * kDim);
+  uint4* xo = reinterpret_cast<uint4*>(cxn + (size_t)s * kDim);
+  for (int i = threadIdx.x; i < kDim / 8; i += blockDim.x) ho[i] = hi[i], xo[i] = xi[i];
+  for (int i = threadIdx.x; i < ::glm::kTopK; i += blockDim.x)
+    ctopk[(size_t)s * ::glm::kTopK + i] = p >= ::glm::kTopK ? topk[(size_t)r * ::glm::kTopK + i] : i;
+  if (threadIdx.x == 0) cpos[s] = p, cslot[s] = in->slot[r];
   pdl_go();
 }
 
@@ -109,14 +136,15 @@ __global__ void __launch_bounds__(1024) k_local_top1(const float* logits, int vo
   pdl_go();
 }
 
-__global__ void k_publish(SampleOut* outs, const StepIn* in, const int32_t* draft, int ndraft, uint32_t* counter) {
+__global__ void k_publish(SampleOut* outs, const StepIn* in, const int32_t* draft, const int32_t* acc, int ndraft,
+                          int nsess) {
   pdl_wait();
   SampleOut& o = outs[in->step % kOutSlots];
-  const int R = in->rows;
-  for (int i = threadIdx.x; i < kMaxRows * kMaxDrafts; i += blockDim.x) {
-    const int r = i / kMaxDrafts, k = i % kMaxDrafts;
-    o.draft[r][k] = r < R && k < ndraft ? draft[k * kMaxRows + r] : -1;
+  for (int i = threadIdx.x; i < kMaxSess * kMaxDrafts; i += blockDim.x) {
+    const int s = i / kMaxDrafts, k = i % kMaxDrafts;
+    o.draft[s][k] = s < nsess && k < ndraft ? draft[k * kMaxSess + s] : -1;
   }
+  for (int s = threadIdx.x; s < kMaxSess; s += blockDim.x) o.accepted[s] = s < nsess ? acc[s] : -1;
   __threadfence_system();
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -157,8 +185,14 @@ void embed_pick(const uint16_t* ebuf, const int32_t* tokens, const int32_t* pos,
                 cudaStream_t s, bool pdl) {
   ::glm::launch(k_embed_pick, dim3(R), dim3(256), 0, s, pdl, ebuf, tokens, pos, zero_pos0 ? 1 : 0, out);
 }
-void mtp_tokens(const StepIn* in, const int32_t* fb, int R, int32_t* tok, int32_t* pos, cudaStream_t s, bool pdl) {
-  ::glm::launch(k_mtp_tokens, dim3(1), dim3(32), 0, s, pdl, in, fb, R, tok, pos);
+void mtp_tokens(const StepIn* in, const int32_t* fb, int R, int32_t* tok, int32_t* pos, int32_t* sel, int32_t* acc,
+                cudaStream_t s, bool pdl) {
+  ::glm::launch(k_mtp_tokens, dim3(1), dim3(32), 0, s, pdl, in, fb, R, tok, pos, sel, acc);
+}
+void mtp_select(const StepIn* in, const int32_t* sel, int nsess, const int32_t* pos, const uint16_t* h, const uint16_t* xn,
+                const int* topk, uint16_t* ch, uint16_t* cxn, int* ctopk, int32_t* cpos, int32_t* cslot, cudaStream_t s,
+                bool pdl) {
+  ::glm::launch(k_mtp_select, dim3(nsess), dim3(256), 0, s, pdl, in, sel, pos, h, xn, topk, ch, cxn, ctopk, cpos, cslot);
 }
 void mtp_next(const comm::glm::Cand* best, int R, int32_t* tok, int32_t* pos, int32_t* draft_k, cudaStream_t s, bool pdl) {
   ::glm::launch(k_mtp_next, dim3(1), dim3(32), 0, s, pdl, best, R, tok, pos, draft_k);
@@ -166,9 +200,9 @@ void mtp_next(const comm::glm::Cand* best, int R, int32_t* tok, int32_t* pos, in
 void local_top1(const float* logits, int R, int vocab0, comm::glm::Cand* out, cudaStream_t s, bool pdl) {
   ::glm::launch(k_local_top1, dim3(R), dim3(1024), 0, s, pdl, logits, vocab0, out);
 }
-void publish(SampleOut* outs, const StepIn* in, const int32_t* draft, int ndraft, uint32_t* counter, cudaStream_t s,
-             bool pdl) {
-  ::glm::launch(k_publish, dim3(1), dim3(128), 0, s, pdl, outs, in, draft, ndraft, counter);
+void publish(SampleOut* outs, const StepIn* in, const int32_t* draft, const int32_t* acc, int ndraft, int nsess,
+             cudaStream_t s, bool pdl) {
+  ::glm::launch(k_publish, dim3(1), dim3(128), 0, s, pdl, outs, in, draft, acc, ndraft, nsess);
 }
 void add_rows(const uint16_t* res, const float* a, const float* b, size_t n, uint16_t* h, cudaStream_t s) {
   if (!n) return;
