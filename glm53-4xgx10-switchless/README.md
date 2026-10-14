@@ -29,14 +29,17 @@ Scouting done on 2026-10-13; the plan is in [DESIGN.md](DESIGN.md). Nothing runs
   at 6–16 rows, prefill at 35–37 % of the bf16 peak, [docs/experts.md](docs/experts.md)); the ring collectives
   (a step's 256 collectives in 4.40 ms, [docs/ring.md](docs/ring.md)); the per-rank weight files with every
   non-expert tensor converted and verified byte for byte (zai's FP8 rule reproduced bit for bit,
-  [docs/layout.md](docs/layout.md)); the layer runner and the TP=4 decode step on all four ranks (46.4 ms at
-  one row on synthetic experts, 1.35× the floor; layers 0–3 match the golden hidden states,
-  [docs/engine.md](docs/engine.md)); the CPU reference with golden data over 38k tokens
+  [docs/layout.md](docs/layout.md)); the layer runner and the TP=4 decode step on all four ranks (43.6 ms at
+  one row on synthetic experts, 1.27× the floor after the tuning pass: inside the graph the MoE, o_proj and
+  the head sit at their bandwidth floors and the rest is the collectives' latency and attention; layers 0–3
+  match the golden hidden states, [docs/engine.md](docs/engine.md)); the rank-0 server with exact prefix
+  reuse, a paged store with a disk tier, batched and kept sessions ([docs/serving.md](docs/serving.md));
+  the MTP layer's experts in the rank files at NVFP4; the CPU reference with golden data over 38k tokens
   ([docs/reference.md](docs/reference.md)). Every experiment is indexed in
   [docs/experiments.md](docs/experiments.md).
 - **Not yet:** the routed experts in the rank files (disk: the fill is ~96 GiB a rank at NVFP4, ~80 at the
-  mixture), the quantiser's 3-bit fill and the KL bake-off against the master, the server, MTP speculation,
-  the end-to-end check of logits against the golden data.
+  mixture), the quantiser's 3-bit fill and the KL bake-off against the master, MTP speculation (G7, in progress),
+  the service's first start on the ring, the end-to-end check of logits against the golden data.
 | | |
 |---|---|
 | [DESIGN.md](DESIGN.md) | target, budgets, decisions, risks, the experiments in order, milestones |
