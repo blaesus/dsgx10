@@ -1,4 +1,4 @@
-// The per-rank weight file (".glw"): one rank's slice of every tensor GLM-5.3's engine uses, in the formats and
+// The per-rank weight file (".glw"): one rank's slice of every tensor altar-1's engine uses, in the formats and
 // tile layouts the kernels read, laid out so a loader can stream it into one device arena with large O_DIRECT
 // reads. The DeepSeek engine's .dsw container (ds41f-4xgx10-switchless/engine/weights/dsw.h), this engine's
 // own copy: a new magic, dtypes, layouts and TOC fields. Format, plan and tools: docs/layout.md.
@@ -19,7 +19,8 @@
 
 namespace glw {
 
-constexpr char kMagic[8] = {'G', 'L', 'M', '5', '3', 'W', '0', '1'};
+// altar-1's own magic (GLM-5.3's was GLM53W01): an engine of either kit refuses the other's files.
+constexpr char kMagic[8] = {'A', 'L', 'T', 'R', '1', 'W', '0', '1'};
 constexpr uint32_t kVersion = 1;
 constexpr uint64_t kAlign = 4096;
 constexpr uint32_t kGlobal = 0xFFFFFFFFu;  // TocEntry::layer of a tensor that belongs to no layer
@@ -85,6 +86,15 @@ enum class Layout : uint32_t {
   // are contiguous (every matrix is a multiple of 4 KiB), so they form the layer's pool from expert 0's entry on;
   // the layer's desc entry (gx::MatDesc [256][3]) holds offsets relative to it.
   ExpertPool = 3,
+  // INT4-g32 (compressed-tensors pack-quantized, asymmetric) attention weights q_b, W_UV, o_proj of layers 4-76:
+  // the expert kernels' 2,368-byte INT4 block (experts.h kI4Blk; attn/tools/pack.py int4_tiles), one U8 entry of
+  // shape [N/8][K/512][2368] for the natural [N][K]; blk_rows x blk_k = 1 x 32 (a scale and zero point a row and
+  // 32 k). Byte formulas: experts/layout.h, "the engine layout", INT4.
+  Int4Tile = 4,
+  // kBF16T (attn.h WFmt::kBF16T, attn/tools/pack.py bf16_tiles): a BF16 projection [N][K] (TOC shape natural) in
+  // the GEMV's lane order [N/8][K/64][2 halves][32 lanes][8 values]: chunk (i, j) is rows 8i.., k 64j.. at
+  // ((i K/64) + j) 1024 B; lane 4g + t's half h holds row 8i + g, k = 64j + 16t + 8h + 0..7. Same bytes as row-major.
+  Bf16Tile = 5,
 };
 inline const char* layout_name(Layout l) {
   switch (l) {
@@ -92,6 +102,8 @@ inline const char* layout_name(Layout l) {
     case Layout::T64: return "T64";
     case Layout::T128: return "T128";
     case Layout::ExpertPool: return "expert-pool";
+    case Layout::Int4Tile: return "int4-tile";
+    case Layout::Bf16Tile: return "bf16-tile";
   }
   return "?";
 }
@@ -109,6 +121,8 @@ enum Flags : uint32_t {
   kScale = 4,        // an FP8 weight's f32 scale table: [N/blk_rows][K/blk_k], or [N/2/blk_rows][2][K/blk_k]
                      // for an interleaved gate/up pair
   kInterleaved = 8,  // gate/up rows interleaved (2i gate, 2i+1 up): the SwiGLU GEMV's input
+  kDequant = 16,     // BF16 dequantised from INT4 by the contract's rule, bf16_rne((q - z) * s): W_UK^T of layers
+                     // 4-76 (docs/model.md § 4.2); exact, not lossy
 };
 
 struct Header {
