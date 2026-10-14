@@ -33,8 +33,12 @@ mkdir -p "$(dirname "$OUT")"
 steps=("$@")
 [ ${#steps[@]} -gt 0 ] || steps=(t-cpu t-deq t-route t-i4 t-b16 t-eq bw d-i4 d-b16 d2-b16 d2-i4 p-i4 p-b16 sh)
 rc=0
+BUDGET=${BUDGET:-570}  # s: the job stays inside a 10-minute ring window; steps left over run when it is started again
+t0=$SECONDS
 for s in "${steps[@]}"; do
   grep -q "^DONE	$s\$" "$OUT" && { echo "skip $s (done)"; continue; }
+  left=$((BUDGET - (SECONDS - t0)))
+  [ $left -ge 30 ] || { echo "budget spent: $s and the rest left for the next run"; break; }
   echo "== $s $(date '+%T')"
   case $s in
     t-cpu) cmd=("$BIN/test_experts" --cpu) ;;
@@ -54,7 +58,7 @@ for s in "${steps[@]}"; do
   esac
   [ "$s" = topk ] || cmd+=(--out "$OUT")
   case $s in t-* | r-*) cmd=(nice -n 19 "${cmd[@]}") ;; esac  # CPU references at nice 19
-  if timeout -s TERM 420 "${cmd[@]}" > >(tee -a "${OUT%.tsv}.log") 2>&1; then
+  if timeout -s TERM $((left < 420 ? left : 420)) "${cmd[@]}" > >(tee -a "${OUT%.tsv}.log") 2>&1; then
     echo "DONE	$s" >> "$OUT"
   else
     r=$?
