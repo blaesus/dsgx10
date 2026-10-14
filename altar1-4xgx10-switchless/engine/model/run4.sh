@@ -2,12 +2,12 @@
 # Run one ring binary on all four boxes (comm/run4.sh's copy for the model's driver): ranks 1-3 detached on
 # the workers, rank 0 here in the foreground. The binary and the fleet file (FLEET=FILE; default this configuration's
 # fleet/homelab.conf, the same boxes as the DeepSeek engine's) go to ~/dsgb10-data/$DATA_NAME/run/ on every box (DATA_NAME:
-# default glm53-model), the fleet file as fleet.conf beside the binary; logs in run/logs/<name>.<rank>.log there; worker log
+# default altar1-model), the fleet file as fleet.conf beside the binary; logs in run/logs/<name>.<rank>.log there; worker log
 # tails are printed after. NSYS=1: every rank runs under nsys (CUDA trace, graph nodes, the cudaProfilerApi range), the
 # reports collected into run/nsys/<name>.<rank>.nsys-rep on this box.
 # GPU and ring code only through the DeepSeek engine's ring.sh (it lends the ring while the service is idle and
 # preempts the job for a request: then this script's TERM trap stops the workers' ranks too):
-#   OWNER=glm53-model ds41f-4xgx10-switchless/engine/server/ring.sh glm53-4xgx10-switchless/engine/model/run4.sh <binary> [args...]
+#   OWNER=altar1-model ds41f-4xgx10-switchless/engine/server/ring.sh altar1-4xgx10-switchless/engine/model/run4.sh <binary> [args...]
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 FLEET=${FLEET:-$HERE/../../fleet/homelab.conf}
@@ -19,7 +19,7 @@ echo 1000 > /proc/self/oom_score_adj
 BIN=$1
 shift
 NAME=$(basename "$BIN")
-DATA_NAME=${DATA_NAME:-glm53-model}
+DATA_NAME=${DATA_NAME:-altar1-model}
 RD="~/dsgb10-data/$DATA_NAME/run"  # as written, for the workers' shells
 LRD=$(fleet_local "$RD")
 PAT="[d]sgb10-data/$DATA_NAME/run/$NAME"  # [d]: never matches the shell running pkill
