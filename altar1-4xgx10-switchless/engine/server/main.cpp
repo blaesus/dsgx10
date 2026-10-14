@@ -34,6 +34,7 @@
 // --step-timeout S (120): the watchdog's limit for one step or chunk. --index-scratch-mib N (512): the prefill
 // indexer's score scratch (128 with --chunk 2048: the memory rule's setting beside the 76.6 GiB rank files).
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
@@ -114,6 +115,7 @@ struct Args {
   int step_timeout = 120;
   int index_scratch_mib = 512;  // the prefill indexer's score scratch (Options::index_scratch)
   double device_margin_gib = 1;  // free device memory the pool leaves (CUDA's own allocations after the pool)
+  bool reclaim = true;  // --no-reclaim: no anonymous memory touched to reclaim the page cache before the pool
   bool spec = true;
   int spec_drafts = 3, spec_force = 0;
   bool spec_oracle = false;
@@ -171,6 +173,7 @@ int main(int argc, char** argv) {
     else if (s == "--worker-margin-gib") a.worker_margin_gib = std::atof(val().c_str());
     else if (s == "--min-free-gib") a.min_free_gib = std::atof(val().c_str());
     else if (s == "--device-margin-gib") a.device_margin_gib = std::atof(val().c_str());
+    else if (s == "--no-reclaim") a.reclaim = false;
     else if (s == "--disk-gib") a.disk_gib = std::atof(val().c_str());
     else if (s == "--disk-margin-gib") a.disk_margin_gib = std::atof(val().c_str());
     else if (s == "--disk-rank0-gib") a.disk_rank0_gib = std::atof(val().c_str());
@@ -318,14 +321,37 @@ int main(int argc, char** argv) {
 
   // 3. the cache pool: every rank's offer, the smallest taken
   size_t dfree = 0, dtotal = 0;
-  CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
-  const size_t avail = meminfo("MemAvailable"), total = meminfo("MemTotal");
   const size_t margin = (size_t)(std::max(rk == 0 ? a.margin_gib : a.worker_margin_gib, a.min_free_gib) * kGiB);
   const size_t dmargin = (size_t)(a.device_margin_gib * kGiB);
+  // The page cache of other files (another engine's, others' work) holds pages CUDA will not take; anonymous memory
+  // makes the kernel reclaim it: touch what the pool wants beyond the free pages, staying above the margin, and let
+  // it go again just before the pool is allocated (--no-reclaim: not)
+  double reclaimed = 0, dfree0 = 0;
+  {
+    CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
+    dfree0 = dfree / kGiB;
+    const size_t av = meminfo("MemAvailable");
+    const size_t want = std::min<size_t>(av > margin ? av - margin : 0, (size_t)std::min(a.kv_gib * kGiB, 1e18)) + dmargin;
+    if (a.reclaim && want > dfree) {
+      std::vector<std::pair<void*, size_t>> held;
+      size_t got = 0;
+      const size_t piece = 256ull << 20, need = want - dfree;
+      while (got < need && meminfo("MemAvailable") > margin + piece) {
+        void* p = mmap(nullptr, piece, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        if (p == MAP_FAILED) break;
+        held.emplace_back(p, piece), got += piece;
+      }
+      for (auto& h : held) munmap(h.first, h.second);
+      reclaimed = got / kGiB;
+      CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
+    }
+  }
+  const size_t avail = meminfo("MemAvailable"), total = meminfo("MemTotal");
   const size_t offer = std::min(dfree > dmargin ? dfree - dmargin : 0, avail > margin ? avail - margin : 0);
   const double wgib = m.weight_bytes() / kGiB;
-  const double mine[6] = {(double)offer, dfree / kGiB, avail / kGiB, wgib, file_gib, (double)m.file_expert_layers()};
-  double all[4][6];
+  const double mine[8] = {(double)offer, dfree / kGiB, avail / kGiB, wgib, file_gib, (double)m.file_expert_layers(),
+                          dfree0, reclaimed};
+  double all[4][8];
   ring.allgather_host(mine, all, sizeof mine);
   size_t pool = (size_t)std::min(a.kv_gib * kGiB, 1e18);
   for (const auto& r : all) pool = std::min(pool, (size_t)r[0]);
@@ -350,7 +376,7 @@ int main(int argc, char** argv) {
     std::printf("cache pool: %d pages of %d positions = %d positions, %.2f GiB a rank (%zu B a position); free device / "
                 "available host memory before it, ranks 0-3:",
                 pages, a.page, pages * a.page, pages * (double)page_bytes / kGiB, pos_bytes);
-    for (const auto& r : all) std::printf(" %.2f / %.2f", r[1], r[2]);
+    for (const auto& r : all) std::printf(" %.2f / %.2f (free device %.2f before %.2f GiB of anonymous memory reclaimed the page cache)", r[1], r[2], r[6], r[7]);
     std::printf(" GiB; the offer: min(free device less %.1f, MemAvailable less %.1f (rank 0) / %.1f GiB)\n",
                 a.device_margin_gib, a.margin_gib, a.worker_margin_gib);
     std::printf("weights: %s, %.2f GiB a rank bound (%d MoE layers' experts from the file); the file at its reserved "

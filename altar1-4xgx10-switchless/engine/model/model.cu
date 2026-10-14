@@ -413,9 +413,12 @@ uint64_t Model::Impl::launch(const Batch& b, Sink* sink) {
   if (b.spec && !opt.attn_splits) die("model: a verify step needs a fixed split-K (Options::attn_splits, --splits)");
   for (int r = 0; r < R; ++r) {
     const bool same = r > 0 && b.sess[r] == b.sess[r - 1];
-    // the chain of the session's last row writes MTP entries up to passes - 1 positions past it
-    bool ok = b.pos[r] >= 0 && b.pos[r] + passes < opt.max_ctx && b.slot[r] >= 0 && b.slot[r] < opt.slots &&
-              (size_t)b.slot[r] * stride + b.pos[r] + passes < pool_positions() && b.sess[r] >= 0 &&
+    // the chain of the session's last row writes MTP entries up to passes - 1 positions past it: the last position
+    // written is pos + max(passes, 1) - 1 (was "pos + passes <", one short: a verify step whose last row's chain
+    // ended on the pool's last position died, docs/serving.md § 8)
+    const int reach = std::max(passes, 1);
+    bool ok = b.pos[r] >= 0 && b.pos[r] + reach <= opt.max_ctx && b.slot[r] >= 0 && b.slot[r] < opt.slots &&
+              (size_t)b.slot[r] * stride + b.pos[r] + reach <= pool_positions() && b.sess[r] >= 0 &&
               b.sess[r] < b.nsess && (r > 0 || b.sess[r] == 0) && (r + 1 < R || b.sess[r] == b.nsess - 1);
     if (r > 0 && !same) ok &= b.sess[r] == b.sess[r - 1] + 1;
     if (same) ok &= b.slot[r] == b.slot[r - 1] && b.pos[r] == b.pos[r - 1] + 1;
