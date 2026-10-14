@@ -32,12 +32,12 @@ configuration's own reading of the index and config on 2026-10-14, cited as "our
   master: altar-1's BF16 `q_a_proj`, `kv_a_proj_with_mqa`, shared-expert `down_proj` and the BF16 experts of layers
   3, 77 and 78 equal `bf16(FP8 × block scale)` of `zai-org/GLM-5.3` bit for bit. AWQ's smoothing is also folded into
   the BF16 tensors: `post_attention_layernorm`, `q_a_layernorm` and `kv_a_layernorm` of the INT4 layers differ from
-  GLM-5.3's by per-channel factors of 0.27–6.1, and the router and shared-expert `gate_proj` columns carry the
-  inverse factors. So **altar-1 must be served from its own tensors**; glm53's non-expert rank files do not apply.
+  GLM-5.3's by per-channel factors (0.27–6.1 in layer 4), and the input columns of the router and the shared
+  expert's `gate_proj` carry the compensating factors. So **altar-1 must be served from its own tensors**; glm53's non-expert rank files do not apply.
 - **Quality, vendor-run only.** KL to GLM-5.3 BF16 **0.506 nats** on 0xSero's 25-window panel (fp16-stored
   log-probabilities; 95 % interval 0.403–0.607). For scale, the unpruned GLM-5.3 at EXL3 3 bpw scores 0.089 and
-  `Inferact/GLM-5.3-NVFP4` 0.117 on the same panel, so the pruning costs about five times what 3-bit quantisation
-  costs. Aikido's CVE benchmark gives altar-1 a per-run recall of 60.4 % against 61.5 % for the unpruned AWQ base and
+  `Inferact/GLM-5.3-NVFP4` 0.117 on the same panel: altar-1's KL is 5.7 times the unpruned 3-bit build's, so most of
+  it is the pruning (*inferred*). Aikido's CVE benchmark gives altar-1 a per-run recall of 60.4 % against 61.5 % for the unpruned AWQ base and
   65.6 % for GLM-5.3 BF16, on 32 CVEs × 3 runs. Nobody independent has evaluated it.
 - **Engines.** vLLM with Marlin (vendor; no tok/s published). An independent MLX conversion decodes at **13.7
   tok/s** on one Mac Studio M3 Ultra (512 GB). Nothing has been published for altar-1 on DGX Spark or GB10, and no
@@ -46,9 +46,11 @@ configuration's own reading of the index and config on 2026-10-14, cited as "our
   glm53's 87 GiB budget with no requantisation. A one-row decode token reads **33.7 GB** over the four ranks (13.95
   GB of routed experts, 19.76 GB of everything else), a floor of **~36 ms a token** at 235 GB/s a box before
   drafting, against glm53's ~32 ms (§6).
-- **The reference is not runnable as released** (by reading; see [model.md § 4.4](model.md)). transformers 5.16.1 to
-  5.19.0 drop the experts' `weight_zero_point` when they fuse the experts at load, and compressed-tensors then
-  refuses the asymmetric decompression. The exact math is still fully defined by the compressed-tensors source.
+- **transformers cannot load it** ([model.md § 4.4](model.md#44-what-transformers-does-when-it-loads-this-checkpoint)).
+  transformers 5.16.1 to 5.19.0 (and main of 2026-10-14) drop the experts' `weight_zero_point` when they fuse the
+  experts at load, and compressed-tensors then refuses the asymmetric decompression. The same loader leaves the BF16
+  experts of layers 3 and 77 at random initialisation. Both were reproduced on a tiny model on 2026-10-14. The exact
+  math is still fully defined by the compressed-tensors source, and vLLM's Marlin dequantises to the same bits.
 
 ## 1. The release
 
@@ -157,7 +159,7 @@ Hence the post's "92 % of parent coverage" (23 of 25). The caveats:
 | Calibration | "STEM and Agentic", linking [`cyankiwi/calibration`](https://huggingface.co/datasets/cyankiwi/calibration) (`1dc050f7`, no README): 384 conversations, from Nemotron-SFT-Multilingual-v1 (136), MMLU-ProX (120), Nemotron-Post-Training-v1 (96) and Nemotron-SWE-v1 (32); English 128, Chinese 64, other languages 16–32 each |
 | Source weights | **The FP8 release** (*checked*, 2026-10-14): in layers 3, 4, 77 and 78, every sampled BF16 weight of altar-1 (128 rows each of `q_a_proj`, `kv_a_proj_with_mqa`, the shared `down_proj`, and 10 BF16 expert matrices of layers 3, 77, 78) equals `bf16_rne(E4M3 × weight_scale_inv)` of `zai-org/GLM-5.3` at `c5087a76`, 100 % of values; none equals the BF16 master |
 | AWQ smoothing | Folded into the BF16 tensors (*checked*, layer 4): `input_layernorm` is unchanged, but `post_attention_layernorm` differs from GLM-5.3's by per-channel factors 0.39–1.46, `q_a_layernorm` 0.37–6.05, `kv_a_layernorm` 0.27–3.45. The router `gate.weight` columns equal GLM-5.3's times the same per-channel factor as the norm's change (median deviation 0.13 %, i.e. bf16 rounding), so router logits are the same function up to rounding. The shared-expert `gate_proj` (corr 0.9955) also carries the factor. In layers 3 and 77, where everything is BF16, the norms equal the release's |
-| What stays BF16 | Per the `ignore` list: `lm_head`; in every layer `q_a_proj`, `kv_a_proj_with_mqa`, the router and the shared expert; the indexer's `wq_b`, `wk` and `weights_proj` in the 22 layers that have one (0, 1, 2, 6, 10, …, 74 and the MTP layer 78); all attention projections of layers 0–3, 77 and 78; the dense MLPs of layers 0–2; and **all routed experts of layers 3, 77 and 78**. The `kv_a_proj` and `q_a_proj` exclusion follows the usual practice for small, sensitive MLA down-projections; the indexer and router are excluded by every GLM-5.3 quantisation read ([glm53 scouting § 1](../../glm53-4xgx10-switchless/docs/scouting.md#1-the-official-release)) |
+| What stays BF16 | Per the `ignore` list: `lm_head`; in every layer `q_a_proj`, `kv_a_proj_with_mqa`, the router and the shared expert; the indexer's `wq_b`, `wk` and `weights_proj` in the 22 layers that have one (0, 1, 2, 6, 10, …, 74 and the MTP layer 78); all attention projections of layers 0–3, 77 and 78; the dense MLPs of layers 0–2; and **all routed experts of layers 3, 77 and 78**. *Inferred:* the `q_a_proj` and `kv_a_proj` exclusion follows common practice for the small MLA down-projections; the indexer and router are excluded by every GLM-5.3 quantisation read ([glm53 scouting § 1](../../glm53-4xgx10-switchless/docs/scouting.md#1-the-official-release)) |
 | Why layers 3 and 77 stay BF16 | **Not explained anywhere.** [Discussion #1](https://huggingface.co/cyankiwi/GLM-5.3-AWQ-INT4/discussions/1) asks why 5.3 is "~48 GB larger than 5.2" and whether "the BF16 retention [is] intentional"; no answer as of 2026-10-14. *Inferred:* the first and last MoE layers are the usual sensitive ones, and 78 is the MTP layer that transformers does not run (so an activation-calibrated method like AWQ cannot calibrate it). Layers 3 and 77 cost 23.6 GiB in altar-1 against ~6.8 at INT4 |
 | Quality | None published for the quant itself (the card repeats Z.ai's GLM-5.3 benchmarks). In the fidelity study its pruned cuts are the W4A16 rows; the unpruned base was not scored there. Aikido's CVE table gives it 61.5 % recall against 65.6 % for BF16 |
 | Engines | Z.ai's list (SGLang, vLLM and others). A user in the same discussion (2026-09-30): "running it on 4x H200 with vLLM. Has anyone managed to serve it with SGLang on Hopper?" |
