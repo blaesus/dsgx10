@@ -1,5 +1,5 @@
 // FP8 GEMM for prefill chunks (any number of rows) on the bf16 tensor cores: the GEMV's arithmetic in the
-// GEMV's order, so every output equals gemv()'s bit for bit at the same splitk (docs/attention.md § 3).
+// GEMV's order, so every output equals gemv()'s bit for bit at the same splitk (docs/attention.md § 5).
 //
 // A CTA owns a BM x BN output tile; stages of 64 k go global -> shared by cp.async (STAGES deep): the
 // activations as [BM][64] bf16 (16-byte chunk c of row r at c ^ (r & 1): conflict-free 128-bit reads), the

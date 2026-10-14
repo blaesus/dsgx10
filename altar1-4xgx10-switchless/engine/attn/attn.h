@@ -48,7 +48,7 @@ constexpr bool full_indexer(int l) { return ((l - 2 > 0 ? l - 2 : 0) % 4) == 0; 
 // the full layer whose top-k layer l uses (itself when full)
 constexpr int index_source(int l) { return full_indexer(l) ? l : index_source(l - 1); }
 
-// ---- this rank's x-projection: one BF16 GEMV of the normed layer input (docs/attention.md § split) ----------
+// ---- this rank's x-projection: one BF16 GEMV of the normed layer input (docs/attention.md § 2) ----------
 // Rank r's rows, in order: q_a rows [512r, +512), kv_a latent rows [128r, +128), kv_a rope rows [512+16r, +16),
 // and on full-indexer layers the indexer's wk rows [32r, +32). After the all-gather the four ranks' blocks lie
 // in rank order: [rows][4][kXRows] (shared layers: kXRowsShared, the same without wk).

@@ -422,7 +422,7 @@ void launch_gemv(const uint16_t* x, int ldx, int rows, int K, const Segs& sd, in
       default: launch_gemv_cfg<true, OUT, HI, 8, 4, false>(x, ldx, rows, K, sd, splitk, none, s, pdl); return;
     }
   } else {
-    if (want < 0) {  // by shape, measured on GB10 (docs/attention.md § 5): bit-neutral
+    if (want < 0) {  // by shape, measured on GB10 (docs/attention.md § 7): bit-neutral
       const size_t N = (size_t)sd.tile_end * 8;
       want = K <= 512 ? 2 : N * K <= ((size_t)1 << 21) ? 4 : N >= 16384 ? 0 : 1;
     }

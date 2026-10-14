@@ -1,5 +1,5 @@
-"""The engine's per-rank attention-side weight layouts: the reference for the converter (docs/attention.md,
-"Weight tiles"). Every function is a lossless re-cut of the source tensors, except W_UK^T of an INT4 kv_b, which is
+"""The engine's per-rank attention-side weight layouts: the reference for the converter (docs/attention.md § 4,
+"Layouts"). Every function is a lossless re-cut of the source tensors, except W_UK^T of an INT4 kv_b, which is
 served as its exact dequantisation (BF16, the contract's weight bit for bit).
 
 altar-1 serves two formats here (docs/attention.md § 2):
