@@ -1,7 +1,7 @@
 // Timings of engine/attn on one GB10 (this rank's shapes at TP=4). Weights and caches are cycled through pools
 // several times larger than L2 (24 MB), so every timed launch reads from DRAM, as a step's would. Each figure is
 // the median over replays of a CUDA graph of one pass over the pool, divided by the launches in it.
-// usage: bench_attn [--out FILE] [--only bw,gemv,index,attn,prefill,pgemm,pattn] [--ctx 32768,131072,262144]
+// usage: bench_attn [--out FILE] [--only bw,agemv,agemvcfg,apgemm,gemv,index,attn,prefill,pgemm,pattn] [--ctx 32768,131072,262144]
 #include <algorithm>
 #include <cstdarg>
 #include <random>
@@ -297,6 +297,7 @@ void bench_pgemm() {
     std::vector<GemvSeg> sg(c.n.size());
     size_t wo = 0, so = 0, yo = 0;
     for (size_t i = 0; i < c.n.size(); ++i) {
+      sg[i].fmt = WFmt::kFP8;
       sg[i].w = w.p + wo;
       sg[i].s = reinterpret_cast<const float*>(w.p + wbytes + so);
       sg[i].n = c.n[i];
@@ -336,6 +337,203 @@ void bench_pgemm() {
     }
   }
 }
+// ---- altar-1's projections: BF16 and INT4 GEMVs (decode) and GEMMs (prefill) -----------------------------------
+struct ACase {
+  const char* name;
+  std::vector<std::pair<WFmt, int>> seg;  // (format, rows) a segment
+  int K, group_rows, x_group, ldx;
+  GemvOut out;
+  int splitk;
+};
+const std::vector<ACase>& altar_cases() {
+  static const std::vector<ACase> cs = {
+      {"x-projection BF16 688x6144", {{WFmt::kBF16, kXRows}}, kDim, 0, 0, kDim, GemvOut::kBF16, 4},
+      {"x-projection BF16, shared layer 656x6144", {{WFmt::kBF16, kXRowsShared}}, kDim, 0, 0, kDim, GemvOut::kBF16, 4},
+      {"q_b INT4 4096x2048", {{WFmt::kINT4, kOProjK}}, kQLora, 0, 0, kQLora, GemvOut::kBF16, 1},
+      {"indexer wq_b BF16 1024x2048", {{WFmt::kBF16, 1024}}, kQLora, 0, 0, kQLora, GemvOut::kBF16, 1},
+      {"q_b INT4 + wq_b BF16 (one call, two launches)", {{WFmt::kINT4, kOProjK}, {WFmt::kBF16, 1024}}, kQLora, 0, 0, kQLora,
+       GemvOut::kBF16, 1},
+      {"W_UK^T BF16 16x(512x192) grouped", {{WFmt::kBF16, kHeads * kKvLora}}, kNope, kKvLora, kQkDim, kOProjK, GemvOut::kBF16, 1},
+      {"W_UV INT4 16x(256x512) grouped", {{WFmt::kINT4, kOProjK}}, kKvLora, kVDim, kKvLora, kHeads * kKvLora, GemvOut::kBF16, 1},
+      {"o_proj INT4 6144x4096 (f32)", {{WFmt::kINT4, kDim}}, kOProjK, 0, 0, kOProjK, GemvOut::kF32, 1},
+      {"q_b BF16 4096x2048 (BF16 layers)", {{WFmt::kBF16, kOProjK}}, kQLora, 0, 0, kQLora, GemvOut::kBF16, 1},
+      {"q_b BF16 + wq_b BF16 (BF16 layers)", {{WFmt::kBF16, kOProjK}, {WFmt::kBF16, 1024}}, kQLora, 0, 0, kQLora, GemvOut::kBF16, 1},
+      {"W_UV BF16 grouped (BF16 layers)", {{WFmt::kBF16, kOProjK}}, kKvLora, kVDim, kKvLora, kHeads * kKvLora, GemvOut::kBF16, 1},
+      {"o_proj BF16 6144x4096 (f32, BF16 layers)", {{WFmt::kBF16, kDim}}, kOProjK, 0, 0, kOProjK, GemvOut::kF32, 1},
+      {"dense gate+up BF16 6144x6144 (SwiGLU)", {{WFmt::kBF16, 2 * kDenseInterRank}}, kDim, 0, 0, kDim, GemvOut::kSwiGLU, 1},
+      {"dense down BF16 6144x3072 (f32)", {{WFmt::kBF16, kDim}}, kDenseInterRank, 0, 0, kDenseInterRank, GemvOut::kF32, 1},
+      {"shared gate+up BF16 1024x6144 (SwiGLU)", {{WFmt::kBF16, 2 * kSharedInterRank}}, kDim, 0, 0, kDim, GemvOut::kSwiGLU, 4},
+      {"shared down BF16 6144x512 (f32)", {{WFmt::kBF16, kDim}}, kSharedInterRank, 0, 0, kSharedInterRank, GemvOut::kF32, 1},
+      {"head BF16 38720x6144", {{WFmt::kBF16, kVocabRank}}, kDim, 0, 0, kDim, GemvOut::kBF16, 1},
+      // the same BF16 shapes in the GEMV's lane order (kBF16T)
+      {"x-projection BF16T 688x6144", {{WFmt::kBF16T, kXRows}}, kDim, 0, 0, kDim, GemvOut::kBF16, 4},
+      {"indexer wq_b BF16T 1024x2048", {{WFmt::kBF16T, 1024}}, kQLora, 0, 0, kQLora, GemvOut::kBF16, 1},
+      {"q_b INT4 + wq_b BF16T (one call, two launches)", {{WFmt::kINT4, kOProjK}, {WFmt::kBF16T, 1024}}, kQLora, 0, 0,
+       kQLora, GemvOut::kBF16, 1},
+      {"W_UK^T BF16T 16x(512x192) grouped", {{WFmt::kBF16T, kHeads * kKvLora}}, kNope, kKvLora, kQkDim, kOProjK,
+       GemvOut::kBF16, 1},
+      {"q_b BF16T + wq_b BF16T (BF16 layers)", {{WFmt::kBF16T, kOProjK}, {WFmt::kBF16T, 1024}}, kQLora, 0, 0, kQLora,
+       GemvOut::kBF16, 1},
+      {"W_UV BF16T grouped (BF16 layers)", {{WFmt::kBF16T, kOProjK}}, kKvLora, kVDim, kKvLora, kHeads * kKvLora,
+       GemvOut::kBF16, 1},
+      {"o_proj BF16T 6144x4096 (f32, BF16 layers)", {{WFmt::kBF16T, kDim}}, kOProjK, 0, 0, kOProjK, GemvOut::kF32, 1},
+      {"dense gate+up BF16T 6144x6144 (SwiGLU)", {{WFmt::kBF16T, 2 * kDenseInterRank}}, kDim, 0, 0, kDim,
+       GemvOut::kSwiGLU, 1},
+      {"dense down BF16T 6144x3072 (f32)", {{WFmt::kBF16T, kDim}}, kDenseInterRank, 0, 0, kDenseInterRank, GemvOut::kF32, 1},
+      {"shared gate+up BF16T 1024x6144 (SwiGLU)", {{WFmt::kBF16T, 2 * kSharedInterRank}}, kDim, 0, 0, kDim,
+       GemvOut::kSwiGLU, 4},
+      {"shared down BF16T 6144x512 (f32)", {{WFmt::kBF16T, kDim}}, kSharedInterRank, 0, 0, kSharedInterRank,
+       GemvOut::kF32, 1},
+      {"head BF16T 38720x6144", {{WFmt::kBF16T, kVocabRank}}, kDim, 0, 0, kDim, GemvOut::kBF16, 1},
+  };
+  return cs;
+}
+// the cases in order, or reversed with BENCH_REVERSE=1 (an A/B in both orders: every BF16 case before its BF16T twin,
+// then after it)
+std::vector<ACase> altar_order() {
+  std::vector<ACase> v = altar_cases();
+  const char* e = std::getenv("BENCH_REVERSE");
+  if (e && *e == '1') std::reverse(v.begin(), v.end());
+  return v;
+}
+size_t acase_bytes(const ACase& c) {
+  size_t b = 0;
+  for (auto [f, n] : c.seg) b += weight_bytes(f, n, c.K);
+  return b;
+}
+// a step's segments over pool slot l (weights back to back); y shared
+std::vector<GemvSeg> acase_segs(const ACase& c, const uint8_t* pool, size_t per, int l, uint8_t* y, int N) {
+  std::vector<GemvSeg> sg(c.seg.size());
+  size_t wo = 0, yo = 0;
+  for (size_t i = 0; i < c.seg.size(); ++i) {
+    sg[i].fmt = c.seg[i].first;
+    sg[i].w = pool + per * l + wo;
+    sg[i].n = c.seg[i].second;
+    sg[i].group_rows = c.group_rows;
+    sg[i].x_group = c.x_group;
+    sg[i].ldy = c.out == GemvOut::kSwiGLU ? N / 2 : N;
+    sg[i].y = y + yo * (c.out == GemvOut::kF32 ? 4 : 2);
+    wo += weight_bytes(c.seg[i].first, c.seg[i].second, c.K);
+    yo += c.seg[i].second;
+  }
+  return sg;
+}
+// decode: every case at 1, 6, 16 rows (PDL chain; 1 row also plain), then the launch shapes at 1, 6, 16 rows
+void bench_agemv(bool sweep) {
+  Dev<uint16_t> x(16 * 16384);
+  fill(x.p, x.n * 2, 7, 1);
+  Dev<uint8_t> y(16 * 40000 * 4);
+  for (const auto& c : altar_order()) {
+    const size_t per = acase_bytes(c);
+    int N = 0;
+    for (auto& s : c.seg) N += s.second;
+    const int L = (int)std::max<size_t>(4, ((size_t)768 << 20) / per);
+    Dev<uint8_t> pool(per * L);
+    fill(pool.p, per * L, 11, 1);  // bf16 pairs: valid values, scales and nibbles alike
+    auto run = [&](int rows, bool pdl) {
+      return time_graph(L, [&](int l, cudaStream_t s) {
+        auto sg = acase_segs(c, pool.p, per, l, y.p, N);
+        gemv(x.p, c.ldx, rows, c.K, sg.data(), (int)sg.size(), c.out, c.splitk, s, pdl);
+      });
+    };
+    for (int rows : {1, 6, 16})
+      for (int pdl = 0; pdl < 2; ++pdl) {
+        if (!pdl && rows != 1) continue;
+        const double us = run(rows, pdl != 0);
+        result("agemv\t%s\t%s\trows %d\t%.2f MB\t%.1f us\t%.1f GB/s\t%.1f %% of 235", c.name, pdl ? "PDL chain" : "plain", rows,
+               per / 1e6, us, per / us / 1e3, per / us / 1e3 / 2.35);
+      }
+    if (!sweep || c.seg.size() > 1) continue;
+    for (int cfg = 0; cfg < 6; ++cfg)
+      for (int rows : {1, 6, 16}) {
+        gemv_config(cfg);
+        const double us = run(rows, true);
+        result("agemvcfg\t%s\tcfg %d\trows %d\t%.1f us\t%.1f %% of 235", c.name, cfg, rows, us, per / us / 1e3 / 2.35);
+      }
+    gemv_config(-1);
+  }
+  // the BF16 x-projection and the index weights: two launches against one
+  {
+    const size_t wb = (size_t)kXRows * kDim * 2, ib = (size_t)kIdxHeadsRank * kDim * 2, per = wb + ib;
+    const int L = (int)std::max<size_t>(4, ((size_t)768 << 20) / per);
+    Dev<uint8_t> pool(per * L);
+    fill(pool.p, per * L, 11, 1);
+    Dev<float> w(16 * kIdxHeadsRank);
+    for (int fused = 0; fused < 2; ++fused)
+      for (int rows : {1, 6, 16}) {
+        const double us = time_graph(L, [&](int l, cudaStream_t s) {
+          GemvSeg sg;
+          sg.fmt = WFmt::kBF16;
+          sg.w = pool.p + per * l;
+          sg.n = kXRows;
+          sg.y = y.p;
+          sg.ldy = 40000;
+          const uint16_t* wp = reinterpret_cast<const uint16_t*>(pool.p + per * l + wb);
+          if (fused) {
+            GemvIw iw;
+            iw.wproj = wp, iw.nh = kIdxHeadsRank, iw.w = w.p, iw.ldw = kIdxHeadsRank;
+            gemv(x.p, kDim, rows, kDim, &sg, 1, GemvOut::kBF16, 4, s, true, &iw);
+          } else {
+            gemv(x.p, kDim, rows, kDim, &sg, 1, GemvOut::kBF16, 4, s, true);
+            index_weights(x.p, rows, wp, kIdxHeadsRank, w.p, kIdxHeadsRank, s, true);
+          }
+        });
+        result("agemv\tx-projection BF16 + index weights_proj (%s)\tPDL chain\trows %d\t%.2f MB\t%.1f us\t%.1f %% of 235",
+               fused ? "one launch" : "two launches", rows, per / 1e6, us, per / us / 1e3 / 2.35);
+      }
+  }
+}
+
+// prefill: the GEMMs at 2,600 and 8,192 rows (INT4: the dequantisation into the scratch included, and alone)
+void bench_apgemm(bool rsweep) {
+  const int RMAX = 8192;
+  Dev<uint16_t> x((size_t)RMAX * kHeads * kKvLora);
+  fill(x.p, x.n * 2, 7, 1);
+  Dev<uint8_t> y((size_t)2600 * kVocabRank * 2);  // the largest output: the head at 2,600 rows (bf16)
+  const size_t scratch_elems = (size_t)kDim * kOProjK;
+  Dev<uint16_t> scratch(scratch_elems);
+  for (const auto& c : altar_order()) {
+    const size_t per = acase_bytes(c);
+    int N = 0;
+    bool int4 = false;
+    for (auto& s : c.seg) N += s.second, int4 = int4 || s.first == WFmt::kINT4;
+    Dev<uint8_t> w(per);
+    fill(w.p, per, 11, 1);
+    auto sg = acase_segs(c, w.p, per, 0, y.p, N);
+    for (int rows : {2600, 8192}) {
+      const size_t es = c.out == GemvOut::kF32 ? 4 : 2;
+      if ((size_t)rows * (c.out == GemvOut::kSwiGLU ? N / 2 : N) * es > y.n) continue;
+      const double fl = 2.0 * rows * N * c.K;
+      const double us = time_graph(1, [&](int, cudaStream_t s) {
+        gemm(x.p, c.ldx, rows, c.K, sg.data(), (int)sg.size(), c.out, c.splitk, s, false, scratch.p, scratch_elems);
+      }, 5);
+      result("apgemm\t%s\trows %d\t%.1f us\t%.1f TFLOPS\t%.1f %% of 107", c.name, rows, us, fl / us / 1e6, fl / us / 1e6 / 1.07);
+      if (!rsweep) continue;
+      for (int gm : {0, 2, 4, 8, 16, 16, 8, 4, 2, 0}) {  // the raster, up and back down (A/B in both orders)
+        gemm_raster(gm);
+        const double ur = time_graph(1, [&](int, cudaStream_t s) {
+          gemm(x.p, c.ldx, rows, c.K, sg.data(), (int)sg.size(), c.out, c.splitk, s, false, scratch.p, scratch_elems);
+        }, 5);
+        result("apgemmr\t%s\trows %d\traster %d\t%.1f us\t%.1f TFLOPS\t%.1f %% of 107", c.name, rows, gm, ur, fl / ur / 1e6,
+               fl / ur / 1e6 / 1.07);
+      }
+      gemm_raster(-1);
+    }
+    if (int4)
+      for (auto& g : sg) {
+        if (g.fmt != WFmt::kINT4) continue;
+        const double b = weight_bytes(WFmt::kINT4, g.n, c.K) + (double)g.n * c.K * 2;
+        for (int tiled = 0; tiled < 2; ++tiled) {
+          const double us = time_graph(1, [&](int, cudaStream_t s) {
+            dequant_int4(g.w, g.n, c.K, scratch.p, c.K, s, false, tiled != 0);
+          }, 5);
+          result("apgemm\t%s\tdequant_int4 alone [%d][%d] %s\t%.1f us\t%.1f GB/s (read + write)", c.name, g.n, c.K,
+                 tiled ? "kBF16T" : "row-major", us, b / us / 1e3);
+        }
+      }
+  }
+}
+
 
 // ---- the indexer at decode ------------------------------------------------------------------------------------
 void bench_index(const std::vector<int>& ctxs) {
@@ -784,7 +982,7 @@ void bench_pattn() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string only = "bw,gemv,index,attn,prefill,pgemm", out;  // pattn: only when asked
+  std::string only = "bw,agemv,apgemm,index,attn,prefill", out;  // glm53 FP8 gemv/pgemm, agemvcfg, pattn: when asked
   std::vector<int> ctxs = {32768, 131072, 262144};
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -795,7 +993,7 @@ int main(int argc, char** argv) {
       std::string s = argv[++i];
       size_t p = 0;
       while (p < s.size()) { ctxs.push_back(std::stoi(s.substr(p))); p = s.find(',', p); if (p == std::string::npos) break; ++p; }
-    } else die("usage: bench_attn [--out FILE] [--only bw,gemv,index,attn,prefill,pgemm,pattn] [--ctx a,b,c]");
+    } else die("usage: bench_attn [--out FILE] [--only bw,agemv,agemvcfg,apgemm,gemv,index,attn,prefill,pgemm,pattn] [--ctx a,b,c]");
   }
   if (!out.empty()) g_out = fopen(out.c_str(), "a");
   cudaDeviceProp pr;
@@ -808,6 +1006,8 @@ int main(int argc, char** argv) {
   if (want("attn")) bench_attn(ctxs);
   if (want("prefill")) bench_prefill(ctxs);
   if (want("pgemm")) bench_pgemm();
+  if (want("agemv") || want("agemvcfg")) bench_agemv(want("agemvcfg"));
+  if (want("apgemm") || want("apgemmr")) bench_apgemm(want("apgemmr"));
   if (want("pattn")) bench_pattn();
   if (want("pstress")) bench_pstress();
   return 0;
