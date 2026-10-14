@@ -11,7 +11,9 @@
 // The cache pool (paged, docs/serving.md): pages of --page N positions (1024); every rank offers, after the weights
 //   and the prefill buffers, the smaller of its free device memory less --device-margin-gib (1) and its MemAvailable
 //   less --margin-gib (8 on rank 0, --worker-margin-gib 8 on the others: the fleet's memory rule keeps 8 GiB
-//   available on every box), and all take the smallest offer, at most --kv-gib (default: no cap). Free device memory
+//   available on every box) and less --device-margin-gib again (what CUDA allocates after the pool, graphs and the
+//   spec buffers, ~0.7 GiB: without it rank 2 went to 7.36 GiB at the service's start of 2026-10-14 16:55), and all
+//   take the smallest offer, at most --kv-gib (default: no cap). Free device memory
 //   binds: CUDA on GB10 allocates free pages only and does not reclaim the page cache (a pool sized from MemAvailable
 //   on 2026-10-14 13:33 ran rank 0 out of memory: docs/serving.md § 3), so the rank file's own cache is dropped
 //   before the load and other files' cache (another engine's) caps the pool. The memory guard: after the weights and the prefill
@@ -114,7 +116,7 @@ struct Args {
   std::string disk_dir, disk_tag;
   int step_timeout = 120;
   int index_scratch_mib = 512;  // the prefill indexer's score scratch (Options::index_scratch)
-  double device_margin_gib = 1;  // free device memory the pool leaves (CUDA's own allocations after the pool)
+  double device_margin_gib = 1;  // what the pool leaves for CUDA's own allocations after it (device and MemAvailable)
   bool reclaim = true;  // --no-reclaim: no anonymous memory touched to reclaim the page cache before the pool
   bool spec = true;
   int spec_drafts = 3, spec_force = 0;
@@ -332,7 +334,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
     dfree0 = dfree / kGiB;
     const size_t av = meminfo("MemAvailable");
-    const size_t want = std::min<size_t>(av > margin ? av - margin : 0, (size_t)std::min(a.kv_gib * kGiB, 1e18)) + dmargin;
+    const size_t want = std::min<size_t>(av > margin + dmargin ? av - margin - dmargin : 0,
+                                         (size_t)std::min(a.kv_gib * kGiB, 1e18)) + dmargin;
     if (a.reclaim && want > dfree) {
       std::vector<std::pair<void*, size_t>> held;
       size_t got = 0;
@@ -348,7 +351,7 @@ int main(int argc, char** argv) {
     }
   }
   const size_t avail = meminfo("MemAvailable"), total = meminfo("MemTotal");
-  const size_t offer = std::min(dfree > dmargin ? dfree - dmargin : 0, avail > margin ? avail - margin : 0);
+  const size_t offer = std::min(dfree > dmargin ? dfree - dmargin : 0, avail > margin + dmargin ? avail - margin - dmargin : 0);
   const double wgib = m.weight_bytes() / kGiB;
   const double mine[8] = {(double)offer, dfree / kGiB, avail / kGiB, wgib, file_gib, (double)m.file_expert_layers(),
                           dfree0, reclaimed};
@@ -378,8 +381,8 @@ int main(int argc, char** argv) {
                 "available host memory before it, ranks 0-3:",
                 pages, a.page, pages * a.page, pages * (double)page_bytes / kGiB, pos_bytes);
     for (const auto& r : all) std::printf(" %.2f / %.2f (free device %.2f before %.2f GiB of anonymous memory reclaimed the page cache)", r[1], r[2], r[6], r[7]);
-    std::printf(" GiB; the offer: min(free device less %.1f, MemAvailable less %.1f (rank 0) / %.1f GiB)\n",
-                a.device_margin_gib, a.margin_gib, a.worker_margin_gib);
+    std::printf(" GiB; the offer: min(free device less %.1f, MemAvailable less %.1f (rank 0) / %.1f GiB and %.1f)\n",
+                a.device_margin_gib, a.margin_gib, a.worker_margin_gib, a.device_margin_gib);
     std::printf("weights: %s, %.2f GiB a rank bound (%d MoE layers' experts from the file); the file at its reserved "
                 "size: %.2f GiB; MemTotal %.2f GiB\n",
                 wpath.c_str(), wgib, m.file_expert_layers(), file_gib, total / kGiB);
