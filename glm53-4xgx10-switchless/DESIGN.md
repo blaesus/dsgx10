@@ -108,6 +108,11 @@ cost as many decode bytes as the experts (13.1B attention parameters are read ev
 10. **Production on the ring keeps serving DeepSeek.** Every GPU job here is a ring job: build and check on the
    CPU first, then short (< 15 min) preemptible windows; the reference and the quantiser run on the CPU, on
    rank 2 (the box with the disk).
+11. **Decode's routed-expert sum is not prefill's, by default** (G4 2026-10-14, kept at E1): `moe_decode` sums a
+   strip's K in a different order from `moe_prefill`, so a token's cache entry from a decode step and from a prefill
+   of the same text differ in the last bits from layer 4 on, though every token the server emitted on a reused prefix
+   equalled the cold run's in G6/G7. A decode variant in prefill's order (`DecodeCfg::up` 6–8) is bit-equal and 5–10 %
+   slower; it stays opt-in until a measurement shows the difference matters for prefix reuse or batch invariance.
 
 ## Risks and open questions
 

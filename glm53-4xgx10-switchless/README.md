@@ -40,6 +40,9 @@ Scouting done on 2026-10-13; the plan is in [DESIGN.md](DESIGN.md). Nothing runs
   the service started on the ring, lending and reclaiming against the DeepSeek service; the CPU reference with golden data over 38k tokens
   ([docs/reference.md](docs/reference.md)). Every experiment is indexed in
   [docs/experiments.md](docs/experiments.md).
+- **The expert code is in the kernels (E1, 2026-10-14):** the two-subset 3-bit code for gate/up with NVFP4 down
+  (3.83 bits a weight) decodes at 89–95 % of bandwidth, bit-exact to its definition, with the packer and the
+  loader's checks ([docs/experts.md](docs/experts.md) § 13, [docs/quantiser.md](docs/quantiser.md)).
 - **Not yet:** the routed experts in the rank files (disk: the fill is ~96 GiB a rank at NVFP4, ~80 at the
   mixture), the quantiser's 3-bit fill and the KL bake-off against the master, the drafts' acceptance on real text (G7's speculative decoding is in and exact, [docs/engine.md](docs/engine.md#drafts-g7-2026-10-14)),
   the end-to-end check of logits against the golden data.
