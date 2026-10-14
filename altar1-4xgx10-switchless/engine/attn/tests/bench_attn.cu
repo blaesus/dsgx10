@@ -522,9 +522,14 @@ void bench_apgemm(bool rsweep) {
     if (int4)
       for (auto& g : sg) {
         if (g.fmt != WFmt::kINT4) continue;
-        const double us = time_graph(1, [&](int, cudaStream_t s) { dequant_int4(g.w, g.n, c.K, scratch.p, c.K, s); }, 5);
         const double b = weight_bytes(WFmt::kINT4, g.n, c.K) + (double)g.n * c.K * 2;
-        result("apgemm\t%s\tdequant_int4 alone [%d][%d]\t%.1f us\t%.1f GB/s (read + write)", c.name, g.n, c.K, us, b / us / 1e3);
+        for (int tiled = 0; tiled < 2; ++tiled) {
+          const double us = time_graph(1, [&](int, cudaStream_t s) {
+            dequant_int4(g.w, g.n, c.K, scratch.p, c.K, s, false, tiled != 0);
+          }, 5);
+          result("apgemm\t%s\tdequant_int4 alone [%d][%d] %s\t%.1f us\t%.1f GB/s (read + write)", c.name, g.n, c.K,
+                 tiled ? "kBF16T" : "row-major", us, b / us / 1e3);
+        }
       }
   }
 }

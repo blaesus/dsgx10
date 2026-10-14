@@ -151,9 +151,11 @@ void gemm_raster(int gm);
 // BF16 weights only (the router, the head): gemm() with every segment taken as BF16 (kNone allowed).
 void gemm_bf16(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
                cudaStream_t s, bool pdl = false);
-// An INT4 tile [N][K] -> the contract's bf16 weight, row-major [N][K] (ld elements a row): the GEMV's dequantisation
-// element for element (attn_tests D: = tools/pack.py int4_dequant = compressed-tensors' decompress).
-void dequant_int4(const void* tiles, int N, int K, uint16_t* out, size_t ld, cudaStream_t s, bool pdl = false);
+// An INT4 tile [N][K] -> the contract's bf16 weight, row-major [N][K] (ld elements a row) or, tiled, kBF16T (ld
+// unused): the GEMV's dequantisation element for element (attn_tests A, D, R: = tools/pack.py int4_dequant =
+// compressed-tensors' decompress). gemm() uses the tiled form for its INT4 scratch.
+void dequant_int4(const void* tiles, int N, int K, uint16_t* out, size_t ld, cudaStream_t s, bool pdl = false,
+                  bool tiled = false);
 
 // ---- norms, RoPE, cache entries ------------------------------------------------------------------------------
 // RMSNorm as the reference: bf16(w * bf16(x * rsqrt(mean(x^2) + eps))), fp32 statistics. [rows][D] bf16.

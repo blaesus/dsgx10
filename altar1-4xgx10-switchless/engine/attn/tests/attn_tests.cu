@@ -220,6 +220,20 @@ std::vector<float> onehot(const GemvSeg& s0, int N, int K, int ldx, int xoff_str
 }
 
 // ---- A (BF16 and INT4 layers): the tiles decode to the contract's weights through the kernels' fragment maps -----
+// kBF16T, BF16 in the GEMV's lane order: [N/8][K/64][2 halves][32 lanes][8 values], lane 4g + t's half h: row
+// 8i + g, k = 64j + 16t + 8h .. + 7
+std::vector<uint16_t> tile_bf16(const std::vector<uint16_t>& w, int N, int K) {
+  std::vector<uint16_t> o(w.size());
+  const int J = K / 64;
+  for (int i = 0; i < N / 8; ++i)
+    for (int j = 0; j < J; ++j)
+      for (int h = 0; h < 2; ++h)
+        for (int l = 0; l < 32; ++l)
+          for (int e = 0; e < 8; ++e)
+            o[((((size_t)i * J + j) * 2 + h) * 32 + l) * 8 + e] =
+                w[(size_t)(8 * i + (l >> 2)) * K + 64 * j + 16 * (l & 3) + 8 * h + e];
+  return o;
+}
 void test_dequant() {
   if (g_fmt == "fp8") return test_dequant_fp8();
   // the BF16 x-projection: rank 0's rows 0..511 are q_a's
@@ -284,6 +298,11 @@ void test_dequant() {
       const auto& ref = L(p + nm + "_deq");
       const bool ok = std::memcmp(h.data(), ref.data.data(), h.size() * 2) == 0;
       T(ok, "A dequant_int4 rank %d %s [%d][%d] = pack.py int4_dequant, bit for bit", r, nm, N, K);
+      std::vector<uint16_t> hr(ref.data.size() / 2);
+      std::memcpy(hr.data(), ref.data.data(), hr.size() * 2);
+      out.zero();
+      dequant_int4(w->w.p, N, K, out.p, 0, 0, false, true);
+      T(out.down() == tile_bf16(hr, N, K), "A dequant_int4 rank %d %s, tiled (kBF16T) = pack.py's, bit for bit", r, nm);
     }
   }
 }
@@ -387,20 +406,6 @@ void test_int4(int S) {
   }
 }
 
-// kBF16T, BF16 in the GEMV's lane order: [N/8][K/64][2 halves][32 lanes][8 values], lane 4g + t's half h: row
-// 8i + g, k = 64j + 16t + 8h .. + 7
-std::vector<uint16_t> tile_bf16(const std::vector<uint16_t>& w, int N, int K) {
-  std::vector<uint16_t> o(w.size());
-  const int J = K / 64;
-  for (int i = 0; i < N / 8; ++i)
-    for (int j = 0; j < J; ++j)
-      for (int h = 0; h < 2; ++h)
-        for (int l = 0; l < 32; ++l)
-          for (int e = 0; e < 8; ++e)
-            o[((((size_t)i * J + j) * 2 + h) * 32 + l) * 8 + e] =
-                w[(size_t)(8 * i + (l >> 2)) * K + 64 * j + 16 * (l & 3) + 8 * h + e];
-  return o;
-}
 std::vector<uint16_t> rand_bf16(size_t n, uint64_t seed, float scale) {
   std::vector<uint16_t> v(n);
   uint64_t z = seed * 0x9E3779B97F4A7C15ull + 1;

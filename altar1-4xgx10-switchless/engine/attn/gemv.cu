@@ -335,7 +335,7 @@ __global__ void __launch_bounds__(NWP * 32) k_gemv4(const uint16_t* __restrict__
 // ---- INT4 -> bf16 (the prefill's weights; gemm.cu) ------------------------------------------------------------
 // one thread a (lane, unit) of a block: 32 values, the GEMV's arithmetic; out row-major [N][ld]
 __global__ void __launch_bounds__(256) k_dequant_int4(const uint8_t* __restrict__ w, int N, int K, uint16_t* __restrict__ out,
-                                                      size_t ld) {
+                                                      size_t ld, bool tiled) {
   pdl_trigger();
   const int JB = K >> 9;
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;  // (block, jj, lane)
@@ -355,9 +355,15 @@ __global__ void __launch_bounds__(256) k_dequant_int4(const uint8_t* __restrict_
   for (int q = 0; q < 2; ++q) {
     uint32_t o[8];
     int4x16_to_bf16(lov[q], hiv[q], int4_zz((zw >> (8 * jj + 4 * q)) & 0xFu), prmt(sw, 0, q ? 0x3232u : 0x1010u), o);
-    uint4* d = reinterpret_cast<uint4*>(row + 512 * b + 128 * jj + 64 * q + 16 * t);
-    d[0] = make_uint4(o[0], o[1], o[2], o[3]);
-    d[1] = make_uint4(o[4], o[5], o[6], o[7]);
+    if (tiled) {  // kBF16T: chunk 8b + 2jj + q of tile n8, the lane's halves at 16 l and 512 + 16 l
+      uint16_t* c = out + ((size_t)n8 * (K >> 6) + 8 * b + 2 * jj + q) * 512 + 8 * lane;
+      *reinterpret_cast<uint4*>(c) = make_uint4(o[0], o[1], o[2], o[3]);
+      *reinterpret_cast<uint4*>(c + 256) = make_uint4(o[4], o[5], o[6], o[7]);
+    } else {
+      uint4* d = reinterpret_cast<uint4*>(row + 512 * b + 128 * jj + 64 * q + 16 * t);
+      d[0] = make_uint4(o[0], o[1], o[2], o[3]);
+      d[1] = make_uint4(o[4], o[5], o[6], o[7]);
+    }
   }
 }
 
@@ -547,11 +553,11 @@ void gemv(bool fp8, const uint16_t* x, int ldx, int rows, int K, const GemvSeg* 
   gemv(x, ldx, rows, K, g, nseg, out, splitk, s, pdl, iw);
 }
 
-void dequant_int4(const void* tiles, int N, int K, uint16_t* out, size_t ld, cudaStream_t s, bool pdl) {
-  if (N % 8 || K % kInt4BlkK || ld < (size_t)K || ld % 8) die("dequant_int4: [%d][%d], ld %zu", N, K, ld);
+void dequant_int4(const void* tiles, int N, int K, uint16_t* out, size_t ld, cudaStream_t s, bool pdl, bool tiled) {
+  if (N % 8 || K % kInt4BlkK || (!tiled && (ld < (size_t)K || ld % 8))) die("dequant_int4: [%d][%d], ld %zu", N, K, ld);
   const size_t threads = (size_t)(N / 8) * (K / kInt4BlkK) * 128;
   launch(k_dequant_int4, dim3((unsigned)((threads + 255) / 256)), dim3(256), 0, s, pdl, static_cast<const uint8_t*>(tiles),
-         N, K, out, ld);
+         N, K, out, ld, tiled);
   CUDA_CHECK(cudaGetLastError());
 }
 

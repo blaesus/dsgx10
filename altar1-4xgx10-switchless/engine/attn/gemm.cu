@@ -9,9 +9,10 @@
 // GEMV's four MMAs from zero; the stage's f32 result is scaled and added to the accumulator (acc += s * c),
 // k in order. With split-K the parts' sums are kept apart and added in part order, as the GEMV's warps do.
 // BF16 weights (row-major [N][K] or kBF16T, no scales): the BF16 GEMV's arithmetic instead, the four MMAs of a
-// chunk accumulating straight into the sum (k in order), the weights staged half-major, kBF16T's order: an
-// n-tile's 1 KB as [2 halves][32 lanes][16 B], lane 4g + t's half h = row g, k = 16t + 8h .. + 7 of the chunk
-// (the GEMV's two 16-byte loads; conflict-free shared-memory reads).
+// chunk accumulating straight into the sum (k in order), an n-tile's 1 KB of a stage holding lane 4g + t's 32
+// bytes (row g, k = 16t .. + 15 of the chunk: the GEMV's two 16-byte loads) in the source's order, so that the
+// copies stay linear: lane-major [32 lanes][2 halves][16 B] for row-major weights, half-major [2][32][16 B] for
+// kBF16T (measured: either order for the other form costs 20-25 % of the TFLOPS).
 #include <algorithm>
 
 #include "attn/attn.h"
@@ -108,7 +109,7 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
       bok[j] = n < sg.n;
       bsrc[j] = sg.tiled ? sg.w + ((size_t)(bok[j] ? n >> 3 : 0) * J) * 1024 + 512 * hf + 16 * l
                          : sg.w + ((size_t)(bok[j] ? n : 0) * K + 16 * (l & 3) + 8 * hf) * 2;
-      bdst[j] = SA + nt * 1024 + 512 * hf + 16 * l;  // half-major in shared memory: conflict-free fragment reads
+      bdst[j] = SA + nt * 1024 + (sg.tiled ? 512 * hf + 16 * l : 32 * l + 16 * hf);  // as the source orders them
     } else {
       const int nt = i >> 5, l = i & 31, n = n0 + 8 * nt;
       bok[j] = n < sg.n;
@@ -194,8 +195,8 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
 #pragma unroll
     for (int ni = 0; ni < NI; ++ni) {
       if constexpr (BW) {
-        const uint8_t* wb = sb0 + (wn * (WN / 8) + ni) * 1024 + 16 * lane;
-        const uint4 w0 = *reinterpret_cast<const uint4*>(wb), w1 = *reinterpret_cast<const uint4*>(wb + 512);
+        const uint8_t* wb = sb0 + (wn * (WN / 8) + ni) * 1024 + (sg.tiled ? 16 : 32) * lane;
+        const uint4 w0 = *reinterpret_cast<const uint4*>(wb), w1 = *reinterpret_cast<const uint4*>(wb + (sg.tiled ? 512 : 16));
 #pragma unroll
         for (int mi = 0; mi < MI; ++mi) {
           float(&c)[4] = acc[mi][ni];
@@ -449,9 +450,9 @@ void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int 
     if (K % kInt4BlkK || (K / kInt4BlkK) % splitk) die("gemm: INT4 K %d for split-K %d", K, splitk);
     if (!scratch || scratch_elems < (size_t)g.n * K) die("gemm: INT4 [%d][%d] needs a bf16 scratch of %zu elements (%zu given)",
                                                          g.n, K, (size_t)g.n * K, scratch_elems);
-    dequant_int4(g.w, g.n, K, scratch, K, s, pdl);
+    dequant_int4(g.w, g.n, K, scratch, K, s, pdl, true);  // into kBF16T: coalesced writes, the faster GEMM
     GemvSeg d = g;
-    d.fmt = WFmt::kBF16;
+    d.fmt = WFmt::kBF16T;
     d.w = scratch;
     gemm_bf16_run(x, ldx, rows, K, &d, 1, out, splitk, s, pdl);
   }
