@@ -189,9 +189,9 @@ __global__ void __launch_bounds__(NWP * 32) k_gemv(const uint16_t* __restrict__ 
   const int j0 = (J * pl.kpart) / splitk, j1 = (J * (pl.kpart + 1)) / splitk;
   // weights
   const uint8_t* wp = FP8         ? sg.w + ((size_t)pl.lt * J) * 512 + lane * 16
-                     : sg.tiled ? sg.w + ((size_t)pl.lt * J) * 1024 + lane * 32
+                     : sg.tiled ? sg.w + ((size_t)pl.lt * J) * 1024 + lane * 16
                                 : sg.w + ((size_t)(n0 + g) * K + 16 * t) * 2;
-  const int wstep = sg.tiled ? 1024 : 128;  // BF16: a chunk's stride
+  const int wstep = sg.tiled ? 1024 : 128, whalf = sg.tiled ? 512 : 16;  // BF16: a chunk's stride, its second half
   // scale row: the tile's block; SwiGLU: lane t's intermediate (n0/2 + t)'s gate block row (up follows it)
   const float* sp = !FP8 ? nullptr
                     : OUT == (int)GemvOut::kSwiGLU ? sg.s + (size_t)(((n0 >> 1) + t) >> sg.lrs) * 2 * (K >> sg.lks)
@@ -204,7 +204,7 @@ __global__ void __launch_bounds__(NWP * 32) k_gemv(const uint16_t* __restrict__ 
       b[0] = ldg_stream128(wp + (size_t)j * 512);
     } else {
       b[0] = ldg_stream128(wp + (size_t)j * wstep);
-      b[1] = ldg_stream128(wp + (size_t)j * wstep + 16);
+      b[1] = ldg_stream128(wp + (size_t)j * wstep + whalf);
     }
   };
   if (pl.valid) {

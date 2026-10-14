@@ -175,17 +175,18 @@ def bf16_gate_up(gate, up, r, inter):
 
 
 def bf16_tiles(w):
-    """kBF16T: a BF16 [N][K] matrix (any of the above) in the GEMV's lane order, [N/8][K/64][32 lanes][16 values]:
-    lane 4g + t of tile i, chunk j holds row 8i + g, k = 64j + 16t .. + 15. The same values as the row-major form
-    (the kernels give the same outputs bit for bit); each warp's 64-k chunk is one contiguous 1 KB."""
+    """kBF16T: a BF16 [N][K] matrix (any of the above) in the GEMV's lane order, [N/8][K/64][2 halves][32 lanes]
+    [8 values]: in chunk j of tile i, lane 4g + t's half h holds row 8i + g, k = 64j + 16t + 8h .. + 7. The same
+    values as the row-major form (the kernels give the same outputs bit for bit); each warp's 64-k chunk is one
+    contiguous 1 KB. For K % 128 == 0 this is experts/layout.h's BF16 expert block (2048 B = two chunks)."""
     N, K = w.shape
     assert N % 8 == 0 and K % 64 == 0, (N, K)
-    return np.ascontiguousarray(w.reshape(N // 8, 8, K // 64, 4, 16).transpose(0, 2, 1, 3, 4)).reshape(N, K)
+    return np.ascontiguousarray(w.reshape(N // 8, 8, K // 64, 4, 2, 8).transpose(0, 2, 4, 1, 3, 5)).reshape(N, K)
 
 
 def bf16_untile(t, N, K):
     """the inverse of bf16_tiles"""
-    return np.ascontiguousarray(t.reshape(N // 8, K // 64, 8, 4, 16).transpose(0, 2, 1, 3, 4)).reshape(N, K)
+    return np.ascontiguousarray(t.reshape(N // 8, K // 64, 2, 8, 4, 8).transpose(0, 3, 1, 4, 2, 5)).reshape(N, K)
 
 
 def int4_q_b(qb, r):

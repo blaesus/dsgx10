@@ -75,9 +75,11 @@ enum class WFmt : int {
   kBF16 = 1,
   kINT4 = 2,
   kFP8 = 3,
-  kBF16T = 4,  // BF16 in the GEMV's lane order: [N/8][K/64][32 lanes][32 B], lane 4g + t of tile i, chunk j holding
-               // row 8i + g, k = 64j + 16t .. + 15 (each warp's chunk one contiguous 1 KB; the same values and
-               // arithmetic as kBF16, so the same outputs bit for bit; may share a launch with kBF16)
+  kBF16T = 4,  // BF16 in the GEMV's lane order: [N/8][K/64][2 halves][32 lanes][8 values]: in chunk j of tile i,
+               // lane 4g + t's half h holds row 8i + g, k = 64j + 16t + 8h .. + 7 (each warp's chunk one contiguous
+               // 1 KB, each 16-byte load instruction 512 contiguous bytes; = experts/layout.h's BF16 block when
+               // K % 128 == 0). The same values and arithmetic as kBF16, so the same outputs bit for bit; may share
+               // a launch with kBF16
 };
 inline constexpr int kInt4BlkK = 512, kInt4Blk = 2368;  // the INT4 tile's block: 8 rows x 512 k, its bytes
 // a matrix's bytes in its format (FP8: the codes only)

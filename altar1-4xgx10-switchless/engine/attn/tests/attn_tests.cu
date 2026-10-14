@@ -387,15 +387,18 @@ void test_int4(int S) {
   }
 }
 
-// kBF16T, BF16 in the GEMV's lane order: [N/8][K/64][32 lanes][16 values], lane 4g + t: row 8i + g, k 64j + 16t ..
+// kBF16T, BF16 in the GEMV's lane order: [N/8][K/64][2 halves][32 lanes][8 values], lane 4g + t's half h: row
+// 8i + g, k = 64j + 16t + 8h .. + 7
 std::vector<uint16_t> tile_bf16(const std::vector<uint16_t>& w, int N, int K) {
   std::vector<uint16_t> o(w.size());
   const int J = K / 64;
   for (int i = 0; i < N / 8; ++i)
     for (int j = 0; j < J; ++j)
-      for (int l = 0; l < 32; ++l)
-        for (int e = 0; e < 16; ++e)
-          o[(((size_t)i * J + j) * 32 + l) * 16 + e] = w[(size_t)(8 * i + (l >> 2)) * K + 64 * j + 16 * (l & 3) + e];
+      for (int h = 0; h < 2; ++h)
+        for (int l = 0; l < 32; ++l)
+          for (int e = 0; e < 8; ++e)
+            o[((((size_t)i * J + j) * 2 + h) * 32 + l) * 8 + e] =
+                w[(size_t)(8 * i + (l >> 2)) * K + 64 * j + 16 * (l & 3) + 8 * h + e];
   return o;
 }
 std::vector<uint16_t> rand_bf16(size_t n, uint64_t seed, float scale) {
