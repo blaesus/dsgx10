@@ -111,10 +111,11 @@ T* dalloc(size_t n) {
 
 // ---- (a) the hidden all-reduce ------------------------------------------------------------------------------
 
-__global__ void k_add_res(const float* sum, const uint16_t* res, uint16_t* h, int n) {
+// h = bf16(res + sum), one rounding (decision 8); r2: bf16(res + bf16(sum)), the double rounding
+__global__ void k_add_res(const float* sum, const uint16_t* res, uint16_t* h, int n, bool r2) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  const float y = __bfloat162float(__float2bfloat16_rn(sum[i]));
+  const float y = r2 ? __bfloat162float(__float2bfloat16_rn(sum[i])) : sum[i];
   const float r = __uint_as_float((uint32_t)res[i] << 16);
   h[i] = __bfloat16_as_ushort(__float2bfloat16_rn(__fadd_rn(r, y)));
 }
@@ -180,66 +181,69 @@ void test_allreduce(Ring& ring, cudaStream_t st, Checker& ck) {
       hp[i] = test_value(me, i, salt);
       hres_in[i] = f2bf(test_value(7, i, salt ^ 0x5555));
     }
-    // expected residual and normed rows
-    for (int r = 0; r < R; ++r) {
-      std::vector<float> h(kDim);
-      for (int c = 0; c < kDim; ++c) {
-        const size_t i = (size_t)r * kDim + c;
-        h[c] = bfr(bf2f(hres_in[i]) + bfr(hsum[i]));
-        exp_res[i] = f2bf(h[c]);
+    for (int r2 = 0; r2 < 2; ++r2) {  // the contract's one rounding, then the old double rounding (round2)
+      // expected residual and normed rows
+      for (int r = 0; r < R; ++r) {
+        std::vector<float> h(kDim);
+        for (int c = 0; c < kDim; ++c) {
+          const size_t i = (size_t)r * kDim + c;
+          h[c] = bfr(bf2f(hres_in[i]) + (r2 ? bfr(hsum[i]) : hsum[i]));  // the epilogue's h: one f32 add, one rounding
+          exp_res[i] = f2bf(h[c]);
+        }
+        host_rmsnorm(h.data(), hw.data(), G::kNormEps, &exp_xn[(size_t)r * kDim]);
       }
-      host_rmsnorm(h.data(), hw.data(), G::kNormEps, &exp_xn[(size_t)r * kDim]);
-    }
-    CUDA_CHECK(cudaMemcpy(part, hp.data(), n * 4, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(res, hres_in.data(), n * 2, cudaMemcpyHostToDevice));
-    // the generic all-reduce and the GPU reference chain: + residual, attn's rmsnorm
-    comm::allreduce_f32(ch, part, ref32, n, st);
-    k_add_res<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(ref32, res, hres, (int)n);
-    ::glm::rmsnorm(hres, kDim, w, G::kNormEps, kDim, xn_ref, kDim, R, st);
-    CUDA_CHECK(cudaMemcpyAsync(g32.data(), ref32, n * 4, cudaMemcpyDeviceToHost, st));
-    CUDA_CHECK(cudaMemcpyAsync(gxr.data(), xn_ref, n * 2, cudaMemcpyDeviceToHost, st));
-    sync_or_die(ring, st, 30, "allreduce reference");
-    size_t bad = 0;
-    for (size_t i = 0; i < n; ++i) bad += std::memcmp(&g32[i], &hsum[i], 4) != 0;
-    size_t badr = 0;
-    for (size_t i = 0; i < n; ++i) badr += gxr[i] != exp_xn[i];
-    char nm[160];
-    std::snprintf(nm, sizeof nm, "reference chain %2d rows: comm::allreduce_f32 vs host, rmsnorm vs host", R);
-    ck.report(nm, bad + badr, 2 * n, fnv(gxr.data(), n * 2));
-    for (int S : {1, 8, 16, 32}) {  // 1: the add-norm's one block a row (no plain variant)
-      for (int pdl = 0; pdl < 2; ++pdl) {
-        CUDA_CHECK(cudaMemsetAsync(out32, 0xff, n * 4, st));
-        CUDA_CHECK(cudaMemsetAsync(out16, 0xff, n * 2, st));
-        G::allreduce_hidden(ch, part, R, out32, out16, st, pdl, S == 1 ? 8 : S);
-        CUDA_CHECK(cudaMemcpyAsync(g32.data(), out32, n * 4, cudaMemcpyDeviceToHost, st));
-        CUDA_CHECK(cudaMemcpyAsync(g16.data(), out16, n * 2, cudaMemcpyDeviceToHost, st));
-        sync_or_die(ring, st, 30, "allreduce_hidden");
-        bad = 0;
-        for (size_t i = 0; i < n; ++i) bad += std::memcmp(&g32[i], &hsum[i], 4) != 0 || g16[i] != f2bf(hsum[i]);
-        std::snprintf(nm, sizeof nm, "allreduce_hidden   %2d rows, %2d slices%s", R, S, pdl ? ", pdl" : "");
-        ck.report(nm, bad, n, fnv(g16.data(), n * 2, fnv(g32.data(), n * 4)));
-        // fused: separate residual out, then in place (twice: run to run)
-        CUDA_CHECK(cudaMemsetAsync(res2, 0xff, n * 2, st));
-        CUDA_CHECK(cudaMemsetAsync(xn, 0xff, n * 2, st));
-        G::allreduce_add_norm(ch, part, R, res, res2, w, G::kNormEps, xn, st, pdl, S);
-        CUDA_CHECK(cudaMemcpyAsync(gres.data(), res2, n * 2, cudaMemcpyDeviceToHost, st));
-        CUDA_CHECK(cudaMemcpyAsync(gxn.data(), xn, n * 2, cudaMemcpyDeviceToHost, st));
-        sync_or_die(ring, st, 30, "allreduce_add_norm");
-        bad = 0;
-        for (size_t i = 0; i < n; ++i) bad += gres[i] != exp_res[i] || gxn[i] != exp_xn[i] || gxn[i] != gxr[i];
-        const uint64_t h1 = fnv(gxn.data(), n * 2, fnv(gres.data(), n * 2));
-        for (int rep = 0; rep < 2; ++rep) {
-          CUDA_CHECK(cudaMemcpyAsync(res2, res, n * 2, cudaMemcpyDeviceToDevice, st));
+      CUDA_CHECK(cudaMemcpy(part, hp.data(), n * 4, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(res, hres_in.data(), n * 2, cudaMemcpyHostToDevice));
+      // the generic all-reduce and the GPU reference chain: + residual, attn's rmsnorm
+      comm::allreduce_f32(ch, part, ref32, n, st);
+      k_add_res<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(ref32, res, hres, (int)n, r2);
+      ::glm::rmsnorm(hres, kDim, w, G::kNormEps, kDim, xn_ref, kDim, R, st);
+      CUDA_CHECK(cudaMemcpyAsync(g32.data(), ref32, n * 4, cudaMemcpyDeviceToHost, st));
+      CUDA_CHECK(cudaMemcpyAsync(gxr.data(), xn_ref, n * 2, cudaMemcpyDeviceToHost, st));
+      sync_or_die(ring, st, 30, "allreduce reference");
+      size_t bad = 0;
+      for (size_t i = 0; i < n; ++i) bad += std::memcmp(&g32[i], &hsum[i], 4) != 0;
+      size_t badr = 0;
+      for (size_t i = 0; i < n; ++i) badr += gxr[i] != exp_xn[i];
+      char nm[160];
+      std::snprintf(nm, sizeof nm, "reference chain %2d rows%s: comm::allreduce_f32 vs host, rmsnorm vs host", R,
+                    r2 ? ", round2" : "");
+      ck.report(nm, bad + badr, 2 * n, fnv(gxr.data(), n * 2));
+      for (int S : {1, 8, 16, 32}) {  // 1: the add-norm's one block a row (no plain variant)
+        for (int pdl = 0; pdl < 2; ++pdl) {
+          CUDA_CHECK(cudaMemsetAsync(out32, 0xff, n * 4, st));
+          CUDA_CHECK(cudaMemsetAsync(out16, 0xff, n * 2, st));
+          G::allreduce_hidden(ch, part, R, out32, out16, st, pdl, S == 1 ? 8 : S);
+          CUDA_CHECK(cudaMemcpyAsync(g32.data(), out32, n * 4, cudaMemcpyDeviceToHost, st));
+          CUDA_CHECK(cudaMemcpyAsync(g16.data(), out16, n * 2, cudaMemcpyDeviceToHost, st));
+          sync_or_die(ring, st, 30, "allreduce_hidden");
+          bad = 0;
+          for (size_t i = 0; i < n; ++i) bad += std::memcmp(&g32[i], &hsum[i], 4) != 0 || g16[i] != f2bf(hsum[i]);
+          std::snprintf(nm, sizeof nm, "allreduce_hidden   %2d rows, %2d slices%s", R, S, pdl ? ", pdl" : "");
+          ck.report(nm, bad, n, fnv(g16.data(), n * 2, fnv(g32.data(), n * 4)));
+          // fused: separate residual out, then in place (twice: run to run)
+          CUDA_CHECK(cudaMemsetAsync(res2, 0xff, n * 2, st));
           CUDA_CHECK(cudaMemsetAsync(xn, 0xff, n * 2, st));
-          G::allreduce_add_norm(ch, part, R, res2, res2, w, G::kNormEps, xn, st, pdl, S);
+          G::allreduce_add_norm(ch, part, R, res, res2, w, G::kNormEps, xn, st, pdl, S, r2);
           CUDA_CHECK(cudaMemcpyAsync(gres.data(), res2, n * 2, cudaMemcpyDeviceToHost, st));
           CUDA_CHECK(cudaMemcpyAsync(gxn.data(), xn, n * 2, cudaMemcpyDeviceToHost, st));
-          sync_or_die(ring, st, 30, "allreduce_add_norm in place");
-          bad += fnv(gxn.data(), n * 2, fnv(gres.data(), n * 2)) != h1;
+          sync_or_die(ring, st, 30, "allreduce_add_norm");
+          bad = 0;
+          for (size_t i = 0; i < n; ++i) bad += gres[i] != exp_res[i] || gxn[i] != exp_xn[i] || gxn[i] != gxr[i];
+          const uint64_t h1 = fnv(gxn.data(), n * 2, fnv(gres.data(), n * 2));
+          for (int rep = 0; rep < 2; ++rep) {
+            CUDA_CHECK(cudaMemcpyAsync(res2, res, n * 2, cudaMemcpyDeviceToDevice, st));
+            CUDA_CHECK(cudaMemsetAsync(xn, 0xff, n * 2, st));
+            G::allreduce_add_norm(ch, part, R, res2, res2, w, G::kNormEps, xn, st, pdl, S, r2);
+            CUDA_CHECK(cudaMemcpyAsync(gres.data(), res2, n * 2, cudaMemcpyDeviceToHost, st));
+            CUDA_CHECK(cudaMemcpyAsync(gxn.data(), xn, n * 2, cudaMemcpyDeviceToHost, st));
+            sync_or_die(ring, st, 30, "allreduce_add_norm in place");
+            bad += fnv(gxn.data(), n * 2, fnv(gres.data(), n * 2)) != h1;
+          }
+          std::snprintf(nm, sizeof nm, "allreduce_add_norm %2d rows, %2d slices%s%s (vs host, vs rmsnorm, in place x2)", R,
+                        S, pdl ? ", pdl" : "", r2 ? ", round2 (h = bf16(res + bf16(sum)))" : " (h = bf16(res + sum))");
+          ck.report(nm, bad, n, h1);
         }
-        std::snprintf(nm, sizeof nm, "allreduce_add_norm %2d rows, %2d slices%s (vs host, vs rmsnorm, in place x2)", R, S,
-                      pdl ? ", pdl" : "");
-        ck.report(nm, bad, n, h1);
       }
     }
     // the MoE layer's two partials (allreduce2_add_norm): y = bf16(bf16(sum) + bf16(sum2)), then as above
@@ -262,18 +266,18 @@ void test_allreduce(Ring& ring, cudaStream_t st, Checker& ck) {
         host_rmsnorm(h.data(), hw.data(), G::kNormEps, &exp2_xn[(size_t)r * kDim]);
       }
       CUDA_CHECK(cudaMemcpy(ref32, hp2.data(), n * 4, cudaMemcpyHostToDevice));
-      for (int pdl = 0; pdl < 4; ++pdl) {  // bit 1: one block a row
+      for (int pdl = 0; pdl < 8; ++pdl) {  // bit 1: one block a row; bit 2: round2 (y is bf16 already: the same h)
         CUDA_CHECK(cudaMemsetAsync(res2, 0xff, n * 2, st));
         CUDA_CHECK(cudaMemsetAsync(xn, 0xff, n * 2, st));
-        G::allreduce2_add_norm(ch, part, ref32, R, res, res2, w, G::kNormEps, xn, st, pdl & 1, pdl & 2 ? 1 : 0);
+        G::allreduce2_add_norm(ch, part, ref32, R, res, res2, w, G::kNormEps, xn, st, pdl & 1, pdl & 2 ? 1 : 0, pdl & 4);
         CUDA_CHECK(cudaMemcpyAsync(gres.data(), res2, n * 2, cudaMemcpyDeviceToHost, st));
         CUDA_CHECK(cudaMemcpyAsync(gxn.data(), xn, n * 2, cudaMemcpyDeviceToHost, st));
         sync_or_die(ring, st, 30, "allreduce2_add_norm");
         size_t bad2 = 0;
         for (size_t i = 0; i < n; ++i) bad2 += gres[i] != exp2_res[i] || gxn[i] != exp2_xn[i];
         char nm2[160];
-        std::snprintf(nm2, sizeof nm2, "allreduce2_add_norm %2d rows%s%s (two partials, vs host)", R, pdl & 1 ? ", pdl" : "",
-                      pdl & 2 ? ", a block a row" : "");
+        std::snprintf(nm2, sizeof nm2, "allreduce2_add_norm %2d rows%s%s%s (two partials, vs host)", R,
+                      pdl & 1 ? ", pdl" : "", pdl & 2 ? ", a block a row" : "", pdl & 4 ? ", round2" : "");
         ck.report(nm2, bad2, n, fnv(gxn.data(), n * 2, fnv(gres.data(), n * 2)));
       }
     }

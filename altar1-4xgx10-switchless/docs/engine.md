@@ -253,9 +253,14 @@ rounded, then added: the reference's `--combine bf16` order for this step). Sinc
 - **Prefill**: `sublayer_end` reduce-scatters yr + ys as one contribution (`comm::reduce_scatter_rows_f32_sum2`: the
   send copy adds the two f32 inputs, one `__fadd_rn` an element), then the residual add and the norm on one sum
   (`ops::add_rows` with one input). The f32 add is the same as decode's, so decode = prefill still holds.
-- **The residual**: h = bf16(res + bf16(Σ_ranks yr)), the rounding `allreduce_add_norm` already does for o_proj and
-  the dense MLP. The reference's f32 mode rounds once *with* the residual, bf16(res + Σ); the engine rounds the sum
-  to bf16 first, as it always has for every sublayer. That difference is outside this change (open, see below).
+- **The residual** (second decision, commit 59e9515): decision 8's sum is "rounded to bf16 once, when added to the
+  residual", and the reference's contract mode computes h = bf16(f32(res) + Σ) with Σ still f32 for every
+  sublayer. The engine rounded twice, h = bf16(res + bf16(Σ)). Now every add-norm collective (`k_allreduce_hidden`,
+  `k_ar_norm_row`; plain, posted, two-partial) and prefill's `ops::add_rows` compute **h = bf16(f32(res) + Σ)**, for
+  o_proj, the dense MLPs (layers 0–2), the MoE layers and the MTP layer, up to the final norm before the head; the
+  RMSNorm after it is unchanged. The double rounding stays selectable as **`kTuneResRound2`** (bit 12,
+  output-changing, in neither `kTuneDefault` nor `kTuneAll`; `glm_run --res-round2`). With bits 11 and 12 both on
+  the engine gives the outputs it gave before 5087b2f, bit for bit (below).
 - **Saved**: the second partial's traffic. Decode: R × 24,576 B less in each MoE layer's all-reduce (its send is
   R rows, not 2R): 75 layers × 24,576 B = 1.8 MB a step at 1 row, 29.5 MB at 16 rows (each rank's contribution).
   Prefill: one reduce-scatter fewer a MoE layer, m × 24,576 B: **201 MB a layer for an 8,192-row chunk**.
@@ -288,9 +293,25 @@ check printed FAIL at every row count: a bug in the check, not the engine. After
 block runs A, so its "B again after the rounds" hash was A's. Every rank agreed, and A's hashes are the old
 default's. Fixed in glm_run (set B before that hash), not rerun (ring time is A8's).
 
-**Left**: the residual's rounding against the reference's f32 mode (above); the comparison against A1's golden data
-on the real files (A8); a prefill A/B (`pfab`) of the saved reduce-scatter; the MTP layer's combine is in the code
-path but no check here ran drafts.
+**The residual's one rounding** (commit 59e9515, binaries bin7 and comm bin7, synthetic weights):
+
+- *Kernel level* (`comm/run.sh test`, `coll_tests`, four ranks, 15:20, sources `24532428137205f8`): `allreduce_add_norm`'s h and xn equal the
+  host's f32 add rounded once (and with round2, rounded twice) and attn's rmsnorm on it, at 1–16 rows, slices 1, 8,
+  16, 32, with and without PDL, separate and in place; `allreduce2_add_norm` the same with round2 on and off (its y
+  is bf16 already). 510 checks ok, 0 failures, identical on all ranks.
+- *Model* (`check`, `check6`, 15:26 and 15:27, default 0x7f7): every check PASS, as in the list above (incl.
+  decode = prefill in all 79 caches with `--moe-up 6`).
+- *The old outputs* (`run.sh ab`, A = 0x1ff7, bits 11 and 12, B = 0x7f7, 4 rounds, job 15:34): A's hashes equal the
+  pre-5087b2f default's at every row count (1 row aa5124b549d4091c, 2 rows 74f6421cf905b042, 4 rows
+  8a0e4df83ce778d4, 6 rows 4752875ee45d0d7b, 16 rows 909806d4f89f5930); the contract's (B) are e9f715e6a3eed0b9,
+  ce60356e87c69fa3, bfe839ddafe0d05a, 12e7b27f6728c7b6, 93df0cf3e434e600; the check passes (B the same after the
+  rounds, every rank the same). The epilogue loses one rounding and does nothing else, so its cost does not change.
+  The job's times (46.40 → 46.22, 62.39 → 61.01, 81.52 → 78.55, 96.94 → 94.03, 140.12 → 134.41 ms) mix both
+  changes over 4 rounds, so they are not a measurement of this one.
+
+**Left**: the comparison against A1's golden data on the real files (A8, with bits 11 and 12 for the old order); a
+prefill A/B (`pfab`) of the saved reduce-scatter; no check here ran drafts, so the MTP layer's path is in the code but
+not exercised.
 
 ### 9.2 The fused BF16 shared expert (`gx::SharedW::bgu, bd`; docs/experts.md § 11)
 
