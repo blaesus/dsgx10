@@ -135,6 +135,10 @@ void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int 
 // bench knob: the FP8 GEMM tile configuration (-1, the default: 4 for a split-K, else 0; 0-5: gemm.cu). Outputs do
 // not depend on it.
 void gemm_config(int cfg);
+// bench knob: the GEMMs' raster, groups of gm row tiles with row tiles fastest (-1, the default: kGemmRaster; 0:
+// blockIdx order, the column tiles fastest). Outputs do not depend on it.
+inline constexpr int kGemmRaster = 8;
+void gemm_raster(int gm);
 // BF16 weights only (the router, the head): gemm() with every segment taken as BF16 (kNone allowed).
 void gemm_bf16(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
                cudaStream_t s, bool pdl = false);

@@ -30,6 +30,7 @@ struct GSeg {
 struct GArgs {
   const uint16_t* x;
   int ldx, rows, K, splitk, nseg;
+  int gm;  // the raster: groups of gm row tiles, row tiles fastest within a group (0: blockIdx as is)
   GSeg s[kMaxSegs];
 };
 
@@ -62,13 +63,23 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
   const int wm = warp % NWM, wn = warp / NWM;
   // the CTA's segment and tile
+  // grouped raster: the CTAs in flight share a few row tiles' activations and a few column tiles' weights (in
+  // blockIdx order the weights would be read once a row tile; at 2,600 rows that bound the BF16 GEMM by bandwidth).
+  // Which CTA computes a tile changes nothing in its arithmetic.
+  int bx = blockIdx.x, by = blockIdx.y;
+  if (a.gm > 0) {
+    const int gx = gridDim.x, gy = gridDim.y, id = by * gx + bx, grp = id / (a.gm * gx), first = grp * a.gm;
+    const int gsz = min(a.gm, gy - first), in = id - grp * a.gm * gx;
+    by = first + in % gsz;
+    bx = in / gsz;
+  }
   int si = 0;
 #pragma unroll
   for (int i = 1; i < kMaxSegs; ++i)
-    if (i < a.nseg && (int)blockIdx.x >= a.s[i].cta0) si = i;
+    if (i < a.nseg && bx >= a.s[i].cta0) si = i;
   const GSeg sg = a.s[si];
-  const int n0 = ((int)blockIdx.x - sg.cta0) * BN;  // first row of W in the segment
-  const int m0 = blockIdx.y * BM;
+  const int n0 = (bx - sg.cta0) * BN;  // first row of W in the segment
+  const int m0 = by * BM;
   const int K = a.K, J = K >> 6;
   const uint16_t* xb = a.x + (sg.group_rows ? (size_t)(n0 / sg.group_rows) * sg.x_group : 0);
 
@@ -299,6 +310,7 @@ void launch_gemm(const GArgs& a, int gx, cudaStream_t s, bool pdl) {
 }
 
 int g_gemm_cfg = -1;  // a bench knob: tile configurations (-1, the default: by shape)
+int g_gemm_gm = -1;   // a bench knob: the raster (-1, the default: kGemmRaster)
 
 // the launch arguments; returns the CTA columns (BN weight rows a CTA)
 int gemm_args(GArgs& a, const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out,
@@ -310,6 +322,7 @@ int gemm_args(GArgs& a, const uint16_t* x, int ldx, int rows, int K, const GemvS
   a.K = K;
   a.splitk = splitk;
   a.nseg = nseg;
+  a.gm = g_gemm_gm >= 0 ? g_gemm_gm : kGemmRaster;
   int c0 = 0;
   for (int i = 0; i < nseg; ++i) {
     const GemvSeg& g = segs[i];
@@ -396,6 +409,7 @@ void gemm_check(const char* who, int rows, int K, int nseg, int splitk) {
 }  // namespace
 
 void gemm_config(int cfg) { g_gemm_cfg = cfg; }
+void gemm_raster(int gm) { g_gemm_gm = gm; }
 
 void gemm_bf16(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
                cudaStream_t s, bool pdl) {

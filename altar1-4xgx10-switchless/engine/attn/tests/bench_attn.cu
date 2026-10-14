@@ -457,7 +457,7 @@ void bench_agemv(bool sweep) {
 }
 
 // prefill: the GEMMs at 2,600 and 8,192 rows (INT4: the dequantisation into the scratch included, and alone)
-void bench_apgemm() {
+void bench_apgemm(bool rsweep) {
   const int RMAX = 8192;
   Dev<uint16_t> x((size_t)RMAX * kHeads * kKvLora);
   fill(x.p, x.n * 2, 7, 1);
@@ -480,6 +480,16 @@ void bench_apgemm() {
         gemm(x.p, c.ldx, rows, c.K, sg.data(), (int)sg.size(), c.out, c.splitk, s, false, scratch.p, scratch_elems);
       }, 5);
       result("apgemm\t%s\trows %d\t%.1f us\t%.1f TFLOPS\t%.1f %% of 107", c.name, rows, us, fl / us / 1e6, fl / us / 1e6 / 1.07);
+      if (!rsweep) continue;
+      for (int gm : {0, 2, 4, 8, 16, 16, 8, 4, 2, 0}) {  // the raster, up and back down (A/B in both orders)
+        gemm_raster(gm);
+        const double ur = time_graph(1, [&](int, cudaStream_t s) {
+          gemm(x.p, c.ldx, rows, c.K, sg.data(), (int)sg.size(), c.out, c.splitk, s, false, scratch.p, scratch_elems);
+        }, 5);
+        result("apgemmr\t%s\trows %d\traster %d\t%.1f us\t%.1f TFLOPS\t%.1f %% of 107", c.name, rows, gm, ur, fl / ur / 1e6,
+               fl / ur / 1e6 / 1.07);
+      }
+      gemm_raster(-1);
     }
     if (int4)
       for (auto& g : sg) {
@@ -964,7 +974,7 @@ int main(int argc, char** argv) {
   if (want("prefill")) bench_prefill(ctxs);
   if (want("pgemm")) bench_pgemm();
   if (want("agemv") || want("agemvcfg")) bench_agemv(want("agemvcfg"));
-  if (want("apgemm")) bench_apgemm();
+  if (want("apgemm") || want("apgemmr")) bench_apgemm(want("apgemmr"));
   if (want("pattn")) bench_pattn();
   if (want("pstress")) bench_pstress();
   return 0;

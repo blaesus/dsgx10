@@ -434,7 +434,7 @@ void test_gemvs(int S, int nd) {
         std::memcpy(&ec[i * kLat + kKvLora + r * kXRope], b + kXQa + kXKv, kXRope * 2);
         std::memcpy(&ek[i * kIdxDim + r * kXWk], b + kXRowsShared, kXWk * 2);
       }
-    check_bf16("B q_a (FP8 GEMV, 16 rows, 4 ranks' slices gathered)", eq.data(), qa + (size_t)r0 * kQLora, rows, kQLora, kQLora, kQLora);
+    check_bf16("B q_a (x-projection GEMV, 16 rows, 4 ranks' slices gathered)", eq.data(), qa + (size_t)r0 * kQLora, rows, kQLora, kQLora, kQLora);
     check_bf16("B kv_a_proj_with_mqa", ec.data(), ckv + (size_t)r0 * kLat, rows, kLat, kLat, kLat);
     check_bf16("B indexer wk", ek.data(), kpre + (size_t)r0 * kIdxDim, rows, kIdxDim, kIdxDim, kIdxDim);
   }
@@ -1180,18 +1180,22 @@ void test_gemm(int S) {
     for (auto& y : ya) ref.push_back(y.down());
     bool ok = true;
     std::string which;
-    for (int cfg = 0; cfg < 6; ++cfg) {
+    for (int v = 0; v < 10; ++v) {  // tile configurations 0-5 (default raster), then rasters 0, 1, 3, 16 (default tiles)
+      static const int kRasters[4] = {0, 1, 3, 16};
+      const int cfg = v < 6 ? v : -1, gm = v < 6 ? -1 : kRasters[v - 6];
       for (auto& y : yb) y.zero();
       gemm_config(cfg);
+      gemm_raster(gm);
       prefill_gemm(c.x, c.ldx, S, c.K, sb, c.out, c.splitk);
       sync();
       bool e = true;
       for (size_t i = 0; i < yb.size(); ++i) e = e && yb[i].down() == ref[i];
-      if (!e) which += " " + std::to_string(cfg);
+      if (!e) which += v < 6 ? " cfg " + std::to_string(cfg) : " raster " + std::to_string(gm);
       ok = ok && e;
     }
     gemm_config(-1);
-    T(ok, "P GEMM %s, %d rows: = the 16-row GEMV bit for bit in tile configurations 0-5%s%s", c.name.c_str(), S,
+    gemm_raster(-1);
+    T(ok, "P GEMM %s, %d rows: = the 16-row GEMV bit for bit in tile configurations 0-5 and rasters 0/1/3/16%s%s", c.name.c_str(), S,
       ok ? "" : "; differ in", which.c_str());
   }
   // BF16 weights (gemm_bf16 = the BF16 GEMV): rank 0's head rows, whole and in the router's shape (256 rows, split-K 4)
@@ -1274,7 +1278,8 @@ void test_real() {
     const auto hy = y.down();
     char what[160];
     std::snprintf(what, sizeof what, "R L%d %s (%s GEMV, 16 rows) vs torch's f32-accumulated product on the library's weights",
-                  layer, c.name, c.fmt == WFmt::kINT4 ? "INT4" : "BF16");
+                  n.size() > 5 && n.substr(n.size() - 5) == "_bf16" ? manifest_int("bf16_layer") : layer, c.name,
+                  c.fmt == WFmt::kINT4 ? "INT4" : "BF16");
     check_bf16(what, hy.data(), yref.as<uint16_t>(), 16, c.N, c.N, c.N);
   }
   (void)rank;
