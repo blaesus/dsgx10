@@ -18,6 +18,10 @@
 // expert's f32 output, made before this step) and k_down only forwards it into a posted collective's buffer.
 #include <cstdio>
 
+#ifndef KUP_XPF
+#define KUP_XPF true
+#endif
+
 #include "comm/ring_dev.cuh"
 #include "common/check.h"
 #include "experts/formats.cuh"
@@ -103,6 +107,9 @@ __device__ void build_union(Union<W>& U, const Params& a) {
   __syncthreads();
 }
 
+// k_up: load the next routed task's first blocks under the current task's epilogue (bit-neutral; docs/engine.md, "Tuning")
+constexpr bool kUpXpf = KUP_XPF;
+
 __device__ __forceinline__ float bf_round(float f) { return __bfloat162float(__float2bfloat16_rn(f)); }
 
 __device__ __forceinline__ float silu_mul(float g, float u) {  // h = bf16(bf16(silu(g)) * u), g and u bf16 values
@@ -169,6 +176,19 @@ __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
   build_union(U, a);
   pdl_launch_dependents();
   const int ntask = nsh + TPE * U.n;
+  // the routed tasks' blocks: warp's K range [b0, b0 + nb) of the 12 (48) blocks; rb the P blocks in flight. With
+  // XPF (kUpXpf, WK > 1) the next routed task's first P blocks are loaded under the current task's epilogue (pf: that
+  // task); the loads, their order and the MMAs are the same, so the same bits.
+  constexpr bool XPF = kUpXpf && WK > 1;
+  const int b0 = kUpB * warp / WK, nb = kUpB * (warp + 1) / WK - b0;
+  Raw rb[P][NTL];
+  int pf = -1;
+  auto rbase = [&](int tk, const uint8_t* (&bs)[NTL]) {
+    const int sl = (tk - nsh) / TPE, sg = (tk - nsh) % TPE;
+    const MatDesc* d = a.L.desc + U.id[sl] * 3;
+#pragma unroll
+    for (int i = 0; i < NTL; ++i) bs[i] = a.L.pool + __ldg(&d[i / NT].off) + (size_t)(sg * NT + i % NT) * kUpB * F::kBlk;
+  };
 
   // The first wave is static (CTA b: task b, so the shared expert's tasks load before the wait); then, with a
   // queue, each CTA claims the next task when it starts one, so CTAs that finish early take more.
@@ -294,20 +314,16 @@ __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
       const MatDesc* dg = a.L.desc + ex * 3;
       if (__ldg(&dg[0].fmt) != F::kFmt || __ldg(&dg[1].fmt) != F::kFmt) __trap();  // the layer's format, every matrix
       const uint8_t* base[NTL];
-#pragma unroll
-      for (int i = 0; i < NTL; ++i) {
-        const int m = i / NT;
-        base[i] = a.L.pool + __ldg(&dg[m].off) + (size_t)(st * NT + i % NT) * kUpB * F::kBlk;
-      }
-      const int b0 = kUpB * warp / WK, nb = kUpB * (warp + 1) / WK - b0;
-      Raw rb[P][NTL];
+      rbase(task, base);
       auto load = [&](int s, int b) {
 #pragma unroll
         for (int i = 0; i < NTL; ++i) F::load(rb[s][i], base[i] + (size_t)(b0 + b) * F::kBlk, lane);
       };
+      if (pf != task)
 #pragma unroll
-      for (int s = 0; s < P; ++s)
-        if (s < nb) load(s, s);
+        for (int s = 0; s < P; ++s)
+          if (s < nb) load(s, s);
+      pf = -1;
       for (int b = 0; b < nb; b += P) {
 #pragma unroll
         for (int s = 0; s < P; ++s) {
@@ -338,6 +354,19 @@ __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
       for (int i = 0; i < NTL; ++i)
         *reinterpret_cast<float4*>(&red[warp][i][lane][0]) = make_float4(c[i][0], c[i][1], c[i][2], c[i][3]);
       __syncthreads();
+      if constexpr (XPF) {  // the next routed task's first blocks, loaded now, under this task's epilogue
+        const int nx = a.ctr ? s_next[it & 1] : task + (int)gridDim.x;
+        if (nx < ntask && nx >= nsh) {
+          const uint8_t* nbase[NTL];
+          rbase(nx, nbase);
+#pragma unroll
+          for (int s = 0; s < P; ++s)
+            if (s < nb)
+#pragma unroll
+              for (int i = 0; i < NTL; ++i) F::load(rb[s][i], nbase[i] + (size_t)(b0 + s) * F::kBlk, lane);
+          pf = nx;
+        }
+      }
     }
     float kg = 1.f, ku = 1.f;
     if (!sh) {
