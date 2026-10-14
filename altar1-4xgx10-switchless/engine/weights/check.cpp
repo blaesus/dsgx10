@@ -64,7 +64,10 @@ static int check(const std::string& file, int want_rank) {
     if (e.layout == uint32_t(Layout::Int4Tile) &&
         (e.ndim != 3 || e.dtype != uint32_t(DType::U8) || e.shape[2] != 2368 || e.blk_rows != 1 || e.blk_k != 32))
       std::printf("BAD %s: an INT4 tile is U8 [N/8][K/512][2368], blk 1 x 32\n", name.c_str()), bad++;
-    if (e.layout > uint32_t(Layout::Int4Tile)) std::printf("BAD %s: layout %u\n", name.c_str(), e.layout), bad++;
+    if (e.layout == uint32_t(Layout::Bf16Tile) &&
+        (e.ndim != 2 || e.dtype != uint32_t(DType::BF16) || e.shape[0] % 8 || e.shape[1] % 64))
+      std::printf("BAD %s: kBF16T needs BF16 [N%%8][K%%64]\n", name.c_str()), bad++;
+    if (e.layout > uint32_t(Layout::Bf16Tile)) std::printf("BAD %s: layout %u\n", name.c_str(), e.layout), bad++;
     expect += align_up(e.bytes);
     data_entries.push_back(i);
   }

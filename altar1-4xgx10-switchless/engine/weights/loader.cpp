@@ -36,7 +36,7 @@ WeightFile::WeightFile(const std::string& path, int rank, int world) : path_(pat
     DeviceTensor& t = tensors_[i];
     t.name.assign(e.name, strnlen(e.name, sizeof e.name));
     t.dtype = DType(e.dtype);
-    if (e.layout > uint32_t(Layout::Int4Tile)) die("%s: bad layout %u", t.name.c_str(), e.layout);
+    if (e.layout > uint32_t(Layout::Bf16Tile)) die("%s: bad layout %u", t.name.c_str(), e.layout);
     if (e.kind < uint32_t(SliceKind::Replicated) || e.kind > uint32_t(SliceKind::Reserved))
       die("%s: bad kind %u", t.name.c_str(), e.kind);
     t.layout = Layout(e.layout);

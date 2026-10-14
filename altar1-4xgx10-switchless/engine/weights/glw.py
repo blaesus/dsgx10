@@ -42,8 +42,8 @@ DTYPE_BYTES = {F32: 4, BF16: 2, F8: 1, U8: 1, U32: 4}
 NP_DTYPE = {F32: np.float32, BF16: np.uint16, F8: np.uint8, U8: np.uint8, U32: np.uint32}
 REPLICATED, ROWS, COLS, RECUT, GENERATED, RESERVED = 1, 2, 3, 4, 5, 6
 KIND_NAME = {1: "replicated", 2: "rows", 3: "cols", 4: "recut", 5: "generated", 6: "reserved"}
-NATURAL, T64, T128, EXPERT_POOL, INT4_TILE = 0, 1, 2, 3, 4
-LAYOUT_NAME = {0: "natural", 1: "T64", 2: "T128", 3: "expert-pool", 4: "int4-tile"}
+NATURAL, T64, T128, EXPERT_POOL, INT4_TILE, BF16_TILE = 0, 1, 2, 3, 4, 5
+LAYOUT_NAME = {0: "natural", 1: "T64", 2: "T128", 3: "expert-pool", 4: "int4-tile", 5: "bf16-tile"}
 FMT_NVFP4, FMT_S3, FMT_INT4, FMT_BF16, FMT_NONE = 0, 1, 2, 3, 0xFFFFFFFF
 FMT_NAME = {0: "nvfp4", 1: "s3", 2: "int4", 3: "bf16"}
 LOSSY, RESERVED_FLAG, SCALE, INTERLEAVED, DEQUANT = 1, 2, 4, 8, 16
@@ -131,6 +131,22 @@ class AttnInt4:
 
 
 ATTN_INT4 = None  # set by attn_formats.register()
+
+# kBF16T (attn.h WFmt::kBF16T, attn/tools/pack.py bf16_tiles): a BF16 [N][K] projection in the GEMV's lane order,
+# [N/8][K/64][2 halves][32 lanes][8 values]; the same values and bytes as row-major, read faster (attention.md § 4).
+# Every BF16 projection a GEMV reads is written so (layout BF16_TILE, the natural shape in the TOC) unless
+# BF16_TILED[0] is False; the embedding (a row lookup), norms, router, bias and RoPE table stay natural.
+BF16_TILER = None  # fn(uint16 [N][K]) -> uint16 [N][K] in kBF16T order; set by packers.register()
+BF16_TILED = [True]
+BF16_TILED_RE = re.compile(r"^(head\.weight|layers\.\d+\.(attn\.(xproj|q_b|w_uk|w_uv|o_proj)\.weight|"
+                           r"indexer\.(wq_b|weights_proj)\.weight|(mlp|shared)\.(gate_up|down)\.weight|"
+                           r"mtp\.eh_proj\.weight))$")
+
+
+def bf16_tiled(o):
+    """Is this BF16 output written as kBF16T?"""
+    return BF16_TILED[0] and o.dtype == BF16 and o.layout == NATURAL and len(o.shape) == 2 and \
+        bool(BF16_TILED_RE.match(o.name))
 
 
 def expert_fmt(gate, up=None, down=None):
@@ -231,10 +247,21 @@ class Unit:
         os_ = self._outs(r)
         for o in os_:
             o.component = self.component
+            if bf16_tiled(o):
+                o.layout = BF16_TILE
         return os_
 
     def build(self, R, r):
-        return self._build(R, r)
+        d = self._build(R, r)
+        for o in self.outs(r):
+            if o.layout == BF16_TILE and o.name in d:
+                if BF16_TILER is None:
+                    raise SystemExit("kBF16T requested but attn/tools/pack.py's bf16_tiles is not registered")
+                w = np.ascontiguousarray(d[o.name])
+                if w.dtype != np.uint16 or tuple(w.shape) != o.shape or o.shape[0] % 8 or o.shape[1] % 64:
+                    raise SystemExit(f"{o.name}: {w.dtype} {w.shape} cannot be kBF16T ({o.shape})")
+                d[o.name] = BF16_TILER(w)
+        return d
 
 
 def global_units(ck):

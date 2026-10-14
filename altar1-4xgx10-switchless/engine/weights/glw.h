@@ -91,6 +91,10 @@ enum class Layout : uint32_t {
   // shape [N/8][K/512][2368] for the natural [N][K]; blk_rows x blk_k = 1 x 32 (a scale and zero point a row and
   // 32 k). Byte formulas: experts/layout.h, "the engine layout", INT4.
   Int4Tile = 4,
+  // kBF16T (attn.h WFmt::kBF16T, attn/tools/pack.py bf16_tiles): a BF16 projection [N][K] (TOC shape natural) in
+  // the GEMV's lane order [N/8][K/64][2 halves][32 lanes][8 values]: chunk (i, j) is rows 8i.., k 64j.. at
+  // ((i K/64) + j) 1024 B; lane 4g + t's half h holds row 8i + g, k = 64j + 16t + 8h + 0..7. Same bytes as row-major.
+  Bf16Tile = 5,
 };
 inline const char* layout_name(Layout l) {
   switch (l) {
@@ -99,6 +103,7 @@ inline const char* layout_name(Layout l) {
     case Layout::T128: return "T128";
     case Layout::ExpertPool: return "expert-pool";
     case Layout::Int4Tile: return "int4-tile";
+    case Layout::Bf16Tile: return "bf16-tile";
   }
   return "?";
 }

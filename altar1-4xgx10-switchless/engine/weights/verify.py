@@ -248,6 +248,7 @@ UNTILE_EXPERT = {(glw.FMT_INT4, "int4 (TEST stand-in)"): _untile_test_int4,
                  (glw.FMT_BF16, "bf16 (TEST stand-in)"): _untile_test_bf16}
 # packer name -> un-tiler({suffix: bytes}, N, K, grouped) -> int4 dict
 UNTILE_ATTN = {"TEST": lambda d, N, K, g: _untile_test_int4(d[".weight"], N, K)}
+UNTILE_BF16T = [None]  # fn(bytes, N, K) -> uint16 [N][K]: kBF16T written out again (verify_layouts)
 DESC_EXPECT = {}  # packer name -> fn(off, fmt) -> the 64 desc bytes the kernels expect (layout.h make_desc)
 
 
@@ -315,6 +316,11 @@ def indep(files, ck):
                 else:
                     kind, pcs, inter = describe(n, r)
                     b = read_entry(fd, e)
+                    if e["layout"] == glw.BF16_TILE:
+                        if kind not in ("plain", "dequant") or e["dtype"] != glw.BF16 or UNTILE_BF16T[0] is None:
+                            raise SystemExit(f"{path} {n}: kBF16T on a {kind} entry, or no un-tiler")
+                        b = UNTILE_BF16T[0](b, *e["shape"][:2]).tobytes()
+                        cnt["bf16 un-tiled from kBF16T"] += len(b) // 2
                     if kind == "plain":
                         want = plain_bytes(C, pcs, inter)
                         if tuple(want.shape) != tuple(e["shape"]):

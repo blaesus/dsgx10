@@ -10,6 +10,9 @@ lane's values are k = kBK b + 128 jj + 64 q + 16 t + i):
     group c = 16 b + 4 jj + 2 q + (t >> 1): scale (bf16) at 2048 + 32 g + 16 (t >> 1) + 2 (2 jj + q),
     zero point nibble (2 jj + q) of the u32 at 2304 + 8 g + 4 (t >> 1), low nibble first.
   BF16, kBK 128, 2048 B: lane l's 16 B at 512 p + 16 l, p = 0..3, hold k = 128 b + 64 (p >> 1) + 16 t + 8 (p & 1) + 0..7.
+  kBF16T (attn.h WFmt::kBF16T, a non-expert BF16 projection [N][K]): 1 KB chunk (i, j) = rows 8 i .., k 64 j ..
+    at ((i * K/64) + j) * 1024; in it element (h, l, e) at 2 (256 h + 8 l + e) holds row 8 i + g, k = 64 j + 16 t +
+    8 h + e (l = 4 g + t).
   MatDesc (experts.h, 64 B): u64 off, f32 s2 (1.0 for INT4 and BF16), u32 fmt, 12 zero words.
 
 `selftest()` checks the fast (reshape) un-tilers against a per-element gather written straight from the formulas,
@@ -44,6 +47,23 @@ def _bf16_fast(b, n, k):
     B, N8 = k // 128, n // 8
     x = np.frombuffer(b, np.uint8).view("<u2").reshape(N8, B, 2, 2, 8, 4, 8)  # n8 b ph pl g t e
     return np.ascontiguousarray(x.transpose(0, 4, 1, 2, 5, 3, 6).reshape(n, k)).astype(np.uint16)  # n8 g b ph t pl e
+
+
+def _bf16t_fast(b, n, k):
+    """kBF16T bytes -> uint16 [N][K] row-major."""
+    x = np.frombuffer(b, np.uint8).view("<u2").reshape(n // 8, k // 64, 2, 8, 4, 8)  # i j h g t e
+    return np.ascontiguousarray(x.transpose(0, 3, 1, 4, 2, 5)).reshape(n, k).astype(np.uint16)  # i g j t h e
+
+
+def _bf16t_gather(b, n, k, pts):
+    b = np.frombuffer(b, np.uint8)
+    out = []
+    for nn, kk in pts:
+        i, g, j, r = nn // 8, nn % 8, kk // 64, kk % 64
+        t, h, e = r // 16, (r % 16) // 8, r % 8
+        o = (i * (k // 64) + j) * 1024 + 2 * (256 * h + 8 * (4 * g + t) + e)
+        out.append(int(b[o]) | int(b[o + 1]) << 8)
+    return out
 
 
 def _int4_gather(b, n, k, pts):
@@ -98,6 +118,7 @@ def register(verify):
     verify.DESC_EXPECT[name] = _desc
     # the attention tile is one U8 entry [N/8][K/512][2368] of the same block (attn/tools/pack.py int4_tiles)
     verify.UNTILE_ATTN["pack.py"] = lambda d, N, K, g: _int4_fast(d[".weight"], N, K)
+    verify.UNTILE_BF16T[0] = _bf16t_fast
 
 
 
@@ -116,6 +137,9 @@ def selftest(verify, seed=5):
         b = rng.integers(0, 256, N // 8 * (K // 128) * 2048, dtype=np.uint8).tobytes()
         w = _bf16_fast(b, N, K)
         for (n, k), x in zip(pts, _bf16_gather(b, N, K, pts)):
+            bad += w[n, k] != x
+        w = _bf16t_fast(b[:N * K * 2], N, K)
+        for (n, k), x in zip(pts, _bf16t_gather(b[:N * K * 2], N, K, pts)):
             bad += w[n, k] != x
     for f, F in glw.EXPERT_FORMATS.items():
         un = verify.UNTILE_EXPERT.get((f, F.name))
@@ -139,5 +163,10 @@ def selftest(verify, seed=5):
             d = {k: np.asarray(v).tobytes() for k, v in glw.ATTN_INT4.pack(t, N, K, False).items()}
             bad += not int4.equal(verify.UNTILE_ATTN["pack.py"](d, N, K, False), t)
             print(f"  attention INT4 tile [{N}][{K}]: pack.py's packer, un-tiled here", flush=True)
+    if glw.BF16_TILER is not None:
+        for N, K in ((688, 6144), (8192, 192), (8, 6144), (6144, 512)):
+            w = rng.integers(0, 1 << 16, (N, K), dtype=np.int64).astype(np.uint16)
+            bad += not np.array_equal(_bf16t_fast(np.asarray(glw.BF16_TILER(w)).tobytes(), N, K), w)
+            print(f"  kBF16T [{N}][{K}]: the registered tiler, un-tiled here", flush=True)
     print("verify_layouts selftest:", "ok" if not bad else f"{bad} bad")
     return bad

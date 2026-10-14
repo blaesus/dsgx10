@@ -60,7 +60,9 @@ def _test_formats():
     def unpack(d, N, K, grouped):
         return i4_unpack(d[".weight"], N, K)
     glw.ATTN_INT4 = glw.AttnInt4(outs, pack, unpack, True, os.path.abspath(__file__))
-    return {"experts int4": "TEST", "experts bf16": "TEST", "attention int4": "TEST"}
+    glw.BF16_TILER = lambda w: np.ascontiguousarray(  # TEST: kBF16T by reshape (the real one is pack.py's)
+        w.reshape(w.shape[0] // 8, 8, w.shape[1] // 64, 4, 2, 8).transpose(0, 2, 4, 1, 3, 5)).reshape(w.shape)
+    return {"experts int4": "TEST", "experts bf16": "TEST", "attention int4": "TEST", "bf16 tile": "TEST"}
 
 
 def source_of(F):
@@ -130,6 +132,8 @@ def _real_attn(path):
         p, s, z = P.int4_untile(np.frombuffer(d[".weight"], np.uint8), N, K)
         return dict(packed=p.view(np.int32), scale=s, zp=z.view(np.int32))
     glw.ATTN_INT4 = glw.AttnInt4(outs, pack, unpack, True, os.path.abspath(path))
+    if hasattr(P, "bf16_tiles"):
+        glw.BF16_TILER = P.bf16_tiles
     return True
 
 
@@ -138,7 +142,7 @@ def register(test=False, experts=None, attn=None):
     attention pack.py (default attn/tools/pack.py, used if it has int4_tiles). Returns {what: file or None}."""
     if test:
         return _test_formats()
-    found = {"experts int4": None, "experts bf16": None, "attention int4": None}
+    found = {"experts int4": None, "experts bf16": None, "attention int4": None, "bf16 tile": None}
     ep = experts or os.path.join(glw.ROOT, "int4_pack.py")
     if os.path.exists(ep):
         _real_experts(ep)
@@ -146,4 +150,6 @@ def register(test=False, experts=None, attn=None):
     ap = attn or os.path.join(glw.ATTN_TOOLS, "pack.py")
     if os.path.exists(ap) and _real_attn(ap):
         found["attention int4"] = os.path.basename(ap)
+        if glw.BF16_TILER is not None:
+            found["bf16 tile"] = os.path.basename(ap)
     return found

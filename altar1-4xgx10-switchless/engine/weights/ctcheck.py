@@ -125,7 +125,11 @@ def main():
             if e is None:
                 continue
             fd = os.open(p, os.O_RDONLY)
-            got = np.frombuffer(os.pread(fd, e["bytes"], e["offset"]), np.uint16).reshape(e["shape"])
+            got = np.frombuffer(os.pread(fd, e["bytes"], e["offset"]), np.uint16).reshape(e["shape"][:2])
+            if e["layout"] == glw.BF16_TILE:  # kBF16T: [N/8][K/64][2][8 g][4 t][8] -> row-major
+                N, K = e["shape"][:2]
+                got = np.ascontiguousarray(got.reshape(N // 8, K // 64, 2, 8, 4, 8).transpose(0, 3, 1, 4, 2, 5)
+                                           ).reshape(N, K)
             os.close(fd)
             want = np.concatenate([lw[448 * H:448 * H + 192].T for H in range(16 * r, 16 * r + 16)])
             same = np.array_equal(got, want)

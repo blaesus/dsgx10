@@ -147,12 +147,15 @@ def main():
     ap.add_argument("--test-packers", action="store_true", help="packers.py's test stand-ins (never for rank files)")
     ap.add_argument("--expert-packer", help="the expert kernels' int4_pack.py (default: engine/weights/int4_pack.py)")
     ap.add_argument("--attn-packer", help="the attention side's pack.py with int4_tiles (default: attn/tools/pack.py)")
+    ap.add_argument("--bf16-layout", choices=("tiled", "natural"), default="tiled",
+                    help="BF16 projections as kBF16T (attn/tools/pack.py bf16_tiles, the default) or row-major")
     ap.add_argument("--commit", default="", help="the repo commit the tools were taken from, for the manifest")
     ap.add_argument("--suffix", default="", help="file name suffix (test files)")
     a = ap.parse_args()
     glw._check_crc()
     t0 = time.time()
     reg = packers.register(test=a.test_packers, experts=a.expert_packer, attn=a.attn_packer)
+    glw.BF16_TILED[0] = a.bf16_layout == "tiled"
     print("packers: " + ", ".join(f"{k} {v or 'pending'}" for k, v in reg.items()), flush=True)
     ck = open_checkpoint(a)
     units = glw.make_plan(ck, a.bf16_only)
@@ -217,7 +220,7 @@ def main():
                      "files": {os.path.basename(p): hashlib.sha256(open(p, "rb").read()).hexdigest() for p in glw.tool_files()},
                      "numpy": np.__version__},
             "checkpoint": dict(ck.record(), revision=REVISION, verified=bool(a.manifest and a.hashes)),
-            "packers": reg, "bf16_only": a.bf16_only, "only": a.only or [],
+            "packers": reg, "bf16_only": a.bf16_only, "bf16_layout": a.bf16_layout, "only": a.only or [],
             "rule": "no requantisation: BF16/F32 copied; INT4 packed values, scales, zero points re-tiled; an INT4 "
                     "layer's W_UK^T in BF16 is bf16_rne((q - z) * s) (docs/model.md § 4.2)",
             "sources": srcinfo,
