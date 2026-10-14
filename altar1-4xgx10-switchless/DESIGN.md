@@ -51,7 +51,7 @@ configuration has to get right instead:
 |---|---|
 | Weights a rank | **76.6 GiB** (INT4 experts 62.3, BF16 experts of layers 3/77/78 8.9, attention 2.4, shared experts 1.3, the rest 1.7); budget 87, ceiling 94 |
 | KV a position | 96,640 B a rank in BF16 (glm53's store: 95,232 B of latent and indexer keys + page overhead), every rank holds all of it: a 256k session 23.6 GiB; FP8 cache 52.7 KiB a position is a later, output-changing option |
-| Bytes a decode token a rank | INT4 experts 3.19 GB, BF16 experts of layers 3 and 77 0.30, attention projections 2.57 (o_proj 1.06 INT4 + 0.37 BF16, q_b 0.35, kv_b 0.16, q_a 0.49, kv_a 0.14), shared experts 1.42, dense MLPs 0.34, head 0.48, routers 0.16, indexer 0.10: **8.55 GB → 36.4 ms at 235 GB/s**; a draft pass 0.77 GB |
+| Bytes a decode token a rank | INT4 experts 3.19 GB, BF16 experts of layers 3 and 77 0.30, attention projections 2.57 (o_proj 1.06 INT4 + 0.37 BF16, q_b 0.35, kv_b 0.16, q_a 0.49, kv_a 0.14), shared experts 1.42, dense MLPs 0.34, head 0.48, routers 0.16, indexer 0.10: **8.55 GB → 36.4 ms at 235 GB/s** (the runner counts 8.708 GB → 37.05 ms at 1 row, with W_UK^T BF16 on the INT4 layers: [engine.md § 3](docs/engine.md#3-the-decode-step)); a draft pass 0.77 GB |
 | Expected step | glm53's measured overhead on top (collectives ~5.5 ms, attention ~4 ms): **~45.8 ms, ~22 tok/s** before drafting (*estimate*) |
 | Prefill | as glm53: all 78 layers over every token; BF16 tensor cores 107 TFLOPS; INT4 prefill through dequantised BF16 tiles |
 | Collectives | glm53's 256 a step, 4.40 ms at 1 row, unchanged |

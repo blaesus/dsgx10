@@ -40,7 +40,7 @@ SEQ=${SEQ:-short}
 GDATA=$HOME/dsgb10-data/altar1-model  # the golden run's tokens and rows
 TOKENS=${TOKENS:-$GDATA/$SEQ.tokens.json}
 ROWS=${ROWS:-$GDATA/${SEQ}_rows.npy}
-GOLD=${GOLD:-~/dsgb10-data/glm53-g7/gold/all}  # mtpgold, spec: the golden set's raw copies (tools/gold_prep.py)
+GOLD=${GOLD:-~/dsgb10-data/altar1-model/gold/all}  # mtpgold, spec: the golden set's raw copies (tools/gold_prep.py; not yet made for altar-1)
 mkdir -p "$(dirname "$OUT")"
 SRC=$(cat "$BIN/SOURCES" 2> /dev/null)
 echo "RUN	$(date '+%F %T %z')	$SRC" >> "$OUT"
