@@ -192,7 +192,8 @@ __global__ void __launch_bounds__(kThreads) allgather_bulk_kernel(DevChannel ch,
 template <bool kBf16>
 __global__ void __launch_bounds__(kThreads) reduce_scatter_bulk_kernel(DevChannel ch, const uint8_t* in, size_t ld_in,
                                                                        uint8_t* out, size_t ld_out, uint32_t rows,
-                                                                       uint32_t rb, uint32_t piece) {
+                                                                       uint32_t rb, uint32_t piece,
+                                                                       const uint8_t* in2 = nullptr) {
   const uint64_t s0 = next_seq(ch);
   const uint32_t t0 = blockIdx.x * blockDim.x + threadIdx.x, stride = gridDim.x * blockDim.x;
   const size_t qbytes = (size_t)rows * rb, npieces = (qbytes + piece - 1) / piece;
@@ -206,7 +207,17 @@ __global__ void __launch_bounds__(kThreads) reduce_scatter_bulk_kernel(DevChanne
     uint4* sb = (uint4*)send_buf(ch, s);
     for (int k = 0; k < kRanks; k++) {
       const uint8_t* q = in + (size_t)k * rows * ld_in;
-      for (uint32_t j = t0; j < pl; j += stride) sb[(size_t)k * pl + j] = *(const uint4*)(q + at(u0 + j, ld_in));
+      if (!kBf16 && in2) {  // f32 only: this rank's contribution is in + in2, one __fadd_rn an element
+        const uint8_t* q2 = in2 + (size_t)k * rows * ld_in;
+        for (uint32_t j = t0; j < pl; j += stride) {
+          const float4 x = *(const float4*)(q + at(u0 + j, ld_in)), y = *(const float4*)(q2 + at(u0 + j, ld_in));
+          const float4 z = make_float4(__fadd_rn(x.x, y.x), __fadd_rn(x.y, y.y), __fadd_rn(x.z, y.z), __fadd_rn(x.w, y.w));
+          sb[(size_t)k * pl + j] = make_uint4(__float_as_uint(z.x), __float_as_uint(z.y), __float_as_uint(z.z),
+                                              __float_as_uint(z.w));
+        }
+      } else {
+        for (uint32_t j = t0; j < pl; j += stride) sb[(size_t)k * pl + j] = *(const uint4*)(q + at(u0 + j, ld_in));
+      }
     }
   };
   copy(0, s0);
@@ -384,13 +395,14 @@ void bulk(const DevChannel& ch, const void* in, void* out, size_t bytes, cudaStr
 // rows of rb bytes per quarter (a multiple of 16), row strides in bytes
 template <bool kBf16>
 void rs_bulk(const DevChannel& ch, const void* in, size_t ld_in, void* out, size_t ld_out, size_t rows, size_t rb,
-             cudaStream_t st, int blocks) {
+             cudaStream_t st, int blocks, const void* in2 = nullptr) {
   if (rb % 16 || !rb || !rows || rows * rb > 0xffffffffull * 16 || rb > 0xffffffffu || rows > 0xffffffffu)
     die("comm: bulk reduce-scatter of %zu rows of %zu bytes per quarter (a multiple of 16)", rows, rb);
   const uint32_t piece = (ch.cap / 4) & ~63u;
   blocks = blocks < 1 ? 1 : blocks > 48 ? 48 : blocks;
   reduce_scatter_bulk_kernel<kBf16><<<blocks, kThreads, 0, st>>>(ch, (const uint8_t*)in, ld_in, (uint8_t*)out, ld_out,
-                                                                  (uint32_t)rows, (uint32_t)rb, piece);
+                                                                  (uint32_t)rows, (uint32_t)rb, piece,
+                                                                  (const uint8_t*)in2);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -473,6 +485,11 @@ void reduce_scatter_rows_bf16(const DevChannel& ch, const __nv_bfloat16* in, siz
 void reduce_scatter_rows_f32(const DevChannel& ch, const float* in, size_t ld_in, float* out, size_t ld_out, int rows,
                              int cols, cudaStream_t st, int blocks) {
   rs_bulk<false>(ch, in, ld_in * 4, out, ld_out * 4, rows, (size_t)cols * 4, st, blocks);
+}
+
+void reduce_scatter_rows_f32_sum2(const DevChannel& ch, const float* in, const float* in2, size_t ld_in, float* out,
+                                  size_t ld_out, int rows, int cols, cudaStream_t st, int blocks) {
+  rs_bulk<false>(ch, in, ld_in * 4, out, ld_out * 4, rows, (size_t)cols * 4, st, blocks, in2);
 }
 
 void allgather_multi(const DevChannel& ch, const AgSeg* segs, int nseg, cudaStream_t st, int blocks) {
