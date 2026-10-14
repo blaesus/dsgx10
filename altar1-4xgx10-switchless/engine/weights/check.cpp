@@ -22,7 +22,7 @@ static int check(const std::string& file, int want_rank) {
   pread_all(fd, hb.p, sizeof(Header), 0);
   Header h;
   std::memcpy(&h, hb.p, sizeof h);
-  if (std::memcmp(h.magic, kMagic, 8) != 0) die("%s: not a .glw file", file.c_str());
+  if (std::memcmp(h.magic, kMagic, 8) != 0) die("%s: not an altar-1 .glw file", file.c_str());
   if (h.version != kVersion || h.header_bytes != sizeof(Header) || h.toc_entry_bytes != sizeof(TocEntry) ||
       h.alignment != kAlign || h.file_bytes != fsize || h.data_offset + h.data_bytes != fsize || h.data_offset % kAlign ||
       h.n_tensors * sizeof(TocEntry) > h.data_offset - h.toc_offset)
@@ -61,6 +61,13 @@ static int check(const std::string& file, int want_rank) {
       std::printf("BAD %s: T64 needs [N%%8][K%%64]\n", name.c_str()), bad++;
     if (e.layout == uint32_t(Layout::T128) && (e.ndim != 2 || e.shape[0] % 8 || e.shape[1] % 128))
       std::printf("BAD %s: T128 needs [N%%8][K%%128]\n", name.c_str()), bad++;
+    if (e.layout == uint32_t(Layout::Int4Tile) &&
+        (e.ndim != 3 || e.dtype != uint32_t(DType::U8) || e.shape[2] != 2368 || e.blk_rows != 1 || e.blk_k != 32))
+      std::printf("BAD %s: an INT4 tile is U8 [N/8][K/512][2368], blk 1 x 32\n", name.c_str()), bad++;
+    if (e.layout == uint32_t(Layout::Bf16Tile) &&
+        (e.ndim != 2 || e.dtype != uint32_t(DType::BF16) || e.shape[0] % 8 || e.shape[1] % 64))
+      std::printf("BAD %s: kBF16T needs BF16 [N%%8][K%%64]\n", name.c_str()), bad++;
+    if (e.layout > uint32_t(Layout::Bf16Tile)) std::printf("BAD %s: layout %u\n", name.c_str(), e.layout), bad++;
     expect += align_up(e.bytes);
     data_entries.push_back(i);
   }
