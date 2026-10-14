@@ -3,8 +3,8 @@
 What `engine/model/` does for altar-1, as a delta from GLM-5.3's
 ([glm53 engine.md](../../glm53-4xgx10-switchless/docs/engine.md), "glm53" below): which weights the runner binds
 in which format, how the decode step and prefill changed, the checks, and what was measured. Written 2026-10-14.
-Everything here ran on **synthetic weights in the real formats**: no rank file had been installed when these jobs
-ran, so the golden comparisons, `tf`, `refhash` and the real-file profile are still to do (§ 8). The kernels are
+Sections 1–9 ran on **synthetic weights in the real formats**: no rank file had been installed when these jobs
+ran. The golden comparisons, `tf`, `refhash` and the profile on the installed rank files are § 10 (A8). The kernels are
 [attention.md](attention.md) (A3a) and [experts.md](experts.md) (A3e); the plan is [reuse.md § 5](reuse.md) and
 [DESIGN.md](../DESIGN.md).
 
@@ -19,6 +19,7 @@ ran, so the golden comparisons, `tf`, `refhash` and the real-file profile are st
 7. [Memory](#7-memory)
 8. [Runs, failures and what remains](#8-runs-failures-and-what-remains)
 9. [Tuning: the fused shared expert and the routed gate/up's prefetch](#9-tuning-the-fused-shared-expert-and-the-routed-gateups-prefetch)
+10. [End to end on real weights (A8)](#10-end-to-end-on-real-weights-a8)
 
 ## 1. What is identical
 
@@ -95,7 +96,7 @@ All on synthetic weights in the real formats, four ranks, `run.sh` through `ring
 | `pfab` f7 vs 1f7 at 2,600 / 8,192 / 8,192 @ 24,576, chunks of 8,192 and of 2,048: same bits; **the hashes equal across the two chunkings** (ac6d6970a45927db, b21d8c59c6827347, 71006d0c74943db1) | 11:45, 11:55, ffab66e | PASS |
 | server sources (`engine/server/*.cpp`) against the changed `model.h` | `g++ -fsyntax-only`, ffab66e + this commit | compile |
 
-Not done (need the rank files): `weights` (CRC + `glw_kcheck --gpu`), `tf-prefill`/`tf-decode` against the golden
+Done on the rank files in § 10 (A8), except `glw_kcheck --gpu`: `weights` (CRC + `glw_kcheck --gpu`), `tf-prefill`/`tf-decode` against the golden
 data with `tools/compare_golden.py` (layers 0, 2, 3, 4, 6, 76, 77, 78, short sequence), `refhash` pins, `mtpgold`.
 
 ## 6. Measurements
@@ -216,7 +217,7 @@ the commit named in `bin/SOURCES`. Every job: `OWNER=altar1-model …/ring.sh �
 step repeated with other `EXTRA` options needs its DONE line removed (done by hand before the 11:55 job).
 
 **What remains.**
-- **Real files**: the converter's `engine/weights/` (magic ALTR1W01, layouts 4 and 5) must be merged into altar1
+- **Real files** (done in § 10, A8; kept as written): the converter's `engine/weights/` (magic ALTR1W01, layouts 4 and 5) must be merged into altar1
   before `bind_file` can load a rank file (this branch's loader is glm53's and rejects layouts above 3). Then
   `weights`, `tf` against `~/altar1-ref/golden/` (compare_golden.py, layers 0, 2, 3, 4, 6, 76, 77, 78), the
   `refhash` pins, `check` on the real files, the profile at 1, 2, 4, 6, 16 rows, MemAvailable with 76.6 GiB loaded.
@@ -475,3 +476,251 @@ inside the spread (a wash at 1 row); +2 % at 6 and 16 rows as before. Kept on.
 - **Left**: the INT4 k_up now runs one CTA an SM (231 registers by default, 248 at 9–16 rows); a `__launch_bounds__(192, 2)` variant (≤ 170 registers, maybe spills) was not tried. The
   attention-side INT4 GEMVs (q_b, W_UV, o_proj: 95–100 % at 1 row) were not touched. The real rank files were not
   bound for these A/Bs: the profile on them is the next measurement.
+
+## 10. End to end on real weights (A8)
+
+The engine's first runs on the four installed rank files ([layout.md § 7](layout.md#7-files-written), SHA-256
+`1e4f8f6e…` / `1f4f6610…` / `1c3d81e8…` / `5ce3b0fd…` for ranks 0–3), every routed expert from the file, written
+2026-10-14 (+0100). glm53's G8 is the template ([glm53 engine.md, G8](../../glm53-4xgx10-switchless/docs/engine.md#end-to-end-on-real-weights-g8-2026-10-14)).
+17 ring jobs, 14:44–16:37, all through `ring.sh` as OWNER altar1-g8, all preemptible, none preempted; every job
+exited 0. Data and logs in `~/dsgb10-data/altar1-g8/` on rank 0 (`results-<job>.<time>.tsv`, `chain/job-<job>.<time>.log`,
+`g8/<tag>/<seq>/` dumps, `g8-<name>.json` comparisons); the comparisons' copies on rank 2 in the same tree.
+
+**Two engines were measured**, because the contract changed during the milestone:
+
+| Binaries | Commit | `glm_run` sources | What |
+|---|---|---|---|
+| **pre-fix** | `59139aa` (altar1 `01dec5c` + this milestone's scripts) | `618114de8b64441f` | the tuning's default 0x7f7; MoE combine kTwo, `bf16(bf16(Σ routed) + bf16(Σ shared))`, and every residual add rounded twice |
+| **fixed** (the default from now on) | `4cbe861` (altar1 `fb447a5` + the scripts) | `307d477e1feaf5fd` | decision 8 exactly (§ 9.1): shared and routed experts in one f32 sum, every sublayer's residual add rounded once, `h = bf16(f32(res) + sum)`; the old order is tune bits 11 + 12 (`--combine bf16 --res-round2`) |
+
+Both built with `install.sh` (`DATA_NAME=altar1-g8`, nice 19, -j4) into `~/dsgb10-data/altar1-g8/build`, installed
+into `~/dsgb10-data/altar1-g8/bin` on every rank (`bin/COMMIT`, `bin/SOURCES`; the sources hash also covers `tools/*.py`, so the docstring edit to `compare_golden.py` made after the builds changes it without touching a binary). The jobs are
+`engine/model/g8_job.sh` (`w a b c d o m k p f`), run back to back by `g8_chain.sh`; `run.sh` takes `GW="--weights
+fleet"` to run its synthetic steps (check, bench, pfab, …) on the rank files.
+
+**Golden data.** `run.sh`'s `GOLD` is `~/dsgb10-data/altar1-model/gold/all` on every box: these are **the `all-f32`
+set's raw copies** (`gold_prep.py` output, `~/altar1-ref/gold/all-f32.*` on rank 2, 0.93 GB) copied under the name
+the scripts expect, SHA-256 equal on all four boxes (`gold_copy.log`). The comparisons ran on rank 2 against
+`~/altar1-ref/golden/` with `compare_golden.py g8` (nice 19, 4 threads), the engine's dumps copied there.
+
+### 10.1 The weights
+
+Job `w` (14:44, pre-fix binaries): every rank loaded its file to the GPU with every tensor's CRC32C checked on the
+device copy (`glw_load --verify-crc`): **13,961 / 13,961 tensors, 76.75 GiB, 0 reserved, every CRC matches**, on all
+four ranks (load 8.4–15.9 s from the page cache on ranks 1–3, 40.6 s from rank 0's USB disk; the device CRCs 5.2–5.6 s).
+`glw_kcheck --rank 0` (host binding): 154,542 checks ok, 1,175 bad; **the expert side has no bad check** (36,792 INT4
+and 1,512 BF16 matrices, sizes by tag, contiguity, every descriptor), and all 1,175 bad checks are its non-expert
+half still expecting glm53's FP8 T64 entries with scale tables (e.g. `layers.78.shared.gate_up.weight: BF16
+1024x6144 bf16-tile, the kernels read F8_E4M3 1024x6144 T64`), as layout.md § 6 found. **`--gpu` was not run**: its
+device half binds every projection as FP8 (`host_fp8` dereferences the missing `.scale` entries) and runs the head
+row-major, so on these files it would crash before testing anything; porting it to the INT4 tile and kBF16T is a
+rewrite of its device half, not done. What covers the projections on the files' bytes instead is § 10.3: every
+layer's output against the reference at BF16 noise in layers 0–6.
+
+### 10.2 Memory after the load
+
+`glm_run` records free device memory and MemAvailable on every rank before the load and after the weights and the
+prefill buffers, and stops below 4.5 GiB MemAvailable (`--min-free-mib 4608`); no job stopped. The weights bind
+82.41 GB (76 MoE layers' experts from the file) in 43–49 s. The reference's `all` pass (≤ 6.8 GiB) ran on rank 2
+throughout, and the DeepSeek service had lent the ring. GiB, free device / MemAvailable:
+
+| Job | setting | rank 0 | rank 1 | rank 2 | rank 3 |
+|---|---|---|---|---|---|
+| before the load (range over the jobs) | | 74–88 / 113.3–113.7 | 113.0–113.1 / 115.9–116.0 | 97.6–102.1 / 109.2–112.2 | 114.2–114.7 / 115.9–115.9 |
+| `k` check (14:54) | chunk 2,048, scratch 512 MiB, 6 slots × 8,192 | 6.65 / 29.23 | 29.55 / 32.48 | 16.55 / 26.35 | 30.92 / 32.38 |
+| `p` bench (15:04) | chunk 8,192, scratch 512 MiB | 5.24 / 31.86 | 31.20 / 34.14 | 20.28 / 29.81 | 32.46 / 34.02 |
+| `f` pfab (15:05) | chunk 8,192, max_ctx 33,792, one draft | 2.20 / 29.05 | 29.04 / 31.99 | 16.58 / 26.37 | 30.37 / 31.86 |
+| `a` tf + refhash (15:45, fixed) | chunk 2,048, scratch 128 MiB, 6,400 | 5.90 / 33.89 | 33.45 / 36.40 | 20.66 / 29.43 | 34.63 / 36.28 |
+| `c` tf (15:26, pre-fix) | chunk 2,048, scratch 128 MiB, 8,192 | 0.97 / 33.23 | 33.28 / 36.22 | 18.79 / 30.42 | 34.79 / 36.10 |
+
+**At least 26.35 GiB MemAvailable on every rank after the load in every job** (rank 2, beside the reference), 29.05
+on rank 0, against glm53 G8's 6.7–11.9 GiB with 101 GiB of weights; § 7's estimate was 27–35. Free *device* memory
+(cudaMemGetInfo) on rank 0 falls to ~1 GiB in some jobs while MemAvailable stays at 29–34 GiB: on unified memory
+the driver's figure tracks what else holds pages on that box (the agents' processes, the page cache of its 82 GB
+file on the USB disk), and MemAvailable is what earlyoom watches.
+
+### 10.3 Against the golden data
+
+`tf` teacher-forced over the golden sequences (short, python and prose whole; agentic's first 8,000 of 26,834
+tokens) via prefill (2,048-row chunks), and via decode (16-row steps, one draft pass) on short and python; the dumps
+against `all-f32` (the contract's order, the level-2 set) and `all` (transformers' bf16 order, finished on rank 2 at
+17:01:41) with `compare_golden.py g8`, which also compares the two runs with each other over the same positions:
+the reference's own order variance. KL(golden ‖ engine) and max |Δ logit| over the full logits at the golden sample
+rows (every row of short; 89 / 84 / 65 rows of python, prose, agentic's prefix); argmax and top-20 over every row.
+
+**The bar.** DESIGN decision 2: the engine within 2× the reference's own order variance, here `all` against
+`all-f32` (KL(all-f32 ‖ all), the same direction as the engine's). Before `all` existed, the interim bar was
+reference.md § 6.2's `a1a` pair (short 0.869 / KL 0.098 / 7.6; prose2400 0.874 / 0.160 / 14.7); short's `all`
+equals `a1a-bf16` (the engine's comparison with both gives the same digits), and its 0.098 is the other direction
+of the same pair (KL(bf16 ‖ f32); 0.092 this way round).
+
+Via prefill, fixed engine (jobs `a` 15:45, `c` 15:57), and the pre-fix engine (jobs 15:14, 15:26) on the same text
+(comparisons 17:03–17:20):
+
+| Sequence | against | engine | argmax equal | top-20 overlap | KL mean (p99, max) | max \|Δ logit\| |
+|---|---|---|---:|---:|---|---:|
+| short (291) | `all-f32` | **fixed** | **0.869** | 0.865 | **0.095** (0.92, 3.82) | 6.3 |
+| | | pre-fix | 0.904 | 0.864 | 0.081 (0.69, 1.46) | 6.7 |
+| | `all` | fixed | 0.863 | 0.867 | 0.115 (1.29, 3.30) | 7.2 |
+| | | pre-fix | 0.873 | 0.865 | 0.087 (0.81, 1.06) | 7.1 |
+| | *orders* | | *0.869* | *0.860* | *0.092 (0.86, 2.10)* | *7.6* |
+| python (6,106) | `all-f32` | **fixed** | **0.913** | 0.862 | **0.291** (3.66, 3.93) | 12.4 |
+| | | pre-fix | 0.916 | 0.859 | 0.240 (3.68, 4.81) | 11.4 |
+| | `all` | fixed | 0.909 | 0.859 | 0.224 (2.86, 3.12) | 10.9 |
+| | | pre-fix | 0.920 | 0.861 | 0.190 (2.32, 6.28) | 10.3 |
+| | *orders* | | *0.915* | *0.860* | *0.205 (3.50, 4.40)* | *10.5* |
+| prose (4,762) | `all-f32` | **fixed** | **0.863** | 0.859 | **0.049** (0.47, 0.53) | 6.6 |
+| | | pre-fix | 0.864 | 0.863 | 0.049 (0.47, 0.53) | 6.0 |
+| | `all` | fixed | 0.860 | 0.857 | 0.052 (0.65, 0.76) | 5.8 |
+| | | pre-fix | 0.862 | 0.859 | 0.063 (0.97, 0.98) | 7.7 |
+| | *orders* | | *0.870* | *0.863* | *0.048 (0.42, 0.72)* | *4.8* |
+| agentic (first 8,000) | `all-f32` | **fixed** | **0.738** | 0.759 | **0.364** (6.20, 6.78) | 13.5 |
+| | | pre-fix | 0.729 | 0.753 | 0.453 (9.04, 11.07) | 14.6 |
+| | `all` | fixed | 0.731 | 0.755 | 0.406 (6.78, 9.30) | 13.3 |
+| | | pre-fix | 0.734 | 0.754 | 0.379 (6.15, 11.61) | 15.6 |
+| | *orders* | | *0.736* | *0.754* | *0.323 (6.17, 9.15)* | *13.0* |
+
+Top-1 against the text, engine (fixed) / `all-f32` / `all`: short 0.545 / 0.528 / 0.541, python 0.684 / 0.686 /
+0.688, prose 0.424 / 0.422 / 0.427, agentic 0.472 / 0.475 / 0.470.
+
+**DESIGN decision 2's 2× criterion: met on all four sequences.** The fixed engine against the contract's order
+(`all-f32`), its disagreement over the reference's own:
+
+| | short | python | prose | agentic (8k) |
+|---|---:|---:|---:|---:|
+| argmax (1 − equal) | 1.00× | 1.02× | 1.05× | 0.99× |
+| KL mean | 1.04× | 1.42× | 1.00× | 1.13× |
+| max \|Δ logit\| | 0.83× | 1.18× | 1.38× | 1.03× |
+
+The pre-fix engine was inside the bound too (argmax 0.74 / 0.99 / 1.05 / 1.03×, KL 0.88 / 1.17 / 1.02 / 1.40×).
+Python's KL (1.42×) is the closest to the bound: 89 sample rows, its p99 is the engine's and the orders' alike.
+
+**Via decode, one draft pass** (jobs `b`; fixed 15:47, pre-fix 15:19): fixed short argmax **0.866** against
+`all-f32` (KL 0.095, max |Δ logit| 8.6) and 0.859 against `all` (KL 0.112); python **0.913** (KL 0.157, 9.0) and
+0.911 against `all` (KL 0.175). Pre-fix: short 0.894 / KL 0.096 / 6.3, python 0.917 / 0.222 / 11.6 against
+`all-f32`. Within the same envelope as prefill (argmax 1.03× and 1.02× the orders' disagreement, KL 1.03× and
+0.76×); decode's routed sums are in their own K order (decode = prefill bit for bit only with `--moe-up 6`, § 10.5).
+
+**Hidden states, short, via prefill** (median relative error of the rows against `all-f32`; the orders' own in the
+last line; cosine mean ≥ 0.99999 through layer 3 in all three):
+
+| After layer | 0 | 1 | 2 | 3 | 4 | 6 | 10 | 20 | 30 | 40 | 50 | 60 | 70 | 77 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| fixed | **0.18 %** | 0.29 | 0.32 | 0.39 | 0.47 | 0.57 | 0.81 | 5.45 | 7.22 | 11.2 | 11.1 | 14.4 | 18.0 | 19.9 |
+| pre-fix | 0.32 % | 0.40 | 0.43 | 0.49 | 0.57 | 0.68 | 1.10 | 5.92 | 8.12 | 11.0 | 10.9 | 14.4 | 18.3 | 20.2 |
+| orders (a1a bf16 vs f32) | 0.32 % | 0.40 | 0.43 | 0.50 | 0.58 | 0.70 | 1.12 | 5.62 | 7.60 | 10.7 | 11.2 | 14.6 | 18.8 | 20.4 |
+
+Python's rows give the same through layer 10 (fixed 0.18 / 0.28 / 0.40 / 0.83 % at layers 0, 1, 3, 10). Against
+`a1a-bf16` the pre-fix engine was 0.20 % at layer 0 and the fixed one 0.32 %: **the fix moved the engine from the
+bf16 order's side to the contract's**, and it now sits closer to `all-f32` than the reference's other order does,
+by 25–45 % in layers 0–10. **It is not bit-equal to the contract even at layer 0**: 0.18 % median relative error after
+a dense layer with BF16 weights on both sides is more than f32 accumulation order alone would flip; some rounding
+point inside the attention or the dense MLP still differs (§ 10.7). From layer ~15 routing flips (a quarter of rows
+have their 8th and 9th scores within 1e-3, reference.md § 6.3) amplify every difference, and engine and orders
+reach the same ~20 % by layer 77.
+
+**What the two fixes bought against golden:** the hidden states in layers 0–10 (−25 to −45 %, above). The final
+logits do not resolve the fix: against `all-f32` short loses 3.4 points of argmax and python's KL rises 0.05, agentic gains 0.9 points
+and 0.09 nats of KL, prose is unchanged. Both engines are inside the same envelope (§ 10.3's ratios), and from layer 15 the comparison measures the routing's chaos, not the arithmetic.
+
+The old order through the fixed binaries (job `o`, 16:04, `--combine bf16 --res-round2`): the refhash pins below
+equal the pre-fix engine's (`3d71bf700e718117`, `cefa4693767795d5`) and tf's top-1 and mean log p equal the pre-fix
+run's on short and python: tune bits 11 + 12 reproduce the pre-fix engine on the real files, as § 9.1 found on
+synthetic ones.
+
+### 10.4 The MTP layer
+
+**Teacher-forced on the golden final hidden** (`mtpgold`, job `m`; fixed 16:19, pre-fix 15:36; blocks of 16 rows,
+five chained passes): the MTP's first draft equals the reference's MTP argmax on **0.9925** of 37,985 rows (fixed;
+short 1.000, prose 0.994, python 0.996, agentic 0.991; pre-fix 0.9928), and the one-draft greedy acceptance
+(draft = the reference's main argmax at t+1) is **0.4921** against the reference's **0.492** (short 0.661, prose
+0.523, python 0.698, agentic 0.438, as reference.md § 6.1's 0.661 / 0.522 / 0.698 / 0.438). Layer 78's output
+against the golden rows: cosine mean 0.9987–0.9998, mean relative error 0.9–1.7 % (short 1.07 %, prose 0.92,
+python 1.74, agentic 1.55; pre-fix 1.28 / 1.10 / 1.79 / 1.65). Chained drafts from each block's last row, mean
+accepted length against the main argmax at k = 5: 0.88 / 0.55 / 1.07 / 0.53 (short / prose / python / agentic).
+
+**On the engine's own hidden states** (tf via decode with one draft pass, job `b`): the draft equals the reference's
+MTP argmax on 0.869 (short) and 0.896 (python), fixed (pre-fix 0.841, 0.900); the reference's two orders agree on
+0.872 and 0.909 of the drafts (`all` against `all-f32`; the engine against `all`: 0.862, 0.893). Acceptance on the engine's own text (draft = its own main argmax at t+1): **0.645**
+and **0.687** (pre-fix 0.641, 0.693) against the reference's 0.662 and 0.698. These two jobs are the first runs of
+layer 78 under the fixed combine; both pass.
+
+### 10.5 The refhash pins and the checks
+
+Greedy, 64 tokens after the prompt, each step queued one ahead (the server's way), `--max-ctx 6400 --chunk 2048
+--index-scratch-mib 128`; the hash is over every token's id and logit bits (no drafts):
+
+| Prompt | **fixed** refhash | runs (all four ranks agree in each) | pre-fix (= `--combine bf16 --res-round2`) |
+|---|---|---|---|
+| short (291 tokens) | **`975edafcbf8d617a`** | graphs, graphs, eager (job `a`, 15:45); graphs in a second process (job `d`, 16:13) | `3d71bf700e718117` (jobs 15:14 ×3, 15:34; job `o` 16:04) |
+| python (6,106 tokens) | **`1dd62741b1158d49`** | the same four | `cefa4693767795d5` (the same five) |
+
+The fixed engine's greedy continuation of short begins `785 1196 374 10156 … 25704 264` and leaves the pre-fix one
+at the 24th token; python's at the 18th. tf hashes (rank 0; they cover the dumped layers, so they are per job
+setting): fixed prefill short `89f0df63a231601f`, python `e6716385592bae07` (layers 0–77), prose `7d071927b1130a3c`,
+agentic 8k `d009ace907c5bb42` (layer 77); fixed decode short `3f8b0e4a08d6b3d4`, python `04ba7ac6e3ae3b23`. Each
+ran once: recorded, not pinned.
+
+**`check` and `check6` on the real files** (job `k`; pre-fix 14:54–14:56, fixed 16:30–16:37): chunkings 79 / 79
+caches identical; decode = prefill in layers 0–3 (default K order) and in **all 79 caches with `--moe-up 6`**; 16
+rows in one step = 16 steps of one row (tokens, logit bits, 78 caches); graph = eager; the four ranks identical;
+sampling. **All PASS on both engines.**
+
+### 10.6 The step and prefill on real weights
+
+**Decode** (`run.sh bench` with `GW="--weights fleet"`, context 4,096, graphs + PDL + L2 prefetch, tune 0x7f7, the
+median of the last 4 of 32 steps; one reading a job):
+
+| Rows | fixed (job `p`, 16:25) GPU ms | tok/s | pre-fix (15:04) GPU ms | synthetic, same default (§ 9.4, 0x7f7) | bytes GB | floor ms | fixed × floor |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | **45.70** | 20.9 | 46.52 | 46.91 | 8.708 | 37.05 | 1.233 |
+| 2 | 63.21 | 31.5 | 66.73 | 60.87 | 12.03 | 51.19 | 1.235 |
+| 4 | 92.35 | 44.0 | 91.58 | 79.70 | 18.21 | 77.48 | 1.192 |
+| 6 | 116.08 | 52.9 | 114.67 | 95.26 | 23.81 | 101.32 | 1.146 |
+| 16 | 193.84 | 81.7 | 200.59 | 142.71 | 44.91 | 191.12 | 1.014 |
+
+At 1 row the real files run as fast as the synthetic weights (45.7–46.5 against 46.3–46.9 ms; single readings
+move ±2 ms between jobs), 1.23× the floor and inside A4's ≤ 46 ms. Above one row they are slower: the bench feeds
+synthetic token ids, so with the real router the rows route close to independently and read the distinct experts
+the floor column assumes (it is computed for independent uniform routing), while the synthetic router overlapped
+(§ 6); at 16 rows the step is 1.01× that floor. Real text routes with more overlap than random ids: the server's
+multi-session rates on real prompts are the bar for 2–16 rows, not this table. The fix's removed reduce-scatter
+(one partial instead of two in all-reduce 2) does not show beyond the ±2 ms between single readings (45.70 against
+46.52 ms at 1 row); an interleaved A/B of `--combine bf16 --res-round2` against the default would resolve it.
+
+**Where the time goes**, eager without PDL (ms; events between classes; `bench`'s profiled step):
+
+| Class | 1 row pre-fix | 1 row fixed | 16 rows pre-fix | 16 rows fixed |
+|---|---:|---:|---:|---:|
+| MLP / MoE (router, routed + shared experts) | 26.35 | 25.35 | 144.87 | 143.69 |
+| o_proj | 7.03 | 6.43 | 7.51 | 7.04 |
+| x-projection | 3.71 | 3.38 | 4.03 | 3.79 |
+| q_b + wq_b | 3.32 | 3.16 | 3.59 | 3.53 |
+| W_UK + W_UV | 2.50 | 2.46 | 2.72 | 2.76 |
+| attn_prep + index_select + sparse_attn | 4.15 | 4.06 | 9.69 | 9.35 |
+| head + sample | 2.27 | 2.34 | 2.56 | 2.23 |
+| collectives (all-gathers, all-reduce 1 and 2) | 5.59 | 10.65 | 34.28 | 34.62 |
+| total (eager) | 55.00 | 57.89 | 209.32 | 207.08 |
+
+Per layer at 1 row (fixed): dense 1.096 ms, MoE + full indexer 0.775, MoE + shared indexer 0.671. The eager
+collectives wander between jobs (5.6 against 10.7 ms here, 7.2–9.2 in § 9.4) with the ring's and the boxes'
+conditions; the kernels' classes agree with § 9.4's synthetic ones to within ~1 ms (o_proj 6.4–7.0 against 6.4).
+
+**Prefill** (`run.sh pfab`, job `f`, 15:05–15:14, pre-fix binaries; chunks of 8,192 rows, one MTP draft, A = f7,
+B = 1f7, A B B A): **973 tok/s at 2,600** and **1,115 at 8,192** (913 at 8,192 @ 24,576), B/A 1.017 / 1.055 /
+1.045, A and B the same bits (hashes `db18fb118b03300c`, `c31f9b58bc0059e8`, `55fd47b7d006ac96`). Against the
+synthetic 1,166 / 1,176 / 925 (§ 6): −17 % at 2,600, −5 % at 8,192, −1 % at 24,576: real routing reads more
+distinct experts a chunk than the synthetic router, which matters most for the short prompt. Against glm53's T6
+1,106 / 1,145 / 908 and A5's target: below at 2,600 and 8,192 on real weights. Not repeated on the fixed engine:
+the fix changes one rounding in `sublayer_end`, not a GEMM (python's 6,106-token prefill in the refhash runs, 2,048-row chunks: 6.83–6.91 s before, 6.58–6.67 s after).
+
+### 10.7 What remains
+
+- The `prefill-kTwo`, `prefill-fix` and `decode-fix` comparisons against `all` are in `g8-*-all.json`; reference.md
+  § 10's own steps for `all` (summary, `cmp_runs.py`, `level3.py`, SHA256SUMS) are the reference agent's.
+- **Layer 0 is not bit-equal to the contract** (0.18 % median relative error after a dense layer, § 10.3): a
+  per-operation comparison of layer 0 (attention's intermediate roundings, the dense MLP's SwiGLU, the norms)
+  against `a1a-f32`'s every-position dumps would find the rounding point that differs.
+- `glw_kcheck`'s device half for INT4 tiles and kBF16T (§ 10.1).
+- Prefill on real weights is 17 % below the synthetic figure at 2,600 tokens; drafts on real text through the server
+  (the serving agent's); an interleaved A/B for the fix's step gain.

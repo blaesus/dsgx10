@@ -12,8 +12,8 @@
                                                 order variance, the scale of DESIGN decision 3's 2x criterion)
 
 GOLDEN is a golden run directory (manifest.json); SEQ a sequence's name in it. An engine dump may hold a prefix of the
-sequence (glm_run --tf-max): the comparison is then over its positions. The reference attends with BF16 weights
-(NVIDIA's checkpoint) and this engine with FP8 (docs/attention.md), so the comparison is an envelope, not bit
+sequence (glm_run --tf-max): the comparison is then over its positions. For altar-1 both sides hold the
+checkpoint's bytes, but the f32 sum orders differ and routing flips amplify them (docs/engine.md § 10), so the comparison is an envelope, not bit
 equality: what it prints is measured, not passed or failed.
 """
 import json
