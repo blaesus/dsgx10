@@ -9,9 +9,11 @@ DeepSeek service through its `ring.sh` (jobs of 15 s to 2 min).
 routed experts, layer 3 also with its real NVFP4 experts. Decode step at 1 row **46.4 ms** (21.6 tok/s) against
 a 34.2 ms bandwidth floor (1.35×); after the 2026-10-14 decode-gap pass 43.6 ms (1.27×) in the interleaved A/B, ~44 ms
 on undisturbed ranks, the MoE at its floor and the rest the collectives' latency and attention ([Closing the
-decode gap](#closing-the-decode-gap-2026-10-14)); prefill **854 / 802 / 704 tok/s** at 2,600 / 8,192 / 32,768
-tokens (2.0–2.2× the 16-row GEMV path's 381 / 374 / 350; [Prefill GEMMs](#prefill-gemms-2026-10-14)), 58 % of the
-published 1,374 tok/s at 8k, the collectives now 38 % of a chunk. Against the
+decode gap](#closing-the-decode-gap-2026-10-14)); prefill **1,084 / 1,086 / 860 tok/s** for chunks of 2,600 and
+8,192 from 0 and the last 8,192 of 32,768 tokens, **968 tok/s** for a whole 32,768-token prompt, with the ring's
+collectives overlapped with the compute ([Prefill overlap](#prefill-overlap-2026-10-14); 854 / 794 / 698 and 753
+before, after the tensor-core GEMMs of [Prefill GEMMs](#prefill-gemms-2026-10-14); 381 / 374 / 350 on the 16-row
+GEMVs), 79 % of the published 1,374 tok/s at 8k. Against the
 reference's golden data the residual stream after layers 0–3 agrees to cosine 0.9998 (mean), relative error
 1.2–2.1 %, the size the FP8 requantisation predicts (each FP8 tensor 2.6 % relative error). Every
 self-consistency check passes (below).
@@ -24,13 +26,13 @@ self-consistency check passes (below).
 | `config.h` | the model's constants beyond attn.h/experts.h: the MTP layer 78, 79 caches, dense layers 0–2, vocabulary 154,856 used of 154,880, stop ids 154820/154827/154829 (protocol.md v2) |
 | `model.cu` | the decode step: one layer, the forward, one CUDA graph per row count, launch and wait, profiling, cache hashes |
 | `mtp.cu` | the MTP layer's draft passes (decode) and its eh_proj |
-| `prefill.cu` | prefill chunks of up to 8,192 rows (the projections through attn's `gemm()` / `gemm_bf16()`, `pf_proj`), the MTP cache fill |
+| `prefill.cu` | prefill chunks of up to 8,192 rows (the projections through attn's `gemm()` / `gemm_bf16()`, `pf_proj`; the layers in two pieces of rows, each piece's collectives on a second stream beside the other's compute, `kTunePfOverlap`), the MTP cache fill |
 | `ops.cu`, `sample.cu` | the step-input ring, the vocabulary-split embedding, the top-1 for drafts, publishing; the DeepSeek sampler ported (38,720 ids a rank, ids ≥ 154,856 masked) |
 | `oproj.cu` | o_proj as the producer half of its all-reduce (`kTuneOproj`, off by default; [Closing the decode gap](#closing-the-decode-gap-2026-10-14)) |
-| `tools/step_profile.py` | the per-kernel critical-path profile of `glm_run trace`'s nsys reports, every rank; `--prefill`: one prefill chunk's (`glm_run pftrace`), per kernel kind and per class |
+| `tools/step_profile.py` | the per-kernel critical-path profile of `glm_run trace`'s nsys reports, every rank; `--prefill`: one prefill chunk's (`glm_run pftrace`), per kernel kind and per class, and per stream (busy, idle, the side stream under the main one) |
 | `l2pf.cu` | the paced L2 prefetch (DeepSeek's l2pf): the next weights during collectives and attention |
 | `bind.cu` | binding a `.glw` rank file (names, sizes and layouts checked), synthetic weights, synthetic routed experts for a file whose pools are not filled |
-| `tools/glm_run.cu` | the driver: `bench`, `l2pf`, `ab` (two lever sets, interleaved, timing and output bits), `trace` (under nsys), `prefill`, `pfab` (prefill, two lever sets A B B A, timing and output bits), `pftrace` (one chunk under nsys), `check`, `tf`, `refhash` |
+| `tools/glm_run.cu` | the driver: `bench`, `l2pf`, `ab` (two lever sets, interleaved, timing and output bits), `trace` (under nsys), `prefill`, `pfab` (prefill, two lever sets A B B A, timing and output bits; chunks or whole prompts), `pftrace` (one chunk under nsys), `check`, `tf`, `refhash` |
 | `tools/compare_golden.py` | the `tf` dumps against the golden files (reference.md § 7) |
 | `install.sh`, `run4.sh`, `run.sh` | out-of-tree build (-j4) with the sources' hash; the ring launcher (comm's pattern, binaries under `~/dsgb10-data/glm53-model/`); the resumable ring steps |
 
@@ -74,7 +76,9 @@ indexer for rows at position ≥ 2,048 through `index_select`'s prefill path (st
 merged `k_sel_thresh` + `k_sel_compact` selection) in batches sized to a 512 MiB score scratch (rows below attend
 densely); `sparse_attn` without split; each sublayer ends with an f32
 reduce-scatter by rows, the residual add and the next norm on the rank's quarter of the rows and one
-all-gather of h and the normed rows; the MoE through `moe_prefill`. The MTP cache fill runs after each chunk
+all-gather of h and the normed rows; the MoE through `moe_prefill`. The layers run on two pieces of the chunk's
+rows, each piece's sublayer ends on a second stream while the other piece computes (chunks of 1,024 rows and more;
+the same bits; since 2026-10-14, [Prefill overlap](#prefill-overlap-2026-10-14)). The MTP cache fill runs after each chunk
 (eh_proj, layer 78's norm, x-projection, all-gather and `attn_prep` only — no MoE), the chunk's last row kept
 pending until the next chunk or the first decode step brings the token after it. With a `Sampling`, the last
 row is sampled as a one-row step (head, sampler, draft passes).
@@ -160,7 +164,7 @@ of the 12 ms gap to the floor is the MoE at ~83 % of its bytes' floor at one row
 
 **Prefill** (synthetic, from position 0): 414 / 434 / 419 / 403 / 400 tok/s for chunks of 512 / 1,024 / 2,048
 / 4,096 / 8,192 rows (1.24 s to 20.5 s a chunk), after the expert prefill tuning (6cb6fce); 397–416 before. With
-the prefill GEMMs (2026-10-14): 854 / 802 / 704 tok/s at 2,600 / 8,192 / 32,768 tokens, below.
+the prefill GEMMs (2026-10-14): 854 / 802 / 704 tok/s at 2,600 / 8,192 / 32,768 tokens; with the collectives overlapped (T5, 2026-10-14) 1,084 / 1,086 / 860, a whole 32,768-token prompt 968; below.
 
 ## Closing the decode gap (2026-10-14)
 
@@ -375,12 +379,122 @@ except eh_proj's call, which at 1–16 rows is the same single GEMV launch.
 the table's job ran alone. Not measured: a whole 32,768-token prompt (four chunks), `pfab` without the MTP draft;
 not run: memcheck over `gemm_bf16`.
 
+## Prefill overlap (2026-10-14)
+
+After T4 a chunk spent 38 % of its time in the ring's collectives, bandwidth-bound and on the compute stream, so
+nothing overlapped them. T5 runs them on a stream of their own beside the compute, outputs unchanged bit for bit.
+Ten ring jobs of 1–7 minutes (one of them, attn's tests, on rank 0 only), 02:00–03:07 (+0100); synthetic weights
+except `tf` and the server's tests.
+
+**What changed** (`prefill.cu`, one `Tune` bit `kTunePfOverlap` = 0x80, now in `kTuneDefault` = 0xf7). The chunk's
+rows are split into pieces (`Options::prefill_pieces`, default 2; a multiple of 64 rows each, at least
+`prefill_min_piece` = 512, so chunks under 1,024 rows stay one piece). Each sublayer computes the pieces in order on
+the compute stream; a piece's sublayer end (the f32 reduce-scatter by rows, the residual add and norm on the rank's
+quarter of the piece, the all-gather of h and the normed rows) runs on a second stream, created at the highest
+priority so that a collective's blocks get the next free SMs, while the next piece computes. Events carry the
+dependencies: a piece's sublayer end waits for its compute, the piece's next sublayer waits for its end. There is
+one ring channel, so every collective goes to the second stream in the same order on every rank. The x-projection
+and indexer-query all-gathers are short and the compute waits for them, so a long sublayer end is queued only
+behind the next piece's short ones (deferred); the last piece's MoE end waits behind the next layer's first piece's.
+With two pieces a layer runs: piece 0's attention while the layer before's piece-1 end runs; piece 1's attention
+while piece 0's attention end runs; piece 0's MoE while piece 1's attention end runs; piece 1's MoE while piece 0's
+MoE end runs. The overlapped collectives use `prefill_comm_blocks` (8) blocks, not 16. Bits: a row's arithmetic is
+the whole chunk's. The projections, the router, the indexer and the attention compute a row alike whatever rows
+share the launch (attn's tests P and E), and so do the experts (experts.h: a call's results do not depend on the
+other rows). A piece's attention reads the cache entries its own and the earlier pieces' `attn_prep` wrote. The
+reduce-scatter adds the four ranks' partials in rank order wherever the piece boundaries fall, and the add and the
+norm go row by row. With the bit off (or one piece) the launches are the unpipelined chunk's, in the same order.
+The embedding's all-gathers stay on the compute stream before the layers; the chunk ends by joining the second
+stream, so the MTP fill, the sample and the decode steps after it see a quiet ring. `glm_run` gained
+`--pf-pieces`, `--pf-blocks`, `--pf-min-piece`, and `pfab` takes a whole prompt longer than a chunk;
+`step_profile.py --prefill` prints a per-stream summary (busy time, the main stream's idle time, the side stream's
+time under the main stream's kernels).
+
+**Choosing pieces and blocks** (sources 0d9ee41d6b627474, jobs 1–4, 02:00–02:29; `pfab` 0x77 against 0xf7, 8,192
+rows at 24,576, tok/s of the overlapped side; the unpipelined side 699–713 in every job):
+
+| Pieces | comm blocks 2 | 4 | 8 | 12 | 16 |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 869 | 882 | **892** | 849 | |
+| 3 | | | 887 | | |
+| 4 | | 852 | | | 827 |
+| 8 | | 811 | | | |
+
+At 8,192 from 0: 2 pieces 1,106, 3 pieces 1,060, 2 pieces with 12 blocks 1,058. More pieces mean more short
+all-gathers to wait for and smaller GEMMs; more blocks take more SMs from the compute. Repeats of one setting
+differ by a few per cent (2 × 8 at 24,576: 892 in job 3, 860 in job 5's `pfab` on the final sources, 866 in its
+`pftrace`).
+
+**Prefill throughput** (final sources: `glm_run` 139d188c604ea91a, merged with glm53 at 3b2ae08; job 5,
+02:34–02:42, and job 6, 02:44–02:49; ms of the two runs of each side, A = 0x77, B = 0xf7):
+
+| Tokens (chunk at) | unpipelined (A) | tok/s | overlapped (B) | tok/s | B/A speed |
+|---|---:|---:|---:|---:|---:|
+| 2,600 (0) | 3,046.1 / 3,041.6 | 854 | 2,394.8 / 2,403.2 | **1,084** | 1.27× |
+| 8,192 (0) | 10,301.5 / 10,343.7 | 794 | 7,544.4 / 7,545.6 | **1,086** | 1.37× |
+| 8,192 at 24,576 (the last chunk of 32,768) | 11,717.8 / 11,749.2 | 698 | 9,525.8 / 9,518.7 | **860** | 1.23× |
+| a whole 32,768-token prompt (four chunks) | 43,791.8 / 43,274.3 | 753 | 33,959.1 / 33,738.5 | **968** | 1.29× |
+
+**Against the published bar** (1,374 tok/s cold at 8k): 1,086 tok/s is 79 % of it (T4: 58 %); the 8,192-row chunk
+takes 7.5 s where the bar needs 6.0.
+
+**Where a chunk goes now** (`pftrace`, 8,192 rows at 24,576, the same binary with 0x77 and with the default, job 5;
+ms; rank 0, the four ranks' range in brackets):
+
+| | before (0x77): 11,469–11,507 ms | after (0xf7): 9,446–9,485 ms |
+|---|---:|---:|
+| compute stream busy | 11,476 (all of it, collectives included) | **8,745** (8,371–9,225) |
+| … attention (`k_attn`, `k_prep`) | 2,651 (2,510–2,651) | 3,239 (3,146–3,383) |
+| … MoE prefill | 2,565 (2,462–2,580) | 3,264 (3,059–3,415) |
+| … projections | 1,152 (1,122–1,174) | 1,288 (1,253–1,409) |
+| … indexer | 774 (714–774) | 934 (877–966) |
+| … collectives on the compute stream | 4,185 (4,185–4,505) | 19 (the embedding's; 19–59) |
+| compute stream idle (waiting for the other stream) | 8 | **700** (253–1,088) |
+| collectives' stream busy | – | 5,322 (4,665–5,589), of it under compute 4,610 (4,403–4,610) |
+
+So 87 % of the ring's time now runs under compute, and it takes longer there (5.3 s against 4.2 s: 8 blocks, and
+the compute beside it). **The cost is the compute itself:** beside the ring's copies the compute kernels run 20 %
+slower on rank 0 (7,290 → 8,745 ms busy) and 27 % on rank 2 (7,265 → 9,225), every class alike (attention +22 %,
+MoE +27 %, indexer +21 % on rank 0), more than the 8 SMs the collectives take (17 %). The ring's traffic goes
+through the same memory: a reduce-scatter of 201 MB copies its input into the send buffers, the NICs read those and
+write the neighbours' quarters, and the reduction reads four quarters; by that count (an estimate, not measured) on
+the order of a gigabyte of DRAM traffic in ~10 ms. Rank 2, the slowest under it, sets the chunk: its compute stream
+is idle only 253 ms. The idle time of the other ranks is mostly the x-projection all-gather's wait (the `k_prep`
+after it: 545–715 ms of increments on ranks 0, 1, 3 against 36 ms of kernel) and the next layer's first GEMM
+waiting for the MoE's end (`k_gemm g11x32 <k_pdown_c`: 66–336 against 48–57).
+
+**Exactness.** `pfab`: A and B the same bits in all four runs, at every size, on every rank and at every piece
+count and block count tried (hashes f561aaa161f5703e, b5d2be0e85c00e60, 01f4fa4803ca445f: T4's, and 8ee634566afdf576
+for the whole 32,768-token prompt). `run.sh check` passes with the overlap on (its 2,048- and 1,300-row chunks run
+as two pieces): chunking, decode = prefill, 16 rows = 16 one-row steps, graph = eager, ranks agree, sampling. `tf`
+via prefill on the real rank files (`run.sh tf-prefill`, the 291-token `short` sequence): all 20 dump files
+byte-identical to the `short-prefill` dump of 2026-10-13, with the default (291 rows: one piece) and with
+`--pf-min-piece 64` (pieces of 192 and 99 rows, the overlap on). attn's tests from this tree: 44 pass at S = 300, 96
+at S = 4,600 (attn is unchanged). The server's ring tests (`server/tests/ring_job.sh`: serve, batch, front, kept) pass
+on a `glm53_rank` built from this tree (sources 98817b82c9ab36db). **Decode is unchanged**: the step's code is
+untouched; `ab` 0x77 against 0xf7 43.612 / 43.549 ms at 1 row, 95.482 / 95.432 at 6, the same bits; `bench` of the
+T4 build (d32601a9e8517dd6) against this one, A B B A, wall ms a step over 32 steps: 45.21 / 45.43 against 45.38 /
+45.48 at 1 row, 96.83 / 97.24 against 97.46 / 96.97 at 6 (the GPU medians of 4 steps, 44.4–49.5 ms, are too noisy
+to compare).
+
+**What failed or was not done.** Evict-first cache hints (`__ldcs` / `__stcs`) on the bulk reduce-scatter's and the
+multi all-gather's copies, meant to keep the ring's streams out of the compute's L2 (sources 39643ccbf8d251aa, job
+3): 892 → 866 tok/s at 24,576, 1,106 → 1,088 at 8,192 from 0, no gain; reverted. The server's front phase failed
+once (job 9, 03:02) because the worktree had no `glmfront` build; run again with the main checkout's (the frontend
+is unchanged), it passes. Not tried: the MoE's shared expert first so that its reduce-scatter starts during the
+routed experts (with two pieces the MoE end already runs during the other piece's MoE), a fused residual + norm +
+all-gather after the reduce-scatter, the ring's copies with fewer bytes (the producer writing its partials straight
+into the send buffers, as decode's posted partials do; a chunk's partials are far beyond the 4 MiB buffers).
+
 ## What remains
 
-- **Prefill** (802 tok/s at 8k after the 2026-10-14 GEMMs, 58 % of the published 1,374): the collectives (38 % of a
-  chunk, bandwidth-bound, on the compute stream) want to overlap the compute; then `sparse_attn` at prefill (22 %,
-  no split, ~18 TFLOPS) and the expert GEMMs (22 %). The indexer's batches shrink to 512 rows at a 256k
-  `max_ctx` (512 MiB scratch).
+- **Prefill** (1,086 tok/s at 8k after the 2026-10-14 overlap, 79 % of the published 1,374): the compute now
+  runs 20–27 % slower beside the ring's copies (their memory traffic; [Prefill
+  overlap](#prefill-overlap-2026-10-14)): fewer bytes through memory per collective (a fused residual + norm +
+  all-gather, the producers writing into the send buffers) would give that back; the compute stream still waits
+  0.25–1.1 s a chunk, mostly for the short x-projection all-gathers; then `sparse_attn` at prefill (no split,
+  ~18 TFLOPS alone) and the expert GEMMs, a third of the chunk each. The slowest rank (2) sets the chunk. The
+  indexer's batches shrink to 512 rows at a 256k `max_ctx` (512 MiB scratch).
 - **The decode gap** (1.27–1.30× at 1 row after the 2026-10-14 pass, ~1.29× on undisturbed ranks; G4's target
   1.25×): fewer collectives (merge the x-projection all-gather into the previous all-reduce's epilogue, the
   indexer queries' all-gather into it on full layers), the embedding all-gather onto the sampler's exchange, the

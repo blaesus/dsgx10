@@ -91,7 +91,10 @@ enum Tune : uint32_t {
   kTuneArRow = 1u << 4,  // the fused all-reduces with one block a row (comm::glm slices = 1)
   kTunePfGemm = 1u << 5,    // prefill: the FP8 projections as attn's gemm(), not 16-row GEMV launches (prefill.cu)
   kTunePfRouter = 1u << 6,  // prefill: the BF16 router as attn's gemm_bf16(), not 16-row GEMV launches
-  kTuneDefault = kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter,
+  // prefill: a chunk's rows in Options::prefill_pieces pieces, each piece's collectives on a stream of their own
+  // while the next piece computes (prefill.cu, docs/engine.md "Prefill overlap")
+  kTunePfOverlap = 1u << 7,
+  kTuneDefault = kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter | kTunePfOverlap,
   kTuneAll = 0xffffffffu,
 };
 
@@ -110,6 +113,9 @@ struct Options {
   bool l2pf = true;      // the paced L2 prefetch of the next weights during collectives and attention
   int drafts = 0;        // MTP draft passes after each step's sample, 0..kMaxDrafts (0: no MTP work at all)
   int prefill_rows = 8192;  // rows a prefill chunk, at most (<= kMaxChunk)
+  int prefill_pieces = 2;   // kTunePfOverlap: pieces a chunk (1-8), each of a multiple of 64 rows (2: measured best)
+  int prefill_min_piece = 512;  // kTunePfOverlap: rows of a piece at least (chunks of fewer than twice that: one piece)
+  int prefill_comm_blocks = 8;  // kTunePfOverlap: blocks of the overlapped reduce-scatters and all-gathers (1-16)
   int attn_splits = 0;   // sparse attention's split-K at decode (0: 16 up to 2 rows, 8 above)
   size_t index_scratch = 512ull << 20;  // the prefill indexer's score scratch, bytes
 };
