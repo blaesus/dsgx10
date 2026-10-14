@@ -235,22 +235,26 @@ default's at every row count (1 row aa5124b549d4091c, 2 rows 74f6421cf905b042, 4
 ranks). Synthetic weights in the real formats throughout (4 INT4 pools, context 4,096; the real rank files were not
 bound).
 
-### 9.1 Where the shared expert's partial is summed (no contract change)
+### 9.1 Where the shared expert's partial is summed (unchanged; an open contract question)
 
-The task statement allowed the shared expert's partial to join the routed experts' f32 sum. **It does not, in this
-engine, and the fusion does not move it.** DESIGN decision 2 cites glm53's decision 8 ("the weighted outputs of a
-row's eight routed experts and the shared expert are summed in f32 across experts and ranks and rounded to bf16
-once"), but the code of both engines, the CPU reference and glm53's golden data compute
-**y = bf16(bf16(Σ_ranks yr) + bf16(Σ_ranks ys))**: the routed sum and the shared sum are two partials, each
-all-reduced in f32 and rounded once, then added and rounded again (`comm::glm::allreduce2_add_norm`, kTwo:
-`bfround(bfround(v) + bfround(u))`; `gx::finalize` "as the reference adds the shared expert"; prefill's
-`sublayer_end` takes `p.yr` and `p.ys` the same way). Folding ys into yr would change outputs against the
-reference and against prefill. So the fused kernels still write **ys as its own f32 partial** (k_down, posted into
-the all-reduce's send buffer beside yr, as glm53's fused FP8 path did), and decode's ys equals the two GEMVs'
-bit for bit (§ 9.2). Prefill is unchanged: its shared expert is still `gemm()` at split-K 4 / 1 into `p.ys`, which
-equals the GEMV by attn's test P; `check6` shows decode = prefill in all 79 caches with the fused path (§ 9.4).
-The wording of decision 8 ("and the shared expert") is looser than the code; it is the code's order that the
-golden data pins.
+The task allowed the shared expert's partial to join the routed experts' f32 sum. **The fusion does not move it:**
+the engine's existing order is kept. Both engines compute **y = bf16(bf16(Σ_ranks yr) + bf16(Σ_ranks ys))**: the
+routed sum and the shared sum are two partials, each all-reduced in f32 and rounded, then added and rounded again
+(`comm::glm::allreduce2_add_norm`, kTwo: `bfround(bfround(v) + bfround(u))`; `gx::finalize`; prefill's
+`sublayer_end` takes `p.yr` and `p.ys` the same way). So the fused kernels still write **ys as its own f32
+partial** (k_down, posted into the all-reduce's send buffer beside yr, as glm53's fused FP8 path did), and decode's
+ys equals the two GEMVs' bit for bit (§ 9.2). Prefill is unchanged: its shared expert is still `gemm()` at split-K
+4 / 1 into `p.ys`, equal to the GEMV by attn's test P; `check6` shows decode = prefill in all 79 caches with the
+fused path (§ 9.4).
+
+**Open, found while writing this:** reference.md (A1, merged 2026-10-14) names `--combine f32` the contract
+(glm53 DESIGN decision 8: routed experts and the shared expert summed in f32 and rounded once with the residual),
+and `--combine bf16` transformers' order (the shared expert and the residual added in bf16). For the MoE output the
+engine's kTwo is the bf16 order's shared add, not decision 8's. This predates the tuning (A4's runner, glm53's
+collective) and the tuning keeps it, since every lever here must leave the bits alone. Moving ys into yr's f32 sum
+would be a small change in the fused k_down (add the shared strip after the routed experts in yr's f32 chain) plus
+`allreduce_add_norm` instead of kTwo and the same change in prefill's `sublayer_end`, but it changes outputs: a
+contract decision for the coordinator, to be settled against A1's golden data.
 
 ### 9.2 The fused BF16 shared expert (`gx::SharedW::bgu, bd`; docs/experts.md § 11)
 
