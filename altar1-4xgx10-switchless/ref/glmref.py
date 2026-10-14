@@ -1,20 +1,30 @@
-"""GLM-5.3 layer-streaming CPU reference: the numerics contract (docs/model.md, docs/quantisation.md § 5) as
-torch code, run teacher-forced on the NVFP4 checkpoint, one layer's weights at a time.
+"""altar-1 layer-streaming CPU reference: the numerics contract (DESIGN decision 2, docs/model.md) as torch code,
+run teacher-forced on altar-1's own checkpoint (compressed-tensors INT4 + BF16), one layer's weights at a time.
+A copy of glm53's ref/glmref.py with altar-1's formats; everything not named here is glm53's, line for line.
 
   python3 glmref.py --ckpt CKPT --out-dir OUT --tokens A.tokens.json [B.tokens.json ...] [--threads 8]
+                    [--combine f32|bf16] [--verified SHA256SUMS --wait]
 
 Each tokens file is {"name": ..., "tokens": [...]} (make_tokens.py). All sequences go through each layer
 together, so every layer's weights are read once a pass; each sequence attends only to itself, from
 position 0. The pass is resumable: after every layer the residual stream is checkpointed under
-OUT/state, and a rerun with the same arguments continues from the next layer.
+OUT/state, and a rerun with the same arguments continues from the next layer. With --verified FILE (a
+sha256sum listing of the shards whose SHA-256 equals the revision's manifest) no other shard is opened;
+with --wait the pass sleeps until the shard it needs is listed, so it can run while the checkpoint arrives.
 
-The contract, as implemented here (each line cites the model.md section it follows):
+The contract, as implemented here (each line cites the glm53 model.md section it follows; altar-1's model.md
+gives the deltas):
 - activations are BF16 between operations; every GEMM accumulates in f32 and rounds its output once
-  (§ 2). BF16 weights use torch's bf16 GEMM (f32 accumulation, checked on this CPU).
-- NVFP4 experts (§ 5.2): W' = E2M1(code) · E4M3(block scale), exact in bf16 and f32; the per-tensor
-  weight_scale_2 multiplies the f32 GEMM output before its one rounding: y = bf16(ws2 · Σ x·W'). The
-  FP8 dense MLPs of layers 0-2 (§ 5.3) the same way with their per-tensor weight_scale. No activation
-  quantisation (input_scale is ignored): quantisation.md § 5, level 2.
+  (§ 2). BF16 weights use torch's bf16 GEMM (f32 accumulation, checked on this CPU by glm53's reference).
+- INT4 weights (altar-1 model.md § 4): the routed experts and q_b_proj, kv_b_proj, o_proj of layers 4-76 are
+  compressed-tensors pack-quantized (group 32 along K, asymmetric). The weight is the library's own
+  dequantisation, W = bf16_rne((q - z) * s): q = nibble - 8 (weight_packed I32 [N, K/8], k = 8j + i at bits
+  4i), z = nibble - 8 (weight_zero_point I32 [N/8, K/32], row n = 8w + i at bits 4i), s = weight_scale BF16
+  [N, K/32], computed with the library's ops in its order (int8 -> bf16, bf16 subtract, bf16 multiply:
+  compressed_tensors 0.18.0 quantization/lifecycle/forward_helpers.py _dequantize, lines 562-567), checked
+  equal on every value against compressed_tensors' PackedQuantizationCompressor.decompress (check_int4.py).
+  The dequantised weight is then an ordinary BF16 weight. Everything else is BF16 as shipped: the dense
+  MLPs of layers 0-2, the 168 experts of layers 3, 77 and the MTP layer 78, all other projections.
 - RMSNorm: f32 normalisation, cast to bf16, then a bf16 weight multiply (§ 2.2); eps 1e-5, 1e-6 for the
   two latent norms.
 - RoPE interleaved, bf16 arithmetic with bf16 cos/sin, output de-interleaved (§ 2.4.1).
@@ -24,15 +34,16 @@ The contract, as implemented here (each line cites the model.md section it follo
 - Indexer: q, k bf16 (k through a LayerNorm with bias), RoPE on the first 64; f32 scores, ReLU, f32 head
   weights from an f32 GEMM of fp32(x); top-2048 by torch.topk (ties unspecified, § 2.5). Shared layers
   reuse the last full layer's sets.
-- Router in f32, bias for selection only, top-8 (taken sorted), weights renormalised × 2.5 (§ 2.7).
-- Sublayer outputs (--combine f32, the default and the contract): o_proj, the dense MLP's down projection,
-  each routed expert's down projection (× its f32 weight) and the shared expert's down projection stay f32;
-  they are summed in f32 (routed experts in expert-id order, then the shared expert) and rounded once, as
-  bf16(f32(h) + sum), when added to the residual. This is the TP=4 engine's order: each rank holds f32 partial
-  sums that are all-reduced before any rounding. --combine bf16 is transformers' order instead (each GEMM
-  output rounded to bf16; routed experts weighted and summed in f32, rounded; shared expert and residual
-  added in bf16).
-- Logits are kept in f32 (bf16 hidden × bf16 head, f32 accumulation, no output rounding); transformers'
+- Router in f32 over 168 experts, bias for selection only, top-8 (taken sorted), weights renormalised x 2.5
+  (§ 2.7; altar-1 model.md § 6).
+- Sublayer outputs (--combine f32, the default and the contract, glm53 DESIGN decision 8): o_proj, the dense
+  MLP's down projection, each routed expert's down projection (x its f32 weight) and the shared expert's down
+  projection stay f32; they are summed in f32 (routed experts in expert-id order, then the shared expert) and
+  rounded once, as bf16(f32(h) + sum), when added to the residual. This is the TP=4 engine's prefill order.
+  --combine bf16 is transformers' order instead (each GEMM output rounded to bf16; routed experts weighted
+  and summed in f32, rounded; shared expert and residual added in bf16). Both are one forward from position
+  0 (prefill); the engine's decode sums a strip's K in another order by default (glm53 DESIGN decision 11).
+- Logits are kept in f32 (bf16 hidden x bf16 head, f32 accumulation, no output rounding); transformers'
   bf16 logits are bf16() of them up to summation order.
 - MTP (§ 3): e = enorm(embed(token t+1)) (zeroed at position 0), g = hnorm(post-final-norm hidden of row t),
   eh_proj(cat(e, g)), decoder layer 78 with its own indexer and BF16 experts at position t,
@@ -41,7 +52,6 @@ The contract, as implemented here (each line cites the model.md section it follo
 import argparse
 import json
 import os
-import shutil
 import struct
 import sys
 import threading
@@ -54,41 +64,84 @@ import torch.nn.functional as F
 
 BF16, F32 = torch.bfloat16, torch.float32
 
-# Dimensions (docs/model.md § 1); checked against config.json at start.
+# Dimensions (glm53 docs/model.md § 1; altar-1 model.md § 2); checked against config.json at start.
 D, NH, RQ, RKV, DN, DR, DQK, DV = 6144, 64, 2048, 512, 192, 64, 256, 256
 NI, DI, TOPK = 32, 128, 2048
-NE, K8, DFF = 256, 8, 2048
+NE, K8, DFF = 168, 8, 2048
 NL, MTP = 78, 78
 VOCAB = 154880
 ROUTE_SCALE = 2.5
 ATT_SCALE = DQK ** -0.5
+GROUP = 32  # INT4 group size along K
 
-ST_DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32, "U8": torch.uint8, "F8_E4M3": torch.float8_e4m3fn}
+ST_DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32, "U8": torch.uint8, "F8_E4M3": torch.float8_e4m3fn,
+             "I32": torch.int32, "I64": torch.int64}
 
-# E2M1 codes: bit 3 the sign, bits 0-2 index the magnitudes (model.md § 5.2).
+# E2M1 codes (the NVFP4 MTP-experts option only): bit 3 the sign, bits 0-2 index the magnitudes.
 E2M1 = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=F32)
-# One packed byte -> its two values: low nibble = even k, high nibble = odd k.
 NIB_LUT = torch.stack([E2M1[torch.arange(256) & 15], E2M1[torch.arange(256) >> 4]], dim=1)  # [256, 2] f32
+SHIFTS = torch.arange(0, 32, 4, dtype=torch.int32)  # nibble i of an int32 word at bits 4i
 
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+# ---------------------------------------------------------------------------------------------- INT4
+
+def unpack_nibbles(words):
+    """I32 [..., W] -> int32 [..., W, 8]: nibble i of each word (bits 4i..4i+3), lowest first, 0..15."""
+    return (words.unsqueeze(-1) >> SHIFTS) & 15
+
+
+def int4_dequant(packed, scale, zp):
+    """compressed-tensors pack-quantized INT4, group 32, asymmetric -> the BF16 weight [N, K], as the library
+    computes it (altar-1 model.md § 4.2): x_q = nibble - 8 (int8), z = nibble - 8 (int8, packed along N),
+    W = (x_q.to(bf16) - z.to(bf16)) * scale, in bf16 (one rounding, of the product)."""
+    N, K = packed.shape[0], packed.shape[1] * 8
+    G = scale.shape[1]
+    assert scale.dtype == BF16 and scale.shape[0] == N and K == G * GROUP, (packed.shape, scale.shape)
+    assert zp.shape == (N // 8, G), (zp.shape, N, G)
+    xq = (unpack_nibbles(packed).reshape(N, G, GROUP) - 8).to(torch.int8)
+    z = (unpack_nibbles(zp).permute(0, 2, 1).reshape(N, G) - 8).to(torch.int8)       # row 8w + i <- nibble i
+    w = xq.to(BF16) - z.to(BF16).unsqueeze(-1)
+    w = w * scale.unsqueeze(-1)
+    return w.reshape(N, K)
+
+
 # ---------------------------------------------------------------------------------------------- checkpoint
 
 class Ckpt:
-    """Tensors by name with plain preads (no mmap, so nothing stays in RSS), page cache dropped after."""
+    """Tensors by name with plain preads (no mmap, so nothing stays in RSS), page cache dropped after.
+    verified: a sha256sum listing; only shards named in it are opened (wait: poll for them)."""
 
-    def __init__(self, root):
+    def __init__(self, root, index=None, verified=None, wait=False):
         self.root = root
-        with open(os.path.join(root, "model.safetensors.index.json")) as f:
+        with open(index or os.path.join(root, "model.safetensors.index.json")) as f:
             self.map = json.load(f)["weight_map"]
         self.shards, self.lock = {}, threading.Lock()
+        self.verified, self.wait = verified, wait
+
+    def _ok(self, fname):
+        if self.verified is None:
+            return True
+        try:
+            with open(self.verified) as f:
+                return any(line.split()[-1].lstrip("*") == fname for line in f if line.strip())
+        except FileNotFoundError:
+            return False
 
     def _shard(self, fname):
         with self.lock:
             if fname not in self.shards:
+                said = False
+                while not self._ok(fname):
+                    if not self.wait:
+                        raise RuntimeError(f"{fname} is not in {self.verified} (SHA-256 not verified yet)")
+                    if not said:
+                        log(f"waiting for {fname} to be verified")
+                        said = True
+                    time.sleep(60)
                 fd = os.open(os.path.join(self.root, fname), os.O_RDONLY)
                 n = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
                 self.shards[fname] = (fd, 8 + n, json.loads(os.pread(fd, n, 8)))
@@ -124,28 +177,29 @@ class Ckpt:
             ov[i] = np.frombuffer(os.pread(fd, width, start + int(r) * width), dtype=np.uint8)
         return out
 
-    def slab(self, name, r0, r1):
-        """Rows r0..r1-1 of a 2-D BF16 tensor, one pread, page cache dropped after."""
-        fd, base, e = self.entry(name)
-        assert e["dtype"] == "BF16"
-        width = e["shape"][1] * 2
-        off = base + e["data_offsets"][0] + r0 * width
-        buf = bytearray((r1 - r0) * width)
-        mv, got = memoryview(buf), 0
-        while got < len(buf):
-            k = os.preadv(fd, [mv[got:]], off + got)
-            if k <= 0:
-                raise IOError(f"short read of {name}")
-            got += k
-        os.posix_fadvise(fd, off, len(buf), os.POSIX_FADV_DONTNEED)
-        return torch.frombuffer(buf, dtype=BF16).view(r1 - r0, e["shape"][1])
-
     def has(self, name):
         return name in self.map
 
+    def is_int4(self, p):
+        """p: a module prefix (no '.weight')."""
+        return self.has(p + ".weight_packed")
 
-def nvfp4_raw(ck, p):
-    return ck.get(p + ".weight"), ck.get(p + ".weight_scale"), float(ck.get(p + ".weight_scale_2"))
+    def int4_raw(self, p):
+        return (self.get(p + ".weight_packed"), self.get(p + ".weight_scale"), self.get(p + ".weight_zero_point"),
+                self.get(p + ".weight_shape"))
+
+    def weight(self, p):
+        """A module's weight as BF16: as stored, or INT4 dequantised by the contract's rule."""
+        if self.is_int4(p):
+            return int4_from_raw(self.int4_raw(p))
+        return self.get(p + ".weight")
+
+
+def int4_from_raw(raw):
+    packed, scale, zp, shape = raw
+    w = int4_dequant(packed, scale, zp)
+    assert list(w.shape) == shape.tolist(), (w.shape, shape)
+    return w
 
 
 def nvfp4_dequant(q, s, s2):
@@ -153,11 +207,6 @@ def nvfp4_dequant(q, s, s2):
     n, k2 = q.shape
     w = NIB_LUT[q.long()].view(n, k2 * 2 // 16, 16) * s.to(F32).unsqueeze(-1)
     return w.view(n, k2 * 2), s2
-
-
-def fp8(ck, p):
-    """FP8 per-tensor weight as (E4M3 values in f32, weight_scale)."""
-    return ck.get(p + ".weight").to(F32), float(ck.get(p + ".weight_scale"))
 
 
 # ---------------------------------------------------------------------------------------------- the math
@@ -169,10 +218,7 @@ def rms_norm(x, w, eps):
 
 
 def linear(x, w):
-    """BF16 weight: bf16 GEMM, f32 accumulation, one rounding. An f32 weight (a quantised non-expert tensor,
-    dequantised: tracks mode) runs as an f32 GEMM with one rounding."""
-    if w.dtype == F32:
-        return F.linear(x.to(F32), w).to(BF16)
+    """BF16 weight: bf16 GEMM, f32 accumulation, one rounding."""
     return F.linear(x, w)
 
 
@@ -185,14 +231,15 @@ COMBINE = "f32"
 
 
 def out_linear(x, w):
-    """A sublayer's last GEMM on a BF16 weight: bf16 output (transformers) or f32 (the contract)."""
+    """A sublayer's last GEMM on a BF16 weight (w may be pre-widened to f32): bf16 output (transformers) or
+    f32 (the contract)."""
     if COMBINE == "f32":
         return F.linear(x.to(F32), w.to(F32))
     return linear(x, w)
 
 
 def out_scaled_linear(x, w32, scale, chunk=4096):
-    """The same for a scaled (NVFP4/FP8) weight."""
+    """The same for a scaled (NVFP4) weight."""
     if COMBINE != "f32":
         return scaled_linear(x, w32, scale, chunk)
     out = torch.empty(x.shape[0], w32.shape[0], dtype=F32)
@@ -233,69 +280,21 @@ def silu_mul(g, u):
 
 
 class LayerW:
-    """One layer's non-expert weights, read on demand."""
+    """One layer's non-expert weights, read on demand: `name` is the checkpoint's name of a BF16 tensor; a
+    '.weight' that the checkpoint stores INT4 is dequantised (once a layer, cached)."""
 
-    def __init__(self, ck, l, quant=None, cache=None):
+    def __init__(self, ck, l):
         self.ck, self.p = ck, f"model.layers.{l}"
-        self.quant = quant or {}          # tracks mode: weight name -> "fp8b" | "nvfp4"
-        self.cache = cache if cache is not None else {}
+        self.cache = {}
 
     def __call__(self, name):
-        fmt = self.quant.get(name)
-        if fmt is None:
-            return self.ck.get(f"{self.p}.{name}")
-        key = (self.p, name, fmt)
-        if key not in self.cache:
-            self.cache[key] = quantise_nonexpert(self.ck.get(f"{self.p}.{name}"), fmt)
-        return self.cache[key]
-
-
-def fp8_block(w):
-    """zai's FP8 release, recomputed from the BF16 master: per 128x128 block, scale = amax * f32(1/448)
-    (checked equal to the release's weight_scale_inv on 4 tensors, 100 %), codes e4m3(w / scale) (checked
-    equal to the release's codes, quantisation.md § 3.0). Returns the dequantised values in f32 (code ×
-    scale rounded once to f32)."""
-    w = w.to(F32)
-    R, C = w.shape
-    pr, pc = -R % 128, -C % 128
-    wp = F.pad(w, (0, pc, 0, pr))
-    blk = wp.reshape((R + pr) // 128, 128, (C + pc) // 128, 128)
-    sc = blk.abs().amax(dim=(1, 3), keepdim=True) * torch.tensor(1 / 448, dtype=F32)
-    q = (blk / torch.where(sc == 0, torch.ones_like(sc), sc)).to(torch.float8_e4m3fn).to(F32)
-    return (q * sc).reshape(R + pr, C + pc)[:R, :C].contiguous()
-
-
-def quantise_nonexpert(w, fmt):
-    if fmt == "fp8b":
-        return fp8_block(w)
-    if fmt == "nvfp4":
-        pk = quant_formats().nvfp4_rtn(w.to(F32))
-        wq, s2 = nvfp4_dequant(torch.from_numpy(pk["weight"]),
-                               torch.from_numpy(pk["weight_scale"]).view(torch.float8_e4m3fn),
-                               float(pk["weight_scale_2"]))
-        return wq * s2
-    raise ValueError(fmt)
-
-
-# Non-expert precision presets for tracks mode (--track ne:NAME). "fp8": DESIGN decision 2, zai's FP8 values
-# for the attention, indexer and shared-expert linears (the dense MLPs of layers 0-2 stay the checkpoint's
-# per-tensor FP8 in every track, the routers, norms, indexer weights_proj, embedding and head as shipped);
-# the others put some of them at NVFP4 round-to-nearest (NVIDIA's recipe, quant/formats.py nvfp4_rtn).
-NE_FP8 = ["self_attn.q_a_proj.weight", "self_attn.q_b_proj.weight", "self_attn.kv_a_proj_with_mqa.weight",
-          "self_attn.kv_b_proj.weight", "self_attn.o_proj.weight", "self_attn.indexer.wq_b.weight",
-          "self_attn.indexer.wk.weight", "mlp.shared_experts.gate_proj.weight", "mlp.shared_experts.up_proj.weight",
-          "mlp.shared_experts.down_proj.weight"]
-NE_NVFP4 = {"fp8": [], "o4": ["self_attn.o_proj.weight"],
-            "oqk4": ["self_attn.o_proj.weight", "self_attn.q_b_proj.weight", "self_attn.kv_b_proj.weight"],
-            "oqks4": ["self_attn.o_proj.weight", "self_attn.q_b_proj.weight", "self_attn.kv_b_proj.weight",
-                      "mlp.shared_experts.gate_proj.weight", "mlp.shared_experts.up_proj.weight",
-                      "mlp.shared_experts.down_proj.weight"]}
-
-
-def ne_preset(name):
-    q = {n: "fp8b" for n in NE_FP8}
-    q.update({n: "nvfp4" for n in NE_NVFP4[name]})
-    return q
+        full = f"{self.p}.{name}"
+        if self.ck.has(full):
+            return self.ck.get(full)
+        assert name.endswith(".weight") and self.ck.is_int4(full[:-7]), full
+        if name not in self.cache:
+            self.cache[name] = self.ck.weight(full[:-7])
+        return self.cache[name]
 
 
 def indexer_topk(x, cq, W, cos, sin, block):
@@ -330,7 +329,7 @@ def indexer_topk(x, cq, W, cos, sin, block):
 
 
 def attention(x, W, full, prev_topk, cos, sin, args):
-    """MLA over one sequence (positions 0..S-1). Returns (out [S, D] bf16, topk, margin)."""
+    """MLA over one sequence (positions 0..S-1). Returns (out [S, D] bf16 or f32, topk, margin)."""
     S = x.shape[0]
     cq = rms_norm(linear(x, W("self_attn.q_a_proj.weight")), W("self_attn.q_a_layernorm.weight"), 1e-6)
     q = linear(cq, W("self_attn.q_b_proj.weight")).view(S, NH, DQK)
@@ -378,75 +377,46 @@ def attention(x, W, full, prev_topk, cos, sin, args):
     return out, topk, margin
 
 
-def dense_mlp(x, W):
-    """Layers 0-2: FP8 per-tensor weights, intermediate 12288."""
-    g, sg = fp8(W.ck, W.p + ".mlp.gate_proj")
-    u, su = fp8(W.ck, W.p + ".mlp.up_proj")
-    d, sd = fp8(W.ck, W.p + ".mlp.down_proj")
+def bf16_mlp(x, W, p, chunk=2048):
+    """A BF16 SwiGLU MLP (the dense MLPs of layers 0-2, intermediate 12288; the shared experts), over row
+    chunks so the intermediate stays small. Row chunking changes no bit (glm53 reference § 6.5)."""
+    g, u, d = W(p + ".gate_proj.weight"), W(p + ".up_proj.weight"), W(p + ".down_proj.weight")
+    if COMBINE == "f32":
+        d = d.to(F32)
     out = torch.empty(x.shape, dtype=F32 if COMBINE == "f32" else BF16)
-    for i in range(0, x.shape[0], 2048):
-        xi = x[i:i + 2048]
-        h = silu_mul(scaled_linear(xi, g, sg), scaled_linear(xi, u, su))
-        out[i:i + 2048] = out_scaled_linear(h, d, sd)
+    for i in range(0, x.shape[0], chunk):
+        xi = x[i:i + chunk]
+        out[i:i + chunk] = out_linear(silu_mul(linear(xi, g), linear(xi, u)), d)
     return out
-
-
-def bf16_mlp(x, W, p):
-    return out_linear(silu_mul(linear(x, W(p + ".gate_proj.weight")), linear(x, W(p + ".up_proj.weight"))),
-                  W(p + ".down_proj.weight"))
 
 
 # ---------------------------------------------------------------------------------------------- expert sources
 # A source gives one routed expert's weights in two steps: load(e) only reads (it runs on the I/O threads),
-# prepare(raw) converts on the compute thread and returns ("scaled", (g, sg), (u, su), (d, sd)) with exact f32
-# values and a per-tensor scale, or ("bf16", g, u, d).
+# prepare(raw) converts on the compute thread and returns ("bf16", g, u, d), or ("scaled", (g, sg), (u, su),
+# (d, sd)) with exact f32 values and a per-tensor scale (the NVFP4 MTP option).
 
 class CkptExperts:
-    """The checkpoint's own experts: NVFP4 for layers 3-77, BF16 for the MTP layer."""
+    """The checkpoint's own experts, by the tensors' names: INT4 (weight_packed) on layers 4-76, BF16 on 3, 77
+    and the MTP layer 78."""
 
     def __init__(self, ck, l):
-        self.ck, self.p, self.quantised = ck, f"model.layers.{l}.mlp.experts", l != MTP
-
-    def load(self, e):
-        if self.quantised:
-            return [nvfp4_raw(self.ck, f"{self.p}.{e}.{m}_proj") for m in ("gate", "up", "down")]
-        return [self.ck.get(f"{self.p}.{e}.{m}_proj.weight") for m in ("gate", "up", "down")]
-
-    def prepare(self, raw):
-        if self.quantised:
-            return ("scaled", *[nvfp4_dequant(*t) for t in raw])
-        return ("bf16", *raw)
-
-
-class MasterExperts:
-    """BF16 master experts from fetch_master.py's directory (tensors/<name>.bin, raw little-endian bf16)."""
-
-    SHAPES = {"gate": (DFF, D), "up": (DFF, D), "down": (D, DFF)}
-
-    def __init__(self, root, l):
-        self.root, self.p = root, f"model.layers.{l}.mlp.experts"
-
-    @staticmethod
-    def available(root, l):
-        return os.path.exists(os.path.join(root, "tensors", f"model.layers.{l}.mlp.experts.255.down_proj.weight.bin"))
+        self.ck, self.p = ck, f"model.layers.{l}.mlp.experts"
 
     def load(self, e):
         out = []
         for m in ("gate", "up", "down"):
-            path = os.path.join(self.root, "tensors", f"{self.p}.{e}.{m}_proj.weight.bin")
-            with open(path, "rb") as f:
-                buf = bytearray(f.read())
-            os.posix_fadvise(os.open(path, os.O_RDONLY), 0, 0, os.POSIX_FADV_DONTNEED)
-            out.append(torch.frombuffer(buf, dtype=BF16).view(*self.SHAPES[m]))
+            p = f"{self.p}.{e}.{m}_proj"
+            out.append(("int4", self.ck.int4_raw(p)) if self.ck.is_int4(p) else ("bf16", self.ck.get(p + ".weight")))
         return out
 
     def prepare(self, raw):
-        return ("bf16", *raw)
+        return ("bf16", *[int4_from_raw(t) if k == "int4" else t for k, t in raw])
 
 
 def quant_formats():
-    """The quantiser's formats (../quant/formats.py), imported on first use."""
-    qdir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "quant")
+    """glm53's quantiser formats (glm53-4xgx10-switchless/quant/formats.py, for nvfp4_rtn), imported on use."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    qdir = os.path.join(os.path.dirname(os.path.dirname(here)), "glm53-4xgx10-switchless", "quant")
     if qdir not in sys.path:
         sys.path.insert(0, qdir)
     import formats
@@ -466,11 +436,11 @@ def requantise(fmt, g, u, d):
                                      torch.from_numpy(pk["weight_scale"]).view(torch.float8_e4m3fn),
                                      float(pk["weight_scale_2"])))
         return ("scaled", *out)
-    raise ValueError(f"format {fmt}: not wired yet (only nvfp4_rtn until docs/quantiser.md names the others)")
+    raise ValueError(f"format {fmt}: only nvfp4_rtn")
 
 
 class FormatExperts:
-    """A base source's experts (BF16: the master or the MTP layer) requantised on the fly into `fmt`."""
+    """A BF16 source's experts (the MTP layer's) requantised on the fly into `fmt` (DESIGN decision 5's lever)."""
 
     def __init__(self, base, fmt):
         self.base, self.fmt = base, fmt
@@ -484,67 +454,14 @@ class FormatExperts:
         return requantise(self.fmt, *w)
 
 
-# The quantiser's formats from qprep.py's cache (tracks mode, --qcache). A format name, optionally with the
-# suffix "/sub": the format only on --sub-experts, nvfp4_rtn (NVIDIA's recipe) on the others.
-#   s3x2gu_nvfp4d  gate and up S3x2 (e2m1sub3x2_g16), down nvfp4_rtn (its own amax)
-#   s3x2           all three S3x2
-#   k3, k4         all three trellis K3 / K4 (exllamav3's code, data-free; dequantised f32, scale 1)
-QFORMATS = {"s3x2gu_nvfp4d": ("e2m1sub3x2_g16", "e2m1sub3x2_g16", "nvfp4"),
-            "s3x2": ("e2m1sub3x2_g16",) * 3, "k3": ("trellis_k3",) * 3, "k4": ("trellis_k4",) * 3}
-
-
-class CachedFormatExperts:
-    """The master's experts in one of QFORMATS, read from qprep.py's cache; nvfp4_rtn for experts outside `only`."""
-
-    def __init__(self, master, qcache, l, fmt, only=None):
-        self.m, self.l, self.only = master, l, only
-        self.parts = QFORMATS[fmt]
-        self.root = os.path.join(os.path.expanduser(qcache), f"L{l}")
-
-    def load(self, e):
-        if self.only is not None and e not in self.only:
-            return ("master", self.m.load(e))
-        out = []
-        need_master = "nvfp4" in self.parts
-        bf = self.m.load(e) if need_master else None
-        for i, (m, f) in enumerate(zip(("gate", "up", "down"), self.parts)):
-            if f == "nvfp4":
-                out.append(("nvfp4", bf[i]))
-            elif f.startswith("e2m1"):
-                z = np.load(os.path.join(self.root, f, f"{e}.{m}.npz"))
-                out.append(("s3", torch.from_numpy(z["v2"]), torch.from_numpy(z["sc8"]), float(z["s2"])))
-            else:
-                out.append(("f32", torch.from_numpy(np.load(os.path.join(self.root, f, f"{e}.{m}.npy")))))
-        return ("cached", out)
-
-    def prepare(self, raw):
-        kind, data = raw
-        if kind == "master":
-            return requantise("nvfp4_rtn", *data)
-        fm = quant_formats()
-        res = []
-        for t in data:
-            if t[0] == "nvfp4":
-                pk = fm.nvfp4_rtn(t[1].to(F32))
-                res.append(nvfp4_dequant(torch.from_numpy(pk["weight"]),
-                                         torch.from_numpy(pk["weight_scale"]).view(torch.float8_e4m3fn),
-                                         float(pk["weight_scale_2"])))
-            elif t[0] == "s3":     # (E2M1 level x e4m3 group scale), exact in f32; s2 applied after the GEMM
-                v2, sc8, s2 = t[1], t[2], t[3]
-                R = v2.shape[0]
-                w = ((v2.to(F32) / 2).view(R, -1, 16) * sc8.view(torch.float8_e4m3fn).to(F32).unsqueeze(-1)).view(R, -1)
-                res.append((w, s2))
-            else:
-                res.append((t[1], 1.0))
-        return ("scaled", *res)
-
-
-def moe(x, W, l, pool, src=None, hook=None):
-    """Routed experts + shared expert. Returns (out bf16, routing record, calibration sums)."""
+def moe(x, W, l, pool, src=None):
+    """Routed experts + shared expert. Returns (out, routing record, calibration sums)."""
     N = x.shape[0]
     logits = F.linear(x.to(F32), W("mlp.gate.weight").to(F32))
     s = logits.sigmoid()
-    sel = s + W("mlp.gate.e_score_correction_bias")
+    bias = W("mlp.gate.e_score_correction_bias")
+    assert bias.dtype == F32 and bias.shape == (NE,), (bias.dtype, bias.shape)
+    sel = s + bias
     idx = sel.topk(K8, dim=-1, sorted=True).indices                                       # [N, 8]
     eighth = sel.gather(1, idx[:, -1:]).squeeze(1)
     margin = eighth - sel.scatter(1, idx, float("-inf")).max(dim=1).values
@@ -582,8 +499,6 @@ def moe(x, W, l, pool, src=None, hook=None):
             g, u, d = wts
             h = silu_mul(linear(xe, g), linear(xe, u))
             y = out_linear(h, d)
-        if hook is not None:
-            hook(e, xe)
         we = w[r, k]
         acc.index_add_(0, r, y.to(F32) * we[:, None])
         cnt[e] = len(r)
@@ -605,14 +520,27 @@ def moe(x, W, l, pool, src=None, hook=None):
 
 # ---------------------------------------------------------------------------------------------- driver
 
+def check_config(cfg):
+    assert (cfg["hidden_size"], cfg["num_hidden_layers"], cfg["n_routed_experts"], cfg["index_topk"],
+            cfg["q_lora_rank"], cfg["kv_lora_rank"], cfg["vocab_size"], cfg["num_experts_per_tok"],
+            cfg["routed_scaling_factor"], cfg["n_group"], cfg["first_k_dense_replace"]) == \
+        (D, NL, NE, TOPK, RQ, RKV, VOCAB, K8, ROUTE_SCALE, 1, 3), "config differs from altar-1's"
+    q = cfg["quantization_config"]
+    assert q["format"] == "pack-quantized", q["format"]
+    for g in q["config_groups"].values():
+        wq = g["weights"]
+        assert (wq["num_bits"], wq["group_size"], wq["symmetric"], wq["strategy"], wq["type"]) == \
+            (4, GROUP, False, "group", "int"), wq
+        assert g.get("input_activations") is None
+
+
 class Run:
     def __init__(self, args):
         self.args = args
-        self.ck = Ckpt(args.ckpt)
+        self.ck = Ckpt(args.ckpt, args.index, args.verified, args.wait)
         with open(os.path.join(args.ckpt, "config.json")) as f:
             cfg = json.load(f)
-        assert (cfg["hidden_size"], cfg["num_hidden_layers"], cfg["n_routed_experts"], cfg["index_topk"],
-                cfg["q_lora_rank"], cfg["kv_lora_rank"], cfg["vocab_size"]) == (D, NL, NE, TOPK, RQ, RKV, VOCAB)
+        check_config(cfg)
         self.full = [t == "full" for t in cfg["indexer_types"]]
         self.out = args.out_dir
         self.state = os.path.join(self.out, "state")
@@ -623,8 +551,11 @@ class Run:
             with open(path) as f:
                 t = json.load(f)
             ids = t["tokens"]
+            if args.max_tokens:
+                ids = ids[:args.max_tokens]
             assert len(ids) <= 65536, "index sets are stored as uint16"
-            self.seqs.append({"name": t["name"], "off": off, "n": len(ids), "ids": ids})
+            self.seqs.append({"name": t["name"] + (f"{len(ids)}" if args.max_tokens and len(ids) < len(t["tokens"]) else ""),
+                              "off": off, "n": len(ids), "ids": ids})
             off += len(ids)
         self.N = off
         self.ids = torch.tensor([i for s in self.seqs for i in s["ids"]], dtype=torch.int64)
@@ -645,9 +576,13 @@ class Run:
         return torch.tensor(rows, dtype=torch.int64)
 
     def write_manifest(self):
-        m = {"ckpt": os.path.basename(os.path.normpath(self.args.ckpt)),
+        m = {"ckpt": os.path.basename(os.path.normpath(self.args.ckpt)), "model": "AikidoSec/altar-1",
              "sequences": [{k: s[k] for k in ("name", "off", "n")} for s in self.seqs],
-             "rows": self.N, "contract": "glmref.py docstring", "combine": COMBINE, "files": FILES}
+             "rows": self.N, "contract": "glmref.py docstring", "combine": COMBINE,
+             "order": ("prefill, one forward from position 0; --combine " + COMBINE +
+                       (" (the contract: f32 sublayer sums, one rounding)" if COMBINE == "f32" else
+                        " (transformers: per-GEMM bf16 rounding)")),
+             "files": FILES}
         with open(os.path.join(self.out, "manifest.json"), "w") as f:
             json.dump(m, f, indent=1)
         np.save(os.path.join(self.out, "tokens.npy"), self.ids.to(torch.int32).numpy())
@@ -687,11 +622,11 @@ class Run:
         return sets
 
     # -- one decoder layer over all sequences
-    def layer(self, l, h, prev, seqs, src=None, quant=None, cache=None, hook=None):
-        W = LayerW(self.ck, l, quant, cache)
+    def layer(self, l, h, prev, seqs, src=None):
+        W = LayerW(self.ck, l)
         t0 = time.time()
         x = rms_norm(h, W("input_layernorm.weight"), 1e-5)
-        a = torch.empty_like(h)
+        a = torch.empty(h.shape, dtype=F32 if COMBINE == "f32" else BF16)
         topk, saved = {}, {}
         for s in seqs:
             r0, n = s["off"], s["n"]
@@ -707,9 +642,9 @@ class Run:
         x = rms_norm(h, W("post_attention_layernorm.weight"), 1e-5)
         route = calib = None
         if l < 3:
-            m = dense_mlp(x, W)
+            m = bf16_mlp(x, W, "mlp")
         else:
-            m, route, calib = moe(x, W, l, self.pool, src, hook)
+            m, route, calib = moe(x, W, l, self.pool, src)
         h = add_residual(h, m)
         del m, x
         return h, topk, saved, route, calib, t_att, time.time() - t0
@@ -729,10 +664,11 @@ class Run:
             json.dump(times, f)
 
     def head_outputs(self, hn, rows_next, d, full_rows):
-        """Logits in f32 from the normed hidden: top-20 logprobs, lse, the next token's logprob, and
-        the full logits at full_rows (indices into hn)."""
+        """Logits in f32 from the normed hidden: top-20 logprobs, lse, the next token's logprob, and the full
+        logits at full_rows (indices into hn). The head stays BF16 in memory (1.9 GB) and is widened to f32 a
+        vocabulary slab at a time (glm53 held it all in f32: 10.9 GiB peak)."""
         os.makedirs(d, exist_ok=True)
-        Wh = self.ck.get("lm_head.weight").to(F32)
+        Wh = self.ck.get("lm_head.weight")
         n = hn.shape[0]
         top_i = np.empty((n, 20), np.int32)
         top_lp = np.empty((n, 20), np.float32)
@@ -740,19 +676,24 @@ class Run:
         nxt = np.full(n, np.nan, np.float32)
         full = np.empty((len(full_rows), VOCAB), np.float32)
         fr = {int(r): j for j, r in enumerate(full_rows)}
-        for i in range(0, n, 1024):
-            lg = F.linear(hn[i:i + 1024].to(F32), Wh)                                     # [B, V] f32
+        B, C = 1024, 16384
+        for i in range(0, n, B):
+            xb = hn[i:i + B].to(F32)
+            lg = torch.empty(xb.shape[0], VOCAB, dtype=F32)
+            for v0 in range(0, VOCAB, C):
+                lg[:, v0:v0 + C] = F.linear(xb, Wh[v0:v0 + C].to(F32))                    # [B, V] f32
             ls = torch.logsumexp(lg, dim=-1)
             tv, ti = lg.topk(20, dim=-1)
-            top_i[i:i + 1024] = ti.numpy()
-            top_lp[i:i + 1024] = (tv - ls[:, None]).numpy()
-            lse[i:i + 1024] = ls.numpy()
+            top_i[i:i + B] = ti.numpy()
+            top_lp[i:i + B] = (tv - ls[:, None]).numpy()
+            lse[i:i + B] = ls.numpy()
             for j in range(lg.shape[0]):
                 t = int(rows_next[i + j])
                 if t >= 0:
                     nxt[i + j] = float(lg[j, t] - ls[j])
                 if i + j in fr:
                     full[fr[i + j]] = lg[j].numpy()
+            del lg
         del Wh
         np.save(os.path.join(d, "top20_ids.npy"), top_i)
         np.save(os.path.join(d, "top20_logprobs.npy"), top_lp)
@@ -768,11 +709,9 @@ class Run:
         self.rope, self.rope_s = rope_tables(nmax)
         if a.mtp_from:
             return self.run_mtp_from()
-        if a.track:
-            return self.run_tracks()
         prog = self.progress()
-        if prog["next"] != 0:  # a resume must keep the run's rounding order (runs before --combine were bf16)
-            assert prog.get("combine", "bf16") == COMBINE, f"this run used --combine {prog.get('combine', 'bf16')}"
+        if prog["next"] != 0:  # a resume must keep the run's rounding order
+            assert prog.get("combine") == COMBINE, f"this run used --combine {prog.get('combine')}"
         nxt = prog["next"]
         last = a.layers if a.layers is not None else NL
         if nxt == 0:
@@ -786,19 +725,19 @@ class Run:
         t_pass = time.time()
         if isinstance(nxt, int):
             for l in range(nxt, last):
-                hook = self.cov_hook(l) if a.cov_out and l in a.cov_layers else None
-                h, topk, saved, route, calib, t_att, t_all = self.layer(l, h, prev, self.seqs, None, hook=hook)
+                h, topk, saved, route, calib, t_att, t_all = self.layer(l, h, prev, self.seqs, None)
                 prev = topk
                 self.write_layer(l, h, saved, route, calib, {"attention_s": t_att, "layer_s": t_all})
                 self.save_state(l + 1, h=h)
                 log(f"layer {l:2d} {'full' if self.full[l] else 'shared'} {t_all:7.1f} s (attention {t_att:6.1f} s)"
-                    f"  rss {rss_gib():.1f} GiB")
-                if a.cov_out and l >= max(a.cov_layers):
-                    log(f"covariances done (layers {a.cov_layers}); stopping after layer {l}")
-                    return
+                    f"  rss {rss_gib():.1f} GiB  hwm {rss_gib('VmHWM'):.1f} GiB")
+            if last < NL:
+                log(f"stopped after {last} layers (--layers)")
+                return
             nxt = "head"
             hn = rms_norm(h, self.ck.get("model.norm.weight"), 1e-5)
             self.save_state("head", hfinal=hn)
+            del h
         if nxt == "head":
             hn = self.load_state("hfinal")
             t0 = time.time()
@@ -809,45 +748,17 @@ class Run:
             np.save(os.path.join(self.out, "final_hidden_sample.npy"), hn[self.sample].to(F32).numpy())
             argmax = self.head_outputs(hn, nexts, os.path.join(self.out, "final"), full_rows)
             np.save(os.path.join(self.out, "final", "argmax.npy"), argmax)
-            log(f"head {time.time() - t0:.1f} s")
+            log(f"head {time.time() - t0:.1f} s  hwm {rss_gib('VmHWM'):.1f} GiB")
             self.save_state("mtp" if not a.no_mtp else "done")
             nxt = "mtp" if not a.no_mtp else "done"
         if nxt == "mtp":
             self.run_mtp()
             self.save_state("done")
-        log(f"pass done ({time.time() - t_pass:.0f} s this invocation)")
-
-    def cov_hook(self, l):
-        """Experiment 3b: per routed expert of layer l, the second moments of its inputs over the rows routed to
-        it: gate/up input x (the post-attention RMSNorm output) and down input h = silu(x Wg^T) * (x Wu^T) with
-        the BF16 master's weights (bf16 GEMMs, as the reference). Saved for quant/run.py --cov as
-        layer{l}_expert{e}.pt: {'gate_up': f16 [6144, 6144], 'down': f16 [2048, 2048], 'count': rows,
-        'scale': {'gate_up': s, 'down': s}}, each matrix the f32 mean x x^T (f32 GEMM) divided by its largest
-        diagonal entry s (run.py's ratio does not depend on the scale)."""
-        a = self.args
-        m = MasterExperts(os.path.expanduser(a.master), l)
-        d = os.path.expanduser(a.cov_out)
-        os.makedirs(d, exist_ok=True)
-
-        def norm16(S):
-            s = float(S.diagonal().max())
-            return (S / s).to(torch.float16), s
-
-        def hook(e, xe):
-            g, u, _ = m.load(e)
-            xf = xe.to(F32)
-            hm = silu_mul(linear(xe, g), linear(xe, u)).to(F32)
-            n = xe.shape[0]
-            sx, kx = norm16(xf.T @ xf / n)
-            sh, kh = norm16(hm.T @ hm / n)
-            path = os.path.join(d, f"layer{l}_expert{e}.pt")
-            torch.save({"gate_up": sx, "down": sh, "count": n, "scale": {"gate_up": kx, "down": kh}}, path + ".tmp")
-            os.replace(path + ".tmp", path)
-        return hook
+        log(f"pass done ({time.time() - t_pass:.0f} s this invocation)  hwm {rss_gib('VmHWM'):.1f} GiB")
 
     def run_mtp_from(self):
-        """Experiment 5: replay the MTP layer over a finished run's final hidden states (its state/hfinal.pt),
-        with the MTP experts from --mtp-experts. The run's final/ is linked in for the comparisons."""
+        """Replay the MTP layer over a finished run's final hidden states (its state/hfinal.pt), with the MTP
+        experts from --mtp-experts (DESIGN decision 5's lever). The run's final/ is linked in for comparisons."""
         a = self.args
         src_ids = np.load(os.path.join(a.mtp_from, "tokens.npy"))
         assert np.array_equal(src_ids, self.ids.numpy()), "--mtp-from run has other tokens"
@@ -858,238 +769,6 @@ class Run:
         src = None if a.mtp_experts == "bf16" else FormatExperts(CkptExperts(self.ck, MTP), a.mtp_experts)
         self.run_mtp(hn, src)
         log("MTP replay done")
-
-    def run_tracks(self):
-        """Experiment 3: carry a master track and one track per --track FORMAT@LAYERS through the pass.
-        Master track: BF16 master experts where --master has the layer, the checkpoint's NVFP4 elsewhere.
-        A format track: at its layers that the master has, the master's experts requantised into FORMAT;
-        everywhere else the master track's experts. Reports per layer the hidden-state difference and the
-        routing-set agreement against the master track, and at the end KL(master || track) and top-1."""
-        a = self.args
-        mroot = os.path.expanduser(a.master) if a.master else None
-        have = {l for l in range(3, NL) if mroot and MasterExperts.available(mroot, l)}
-        tracks = [("master", None, set())]
-        quant = {"master": None}
-        for t in a.track:
-            if t.startswith("ne:"):                     # non-expert precision preset, experts as the master's
-                tracks.append((t, None, set()))
-                quant[t] = ne_preset(t[3:])
-                continue
-            fmt, _, ls = t.partition("@")
-            lay = have if ls in ("", "all") else {int(x) for x in ls.split(",")} & have
-            tracks.append((t, fmt, lay))
-            quant[t] = None
-        refs = ["master"] + [r for r in a.track_ref if r in quant]
-        log(f"master layers {sorted(have)}; tracks {[(n, sorted(l)) for n, _, l in tracks]}")
-
-        sub = {int(x) for x in a.sub_experts.split(",") if x}
-
-        def source(fmt, lay, l):
-            if l < 3 or l not in have:
-                return None
-            m = MasterExperts(mroot, l)
-            if l not in lay:
-                return m
-            base, _, only = fmt.partition("/")
-            if base in QFORMATS:
-                return CachedFormatExperts(m, a.qcache, l, base, sub if only == "sub" else None)
-            assert not only, fmt
-            return FormatExperts(m, fmt)
-
-        def signature(n, fmt, lay, l):
-            """The weights a track uses at layer l. Two tracks entering layer l with the same state object and the
-            same signature leave it with the same state: it is computed once and shared (never mutated)."""
-            return (repr(quant[n]), fmt if l in lay else None)
-
-        names = [n for n, _, _ in tracks]
-        kind = {n: ("ne" if n.startswith("ne:") else "fmt" if f else "master") for n, f, _ in tracks}
-        lays = {n: frozenset(y) for n, _, y in tracks}
-
-        def applies(r, n):
-            """A reference is compared with the master-relative tracks of its own kind and layer set."""
-            if r == n:
-                return False
-            if r == "master":
-                return True
-            return kind[r] == kind[n] and (kind[r] == "ne" or lays[r] == lays[n])
-        pairs = [(r, n) for r in refs for n in names if applies(r, n)
-                 and not (n in refs and r != "master" and names.index(n) < names.index(r))]
-
-        # Disk-backed states (RSS stays near one track's working set): state/tracks/L<next>/s<k>.pt holds one
-        # distinct state {"H": residual stream bf16 [N, 6144], "prev": the index sets}, and index.json maps
-        # every track to its state, with the report so far. Tracks that enter a layer with the same state and use
-        # the same weights there share the output state: computed once. A kill resumes at the last whole layer.
-        sroot = os.path.join(self.state, "tracks")
-        os.makedirs(sroot, exist_ok=True)
-        tid = {"tracks": [(n, f, sorted(y)) for n, f, y in tracks], "refs": refs, "combine": COMBINE,
-               "tokens": [s["name"] for s in self.seqs], "N": self.N, "sub": sorted(sub), "qcache": a.qcache}
-        cur = os.path.join(sroot, "current.json")
-
-        def sfile(l, k):
-            return os.path.join(sroot, f"L{l}", f"s{k}.pt")
-
-        if os.path.exists(cur):
-            with open(cur) as f:
-                st = json.load(f)
-            assert st["id"] == json.loads(json.dumps(tid)), "state/tracks is from a different track set: new --out-dir"
-            first, smap, report = st["next"], st["map"], st["report"]
-            report["layers"] = {int(k): v for k, v in report["layers"].items()}
-            log(f"resuming tracks at layer {first}")
-        else:
-            report = {"tracks": names, "master_layers": sorted(have), "layers": {}, "final": {}}
-            os.makedirs(os.path.join(sroot, "L0"), exist_ok=True)
-            torch.save({"H": self.ck.rows("model.embed_tokens.weight", self.ids.tolist()), "prev": {}}, sfile(0, 0))
-            first, smap = 0, {n: 0 for n in names}
-        last = a.layers if a.layers is not None else NL
-        for l in range(first, last):
-            t0 = time.time()
-            os.makedirs(os.path.join(sroot, f"L{l + 1}"), exist_ok=True)
-            done, nmap, routes = {}, {}, {}
-            for n, fmt, lay in tracks:
-                key = (smap[n], signature(n, fmt, lay, l))
-                if key not in done:
-                    st = torch.load(sfile(l, smap[n]), weights_only=False)
-                    h, pv, _, rt, _, _, _ = self.layer(l, st["H"], st["prev"], self.seqs,
-                                                       source(fmt, lay, l) if fmt else source(None, set(), l),
-                                                       quant[n], None)
-                    del st
-                    k = len(done)
-                    torch.save({"H": h, "prev": pv}, sfile(l + 1, k))
-                    routes[k] = None if rt is None else rt["route_idx"]
-                    done[key] = k
-                    del h, pv, rt
-                nmap[n] = done[key]
-            km = nmap["master"]
-            hm = torch.load(sfile(l + 1, km), weights_only=False)["H"].to(F32)
-            rel_k = {}
-            for k in set(nmap.values()):
-                hk = hm if k == km else torch.load(sfile(l + 1, k), weights_only=False)["H"].to(F32)
-                rel_k[k] = ((hk - hm).norm(dim=1) / hm.norm(dim=1)).numpy()
-                del hk
-            del hm
-            rl = {}
-            for n in names[1:]:
-                k = nmap[n]
-                r = {"hidden_rel_median": float(np.median(rel_k[k])), "hidden_rel_max": float(rel_k[k].max())}
-                if routes[k] is not None:
-                    r["route_sets_equal"] = float((np.sort(routes[k], 1) == np.sort(routes[km], 1)).all(1).mean())
-                rl[n] = r
-            report["layers"][l] = rl
-            log(f"layer {l:2d} {time.time() - t0:6.1f} s, {len(done)} distinct  " + "  ".join(
-                f"{n}: rel {v['hidden_rel_median']:.2e} routes {v.get('route_sets_equal', 1):.4f}" for n, v in rl.items())
-                + f"  rss {rss_gib():.1f} GiB")
-            with open(os.path.join(self.out, "tracks.json"), "w") as f:
-                json.dump(report, f, indent=1)
-            with open(cur + ".tmp", "w") as f:
-                json.dump({"id": tid, "next": l + 1, "map": nmap, "report": report}, f)
-            os.replace(cur + ".tmp", cur)
-            shutil.rmtree(os.path.join(sroot, f"L{l}"), ignore_errors=True)
-            smap = nmap
-        self.tracks_head(names, refs, pairs, smap, report, lambda k: sfile(last, k))
-
-    def tracks_head(self, names, refs, pairs, smap, report, sfile):
-        """The head on every distinct final state, streamed over row blocks and vocabulary slabs (RSS stays small):
-        f32 logits (as head_outputs), and per row in f64 with online rescaling: each state's logsumexp and
-        argmax; per pair (r, n) KL(r || n) = sum p_r (z_r - z_n) - lse_r + lse_n, the top-1 agreement and the
-        largest |z_n - z_r|."""
-        t0 = time.time()
-        Wn = self.ck.get("model.norm.weight")
-        ks = sorted(set(smap.values()))
-        hdir = os.path.join(self.state, "tracks", "hn")
-        os.makedirs(hdir, exist_ok=True)
-        for k in ks:                       # the normed final states, raw bf16 on disk, read a row block at a time
-            x = rms_norm(torch.load(sfile(k), weights_only=False)["H"], Wn, 1e-5).contiguous()
-            x.view(torch.int16).numpy().tofile(os.path.join(hdir, f"s{k}.bin"))
-            del x
-
-        class Rows:
-            def __init__(self, k):
-                self.path = os.path.join(hdir, f"s{k}.bin")
-
-            def __getitem__(self, sl):
-                w = D_ * 2
-                with open(self.path, "rb") as f:
-                    f.seek(sl.start * w)
-                    buf = bytearray(f.read((sl.stop - sl.start) * w))
-                return torch.frombuffer(buf, dtype=BF16).view(sl.stop - sl.start, D_)
-        D_ = D
-        hn = {k: Rows(k) for k in ks}
-        N, B, C = self.N, 1024, 8192
-        lse = {k: np.empty(N) for k in ks}
-        amx = {k: np.empty(N, np.int64) for k in ks}
-        kl = {p: np.empty(N) for p in pairs}
-        dmax = {p: np.empty(N) for p in pairs}
-        kp = {p: (smap[p[0]], smap[p[1]]) for p in pairs}
-        rk = sorted({smap[r] for r in refs})
-        for i0 in range(0, N, B):
-            i1 = min(N, i0 + B)
-            m = {k: torch.full((i1 - i0,), -float("inf"), dtype=torch.float64) for k in ks}
-            e = {k: torch.zeros(i1 - i0, dtype=torch.float64) for k in ks}
-            am = {k: torch.zeros(i1 - i0, dtype=torch.int64) for k in ks}
-            A = {p: torch.zeros(i1 - i0, dtype=torch.float64) for p in pairs}
-            DM = {p: torch.zeros(i1 - i0, dtype=torch.float64) for p in pairs}
-            xb = {k: hn[k][slice(i0, i1)] for k in ks}                                     # bf16 row blocks
-            for v0 in range(0, VOCAB, C):
-                v1 = min(VOCAB, v0 + C)
-                Wc = self.ck.slab("lm_head.weight", v0, v1).to(F32)
-
-                def update(k, z):
-                    cm, ci = z.max(-1)
-                    am[k] = torch.where(cm > m[k], ci + v0, am[k])     # first index of the maximum overall
-                    mn = torch.maximum(m[k], cm)
-                    sc = torch.exp(m[k] - mn)
-                    e[k] = e[k] * sc + torch.exp(z - mn[:, None]).sum(-1)
-                    m[k] = mn
-                    return sc
-
-                zr = {k: F.linear(xb[k].to(F32), Wc).double() for k in rk}
-                scr = {k: update(k, zr[k]) for k in rk}
-                for p in pairs:
-                    A[p] = A[p] * scr[kp[p][0]]
-                for k in ks:
-                    z = zr[k] if k in zr else F.linear(xb[k].to(F32), Wc).double()
-                    if k not in zr:
-                        update(k, z)
-                    for p in pairs:
-                        a_, b_ = kp[p]
-                        if b_ == k:
-                            A[p] = A[p] + (torch.exp(zr[a_] - m[a_][:, None]) * (zr[a_] - z)).sum(-1)
-                            DM[p] = torch.maximum(DM[p], (z - zr[a_]).abs().max(-1).values)
-                    del z
-                del zr, Wc
-            for k in ks:
-                lse[k][i0:i1] = (m[k] + e[k].log()).numpy()
-                amx[k][i0:i1] = am[k].numpy()
-            for p in pairs:
-                a_, b_ = kp[p]
-                kl[p][i0:i1] = (A[p] / e[a_]).numpy() - lse[a_][i0:i1] + lse[b_][i0:i1]
-                dmax[p][i0:i1] = DM[p].numpy()
-            log(f"head rows {i1}/{N}  rss {rss_gib():.1f} GiB")
-        ids = self.ids.numpy()
-        tag = lambda x: x.replace("@", "_at_").replace(",", "-").replace(":", "_").replace("/", "_")
-        for p in pairs:
-            r, n = p
-            a_, b_ = kp[p]
-            same = amx[a_] == amx[b_]
-            res = {}
-            for sq in self.seqs:
-                o, c = sq["off"], sq["n"]
-                res[sq["name"]] = {"kl_mean": float(kl[p][o:o + c].mean()),
-                                   "kl_p99": float(np.percentile(kl[p][o:o + c], 99)),
-                                   "kl_max": float(kl[p][o:o + c].max()),
-                                   "top1_agree": float(same[o:o + c].mean()),
-                                   "max_abs_dlogit": float(dmax[p][o:o + c].max()),
-                                   "mean_max_abs_dlogit": float(dmax[p][o:o + c].mean())}
-            report["final"][f"{n} vs {r}"] = res
-            np.save(os.path.join(self.out, f"kl_{tag(n)}_vs_{tag(r)}.npy"), kl[p])
-        amm = amx[smap["master"]]
-        report["final"]["master_top1_vs_next"] = {
-            sq["name"]: float((amm[sq["off"]:sq["off"] + sq["n"] - 1] == ids[sq["off"] + 1:sq["off"] + sq["n"]]).mean())
-            for sq in self.seqs}
-        with open(os.path.join(self.out, "tracks.json"), "w") as f:
-            json.dump(report, f, indent=1)
-        log(f"head {time.time() - t0:.0f} s")
-        log("tracks final " + json.dumps(report["final"]))
 
     def run_mtp(self, hn=None, src=None):
         t0 = time.time()
@@ -1136,23 +815,24 @@ FILES = {
     "layers/LNN/hidden.npy": "[P, 6144] f32 (bf16 values), residual stream after layer NN",
     "layers/LNN/topk_SEQ.npy": "full-indexer layers: [n-2048, 2048] uint16, key positions chosen for positions 2048..n-1, ascending",
     "layers/LNN/topk_margin_SEQ.npy": "[n-2048] f32, the 2048th index score minus the 2049th (0 = a tie at the boundary)",
-    "layers/LNN/route_idx.npy": "MoE layers: [N, 8] uint8, experts chosen, by descending biased score",
+    "layers/LNN/route_idx.npy": "MoE layers: [N, 8] uint8, experts chosen (0..167), by descending biased score",
     "layers/LNN/route_w.npy": "[N, 8] f32, their weights (normalised, x 2.5)",
     "layers/LNN/route_margin.npy": "[N] f32, 8th minus 9th biased score",
-    "layers/LNN/calib.npz": "count [256] int64, mass [256] f64 (sum of weights), gate_up_in_sqsum [256, 6144] f32 and down_in_sqsum [256, 2048] f32: per-expert sums of x^2 of the inputs (diagonal of X^T X)",
+    "layers/LNN/calib.npz": "count [168] int64, mass [168] f64 (sum of weights), gate_up_in_sqsum [168, 6144] f32 and down_in_sqsum [168, 2048] f32: per-expert sums of x^2 of the inputs (diagonal of X^T X)",
     "final_hidden_sample.npy": "[P, 6144] f32, after model.norm",
     "final/top20_ids.npy, top20_logprobs.npy": "[N, 20] int32 / f32, from f32 logits",
     "final/lse.npy, next_logprob.npy, argmax.npy": "[N] logsumexp, log p(next token) (NaN at a sequence's last row), argmax",
     "final/logits.npy, logits_rows.npy": "[P, 154880] f32 full logits at the sample rows",
     "layers/L78/*": "the MTP layer, over the MTP rows (row t of a sequence: hidden t, token t+1)",
     "mtp/*": "as final/, for the MTP rows; next_logprob is log p(token t+2); rows_main maps MTP rows to main rows",
+    "state/hfinal.pt": "the final hidden after model.norm, every row, bf16 [N, 6144] (gold_prep.py reads it)",
 }
 
 
-def rss_gib():
+def rss_gib(key="VmRSS"):
     with open("/proc/self/status") as f:
         for line in f:
-            if line.startswith("VmRSS"):
+            if line.startswith(key):
                 return int(line.split()[1]) / 2**20
     return 0.0
 
@@ -1160,25 +840,18 @@ def rss_gib():
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--index", default=None, help="the index json, if not CKPT/model.safetensors.index.json")
+    ap.add_argument("--verified", default=None, help="sha256sum listing of the verified shards: open no other")
+    ap.add_argument("--wait", action="store_true", help="with --verified: wait for a shard to be listed")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--tokens", nargs="+", required=True)
+    ap.add_argument("--max-tokens", type=int, default=None, help="cut each sequence to this many tokens (its "
+                    "name gets the length appended): the layer checks' 2,400-token input")
     ap.add_argument("--threads", type=int, default=8)
-    ap.add_argument("--layers", type=int, default=None, help="stop after this many layers (a wiring test; logits then meaningless)")
+    ap.add_argument("--layers", type=int, default=None, help="stop after this many layers (a wiring test)")
     ap.add_argument("--no-mtp", action="store_true")
-    ap.add_argument("--mtp-from", default=None, help="experiment 5: replay only the MTP layer over this finished run")
-    ap.add_argument("--mtp-experts", default="bf16", help="with --mtp-from: bf16 (as shipped) or a format, e.g. nvfp4_rtn")
-    ap.add_argument("--track", action="append", default=[], metavar="FORMAT@LAYERS",
-                    help="experiment 3: a track with the master's experts requantised into FORMAT at LAYERS "
-                         "(comma list or 'all'); repeatable; compared with the master track")
-    ap.add_argument("--track-ref", action="append", default=[],
-                    help="tracks mode: another track to compare every track against, besides the master (e.g. ne:fp8)")
-    ap.add_argument("--master", default=None, help="fetch_master.py's directory of BF16 master experts")
-    ap.add_argument("--qcache", default=None, help="tracks mode: qprep.py's cache of the quantiser's formats")
-    ap.add_argument("--sub-experts", default="0,51,102,153,204,255",
-                    help="tracks mode: the experts a FORMAT/sub track quantises (the quantiser's trellis sample)")
-    ap.add_argument("--cov-out", default=None, help="experiment 3b: write per-expert input covariances here "
-                    "(with --master; the pass stops after the last --cov-layers layer)")
-    ap.add_argument("--cov-layers", type=int, nargs="+", default=[3, 40])
+    ap.add_argument("--mtp-from", default=None, help="replay only the MTP layer over this finished run")
+    ap.add_argument("--mtp-experts", default="bf16", help="with --mtp-from: bf16 (as shipped) or nvfp4_rtn")
     ap.add_argument("--combine", choices=("f32", "bf16"), default="f32",
                     help="f32: sublayer outputs summed in f32 and rounded once with the residual (the contract, TP=4 "
                          "engine order); bf16: transformers' per-GEMM rounding")

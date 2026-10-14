@@ -1,4 +1,4 @@
-"""Summarise a glmref.py output directory: teacher-forced top-1 and log-probability per sequence, greedy
+"""Summarise a glmref.py output directory (altar-1: 168 experts a layer): teacher-forced top-1 and log-probability per sequence, greedy
 text at a few places, expert-usage skew per MoE layer (overall and per sequence), the MTP layer's argmax
 acceptance, index-set statistics, and per-layer timing.
 
@@ -11,6 +11,8 @@ import os
 
 import numpy as np
 
+NE = 168  # routed experts a layer (altar-1)
+
 
 def cover(mass, fracs=(0.5, 0.9, 0.99)):
     """How many experts, largest first, carry each fraction of the mass."""
@@ -19,7 +21,7 @@ def cover(mass, fracs=(0.5, 0.9, 0.99)):
     return [int(np.searchsorted(c, f) + 1) for f in fracs]
 
 
-def skew(idx, w, ne=256):
+def skew(idx, w, ne=NE):
     mass = np.bincount(idx.ravel(), weights=w.ravel(), minlength=ne)
     p = mass / mass.sum()
     nz = p[p > 0]
@@ -82,7 +84,7 @@ def main():
                   f"{r['vs_main_argmax']:.3f}   (== token | main right: {r['vs_token_when_main_right']:.3f})")
             moff += m
 
-    print("== expert usage by routing mass (experts carrying 50/90/99 %; top-64 share; effective number)")
+    print("== expert usage by routing mass (experts carrying 50/90/99 %; top-quarter (42) share; effective number)")
     tot = []
     for d in sorted(glob.glob(os.path.join(a.out, "layers", "L*"))):
         l = int(os.path.basename(d)[1:])
@@ -98,15 +100,15 @@ def main():
                 r[s["name"]] = skew(idx[o:o + n], w[o:o + n])
                 moff += s["n"] - 1
             if l != 78 and len(man["sequences"]) > 1 and "agentic" in [s["name"] for s in man["sequences"]]:
-                # transfer: the 64 experts with most mass on the other sequences, their share of agentic's mass
+                # transfer: the NE/4 = 42 experts with most mass on the other sequences, their share of agentic's mass
                 ag = [s for s in man["sequences"] if s["name"] == "agentic"][0]
                 sel = np.zeros(len(idx), bool)
                 sel[ag["off"]:ag["off"] + ag["n"]] = True
-                m_ag = np.bincount(idx[sel].ravel(), weights=w[sel].ravel(), minlength=256)
-                m_ot = np.bincount(idx[~sel].ravel(), weights=w[~sel].ravel(), minlength=256)
-                hot = np.argsort(m_ot)[::-1][:64]
-                r["agentic_share_of_others_top64"] = float(m_ag[hot].sum() / m_ag.sum())
-                r["agentic_share_of_own_top64"] = float(np.sort(m_ag)[::-1][:64].sum() / m_ag.sum())
+                m_ag = np.bincount(idx[sel].ravel(), weights=w[sel].ravel(), minlength=NE)
+                m_ot = np.bincount(idx[~sel].ravel(), weights=w[~sel].ravel(), minlength=NE)
+                hot = np.argsort(m_ot)[::-1][:NE // 4]
+                r["agentic_share_of_others_topq"] = float(m_ag[hot].sum() / m_ag.sum())
+                r["agentic_share_of_own_topq"] = float(np.sort(m_ag)[::-1][:NE // 4].sum() / m_ag.sum())
             mg = np.load(os.path.join(d, "route_margin.npy"))
             r["route_margin_lt_1e-3"] = float((mg < 1e-3).mean())
             tot.append(r["all"]["top_quarter_share"])
@@ -117,15 +119,15 @@ def main():
             mg = np.load(f)
             r.setdefault("index_ties", {})[os.path.basename(f)[12:-4]] = float((mg == 0).mean())
         res["layers"][l] = r
-    tr = [(v["agentic_share_of_own_top64"], v["agentic_share_of_others_top64"]) for v in res["layers"].values()
-          if "agentic_share_of_others_top64" in v]
+    tr = [(v["agentic_share_of_own_topq"], v["agentic_share_of_others_topq"]) for v in res["layers"].values()
+          if "agentic_share_of_others_topq" in v]
     if tr:
         tr = np.array(tr)
-        print(f"agentic mass on its own top-64 experts: mean {tr[:, 0].mean():.3f}; on the top-64 of the other "
+        print(f"agentic mass on its own top-42 experts: mean {tr[:, 0].mean():.3f}; on the top-42 of the other "
               f"sequences: mean {tr[:, 1].mean():.3f} (min {tr[:, 1].min():.3f})")
     if tot:
         print(f"top-quarter share of routing mass: mean {np.mean(tot):.3f}, min {np.min(tot):.3f}, max {np.max(tot):.3f}"
-              f" (uniform 0.25; quantisation.md § 3.4's hybrid threshold 0.40)")
+              f" (uniform 0.25)")
     ls = [v["layer_s"] for k, v in res["layers"].items() if k != 78]
     if ls:
         print(f"timing: {len(ls)} layers, {sum(ls):.0f} s, median {np.median(ls):.1f} s a layer, "
