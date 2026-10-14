@@ -76,7 +76,8 @@ static_assert(sizeof(MatDesc) == 64, "MatDesc is 64 B");
 // block's order). k_up computes its h exactly as attn's gemv(kSwiGLU, split-K 4) does (each 8-row tile's K in four
 // parts of 1536 k, each part one MMA chain in k order, the parts added in part order, the same SwiGLU epilogue)
 // and k_down its ys as gemv(kF32, split-K 1) (one MMA chain over the 512 k): the same bits as the two GEMVs.
-// ys stays its own f32 partial (the all-reduce's second contribution, y = bf16(bf16(sum yr) + bf16(sum ys))).
+// ys is its own f32 partial (the all-reduce's second contribution, y = bf16(bf16(sum yr) + bf16(sum ys))), or with
+// DecodeCfg::ysum added into yr in f32 after the routed experts (decision 8; the runner's default).
 struct SharedW {
   const uint8_t *g = nullptr, *u = nullptr, *d = nullptr;
   const float *gs = nullptr, *us = nullptr, *ds = nullptr;
@@ -128,6 +129,11 @@ struct DecodeCfg {
   // collective (yr's M rows, then ys's) instead of the yr / ys arguments, and posts it from its epilogue, the
   // producer half of comm::glm::allreduce2_add_norm (its consumer half: allreduce2_add_norm_posted). The same bits.
   const comm::DevChannel* post = nullptr;
+  // ysum (glm53 DESIGN decision 8, the contract): k_down adds the shared expert's f32 output ys (fused: computed in
+  // k_down; else the caller's, e.g. the BF16 GEMV's) into yr after the routed experts, one __fadd_rn a value, and
+  // yr is the only output: posted, M rows (the producer half of comm::glm::allreduce_add_norm). ys must be given
+  // (the fused shared expert's scratch). false: ys a separate partial, y = bf16(bf16(sum yr) + bf16(sum ys)).
+  bool ysum = false;
 };
 constexpr int kUpPrefillOrder = 6;  // DecodeCfg::up: "nt1 wk1 p2", decode = prefill bit for bit
 size_t decode_ws_bytes();
