@@ -16,7 +16,7 @@ WeightFile::WeightFile(const std::string& path, int rank, int world) : path_(pat
   pread_all(fd_, hb.p, sizeof(Header), 0);
   std::memcpy(&header_, hb.p, sizeof(Header));
   const Header& h = header_;
-  if (std::memcmp(h.magic, kMagic, 8) != 0) die("%s: not a .glw file", path.c_str());
+  if (std::memcmp(h.magic, kMagic, 8) != 0) die("%s: not an altar-1 .glw file", path.c_str());
   if (h.version != kVersion || h.header_bytes != sizeof(Header) || h.toc_entry_bytes != sizeof(TocEntry) ||
       h.alignment != kAlign || h.file_bytes != fsize_ || h.data_offset + h.data_bytes != fsize_ ||
       h.data_offset % kAlign || h.n_tensors * sizeof(TocEntry) > h.data_offset - h.toc_offset)
@@ -36,7 +36,7 @@ WeightFile::WeightFile(const std::string& path, int rank, int world) : path_(pat
     DeviceTensor& t = tensors_[i];
     t.name.assign(e.name, strnlen(e.name, sizeof e.name));
     t.dtype = DType(e.dtype);
-    if (e.layout > uint32_t(Layout::ExpertPool)) die("%s: bad layout %u", t.name.c_str(), e.layout);
+    if (e.layout > uint32_t(Layout::Int4Tile)) die("%s: bad layout %u", t.name.c_str(), e.layout);
     if (e.kind < uint32_t(SliceKind::Replicated) || e.kind > uint32_t(SliceKind::Reserved))
       die("%s: bad kind %u", t.name.c_str(), e.kind);
     t.layout = Layout(e.layout);

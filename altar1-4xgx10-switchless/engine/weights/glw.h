@@ -1,4 +1,4 @@
-// The per-rank weight file (".glw"): one rank's slice of every tensor GLM-5.3's engine uses, in the formats and
+// The per-rank weight file (".glw"): one rank's slice of every tensor altar-1's engine uses, in the formats and
 // tile layouts the kernels read, laid out so a loader can stream it into one device arena with large O_DIRECT
 // reads. The DeepSeek engine's .dsw container (ds41f-4xgx10-switchless/engine/weights/dsw.h), this engine's
 // own copy: a new magic, dtypes, layouts and TOC fields. Format, plan and tools: docs/layout.md.
@@ -19,7 +19,8 @@
 
 namespace glw {
 
-constexpr char kMagic[8] = {'G', 'L', 'M', '5', '3', 'W', '0', '1'};
+// altar-1's own magic (GLM-5.3's was GLM53W01): an engine of either kit refuses the other's files.
+constexpr char kMagic[8] = {'A', 'L', 'T', 'R', '1', 'W', '0', '1'};
 constexpr uint32_t kVersion = 1;
 constexpr uint64_t kAlign = 4096;
 constexpr uint32_t kGlobal = 0xFFFFFFFFu;  // TocEntry::layer of a tensor that belongs to no layer
@@ -85,6 +86,11 @@ enum class Layout : uint32_t {
   // are contiguous (every matrix is a multiple of 4 KiB), so they form the layer's pool from expert 0's entry on;
   // the layer's desc entry (gx::MatDesc [256][3]) holds offsets relative to it.
   ExpertPool = 3,
+  // INT4-g32 (compressed-tensors pack-quantized, asymmetric) attention weights q_b, W_UV, o_proj of layers 4-76:
+  // the expert kernels' 2,368-byte INT4 block (experts.h kI4Blk; attn/tools/pack.py int4_tiles), one U8 entry of
+  // shape [N/8][K/512][2368] for the natural [N][K]; blk_rows x blk_k = 1 x 32 (a scale and zero point a row and
+  // 32 k). Byte formulas: experts/layout.h, "the engine layout", INT4.
+  Int4Tile = 4,
 };
 inline const char* layout_name(Layout l) {
   switch (l) {
@@ -92,13 +98,16 @@ inline const char* layout_name(Layout l) {
     case Layout::T64: return "T64";
     case Layout::T128: return "T128";
     case Layout::ExpertPool: return "expert-pool";
+    case Layout::Int4Tile: return "int4-tile";
   }
   return "?";
 }
 
 // The routed experts' formats (experts/experts.h Fmt). An expert entry's (and its layer's desc entry's) `fmt` is
-// one nibble a matrix: gate | up << 4 | down << 8 (all NVFP4 = 0); every other entry has None.
-enum class ExpertFmt : uint32_t { NVFP4 = 0, S3 = 1, None = 0xFFFFFFFFu };
+// one nibble a matrix: gate | up << 4 | down << 8 (a layer is single-format: altar-1 stores INT4 = 0x222 on layers
+// 4-76 and BF16 = 0x333 on 3, 77, 78; NVFP4 = 0 is kept for the MTP layer's option); every other entry has None.
+// 1 was GLM-5.3's S3, retired: readers refuse it as any unknown nibble.
+enum class ExpertFmt : uint32_t { NVFP4 = 0, INT4 = 2, BF16 = 3, None = 0xFFFFFFFFu };
 inline uint32_t expert_matrix_fmt(uint32_t tag, int m) { return (tag >> (4 * m)) & 15; }  // m: 0 gate, 1 up, 2 down
 
 enum Flags : uint32_t {
@@ -107,6 +116,8 @@ enum Flags : uint32_t {
   kScale = 4,        // an FP8 weight's f32 scale table: [N/blk_rows][K/blk_k], or [N/2/blk_rows][2][K/blk_k]
                      // for an interleaved gate/up pair
   kInterleaved = 8,  // gate/up rows interleaved (2i gate, 2i+1 up): the SwiGLU GEMV's input
+  kDequant = 16,     // BF16 dequantised from INT4 by the contract's rule, bf16_rne((q - z) * s): W_UK^T of layers
+                     // 4-76 (docs/model.md § 4.2); exact, not lossy
 };
 
 struct Header {

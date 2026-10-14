@@ -1,51 +1,34 @@
 #!/usr/bin/env python3
-"""glw convert: cut the per-rank .glw files (every tensor but the routed experts, whose TOC entries are reserved)
-from NVIDIA's checkpoint (the BF16 master for everything it holds in BF16) and zai's BF16 mirror (the dense MLPs
-of layers 0-2, fetched by range request into --cache), on the CPU.
+"""glw convert: cut altar-1's per-rank .glw files (every tensor but the routed experts, whose TOC entries are
+reserved for experts_fill.py) from the local checkpoint, on the CPU, without requantising anything.
 
-    python -I convert.py --ckpt NV --cache DIR --plan [--list R]       the plan: per-rank bytes by class, coverage
-    python -I convert.py --ckpt NV --cache DIR --out-dir DIR [--ranks 0 1 2 3] [--only SUBSTR] [--commit C]
+    python -I convert.py --ckpt DIR [--index J] --plan [--list] [--ranks R ...]     the plan, bytes a rank, coverage
+    python -I convert.py --ckpt DIR --manifest manifest.tsv --hashes shards.sha256 --out-dir OUT
+                         [--ranks 0 1 2 3] [--only SUBSTR ...] [--bf16-only] [--commit C] [--suffix S]
 
-One pass over the sources writes every requested rank: each unit's sources are read once (SHA-256 while
-reading), FP8 ones quantised once (quant.fp8_rtn, zai's rule) with their relative RMS error against the master,
-and each rank's outputs re-cut by engine/attn/tools/pack.py. Files are written as OUT.tmp and renamed once the TOC
-and header are in place; beside each, OUT.manifest.json (docs/layout.md § 5). Peak memory is one unit's sources
-(the embedding and head, 3.8 GB) plus one rank's outputs. Run at nice 19 with CUDA_VISIBLE_DEVICES= (no GPU).
+--manifest/--hashes: every shard read must have the Hub's LFS SHA-256 (manifest.tsv), as measured on this box
+(`sha256sum` output); without them the run is a test (--unverified-ok) and the manifest says so. --bf16-only
+leaves out the INT4 attention tiles (q_b, W_UV, o_proj of layers 4-76) when their packer has not landed; W_UK^T of
+those layers is written in BF16 by the contract's dequantisation. --test-packers uses packers.py's test stand-ins
+(never for rank files).
+
+One pass over the sources writes every requested rank: each unit's sources are read once (SHA-256 while reading;
+the embedding and head by the rank's rows only) and each rank's outputs cut from them. Files are written as
+OUT.tmp and renamed once the TOC and header are in place; beside each, OUT.manifest.json (docs/layout.md § 5).
+Peak memory is one unit's sources (the largest a dense MLP's three BF16 matrices, 453 MB) plus one rank's outputs.
 """
 import argparse, collections, hashlib, json, os, sys, time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 import numpy as np  # noqa: E402
-import torch  # noqa: E402
 
 import glw  # noqa: E402
-import quant  # noqa: E402
+import packers  # noqa: E402
 import sources  # noqa: E402
 
 GIB = 1 << 30
-
-
-def load_sources(unit, ck, mirror, srcinfo):
-    S = {}
-    for s in unit.srcs:
-        t, sha = (ck if s.origin == "nv" else mirror).get(s.name)
-        info = {"origin": "nvidia" if s.origin == "nv" else "zai-org/GLM-5.3-BF16", "sha256": sha,
-                "dtype": str(t.dtype).replace("torch.", ""), "shape": list(t.shape), "fp8": s.fp8}
-        if s.fp8:
-            codes, scales = quant.fp8_rtn(t)
-            info["rel_err"] = quant.dequant_rel_err(t, codes, scales)
-            S[s.name] = (codes, scales)
-        else:
-            S[s.name] = t
-        srcinfo[s.name] = info
-    return S
-
-
-def rel_err_of(o, srcinfo):
-    errs = [srcinfo[n]["rel_err"] for n in srcinfo if srcinfo[n].get("rel_err") is not None and
-            glw.short(n) in [x.replace("zai-bf16:", "") for x in o.sources]]
-    return max(errs) if errs else 0.0
+REVISION = "AikidoSec/altar-1@5d591cd98958e4e7e429517887e80ca3bb7ce2c4"
 
 
 class RankFile:
@@ -57,13 +40,14 @@ class RankFile:
         self.fd = os.open(self.tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         os.posix_fallocate(self.fd, 0, file_bytes)
 
-    def write(self, name, arr, rel_err):
+    def write(self, name, arr):
         o = self.by_name[name]
-        want = {glw.F32: np.float32, glw.BF16: np.uint16, glw.F8: np.uint8, glw.U8: np.uint8, glw.U32: np.uint32}[o.dtype]
+        want = glw.NP_DTYPE[o.dtype]
         if arr.dtype != want or arr.nbytes != o.bytes:
-            raise SystemExit(f"{name}: built {arr.dtype} {arr.nbytes} B, planned {np.dtype(want)} {o.bytes} B")
-        if o.dtype == glw.F8 and arr.size != int(np.prod(o.shape)):
-            raise SystemExit(f"{name}: element count")
+            raise SystemExit(f"{name}: built {arr.dtype} {arr.shape} {arr.nbytes} B, planned {np.dtype(want)} "
+                             f"{o.shape} {o.bytes} B")
+        if arr.size != int(np.prod(o.shape)):
+            raise SystemExit(f"{name}: element count {arr.size}, planned {o.shape}")
         b = np.ascontiguousarray(arr).view(np.uint8).reshape(-1)
         os.pwrite(self.fd, memoryview(b), o.offset)
         pad = glw.align_up(o.bytes) - o.bytes
@@ -71,14 +55,13 @@ class RankFile:
             os.pwrite(self.fd, bytes(pad), o.offset + o.bytes)
         self.crc[name] = glw.crc32c(b)
         self.sha[name] = hashlib.sha256(memoryview(b)).hexdigest()
-        o.rel_err = rel_err
         self.done.add(name)
 
     def flush(self):
         os.fdatasync(self.fd)
         os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_DONTNEED)
 
-    def finish(self, ck_dir, tool, created):
+    def finish(self, ck_id, tool, created):
         missing = [o.name for o in self.outs if o.kind != glw.RESERVED and o.name not in self.done]
         if missing:
             raise SystemExit(f"rank {self.rank}: {len(missing)} tensors not written, e.g. {missing[:3]}")
@@ -88,7 +71,7 @@ class RankFile:
         enc = lambda s, n: s.encode()[:n]  # noqa: E731
         hdr = glw.HDR.pack(glw.MAGIC, glw.VERSION, glw.HDR_BYTES, self.rank, glw.TP, len(self.outs), glw.ENT_BYTES,
                            self.toc_offset, self.data_offset, self.file_bytes - self.data_offset, self.file_bytes,
-                           glw.ALIGN, toc_crc, enc("GLM-5.3", 64), enc(ck_dir, 256), enc(created, 32), enc(tool, 64))
+                           glw.ALIGN, toc_crc, enc("altar-1", 64), enc(ck_id, 256), enc(created, 32), enc(tool, 64))
         os.pwrite(self.fd, hdr + bytes(glw.HDR_BYTES - len(hdr)), 0)
         os.fsync(self.fd)
         os.close(self.fd)
@@ -113,71 +96,84 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def print_plan(units, r, ck, verbose):
+def print_plan(units, r, verbose):
     outs, toc_off, data_off, fb = glw.layout_rank(units, r)
     comp = collections.OrderedDict()
     lay = collections.Counter()
     res = 0
     for o in outs:
-        c = comp.setdefault(o.component, [0, 0])
+        c = comp.setdefault(o.component, [0, 0, 0])
         c[0] += o.bytes if o.kind != glw.RESERVED else 0
         c[1] += 1
+        c[2] += o.reserve_bytes
         lay[glw.LAYOUT_NAME[o.layout]] += o.bytes
         res += o.reserve_bytes
-    print(f"rank {r}/{glw.TP}: {len(outs)} TOC entries, file {fb / GIB:.3f} GiB ({fb} B; TOC {data_off - toc_off} B), "
-          f"routed experts reserved: {res / GIB:.2f} GiB at NVFP4 when filled")
-    for c, (b, n) in comp.items():
-        print(f"  {c:34s} {b / GIB:8.3f} GiB  {n:5d} entries")
+    print(f"rank {r}/{glw.TP}: {len(outs)} TOC entries, file {fb / GIB:.3f} GiB ({fb} B; TOC {data_off - toc_off} B) "
+          f"before the fill, routed experts reserved: {res / GIB:.3f} GiB, {(fb + res) / GIB:.3f} GiB filled")
+    for c, (b, n, rb) in comp.items():
+        print(f"  {c:40s} {b / GIB:8.3f} GiB  {n:5d} entries" + (f"  ({rb / GIB:.3f} GiB to fill)" if rb else ""))
     print("  by layout: " + ", ".join(f"{k} {v / GIB:.3f} GiB" for k, v in lay.items()))
     if verbose:
         for o in outs:
-            print(f"    {o.name:42s} {glw.DTYPE_NAME[o.dtype]:7s} {'x'.join(map(str, o.shape)):>14s} "
-                  f"{glw.LAYOUT_NAME[o.layout]:11s} {glw.KIND_NAME[o.kind]:10s} {o.bytes:>11d} "
-                  f"{('blk ' + str(o.blk[0]) + 'x' + str(o.blk[1])) if o.blk[0] else '':12s} {o.slice}")
+            print(f"    {o.name:42s} {glw.DTYPE_NAME[o.dtype]:5s} {'x'.join(map(str, o.shape)):>14s} "
+                  f"{glw.LAYOUT_NAME[o.layout]:11s} {glw.KIND_NAME[o.kind]:10s} {o.bytes or o.reserve_bytes:>11d} "
+                  f"{o.slice}")
     return fb
+
+
+def open_checkpoint(a):
+    if not a.plan and not (a.manifest and a.hashes) and not a.unverified_ok:
+        raise SystemExit("--manifest and --hashes (every shard checked against the Hub's SHA-256), or --unverified-ok "
+                         "for a test")
+    ck = sources.Checkpoint(a.ckpt, a.index, a.manifest, a.hashes)
+    st = collections.Counter(s["state"] for s in ck.shards.values())
+    print(f"checkpoint {ck.dir}: {len(ck.meta)} tensors in {len(ck.shards)} shards ({dict(st)})", flush=True)
+    return ck
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True, help="NVIDIA's GLM-5.3-NVFP4 snapshot directory")
-    ap.add_argument("--cache", required=True, help="fetch cache for zai's repos (fetch.py)")
+    ap.add_argument("--ckpt", required=True, help="altar-1's snapshot directory (the shards)")
+    ap.add_argument("--index", help="model.safetensors.index.json (default: in --ckpt)")
+    ap.add_argument("--manifest", help="manifest.tsv: the Hub's LFS SHA-256 and size of every file")
+    ap.add_argument("--hashes", help="sha256sum output over the shards, measured on this box")
+    ap.add_argument("--unverified-ok", action="store_true", help="a test run on shards not checked by SHA-256")
     ap.add_argument("--out-dir")
     ap.add_argument("--ranks", type=int, nargs="+", default=[0, 1, 2, 3])
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--list", action="store_true", help="with --plan: every tensor")
-    ap.add_argument("--only", help="a test file: only tensors whose names contain this")
-    ap.add_argument("--shared-layout", choices=["t64", "t128"], default="t128")
-    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--only", nargs="+", help="a test file: only tensors whose names contain one of these")
+    ap.add_argument("--bf16-only", action="store_true", help="leave out the INT4 attention tiles (packer pending)")
+    ap.add_argument("--test-packers", action="store_true", help="packers.py's test stand-ins (never for rank files)")
+    ap.add_argument("--expert-packer", help="the expert kernels' int4_pack.py (default: engine/weights/int4_pack.py)")
+    ap.add_argument("--attn-packer", help="the attention side's pack.py with int4_tiles (default: attn/tools/pack.py)")
     ap.add_argument("--commit", default="", help="the repo commit the tools were taken from, for the manifest")
     ap.add_argument("--suffix", default="", help="file name suffix (test files)")
     a = ap.parse_args()
-    torch.set_num_threads(a.threads)
     glw._check_crc()
     t0 = time.time()
-    ck = sources.Checkpoint(a.ckpt)
-    units = glw.make_plan(ck, a.shared_layout)
-    used, reserved, replaced = glw.coverage(ck, units)
-    print(f"checkpoint: {len(ck.meta)} tensors; {len(used)} sources of {len(units)} units, {len(reserved)} routed-expert "
-          f"tensors for the reserved entries, {len(replaced)} dense-MLP tensors replaced by the BF16 mirror's master "
-          f"({time.time() - t0:.1f} s)")
+    reg = packers.register(test=a.test_packers, experts=a.expert_packer, attn=a.attn_packer)
+    print("packers: " + ", ".join(f"{k} {v or 'pending'}" for k, v in reg.items()), flush=True)
+    ck = open_checkpoint(a)
+    units = glw.make_plan(ck, a.bf16_only)
+    used, reserved, pending = glw.coverage(ck, units, a.bf16_only)
+    print(f"coverage: {len(used)} sources of {len(units)} units, {len(reserved)} routed-expert tensors for the reserved "
+          f"entries, {len(pending)} INT4 attention tensors pending (--bf16-only) ({time.time() - t0:.1f} s)")
     if a.plan:
         for r in a.ranks:
-            print_plan(units, r, ck, a.list)
+            print_plan(units, r, a.list)
         return 0
     if not a.out_dir:
         raise SystemExit("--out-dir or --plan")
     os.makedirs(a.out_dir, exist_ok=True)
-    mirror = sources.Fetched(a.cache, "bf16")
     tool = glw.tool_version()
     tool_s = tool[:16] + (f" {a.commit[:12]}" if a.commit else "")
     created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    ck_id = os.path.basename(os.path.dirname(os.path.dirname(os.path.normpath(ck.dir)))) + "@" + \
-        os.path.basename(os.path.normpath(ck.dir))  # models--nvidia--GLM-5.3-NVFP4@<revision>
     files = {}
     for r in a.ranks:
         outs, toc_off, data_off, fb = glw.layout_rank(units, r)
         if a.only:
-            outs = [o for o in outs if a.only in o.name]
+            outs = [o for o in outs if any(x in o.name for x in a.only)]
             data_off = glw.align_up(toc_off + len(outs) * glw.ENT_BYTES)
             off = data_off
             for o in outs:
@@ -191,43 +187,44 @@ def main():
     t1 = time.time()
     written = 0
     for u in units:
-        if not u.srcs:
+        if all(o.kind == glw.RESERVED for o in u.outs(a.ranks[0])):
             continue
         if a.only and not any(o.name in files[r].by_name for r in a.ranks for o in u.outs(r)):
             continue
         tu = time.time()
-        S = load_sources(u, ck, mirror, srcinfo)
+        R = glw.Reader(ck, srcinfo)
         for r in a.ranks:
             outs = {o.name: o for o in u.outs(r)}
-            built = u.build(S, r)
+            built = u.build(R, r)
             if set(built) != set(outs):
                 raise SystemExit(f"{u.name}: built {sorted(set(built) ^ set(outs))[:4]} not as planned")
             for n, arr in built.items():
                 if n in files[r].by_name:
-                    files[r].write(n, arr, rel_err_of(outs[n], srcinfo) if outs[n].flags & glw.LOSSY else 0.0)
+                    files[r].write(n, arr)
                     written += arr.nbytes
             files[r].flush()
-        del S
+        del R
         print(f"  {u.name}: {time.time() - tu:.1f} s; {written / GIB:.2f} GiB written, {time.time() - t1:.0f} s",
               flush=True)
     for r, f in files.items():
-        toc_crc = f.finish(ck_id, tool_s, created)
+        toc_crc = f.finish(REVISION, tool_s, created)
         sha = file_sha256(f.path)
         man = {
-            "format": "glw", "version": glw.VERSION, "rank": r, "world": glw.TP, "file": os.path.basename(f.path),
-            "file_bytes": f.file_bytes, "file_sha256": sha, "toc_crc32c": f"{toc_crc:08x}", "created": created,
-            "seconds": round(time.time() - t1, 1),
+            "format": "glw (altar-1)", "magic": glw.MAGIC.decode(), "version": glw.VERSION, "rank": r, "world": glw.TP,
+            "file": os.path.basename(f.path), "file_bytes": f.file_bytes, "file_sha256": sha,
+            "toc_crc32c": f"{toc_crc:08x}", "created": created, "seconds": round(time.time() - t1, 1),
             "tool": {"version": tool, "commit": a.commit, "argv": [os.path.basename(x) for x in sys.argv[:1]] + sys.argv[1:],
                      "files": {os.path.basename(p): hashlib.sha256(open(p, "rb").read()).hexdigest() for p in glw.tool_files()},
-                     "torch": torch.__version__, "numpy": np.__version__},
-            "master": {"nvidia": ck_id, "bf16_mirror": "zai-org/GLM-5.3-BF16@9d2398f478cab2de883137db3a36ad2c96205e24",
-                       "fp8_rule": "per 128x128 block: scale = f32(amax) * f32(1/448); codes = e4m3_rne(f32(w) / scale)"},
-            "only": a.only or "", "shared_layout": a.shared_layout,
-            "sources": {n: v for n, v in srcinfo.items()},
+                     "numpy": np.__version__},
+            "checkpoint": dict(ck.record(), revision=REVISION, verified=bool(a.manifest and a.hashes)),
+            "packers": reg, "bf16_only": a.bf16_only, "only": a.only or [],
+            "rule": "no requantisation: BF16/F32 copied; INT4 packed values, scales, zero points re-tiled; an INT4 "
+                    "layer's W_UK^T in BF16 is bf16_rne((q - z) * s) (docs/model.md § 4.2)",
+            "sources": srcinfo,
             "tensors": [{"name": o.name, "offset": o.offset, "bytes": o.bytes, "crc32c": f"{f.crc.get(o.name, 0):08x}",
-                         "sha256": f.sha.get(o.name, ""), "rel_err": o.rel_err, "kind": glw.KIND_NAME[o.kind],
+                         "sha256": f.sha.get(o.name, ""), "kind": glw.KIND_NAME[o.kind], "flags": o.flags,
                          "layout": glw.LAYOUT_NAME[o.layout], "sources": o.sources} for o in f.outs],
-            "routed_expert_tensors_reserved": len(reserved), "dense_tensors_replaced_by_master": sorted(replaced),
+            "routed_expert_tensors_reserved": len(reserved), "int4_attention_pending": len(pending),
         }
         json.dump(man, open(f.path + ".manifest.json", "w"), indent=1)
         print(f"rank {r}: {f.path} {f.file_bytes} B ({f.file_bytes / GIB:.3f} GiB), sha256 {sha}, TOC crc {toc_crc:08x}")
