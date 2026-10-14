@@ -324,7 +324,8 @@ int main(int argc, char** argv) {
   const size_t margin = (size_t)(std::max(rk == 0 ? a.margin_gib : a.worker_margin_gib, a.min_free_gib) * kGiB);
   const size_t dmargin = (size_t)(a.device_margin_gib * kGiB);
   // The page cache of other files (another engine's, others' work) holds pages CUDA will not take; anonymous memory
-  // makes the kernel reclaim it: touch what the pool wants beyond the free pages, staying above the margin, and let
+  // makes the kernel reclaim it: touch all the pool wants (the kernel hands out its free pages first and reclaims the
+  // cache only below its watermarks, so touching only the shortfall reclaims nothing), staying above the margin, and let
   // it go again just before the pool is allocated (--no-reclaim: not)
   double reclaimed = 0, dfree0 = 0;
   {
@@ -335,7 +336,7 @@ int main(int argc, char** argv) {
     if (a.reclaim && want > dfree) {
       std::vector<std::pair<void*, size_t>> held;
       size_t got = 0;
-      const size_t piece = 256ull << 20, need = want - dfree;
+      const size_t piece = 256ull << 20, need = want;  // all of it: the free pages go first, then the cache
       while (got < need && meminfo("MemAvailable") > margin + piece) {
         void* p = mmap(nullptr, piece, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
         if (p == MAP_FAILED) break;
