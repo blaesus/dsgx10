@@ -4,6 +4,7 @@
 // Weights: --weights PATH (a rank file; "%d" in PATH is the rank; "fleet": the fleet file's RANK<r>_WEIGHTS) or --synthetic
 // [--pools N INT4 expert pools] [--bf16-pools N] [--rowmajor: BF16 projections row-major, not kBF16T] [--seed S].
 // --combine bf16: the MoE layers' old combine order (kTuneMoeBf16Combine, output-changing; default f32, decision 8).
+// --res-round2: the residual adds' old double rounding (kTuneResRound2, output-changing; default one rounding).
 // Modes:
 //   bench     decode steps as graphs at --rows (default 1,2,4,6,8,16) at context --ctx: GPU ms a step, wall ms, host
 //             ms a launch; the floor; then one profiled eager step a row count (ms per kernel class, per layer class)
@@ -117,6 +118,7 @@ struct Args {
   std::vector<int> dump_layers;
   uint32_t ab_base = 0, ab = kTuneAll;  // kTuneAll: every exact lever (not kTuneMoeBf16Combine)
   bool combine_bf16 = false;             // --combine bf16: kTuneMoeBf16Combine on top of --tune (output-changing)
+  bool res_round2 = false;               // --res-round2: kTuneResRound2 on top of --tune (output-changing)
   int ab_rounds = 10;
   int min_free_mib = 4608;  // real weights: stop at the start below this much MemAvailable on any rank
   int tf_max = 0;  // tf, refhash with --gold: a sequence's first tf_max tokens (0: all)
@@ -277,8 +279,8 @@ void ab(Model& m, comm::Ring& ring) {
     for (int r = 1; r < 4; ++r) ranks &= all[r] == all[0];
     record(rk, "ab\trows %d\tA %08x %.3f ms\tB %08x %.3f ms\t(medians of %d rounds, A B / B A)\tB/A median %.4f "
            "(%.4f .. %.4f)\tgain %.2f %%", R, cfg[0], ma, cfg[1], mb, rounds, mr, lo, hi, 100.0 * (1.0 - mr));
-    if ((cfg[0] ^ cfg[1]) & kTuneMoeBf16Combine)  // the MoE combine order differs: other bits, as it should
-      check(rk, hs[0] != hs[1] && hb == hs[1] && ranks, "ab rows %d: the MoE combine orders give other bits (A %016llx, "
+    if ((cfg[0] ^ cfg[1]) & kTuneOutputBits)  // an output-changing bit differs: other bits, as it should
+      check(rk, hs[0] != hs[1] && hb == hs[1] && ranks, "ab rows %d: the output-changing bits give other bits (A %016llx, "
             "B %016llx), B the same after the rounds, every rank the same", R, (unsigned long long)hs[0],
             (unsigned long long)hs[1]);
     else
@@ -1384,6 +1386,7 @@ int main(int argc, char** argv) {
     else if (a == "--moe-up") A.mo.moe_up = std::stoi(nx());
     else if (a == "--rows") A.rows = parse_list(nx());
     else if (a == "--tune") A.mo.tune = (uint32_t)std::stoul(nx(), nullptr, 16);
+    else if (a == "--res-round2") A.res_round2 = true;
     else if (a == "--combine") {
       const std::string c = nx();
       if (c != "bf16" && c != "f32") die("--combine bf16|f32");
@@ -1424,6 +1427,7 @@ int main(int argc, char** argv) {
   }
   if (A.modes.empty()) die("glm_run: a mode (bench l2pf prefill check tf refhash)");
   if (A.combine_bf16) A.mo.tune |= kTuneMoeBf16Combine;
+  if (A.res_round2) A.mo.tune |= kTuneResRound2;
   CUDA_CHECK(cudaSetDevice(0));
   CUDA_CHECK(cudaFree(nullptr));
   comm::Options co;

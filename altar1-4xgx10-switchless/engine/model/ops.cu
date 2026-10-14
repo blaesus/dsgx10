@@ -155,10 +155,10 @@ __global__ void k_publish(SampleOut* outs, const StepIn* in, const int32_t* draf
   pdl_go();
 }
 
-__global__ void k_add_rows(const uint16_t* res, const float* a, const float* b, size_t n, uint16_t* h) {
+__global__ void k_add_rows(const uint16_t* res, const float* a, const float* b, size_t n, uint16_t* h, bool r2) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  float y = bfround(a[i]);
+  float y = r2 || b ? bfround(a[i]) : a[i];
   if (b) y = bfround(__fadd_rn(y, bfround(b[i])));
   h[i] = f2bf(__fadd_rn(bf2f(res[i]), y));
 }
@@ -204,9 +204,9 @@ void publish(SampleOut* outs, const StepIn* in, const int32_t* draft, const int3
              cudaStream_t s, bool pdl) {
   ::glm::launch(k_publish, dim3(1), dim3(128), 0, s, pdl, outs, in, draft, acc, ndraft, nsess);
 }
-void add_rows(const uint16_t* res, const float* a, const float* b, size_t n, uint16_t* h, cudaStream_t s) {
+void add_rows(const uint16_t* res, const float* a, const float* b, size_t n, uint16_t* h, cudaStream_t s, bool round2) {
   if (!n) return;
-  k_add_rows<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(res, a, b, n, h);
+  k_add_rows<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(res, a, b, n, h, round2);
   CUDA_CHECK(cudaGetLastError());
 }
 void iota(int32_t* pos, int32_t* slot, int p0, int sl, int n, cudaStream_t s) {

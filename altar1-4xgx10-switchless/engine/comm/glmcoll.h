@@ -44,9 +44,12 @@ static_assert(kXRows * 2 % 16 == 0 && kXRowsShared * 2 % 16 == 0 && kLogitsBf16R
 // part [R][6144] f32, this rank's partial sums (R in 1..16). sum = ((p0 + p1) + p2) + p3 in f32, the four ranks'
 // partials in rank order: the same bits as comm::allreduce_f32, on every rank, run to run.
 // allreduce_hidden: out_f32 [R][6144] the sums and/or out_bf16 [R][6144] the sums rounded to bf16 (either null).
-// allreduce_add_norm, the residual add and the next RMSNorm fused into the end (the reference's arithmetic, and
-// bit for bit attn's rmsnorm kernel):
-//   y = bf16(sum); h = bf16(res + y) -> res_out (may be res); xn = bf16(w * bf16(h * rsqrt(mean(h^2) + eps)))
+// allreduce_add_norm, the residual add and the next RMSNorm fused into the end (the reference's contract mode,
+// glm53 DESIGN decision 8: the f32 sum rounded to bf16 once, when added to the residual; the norm bit for bit attn's
+// rmsnorm kernel):
+//   h = bf16(f32(res) + sum) -> res_out (may be res); xn = bf16(w * bf16(h * rsqrt(mean(h^2) + eps)))
+// round2 (every add-norm variant; the model's kTuneResRound2, the engine's order before 2026-10-14, output-changing):
+// h = bf16(res + bf16(sum)), the sum rounded first.
 // with mean(h^2) summed in rmsnorm's order (256 threads of 24 contiguous columns, a warp xor-tree, the warps in
 // order). xn [R][6144] bf16, w [6144] bf16. slices: the grid's column split (8, 16 or 32: the same bits; 0: 8, measured best).
 // The fused kernel keeps a row sum per thread in device memory across its blocks: at most one runs at a time
@@ -56,21 +59,25 @@ void allreduce_hidden(const DevChannel& ch, const float* part, int R, float* out
 // slices (these and the add-norm variants below): 0 the default (8), 8, 16 or 32 column slices a row; 1 (the norm
 // variants only) one block of 768 threads a row, no barrier between blocks: the same bits.
 void allreduce_add_norm(const DevChannel& ch, const float* part, int R, const uint16_t* res, uint16_t* res_out,
-                        const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st, bool pdl = false, int slices = 0);
-// The MoE layer's: two partials (the routed experts' yr and the shared expert's ys, experts.h moe_decode), each
-// all-reduced as above in one collective (2 R rows of 24,576 B a rank), then y = bf16(bf16(sum) + bf16(sum2))
-// (experts.h finalize) and the residual add and RMSNorm as allreduce_add_norm.
+                        const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st, bool pdl = false, int slices = 0,
+                        bool round2 = false);
+// The MoE layer's old combine (the model's kTuneMoeBf16Combine; decision 8 uses allreduce_add_norm on yr + ys): two
+// partials (the routed experts' yr and the shared expert's ys, experts.h moe_decode), each all-reduced as above in
+// one collective (2 R rows of 24,576 B a rank), then y = bf16(bf16(sum) + bf16(sum2)) (experts.h finalize) and
+// h = bf16(res + y) and the RMSNorm (y is a bf16 value already: round2 changes nothing here).
 void allreduce2_add_norm(const DevChannel& ch, const float* part, const float* part2, int R, const uint16_t* res,
                          uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st,
-                         bool pdl = false, int slices = 0);
+                         bool pdl = false, int slices = 0, bool round2 = false);
 // allreduce_add_norm's consumer half: the producer kernel (the model's o_proj, oproj.cu) wrote this rank's partial
 // into the send buffer of the collective about to run and posted it; the same bits as allreduce_add_norm.
 void allreduce_add_norm_posted(const DevChannel& ch, int R, const uint16_t* res, uint16_t* res_out, const uint16_t* w,
-                               float eps, uint16_t* xn, cudaStream_t st, bool pdl = false, int slices = 0);
+                               float eps, uint16_t* xn, cudaStream_t st, bool pdl = false, int slices = 0,
+                               bool round2 = false);
 // allreduce2_add_norm's consumer half: the producer (experts.h moe_decode with DecodeCfg::post) wrote both partials into the send
 // buffer of the collective about to run (part rows, then part2 rows) and posted them; the same bits as above.
 void allreduce2_add_norm_posted(const DevChannel& ch, int R, const uint16_t* res, uint16_t* res_out, const uint16_t* w,
-                                float eps, uint16_t* xn, cudaStream_t st, bool pdl = false, int slices = 0);
+                                float eps, uint16_t* xn, cudaStream_t st, bool pdl = false, int slices = 0,
+                                bool round2 = false);
 
 // ---- (b) all-gathers by rows ---------------------------------------------------------------------------------
 // Segment g: this rank's rows of rb bytes at in + r ld_in (r < rows); rank k's row r lands at

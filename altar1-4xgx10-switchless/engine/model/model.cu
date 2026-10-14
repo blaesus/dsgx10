@@ -293,7 +293,8 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
   mark(kKOproj, l);
   l2pf(4, l, R);
   const int ars = tune(kTuneArRow) ? 1 : 0;  // the fused all-reduces' blocks: one a row, or the default slices
-  comm::glm::allreduce_add_norm(ch, part, R, h_, h_, w.ffn_norm, kNormEps, xn_, st, P, ars);
+  const bool r2 = tune(kTuneResRound2);       // the residual adds' old double rounding (output-changing)
+  comm::glm::allreduce_add_norm(ch, part, R, h_, h_, w.ffn_norm, kNormEps, xn_, st, P, ars, r2);
   mark(kKAr1, l);
   if ((flags & kFlagDump) && l == kMtpLayer) dump_rows(sink, l, "attn", pos, R, h_, kEmbRow);  // mtpgold's diagnostics
   if (dense_layer(l)) {
@@ -303,7 +304,7 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     gemv(hm, kDenseInterRank, R, kDenseInterRank, &d, 1, GemvOut::kF32, 1, st, P);
     mark(kKMlp, l);
     l2pf(1, l + 1, R);
-    comm::glm::allreduce_add_norm(ch, part, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
+    comm::glm::allreduce_add_norm(ch, part, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars, r2);
   } else {
     GemvSeg s;  // the router's logits: fp32 products of bf16 values, f32 sums
     s.fmt = WFmt::kBF16, s.w = w.router, s.n = gx::kE, s.y = gl, s.ldy = gx::kE;
@@ -343,11 +344,11 @@ void Model::Impl::layer(int l, int R, const int32_t* pos, const int32_t* slot, u
     mark(kKMlp, l);
     l2pf(1, l + 1, R);
     if (c8) {
-      if (post) comm::glm::allreduce_add_norm_posted(ch, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
-      else comm::glm::allreduce_add_norm(ch, yr, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
+      if (post) comm::glm::allreduce_add_norm_posted(ch, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars, r2);
+      else comm::glm::allreduce_add_norm(ch, yr, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars, r2);
     } else {
-      if (post) comm::glm::allreduce2_add_norm_posted(ch, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
-      else comm::glm::allreduce2_add_norm(ch, yr, ys, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars);
+      if (post) comm::glm::allreduce2_add_norm_posted(ch, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars, r2);
+      else comm::glm::allreduce2_add_norm(ch, yr, ys, R, h_, h_, next_norm, kNormEps, xn_, st, P, ars, r2);
     }
   }
   mark(kKAr2, l);
