@@ -52,7 +52,7 @@ def _bf16_fast(b, n, k):
 def _bf16t_fast(b, n, k):
     """kBF16T bytes -> uint16 [N][K] row-major."""
     x = np.frombuffer(b, np.uint8).view("<u2").reshape(n // 8, k // 64, 2, 8, 4, 8)  # i j h g t e
-    return np.ascontiguousarray(x.transpose(0, 3, 1, 4, 2, 5)).reshape(n, k).astype(np.uint16)  # i g j t h e
+    return np.ascontiguousarray(x.transpose(0, 3, 1, 4, 2, 5)).reshape(n, k).astype(np.uint16, copy=False)  # i g j t h e
 
 
 def _bf16t_gather(b, n, k, pts):

@@ -40,6 +40,33 @@ def read_entry(fd, e, pad=False):
     return b
 
 
+def same(x, y, chunk=64 << 20):
+    """Byte equality of two buffers or arrays, in slices (no copy of either: the head is 476 MB a rank)."""
+    x = np.frombuffer(x, np.uint8) if isinstance(x, (bytes, bytearray)) else np.ascontiguousarray(x).reshape(-1).view(np.uint8)
+    y = np.frombuffer(y, np.uint8) if isinstance(y, (bytes, bytearray)) else np.ascontiguousarray(y).reshape(-1).view(np.uint8)
+    if x.size != y.size:
+        return False
+    return all(np.array_equal(x[i:i + chunk], y[i:i + chunk]) for i in range(0, x.size, chunk))
+
+
+def check_rows_chunked(fd, e, ck, src, rows, cnt, step=4096):
+    """A large row cut (the embedding or the head: 476 MB a rank) in slices of `step` rows: the entry's rows
+    [a, a + step) are bytes [a K 2, +step K 2) in both layouts (a kBF16T tile is 8 whole rows)."""
+    N, K = e["shape"][:2]
+    if tuple(e["shape"]) != (rows[1] - rows[0],) + tuple(ck.shape(src)[1:]) or e["dtype"] != glw.BF16:
+        return f"described [{rows[1] - rows[0]}] x {ck.shape(src)[1:]} BF16, TOC {e['shape']}"
+    for a in range(0, N, step):
+        m = min(step, N - a)
+        got = os.pread(fd, m * K * 2, e["offset"] + a * K * 2)
+        if e["layout"] == glw.BF16_TILE:
+            got = UNTILE_BF16T[0](got, m, K)
+            cnt["bf16 un-tiled from kBF16T"] += got.size
+        if not same(got, ck.get_rows(src, rows[0] + a, rows[0] + a + m)[0]):
+            return f"rows [{a}, +{m}) differ from the checkpoint's bytes"
+    cnt["bf16"] += N * K
+    return None
+
+
 def check_crc(path):
     hd, ents, raw = glw.read_toc(path)
     st = os.stat(path)
@@ -315,17 +342,25 @@ def indep(files, ck):
                     cnt["rope u32"] += len(rope) // 4
                 else:
                     kind, pcs, inter = describe(n, r)
+                    if kind == "plain" and len(pcs) == 1 and pcs[0][1] and not pcs[0][2] and not pcs[0][3] and \
+                            not inter and e["bytes"] > (256 << 20):
+                        why = check_rows_chunked(fd, e, C.ck, pcs[0][0], pcs[0][1], cnt)  # embedding, head
+                        checked += 1
+                        if why:
+                            bad += 1
+                            print(f"MISMATCH {path} {n}: {why}", flush=True)
+                        continue
                     b = read_entry(fd, e)
                     if e["layout"] == glw.BF16_TILE:
                         if kind not in ("plain", "dequant") or e["dtype"] != glw.BF16 or UNTILE_BF16T[0] is None:
                             raise SystemExit(f"{path} {n}: kBF16T on a {kind} entry, or no un-tiler")
-                        b = UNTILE_BF16T[0](b, *e["shape"][:2]).tobytes()
-                        cnt["bf16 un-tiled from kBF16T"] += len(b) // 2
+                        b = UNTILE_BF16T[0](b, *e["shape"][:2])
+                        cnt["bf16 un-tiled from kBF16T"] += b.size
                     if kind == "plain":
                         want = plain_bytes(C, pcs, inter)
                         if tuple(want.shape) != tuple(e["shape"]):
                             why = f"described {want.shape}, TOC {e['shape']}"
-                        elif b != want.tobytes():
+                        elif not same(b, want):
                             why = "differs from the checkpoint's bytes"
                         cnt["f32" if want.dtype == np.float32 else "bf16"] += want.size
                     elif kind == "dequant":
@@ -336,7 +371,7 @@ def indep(files, ck):
                         dq = C.c[key]
                         want = np.concatenate([cut2(dq, rows, cols).T if tr else cut2(dq, rows, cols)
                                                for _, rows, cols, tr in pcs])
-                        why = None if b == np.ascontiguousarray(want).tobytes() else "differs from bf16((q-z)s)"
+                        why = None if same(b, want) else "differs from bf16((q-z)s)"
                         cnt["bf16 dequantised"] += want.size
                     else:
                         why = check_attn_int4(fd, n, e, ed, pcs, C, attn_packer, cnt)
