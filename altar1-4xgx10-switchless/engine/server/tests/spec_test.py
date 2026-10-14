@@ -10,8 +10,8 @@ the drafts server also runs with --spec-force 3 --spec-oracle and --repeat 2: th
 step (all rejected), the second takes the first pass's tokens as drafts, about one in four changed (accepted runs of
 0 to 3, stops inside them).
 
-  spec_test.py --socket S --record FILE                 # against glm53_rank --no-spec
-  spec_test.py --socket S --compare FILE [--repeat 2]   # against glm53_rank (drafts on)
+  spec_test.py --socket S --record FILE                 # against altar1_rank --no-spec
+  spec_test.py --socket S --compare FILE [--repeat 2]   # against altar1_rank (drafts on)
 """
 import argparse
 import json

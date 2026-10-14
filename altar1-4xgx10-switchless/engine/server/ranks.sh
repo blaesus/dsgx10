@@ -1,5 +1,5 @@
-# The four ranks of glm53_rank for jobs and tests (docs/serving.md), sourced by run4.sh and tests/ring_job.sh: the
-# binary and the fleet file shipped to RD (~/dsgb10-data/glm53-server/run) on every box (engine/comm/run4.sh's
+# The four ranks of altar1_rank for jobs and tests (docs/serving.md), sourced by run4.sh and tests/ring_job.sh: the
+# binary and the fleet file shipped to RD (~/dsgb10-data/altar1-serve/run) on every box (engine/comm/run4.sh's
 # pattern), ranks 1-3 started detached on the workers, rank 0 here. Only inside a ring job (the DeepSeek engine's
 # ring.sh): the ranks need the ring.
 HERE=${HERE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
@@ -9,10 +9,10 @@ fleet_load "$FLEET" || exit 2
 # a ring job is preemptible: under memory pressure (earlyoom on every box) it goes first, not the long CPU passes
 # beside it (the reference, the converter); the workers' ranks get the same below
 echo 1000 > /proc/self/oom_score_adj
-NAME=glm53_rank
-RD='~/dsgb10-data/glm53-server/run'  # as written, for the workers' shells
+NAME=altar1_rank
+RD='~/dsgb10-data/altar1-serve/run'  # as written, for the workers' shells
 LRD=$(fleet_local "$RD")
-PAT="[d]sgb10-data/glm53-server/run/$NAME"  # [d]: never matches the shell running pkill
+PAT="[d]sgb10-data/altar1-serve/run/$NAME"  # [d]: never matches the shell running pkill
 SSHO=(-o BatchMode=yes -o ConnectTimeout=10)
 
 ranks_ship() {  # BIN: the binary to every box (under a temporary name, then renamed), the fleet file beside it

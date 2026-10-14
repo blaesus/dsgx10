@@ -7,7 +7,7 @@
 # boxes are stopped, and ring.sh exits 76 (PREEMPT=0: never). For jobs that do not go through run4.sh:
 # a bare flock(1) on the lock registers no want, and waits as long as the service serves
 # (docs/engine.md, "Borrowing the ring"). Inside a job that holds the ring, it runs at once.
-#   OWNER=me glm53-4xgx10-switchless/engine/server/ring.sh glm53-4xgx10-switchless/engine/server/tests/ring_job.sh
+#   OWNER=me altar1-4xgx10-switchless/engine/server/ring.sh altar1-4xgx10-switchless/engine/server/tests/ring_job.sh
 set -u
 [ $# -gt 0 ] || {
   echo "usage: ring.sh <command> [args...]" >&2

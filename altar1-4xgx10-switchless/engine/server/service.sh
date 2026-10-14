@@ -1,48 +1,56 @@
 #!/bin/bash
-# The GLM-5.3 engine as a service (docs/serving.md, "As a service"): the four ranks of glm53_rank in serve mode and
-# the front-end, glmfront, under a supervisor on rank 0 that restarts what fails with bounded backoff: the DeepSeek
-# engine's service.sh re-specialised. No systemd unit: the supervisor is a detached bash process, started and
-# stopped by hand.
+# The altar-1 engine as a service (docs/serving.md, "As a service"): the four ranks of altar1_rank in serve mode and
+# the front-end, altarfront, under a supervisor on rank 0 that restarts what fails with bounded backoff: GLM-5.3's
+# service.sh (itself the DeepSeek engine's re-specialised) with altar-1's names, port, directories and memory. No
+# systemd unit: the supervisor is a detached bash process, started and stopped by hand.
 #
-# The ring. Both services and every ring job take the one ring lock (the fleet's RING_LOCK, ringlock.sh), so the
-# GLM engine never runs while the DeepSeek service (or a job) holds the ring, and the other way round. This service
-# is the ring's borrower, not its owner (DESIGN decision 8: production keeps serving DeepSeek):
+# The ring. Every service and every ring job take the one ring lock (the fleet's RING_LOCK, ringlock.sh), so the
+# altar-1 engine never runs while the DeepSeek service, the GLM-5.3 service or a job holds the ring, and the other way
+# round. This service is the ring's borrower, not its owner (DESIGN decision 9: production keeps serving DeepSeek):
 #   - it takes the ring only through the queue of wants (ring.wants/, as a job does): it registers a want while it
 #     starts and while requests wait at its front-end, and the DeepSeek service lends it the ring as it lends it to a
 #     job (once idle for its DSGB10_YIELD_IDLE_S); it never takes the reclaim flag, so it never preempts a job;
-#   - it gives the ring back (its engine stopped, the sessions kept: GLM53_KEEP_GIB) as soon as anyone reclaims it
-#     (the DeepSeek service's requests wait), and once it has had no request for GLM53_YIELD_IDLE_S;
-#   - meanwhile glmfront holds its requests (GLM53_HOLD_S each), and they bring the engine back through a want.
+#   - it gives the ring back (its engine stopped, the sessions kept: ALTAR1_KEEP_GIB) as soon as anyone reclaims it
+#     (the DeepSeek service's requests wait), and once it has had no request for ALTAR1_YIELD_IDLE_S;
+#   - meanwhile altarfront holds its requests (ALTAR1_HOLD_S each), and they bring the engine back through a want.
 #
 #   engine/server/service.sh start     # returns once it serves, or failed (START_WAIT s, default 900; 0: at once)
 #   engine/server/service.sh stop      # rank 0 first (it stops ranks 1-3), then the front-end
 #   engine/server/service.sh status    # exit 0 serving, 1 waiting / starting / not answering, 3 not running
 #   engine/server/service.sh restart   # stop, then start (with this environment's settings)
-#   engine/server/service.sh forget    # the kept sessions gone on every box, and glmfront's saved table
+#   engine/server/service.sh forget    # the kept sessions gone on every box, and altarfront's saved table
 # Settings, from the environment of start (written to run/settings, which status and stop read):
-#   GLM53_ADDR, GLM53_PORT   the front-end's addresses (127.0.0.1; one or more specific IPv4 addresses, never
-#                            0.0.0.0) and port (18894, the test port). Port 8888 is the DeepSeek service's: refused
-#   GLM53_KEY_FILE           the API key file (mode 600): ~/dsgb10-data/dev-api-key
-#   GLM53_ENGINE_ARGS        glm53_rank's arguments after --mode serve --socket <run/engine.sock>:
-#                            --fill-experts (the rank files' unfilled expert pools synthetic; empty once filled)
-#   GLM53_FRONT_ARGS         more of glmfront's arguments
-#   GLM53_NOTE               added to ring.owner
-#   GLM53_BIN, GLM53_FRONT_BIN  the binaries, copied at start: ~/dsgb10-data/glm53-server/bin/glm53_rank
-#                            (install.sh), frontend/target/release/glmfront
-#   GLM53_YIELD_IDLE_S (600) the ring goes back after this long without a request
-#   GLM53_HOLD_S (900)       while the engine is down, glmfront holds a request this long, then 503
-#   MIN_AVAIL_GIB (20)       a box with less MemAvailable than this fails the engine's start
-#   GLM53_KEEP_GIB (8)       kept sessions: an engine stop keeps the sessions for the next start, up to this many GiB
-# The boxes: FLEET, this configuration's fleet file (fleet/homelab.conf): the workers, SERVICE_DIR (~/glm53/service),
+#   ALTAR1_ADDR, ALTAR1_PORT     the front-end's addresses (127.0.0.1; one or more specific IPv4 addresses, never
+#                                0.0.0.0) and port (18895). Ports 8888 (the DeepSeek service's) and 18894 (the GLM-5.3
+#                                service's) are refused
+#   ALTAR1_KEY_FILE              the API key file (mode 600): ~/dsgb10-data/dev-api-key
+#   ALTAR1_ENGINE_ARGS           altar1_rank's arguments after --mode serve --socket <run/engine.sock>; default
+#                                "--chunk 2048 --index-scratch-mib 128" (the fleet's memory rule while the CPU
+#                                reference and the converter share the boxes; "" for the engine's 8,192-row chunks).
+#                                The disk tier and so the kept sessions are off while rank 0 offers no disk
+#                                (--disk-rank0-gib, default 0: its data disk); add e.g. --disk-rank0-gib 32 once it has room
+#   ALTAR1_FRONT_ARGS            more of altarfront's arguments
+#   ALTAR1_NOTE                  added to ring.owner
+#   ALTAR1_BIN, ALTAR1_FRONT_BIN the binaries, copied at start: ~/dsgb10-data/altar1-serve/bin/altar1_rank
+#                                (install.sh) and ~/dsgb10-data/altar1-serve/bin/altarfront (frontend's release build)
+#   ALTAR1_YIELD_IDLE_S (600)    the ring goes back after this long without a request
+#   ALTAR1_HOLD_S (900)          while the engine is down, altarfront holds a request this long, then 503
+#   MIN_AVAIL_GIB (90)           a box with less MemAvailable than this fails the engine's start (the rank file is
+#                                76.6 GiB a rank; the engine itself stops below 8 GiB after the load: --min-free-gib)
+#   ALTAR1_KEEP_GIB (8)          kept sessions: an engine stop keeps the sessions for the next start, up to this many
+#                                GiB (with a disk tier only)
+# The ranks run with oom_score_adj 1000 (under memory pressure earlyoom stops them first, not the long CPU passes on
+# the boxes); the supervisor and the front-end keep 0.
+# The boxes: FLEET, this configuration's fleet file (fleet/homelab.conf): the workers, SERVICE_DIR (~/altar1/service),
 # the spill directories (RANK<r>_SPILL). Files: SERVICE_DIR/{bin,logs} on every box, run/ on rank 0 (mode 700: the
-# engine's socket, glmfront's admin socket, pids, state, settings); kept sessions as rank<r>.service.{spill,index}
-# and server.service.index in each box's spill directory, glmfront's table in run/front.table.
+# engine's socket, altarfront's admin socket, pids, state, settings); kept sessions as rank<r>.service.{spill,index}
+# and server.service.index in each box's spill directory, altarfront's table in run/front.table.
 set -u
-NAME=glm53_rank
+NAME=altar1_rank
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
 . "$(dirname "$SELF")/ringlock.sh"  # the fleet (FLEET_*); LOCK, RING_OWNER, RING_WANTS, RING_RECLAIM, ring_*
-H=${GLM53_HOME:-$(fleet_local "$FLEET_SERVICE_DIR")}
+H=${ALTAR1_HOME:-$(fleet_local "$FLEET_SERVICE_DIR")}
 RH=${H#"$HOME"/}
 RUN=$H/run LOGS=$H/logs
 SOCK=$RUN/engine.sock ADMIN=$RUN/front.admin
@@ -66,13 +74,13 @@ state() {  # waiting|starting|serving|yielding|restarting|stopping|stopped|faile
 }
 
 settings() {
-  ADDR=${GLM53_ADDR:-127.0.0.1} PORT=${GLM53_PORT:-18894}
-  KEY=${GLM53_KEY_FILE:-$HOME/dsgb10-data/dev-api-key}
-  EARGS=${GLM53_ENGINE_ARGS---fill-experts} FARGS=${GLM53_FRONT_ARGS:-} NOTE=${GLM53_NOTE:-}
-  BIN=${GLM53_BIN:-$HOME/dsgb10-data/glm53-server/bin/$NAME} FBIN=${GLM53_FRONT_BIN:-$SRC/frontend/target/release/glmfront}
-  MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-20}
-  YIELD_IDLE_S=${GLM53_YIELD_IDLE_S:-600} HOLD_S=${GLM53_HOLD_S:-900}
-  KEEP_GIB=${GLM53_KEEP_GIB:-8}
+  ADDR=${ALTAR1_ADDR:-127.0.0.1} PORT=${ALTAR1_PORT:-18895}
+  KEY=${ALTAR1_KEY_FILE:-$HOME/dsgb10-data/dev-api-key}
+  EARGS=${ALTAR1_ENGINE_ARGS---chunk 2048 --index-scratch-mib 128} FARGS=${ALTAR1_FRONT_ARGS:-} NOTE=${ALTAR1_NOTE:-}
+  BIN=${ALTAR1_BIN:-$HOME/dsgb10-data/altar1-serve/bin/$NAME} FBIN=${ALTAR1_FRONT_BIN:-$HOME/dsgb10-data/altar1-serve/bin/altarfront}
+  MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-90}
+  YIELD_IDLE_S=${ALTAR1_YIELD_IDLE_S:-600} HOLD_S=${ALTAR1_HOLD_S:-900}
+  KEEP_GIB=${ALTAR1_KEEP_GIB:-8}
 }
 
 addrs() { tr ', ' '\n\n' <<< "$ADDR" | sed '/^$/d'; }
@@ -88,22 +96,23 @@ health_ok() {
 
 check() {
   local a
-  [ -n "$(addrs)" ] || die "GLM53_ADDR is empty"
+  [ -n "$(addrs)" ] || die "ALTAR1_ADDR is empty"
   for a in $(addrs); do
     case $a in
       0.0.0.0 | :: | '[::]' | '*') die "will not listen on '$a': specific addresses only, never 0.0.0.0" ;;
     esac
-    [[ $a =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "'$a' in GLM53_ADDR is not an IPv4 address"
+    [[ $a =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "'$a' in ALTAR1_ADDR is not an IPv4 address"
   done
-  [ "$(addrs | sort | uniq -d)" = "" ] || die "GLM53_ADDR names an address twice"
-  [[ $PORT =~ ^[0-9]+$ ]] || die "GLM53_PORT '$PORT' is not a port"
+  [ "$(addrs | sort | uniq -d)" = "" ] || die "ALTAR1_ADDR names an address twice"
+  [[ $PORT =~ ^[0-9]+$ ]] || die "ALTAR1_PORT '$PORT' is not a port"
   [ "$PORT" != 8888 ] || die "port 8888 is the DeepSeek service's"
+  [ "$PORT" != 18894 ] || die "port 18894 is the GLM-5.3 service's"
   [ -r "$KEY" ] || die "no API key file $KEY"
   [ $((8#$(stat -c %a "$KEY") & 8#077)) = 0 ] || die "$KEY can be read by others: chmod 600 it"
-  [[ $YIELD_IDLE_S =~ ^[0-9]+$ && $HOLD_S =~ ^[0-9]+$ ]] || die "GLM53_YIELD_IDLE_S and GLM53_HOLD_S are seconds"
-  [[ $KEEP_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "GLM53_KEEP_GIB '$KEEP_GIB' is not GiB"
+  [[ $YIELD_IDLE_S =~ ^[0-9]+$ && $HOLD_S =~ ^[0-9]+$ ]] || die "ALTAR1_YIELD_IDLE_S and ALTAR1_HOLD_S are seconds"
+  [[ $KEEP_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "ALTAR1_KEEP_GIB '$KEEP_GIB' is not GiB"
   [ -x "$BIN" ] || die "no engine binary $BIN (engine/server/install.sh)"
-  [ -x "$FBIN" ] || die "no front-end binary $FBIN (cargo build --release in frontend/)"
+  [ -x "$FBIN" ] || die "no front-end binary $FBIN (cargo build --release in frontend/, copied there)"
 }
 
 sup_pid() {
@@ -143,7 +152,7 @@ freeze() {
   mkdir -p "$H/bin" &&
     cp "$BIN" "$H/bin/$NAME.new" && mv -f "$H/bin/$NAME.new" "$H/bin/$NAME" &&
     cp "$FLEET" "$H/bin/fleet.conf.new" && mv -f "$H/bin/fleet.conf.new" "$H/bin/fleet.conf" &&
-    cp "$FBIN" "$H/bin/glmfront.new" && mv -f "$H/bin/glmfront.new" "$H/bin/glmfront"
+    cp "$FBIN" "$H/bin/altarfront.new" && mv -f "$H/bin/altarfront.new" "$H/bin/altarfront"
 }
 BOXES=0
 freeze_boxes() {  # the frozen engine on every worker, once, with the ring
@@ -179,7 +188,7 @@ start_engine() {  # strays out, memory checked; ranks 1-3, then rank 0
   r=1
   for w in "${WS[@]}"; do
     old=$(for ((i = KEEP - 1; i >= 1; i--)); do echo -n "$i "; done)
-    "${SSH[@]}" "$w" "cd $RH && f=logs/rank.$r.log && if [ -s \$f ]; then for i in $old; do [ -f \$f.\$i ] && mv -f \$f.\$i \$f.\$((i + 1)); done; mv -f \$f \$f.1; fi; setsid nohup bin/$NAME --rank $r $ARGS >> \$f 2>&1 < /dev/null &" ||
+    "${SSH[@]}" "$w" "cd $RH && f=logs/rank.$r.log && if [ -s \$f ]; then for i in $old; do [ -f \$f.\$i ] && mv -f \$f.\$i \$f.\$((i + 1)); done; mv -f \$f \$f.1; fi; echo 1000 > /proc/self/oom_score_adj; setsid nohup bin/$NAME --rank $r $ARGS >> \$f 2>&1 < /dev/null &" ||
       {
         log "starting rank $r on $w failed"
         reap_all 0
@@ -189,7 +198,7 @@ start_engine() {  # strays out, memory checked; ranks 1-3, then rank 0
   done
   rotate "$LOGS/rank.0.log"
   rm -f "$SOCK"
-  "$H/bin/$NAME" --rank 0 $ARGS >> "$LOGS/rank.0.log" 2>&1 < /dev/null 6>&- 7>&- 8>&- 9>&- &
+  (echo 1000 > /proc/self/oom_score_adj; exec "$H/bin/$NAME" --rank 0 $ARGS) >> "$LOGS/rank.0.log" 2>&1 < /dev/null 6>&- 7>&- 8>&- 9>&- &
   R0=$! R0_T=$(date +%s) READY=0 KILL_AT=0
   echo "$R0" > "$RUN/rank0.pid"
   log "engine started: rank 0 pid $R0, $H/bin/$NAME $ARGS"
@@ -216,7 +225,7 @@ stop_engine() {  # rank 0 first: on SIGTERM it ends the requests in flight, keep
 
 start_front() {
   rotate "$LOGS/front.log"
-  "$H/bin/glmfront" serve $(addrs | sed "s|.*|--listen &:$PORT|") --engine-socket "$SOCK" --api-key-file "$KEY" \
+  "$H/bin/altarfront" serve $(addrs | sed "s|.*|--listen &:$PORT|") --engine-socket "$SOCK" --api-key-file "$KEY" \
     --admin-socket "$ADMIN" --hold-s "$HOLD_S" --table-file "$RUN/front.table" $FARGS >> "$LOGS/front.log" 2>&1 < /dev/null 6>&- 7>&- 8>&- 9>&- &
   FE=$! FE_T=$(date +%s)
   echo "$FE" > "$RUN/front.pid"
@@ -238,8 +247,8 @@ stop_front() {
   rm -f "$RUN/front.pid"
 }
 
-admin() { "$H/bin/glmfront" admin --socket "$ADMIN" "$@" 2> /dev/null; }
-own() { echo "$(date '+%F %T') pid $$ service: glm53 service.sh, front-end $(urls)${NOTE:+ ($NOTE)}" > "$RING_OWNER"; }
+admin() { "$H/bin/altarfront" admin --socket "$ADMIN" "$@" 2> /dev/null; }
+own() { echo "$(date '+%F %T') pid $$ service: altar1 service.sh, front-end $(urls)${NOTE:+ ($NOTE)}" > "$RING_OWNER"; }
 
 # The want (ringlock.sh's format, flock'd on fd 7 while it exists): the DeepSeek service lends the ring to it as to
 # a job, and jobs queue behind it by its age.
@@ -247,7 +256,7 @@ WANT=$RING_WANTS/$$
 want_on() {
   [ -e "$WANT" ] && return 0
   mkdir -p "$RING_WANTS" && exec 7> "$WANT.new" && flock 7 &&
-    printf '%s pid %s glm53-service: the GLM-5.3 service (%s)\n%s\n' "$(date '+%F %T')" $$ "$1" "$(ring_key)" >&7 &&
+    printf '%s pid %s altar1-service: the altar-1 service (%s)\n%s\n' "$(date '+%F %T')" $$ "$1" "$(ring_key)" >&7 &&
     mv -f "$WANT.new" "$WANT" && log "want registered: $1"
 }
 want_off() {
@@ -257,7 +266,7 @@ want_off() {
 }
 waiting_requests() { sed -n 's/.* waiting \([0-9]*\) .*/\1/p' <<< "$(admin status)"; }
 
-# The ring back to whoever wants it: glmfront holds requests, the engine stops (keeping the sessions), the lock goes.
+# The ring back to whoever wants it: altarfront holds requests, the engine stops (keeping the sessions), the lock goes.
 give_back() {
   log "giving the ring back: $1"
   state yielding "$1"
@@ -482,7 +491,7 @@ cmd_stop() {
   if [ -f "$RUN/rank0.pid" ] || [ -f "$RUN/front.pid" ]; then
     exec 9>> "$LOCK"
     p=$(cat "$RUN/front.pid" 2> /dev/null)
-    [ -n "$p" ] && [ "$(cat "/proc/$p/comm" 2> /dev/null)" = glmfront ] && kill -TERM "$p"
+    [ -n "$p" ] && [ "$(cat "/proc/$p/comm" 2> /dev/null)" = altarfront ] && kill -TERM "$p"
     if flock -n 9; then  # the ranks only with the ring lock (else they may be another job's)
       pkill -x $NAME
       reap_all 10
@@ -521,7 +530,7 @@ cmd_forget() {
     echo "service.sh: $left kept files are left (a box unreachable?): run forget again" >&2
     return 1
   fi
-  echo "service.sh: forgotten: the kept sessions on every box and glmfront's saved table"
+  echo "service.sh: forgotten: the kept sessions on every box and altarfront's saved table"
 }
 
 cmd_status() {

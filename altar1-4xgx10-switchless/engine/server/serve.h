@@ -14,7 +14,7 @@ namespace srv {
 
 struct ServeOptions {
   std::string socket;          // the front-end's socket (mode 0600)
-  std::string name = "glm-5.3";
+  std::string name = "altar-1";
   int max_ctx = 65536;         // positions a session may reach (prompt + output), at most
   int chunk = 8192;            // rows a prefill command (the model chunks within it by Options::prefill_rows)
   int slots = 4;               // sessions decoding together, a row each per step (B2), at most kMaxSess

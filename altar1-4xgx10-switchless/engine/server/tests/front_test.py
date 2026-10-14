@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""glmfront against the real engine (docs/serving.md): the OpenAI surface over HTTP on a test port, with rank 0
+"""altarfront against the real engine (docs/serving.md): the OpenAI surface over HTTP on a test port, with rank 0
 behind it in place of the mock. Greedy chat completions, streamed and not: the same conversation twice gives the
 same text with the prompt reused (cached_tokens), a second turn reuses the first (cached_tokens > 0), a client
 that disconnects mid-stream is cancelled and the next request is served. With synthetic routed experts the text is
 meaningless; the checks are about the engine behind the front-end, not the words.
 
-  front_test.py http://127.0.0.1:18894 KEY_FILE
+  front_test.py http://127.0.0.1:18895 KEY_FILE
 """
 import http.client
 import json
@@ -62,7 +62,7 @@ def text(m):
 def main():
     msgs = [{'role': 'system', 'content': 'You are a coding agent. ' + 'Be careful. ' * 200},
             {'role': 'user', 'content': 'List the files of the repository and say what each one does.'}]
-    body = {'model': 'glm-5.3', 'messages': msgs, 'max_tokens': 24, 'temperature': 0}
+    body = {'model': 'altar-1', 'messages': msgs, 'max_tokens': 24, 'temperature': 0}
     s1, b1 = post(body)
     check(s1 == 200 and b1['choices'][0]['message'] is not None, 'a chat completion: 200')
     u1 = b1.get('usage', {})

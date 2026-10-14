@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""G8 (docs/engine.md, "End to end on real weights"): real text through glmfront. The four golden conversations of
+"""G8 (docs/engine.md, "End to end on real weights"): real text through altarfront. The four golden conversations of
 ref/tokens (short, prose, python, and agentic's first six messages, ending in a tool result, so the prompt stays
 under 8k tokens), each greedy and then seeded (temperature 1.0, top-p 0.95, seed 1234), up to MAX new tokens, one
 request at a time; then two sessions at once (python with prose, short with agentic, greedy). Per request: the
-time to the first streamed token (TTFT), the decode rate after it, the text; the ids come from glmfront's
+time to the first streamed token (TTFT), the decode rate after it, the text; the ids come from altarfront's
 --dump-dir (N.out.json), matched by order. Writes OUT (JSON); compare two configurations' files with --compare.
 
   g8_front.py run URL KEY_FILE REF_TOKENS_DIR DUMP_DIR OUT.json [--max 512] [--phases single,pair]
