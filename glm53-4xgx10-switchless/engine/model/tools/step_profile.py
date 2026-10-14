@@ -128,7 +128,64 @@ def prefill_profile(ks):
             d[2] += 1
     total = seq[-1][1] - seq[0][0]
     side_ms = sum(k[1] - k[0] for k in side)
-    return kinds, classes, total, len(seq), side_ms
+    return kinds, classes, total, len(seq), side_ms, streams_of(ks, main)
+
+
+def union(iv):
+    """Sorted disjoint union of (start, end) intervals."""
+    out = []
+    for s, e in sorted(iv):
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def measure(u):
+    return sum(e - s for s, e in u)
+
+
+def intersect(a, b):
+    i = j = t = 0
+    while i < len(a) and j < len(b):
+        lo, hi = max(a[i][0], b[j][0]), min(a[i][1], b[j][1])
+        t += max(0, hi - lo)
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return t
+
+
+def streams_of(ks, main):
+    """Per stream (the main one first): kernels, busy time (the union of its kernels), the kernel time per class,
+    and the busy time overlapped with the main stream's; the main stream's idle gaps (waiting for another stream,
+    or launch gaps) between its first start and last end."""
+    by = collections.defaultdict(list)
+    for k in ks:
+        by[k[2]].append(k)
+    mu = union([(k[0], k[1]) for k in by[main]])
+    out = []
+    for sid in [main] + sorted(s for s in by if s != main):
+        u = union([(k[0], k[1]) for k in by[sid]])
+        cl = collections.defaultdict(float)
+        for k in by[sid]:
+            cl[klass(k[3])] += k[1] - k[0]
+        out.append((sid, len(by[sid]), measure(u), intersect(u, mu) if sid != main else measure(u), dict(cl)))
+    return out
+
+
+def stream_report(profs):
+    print("\nper stream (ms; busy = the union of its kernels; with main = the part of it while the main stream runs a "
+          "kernel; main idle = chunk - main busy):")
+    for i, p in enumerate(profs):
+        total = p[2]
+        for j, (sid, n, busy, ov, cl) in enumerate(p[5]):
+            what = "main" if j == 0 else "side"
+            extra = f" idle {(total - busy) / 1e6:8.1f}" if j == 0 else f" with main {ov / 1e6:8.1f}"
+            print(f"  report {i} {what} stream {sid}: {n:6d} kernels, busy {busy / 1e6:8.1f}{extra}; " +
+                  ", ".join(f"{c.split(' (')[0]} {v / 1e6:.1f}" for c, v in sorted(cl.items(), key=lambda x: -x[1])))
 
 
 def prefill_main(a):
@@ -148,6 +205,7 @@ def prefill_main(a):
         v = [p[0].get(k, (0, 0, 0)) for p in profs]
         print(f"{k[:70]:70s} {v[0][2]:6d} " + " ".join(f"{x[0] / 1e6:9.1f} {x[1] / 1e6:9.1f} {100 * x[0] / p[2]:5.1f}"
                                                      for x, p in zip(v, profs)))
+    stream_report(profs)
 
 
 def main():

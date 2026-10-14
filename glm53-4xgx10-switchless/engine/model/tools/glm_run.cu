@@ -13,7 +13,8 @@
 //   trace     graph steps at --rows inside cudaProfilerStart/Stop (run under nsys; tools/step_profile.py)
 //   prefill   prefill chunks of --chunks (default 512,1024,2048,4096,8192) rows at position --ctx: tok/s
 //   pfab      prefill, the lever sets --ab-base and --ab, A B B A for each chunk of --chunks rows at position --at (a
-//             list beside --chunks; default --ctx), the caches before it filled with hashed values: ms and tok/s,
+//             list beside --chunks; default --ctx; a "chunk" above --chunk is a whole prompt in chunks), the caches
+//             before it filled with hashed values: ms and tok/s,
 //             and whether A and B give the same bits (every layer's cache, the last row's sample; with --drafts the
 //             MTP layer's cache holds every row's final normed hidden), every rank
 //   pftrace   one prefill chunk of --chunks[0] rows at --at[0] (after a warm one) inside cudaProfilerStart/Stop (nsys;
@@ -354,7 +355,7 @@ void prefill_ab(Model& m, comm::Ring& ring) {
   }
   for (size_t i = 0; i < A.chunks.size(); ++i) {
     const int C = A.chunks[i], at = i < A.ats.size() ? A.ats[i] : A.ctx;
-    if (C > m.options().prefill_rows) continue;
+    // a prompt longer than a chunk runs as prefill() splits it (chunks of prefill_rows; the timing is the whole call)
     std::vector<int32_t> tok(C);
     for (int j = 0; j < C; ++j) tok[j] = synth_token(A.seed + 3, at + j);
     double ms[2][2] = {};
@@ -714,6 +715,9 @@ int main(int argc, char** argv) {
     else if (a == "--no-pdl") A.mo.pdl = false;
     else if (a == "--fp8-keys") A.mo.fp8_index_keys = true;
     else if (a == "--chunk") A.mo.prefill_rows = std::stoi(nx());
+    else if (a == "--pf-pieces") A.mo.prefill_pieces = std::stoi(nx());
+    else if (a == "--pf-blocks") A.mo.prefill_comm_blocks = std::stoi(nx());
+    else if (a == "--pf-min-piece") A.mo.prefill_min_piece = std::stoi(nx());
     else if (a == "--splits") A.mo.attn_splits = std::stoi(nx());
     else if (a == "--rows") A.rows = parse_list(nx());
     else if (a == "--tune") A.mo.tune = (uint32_t)std::stoul(nx(), nullptr, 16);
@@ -770,7 +774,8 @@ int main(int argc, char** argv) {
   }
   size_t fr = 0, tot = 0;
   CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
-  record(rk, "tune\t%08x", m.options().tune);
+  record(rk, "tune\t%08x\tprefill pieces %d comm blocks %d", m.options().tune, m.options().prefill_pieces,
+         m.options().prefill_comm_blocks);
   record(rk, "start\t%s weights (%d MoE layers' routed experts from the file) %.2f GB\tmax_ctx %d slots %d drafts %d l2pf %d\tbound in %.1f s\tfree %.1f GB",
          A.synthetic ? "synthetic" : "file", m.file_expert_layers(), m.weight_bytes() / 1e9, m.options().max_ctx, m.options().slots,
          m.options().drafts, (int)m.options().l2pf, now_s() - t0, fr / 1e9);
