@@ -256,7 +256,10 @@ one chunk moves out of the old bound (a worst-case 3·(K/64)·2⁻²³ Σ\|x·w\
 ## 8. Files written
 
 `/data/dsgb10/glm53/weights/` on rank 0 (converted 2026-10-13 23:19, tool `63b15f221d924873f8a6358e1e2e8cd46bf41cb290005df4715788c41a75e4a5`, `--commit e33e73f`,
-shared expert in T128; the MTP layer's experts filled 2026-10-14, § 6):
+shared expert in T128; the MTP layer's experts filled 2026-10-14, § 6). The workers' copies (`~/glm53/weights/rank{r}.glw`
+on ranks 1–3) held the 5,560,139,776-byte files without layer 78's experts until 2026-10-14 (G7 found the mixed state: rank
+0 filled, ranks 1–3 not; `glm53_rank` now warns at start when the ranks' files differ); they were replaced that day by
+atomic rename with the filled files, SHA-256 verified against this table:
 
 | File | Bytes | SHA-256 | TOC CRC |
 |---|---:|---|---|
