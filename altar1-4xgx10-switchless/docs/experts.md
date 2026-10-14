@@ -340,3 +340,10 @@ every variant, wk1 = prefill, INT4 = BF16 on the dequantised matrices, batch inv
 
 **Left.** One CTA an SM for the default INT4 k_up; a `__launch_bounds__(192, 2)` build (≤ 170 registers) was not
 tried. The fused shared expert at 1 row costs ~76 µs a layer against 80.3 µs of bytes: no further room there.
+
+**`DecodeCfg::ysum`** (commit 6477b29, the runner's default since; engine.md § 9.1, decision 8): k_down adds the
+shared expert's f32 output into each value's routed sum after the routed experts (one `__fadd_rn`; the fused path
+reads back its own ys write, the GEMV path the caller's ys) and writes or posts yr alone (R rows; the post's size
+halves). `bench_experts --shfused` checks it: the fused and the unfused yr with `ysum` equal the plain f32 add of the
+GEMV's ys into the unfused yr, 26 of 26 cases at 1, 2, 4, 6, 9, 16 rows, INT4 and BF16 (rank 0, 14:52). Registers:
+the default INT4 `k_down<2,1>` with the fused shared expert stays at 218, the BF16 one 208 → 192.

@@ -122,10 +122,23 @@ enum Tune : uint32_t {
   // decode: the routed gate/up kernel loads its next task's first blocks under the current task's epilogue
   // (gx::DecodeCfg::xpf; the same bits)
   kTuneUpXpf = 1u << 10,
+  // NOT a speed lever and never in the default: it CHANGES OUTPUTS. The MoE layer's combine in transformers' order,
+  // the engine's before 2026-10-14: the routed and the shared expert's partials all-reduced separately and
+  // y = bf16(bf16(sum yr) + bf16(sum ys)) (comm::glm::allreduce2_add_norm; prefill two reduce-scatters, ops::add_rows
+  // with two inputs). Off (the contract, glm53 DESIGN decision 8): the shared expert's f32 partial joins the routed
+  // experts' f32 sum after them (gx::DecodeCfg::ysum; prefill comm::reduce_scatter_rows_f32_sum2), one all-reduce,
+  // rounded once to bf16 (docs/engine.md § 9.1). Kept for the A/B against the golden data (glm_run --combine bf16).
+  kTuneMoeBf16Combine = 1u << 11,
+  // NOT a speed lever and never in the default: it CHANGES OUTPUTS. Every sublayer's residual add with the sum
+  // rounded first, h = bf16(res + bf16(sum)), the engine's before 2026-10-14 (decode's add-norm collectives'
+  // round2, prefill's ops::add_rows round2). Off (the contract, decision 8): h = bf16(f32(res) + sum), one rounding
+  // (docs/engine.md § 9.1). With kTuneMoeBf16Combine also on: the outputs of the engine before 5087b2f bit for bit.
+  kTuneResRound2 = 1u << 12,
+  kTuneOutputBits = kTuneMoeBf16Combine | kTuneResRound2,  // the output-changing bits
   kTuneDefault =
       kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter | kTunePfOverlap | kTunePfAttn |
       kTuneShFused | kTuneUpXpf,
-  kTuneAll = 0xffffffffu,
+  kTuneAll = 0xffffffffu & ~kTuneOutputBits,  // every exact lever
 };
 
 struct Options {

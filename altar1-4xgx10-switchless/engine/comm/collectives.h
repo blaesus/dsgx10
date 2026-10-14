@@ -47,6 +47,11 @@ void reduce_scatter_rows_bf16(const DevChannel& ch, const __nv_bfloat16* in, siz
                               size_t ld_out, int rows, int cols, cudaStream_t st, int blocks = 16);
 void reduce_scatter_rows_f32(const DevChannel& ch, const float* in, size_t ld_in, float* out, size_t ld_out, int rows,
                              int cols, cudaStream_t st, int blocks = 16);
+// The same with two inputs of the same shape (strides ld_in): this rank's contribution is in + in2 in f32 (one
+// __fadd_rn an element, in the send copy), so the sums are those of reduce_scatter_rows_f32 on that elementwise sum
+// (the MoE layer's routed and shared partials under decision 8: one reduce-scatter instead of two).
+void reduce_scatter_rows_f32_sum2(const DevChannel& ch, const float* in, const float* in2, size_t ld_in, float* out,
+                                  size_t ld_out, int rows, int cols, cudaStream_t st, int blocks = 16);
 
 // All-gather of several buffers in one pipelined collective: for each segment, out = [in_0 | in_1 |
 // in_2 | in_3] of `bytes` each (a multiple of 16). in may be out + rank * bytes (in place).

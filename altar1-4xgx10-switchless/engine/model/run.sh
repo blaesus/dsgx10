@@ -81,7 +81,7 @@ for s in "${steps[@]}"; do
     mtp) cmd=($G $T --max-ctx 8192 --ctx 4096 --drafts 1 --rows 1,2,4 $EXTRA bench) ;;
     l2pf) cmd=($G $T --max-ctx 8192 --ctx 4096 --rows 1,6,16 $EXTRA l2pf) ;;
     prefill) cmd=($G $T --max-ctx 16384 --ctx 0 --chunk 8192 $EXTRA prefill) ;;
-    ab) cmd=($G $T --max-ctx 8192 --ctx 4096 --rows ${ABROWS:-1,2,4,6,16} --ab ${AB:-ffffffff} --ab-base ${ABBASE:-0} $EXTRA ab) ;;
+    ab) cmd=($G $T --max-ctx 8192 --ctx 4096 --rows ${ABROWS:-1,2,4,6,16} --ab ${AB:-ffffe7ff} --ab-base ${ABBASE:-0} $EXTRA ab) ;;
     trace) cmd=($G $T --max-ctx 8192 --ctx 4096 --rows ${TROWS:-1,6} $EXTRA trace) ;;
     pfab) cmd=($G $T --max-ctx 33792 --drafts ${PFDRAFTS:-1} --chunks ${PFCHUNKS:-2600,8192,8192} --at ${PFAT:-0,0,24576}
       --ab-base ${PFA:-f7} --ab ${PFB:-1f7} $EXTRA pfab) ;;

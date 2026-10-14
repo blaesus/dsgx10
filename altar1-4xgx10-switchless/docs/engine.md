@@ -233,28 +233,85 @@ changes a bit: every A/B below printed the same output hash for A and B, and tho
 default's at every row count (1 row aa5124b549d4091c, 2 rows 74f6421cf905b042, 4 rows 8a0e4df83ce778d4, 6 rows
 4752875ee45d0d7b, 16 rows 909806d4f89f5930: last hidden rows, sampled tokens and every layer's cache, all four
 ranks). Synthetic weights in the real formats throughout (4 INT4 pools, context 4,096; the real rank files were not
-bound).
+bound). Those hashes are of the bf16 combine order; § 9.1's later change of contract (decision 8, commit 6477b29)
+changes the outputs, and the tuning's numbers in §§ 9.2–9.5 were measured before it.
 
-### 9.1 Where the shared expert's partial is summed (unchanged; an open contract question)
+### 9.1 The MoE combine: decision 8 (the shared expert inside the routed experts' f32 sum)
 
-The task allowed the shared expert's partial to join the routed experts' f32 sum. **The fusion does not move it:**
-the engine's existing order is kept. Both engines compute **y = bf16(bf16(Σ_ranks yr) + bf16(Σ_ranks ys))**: the
-routed sum and the shared sum are two partials, each all-reduced in f32 and rounded, then added and rounded again
-(`comm::glm::allreduce2_add_norm`, kTwo: `bfround(bfround(v) + bfround(u))`; `gx::finalize`; prefill's
-`sublayer_end` takes `p.yr` and `p.ys` the same way). So the fused kernels still write **ys as its own f32
-partial** (k_down, posted into the all-reduce's send buffer beside yr, as glm53's fused FP8 path did), and decode's
-ys equals the two GEMVs' bit for bit (§ 9.2). Prefill is unchanged: its shared expert is still `gemm()` at split-K
-4 / 1 into `p.ys`, equal to the GEMV by attn's test P; `check6` shows decode = prefill in all 79 caches with the
-fused path (§ 9.4).
+**Decided 2026-10-14 (coordinator): the contract is glm53 DESIGN decision 8 as written**, which altar1's decision 2
+adopts and in which A1's all-f32 golden set is made: the weighted outputs of a row's routed experts *and the shared
+expert* are summed in f32 across experts and ranks and rounded to bf16 once. Until then both engines computed
+y = bf16(bf16(Σ_ranks yr) + bf16(Σ_ranks ys)) (the routed and the shared sums all-reduced as two partials, each
+rounded, then added: the reference's `--combine bf16` order for this step). Since commit 6477b29:
 
-**Open, found while writing this:** reference.md (A1, merged 2026-10-14) names `--combine f32` the contract
-(glm53 DESIGN decision 8: routed experts and the shared expert summed in f32 and rounded once with the residual),
-and `--combine bf16` transformers' order (the shared expert and the residual added in bf16). For the MoE output the
-engine's kTwo is the bf16 order's shared add, not decision 8's. This predates the tuning (A4's runner, glm53's
-collective) and the tuning keeps it, since every lever here must leave the bits alone. Moving ys into yr's f32 sum
-would be a small change in the fused k_down (add the shared strip after the routed experts in yr's f32 chain) plus
-`allreduce_add_norm` instead of kTwo and the same change in prefill's `sublayer_end`, but it changes outputs: a
-contract decision for the coordinator, to be settled against A1's golden data.
+- **Decode**: `k_down` adds the shared expert's f32 output into each value's routed sum after the routed experts,
+  one `__fadd_rn`: yr = fl(Σ_experts in id order (w·s2)·down(h) + ys) (`gx::DecodeCfg::ysum`). With the fused shared
+  expert ys is k_down's own write; on the GEMV path it is the GEMV's output. yr is the only partial: it goes to
+  `comm::glm::allreduce_add_norm` (posted: `k_down` writes R rows into the send buffer and posts them, the consumer
+  is `allreduce_add_norm_posted`), not `allreduce2_add_norm`. Every layer with a shared expert takes this path:
+  3–76 (INT4 experts), 3 and 77 (BF16), the MTP layer 78 (its draft pass runs the same `layer()`).
+- **Prefill**: `sublayer_end` reduce-scatters yr + ys as one contribution (`comm::reduce_scatter_rows_f32_sum2`: the
+  send copy adds the two f32 inputs, one `__fadd_rn` an element), then the residual add and the norm on one sum
+  (`ops::add_rows` with one input). The f32 add is the same as decode's, so decode = prefill still holds.
+- **The residual** (second decision, commit 59e9515): decision 8's sum is "rounded to bf16 once, when added to the
+  residual", and the reference's contract mode computes h = bf16(f32(res) + Σ) with Σ still f32 for every
+  sublayer. The engine rounded twice, h = bf16(res + bf16(Σ)). Now every add-norm collective (`k_allreduce_hidden`,
+  `k_ar_norm_row`; plain, posted, two-partial) and prefill's `ops::add_rows` compute **h = bf16(f32(res) + Σ)**, for
+  o_proj, the dense MLPs (layers 0–2), the MoE layers and the MTP layer, up to the final norm before the head; the
+  RMSNorm after it is unchanged. The double rounding stays selectable as **`kTuneResRound2`** (bit 12,
+  output-changing, in neither `kTuneDefault` nor `kTuneAll`; `glm_run --res-round2`). With bits 11 and 12 both on
+  the engine gives the outputs it gave before 5087b2f, bit for bit (below).
+- **Saved**: the second partial's traffic. Decode: R × 24,576 B less in each MoE layer's all-reduce (its send is
+  R rows, not 2R): 75 layers × 24,576 B = 1.8 MB a step at 1 row, 29.5 MB at 16 rows (each rank's contribution).
+  Prefill: one reduce-scatter fewer a MoE layer, m × 24,576 B: **201 MB a layer for an 8,192-row chunk**.
+- **The old order** stays selectable: `kTuneMoeBf16Combine` (bit 11), the one tune bit that changes outputs and is
+  never in `kTuneDefault` or `kTuneAll` (`glm_run --combine bf16`). It gives the earlier default's outputs bit for
+  bit (the A/B below: its hashes equal 0x7f7's before the change at every row count).
+
+**Bits** (synthetic weights in the real formats; commit 6477b29, binaries bin6):
+
+- *Kernel level* (`bench_experts --shfused i4|b16`, run.sh `shf-*`, rank 0, 2026-10-14 14:52): for every up and
+  down variant and two shared copies at 1, 2, 4, 6, 9 and 16 rows, the fused path's yr with `ysum` and the unfused
+  path's (the GEMV's ys added in k_down) equal the plain host f32 add of the GEMV's ys into the unfused yr, bit for
+  bit; 26 of 26 cases at every row count, INT4 and BF16 (and the fused h, ys and separate yr as before).
+- *Model* (`run.sh check`, `check6`, 15:02 and 15:03, default 0x7f7): chunkings 79/79 caches identical; decode =
+  prefill in layers 0–3, and in **all 79 caches with `--moe-up 6`** (decode's ysum against prefill's summed
+  reduce-scatter); 16 rows = 16 × 1 row; graph = eager; the four ranks identical; sampling. All PASS.
+
+**The step** (`run.sh ab`, A = 0xff7, the old order, B = 0x7f7, 10 rounds A B / B A, job 15:09):
+
+| Rows | old (0xff7) | decision 8 (0x7f7) | B/A median (range) | gain | hashes old → new |
+|---:|---:|---:|---|---:|---|
+| 1 | 45.691 ms | 46.058 | 1.0026 (0.962..1.082) | −0.26 % | aa5124b549d4091c → ff56682e56a05a80 |
+| 2 | 61.808 | 60.720 | 0.9784 (0.940..1.045) | +2.16 % | 74f6421cf905b042 → e702c76a862bebbc |
+| 4 | 80.673 | 80.178 | 1.0011 (0.944..1.056) | −0.11 % | 8a0e4df83ce778d4 → 5c80d7d05b5398dc |
+| 6 | 97.533 | 96.097 | 0.9853 (0.952..1.018) | +1.47 % | 4752875ee45d0d7b → 33bcb5cc90b266cd |
+| 16 | 143.177 | 138.621 | 0.9662 (0.958..0.984) | **+3.38 %** | 909806d4f89f5930 → eddf9159f2920072 |
+
+Neutral at 1 and 4 rows (inside the spread), faster at 16 rows, where the halved all-reduce is largest. The job's
+check printed FAIL at every row count: a bug in the check, not the engine. After an even number of rounds the last
+block runs A, so its "B again after the rounds" hash was A's. Every rank agreed, and A's hashes are the old
+default's. Fixed in glm_run (set B before that hash), not rerun (ring time is A8's).
+
+**The residual's one rounding** (commit 59e9515, binaries bin7 and comm bin7, synthetic weights):
+
+- *Kernel level* (`comm/run.sh test`, `coll_tests`, four ranks, 15:20, sources `24532428137205f8`): `allreduce_add_norm`'s h and xn equal the
+  host's f32 add rounded once (and with round2, rounded twice) and attn's rmsnorm on it, at 1–16 rows, slices 1, 8,
+  16, 32, with and without PDL, separate and in place; `allreduce2_add_norm` the same with round2 on and off (its y
+  is bf16 already). 510 checks ok, 0 failures, identical on all ranks.
+- *Model* (`check`, `check6`, 15:26 and 15:27, default 0x7f7): every check PASS, as in the list above (incl.
+  decode = prefill in all 79 caches with `--moe-up 6`).
+- *The old outputs* (`run.sh ab`, A = 0x1ff7, bits 11 and 12, B = 0x7f7, 4 rounds, job 15:34): A's hashes equal the
+  pre-5087b2f default's at every row count (1 row aa5124b549d4091c, 2 rows 74f6421cf905b042, 4 rows
+  8a0e4df83ce778d4, 6 rows 4752875ee45d0d7b, 16 rows 909806d4f89f5930); the contract's (B) are e9f715e6a3eed0b9,
+  ce60356e87c69fa3, bfe839ddafe0d05a, 12e7b27f6728c7b6, 93df0cf3e434e600; the check passes (B the same after the
+  rounds, every rank the same). The epilogue loses one rounding and does nothing else, so its cost does not change.
+  The job's times (46.40 → 46.22, 62.39 → 61.01, 81.52 → 78.55, 96.94 → 94.03, 140.12 → 134.41 ms) mix both
+  changes over 4 rounds, so they are not a measurement of this one.
+
+**Left**: the comparison against A1's golden data on the real files (A8, with bits 11 and 12 for the old order); a
+prefill A/B (`pfab`) of the saved reduce-scatter; no check here ran drafts, so the MTP layer's path is in the code but
+not exercised.
 
 ### 9.2 The fused BF16 shared expert (`gx::SharedW::bgu, bd`; docs/experts.md § 11)
 
@@ -268,7 +325,7 @@ block's lane order, so the expert kernels read them with their own fragment code
   are prefetched into L2 before `griddepcontrol.wait` (only an L2 prefetch: holding them in registers across the
   routed tasks took the default kernel from 132 to 223 registers).
 - **k_down**: each warp's NT shared down strips (8 KB each) prefetched into L2 before the wait, then one MMA chain
-  over the 512 k from zero (the GEMV at split-K 1) into ys, posted with yr.
+  over the 512 k from zero (the GEMV at split-K 1) into ys, posted with yr (since § 9.1: added into yr's f32 sum, yr alone posted).
 - A **template parameter** (`SHB`): the unfused instantiations compile to the earlier code (the default INT4
   `k_up<1,6,2>` 132 registers, `k_down<2,1>` 155, as before); the fused ones take 168 (8 B of spill) and 218.
   moe_decode picks SHB from `LayerW::sh.bf16()`. The runner sets it with `kTuneShFused` when both

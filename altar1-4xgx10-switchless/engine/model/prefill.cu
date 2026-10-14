@@ -120,16 +120,25 @@ void detail::pf_proj(bool use_gemm, const uint16_t* x, int ldx, int M, int K, co
 // (and b) reduce-scattered by rows, the residual add and the next norm on this rank's quarter of the piece's rows,
 // the quarter's h and xn rows all-gathered. A row's sums are the four ranks' partials added in rank order wherever
 // the piece boundaries fall, and the add and the norm go row by row: any split of the chunk gives the same bits.
+// sum2 (the MoE layer under decision 8): a + b in f32 is this rank's one contribution (the send copy adds them), so
+// one reduce-scatter; else b is a second partial reduced on its own, y = bf16(bf16(sum a) + bf16(sum b)).
 static void sublayer_end(const comm::DevChannel& ch, int rank, Model::Impl::Pre& p, int r0, int m, const float* a,
-                         const float* b, const uint16_t* norm, cudaStream_t st, int blocks) {
+                         const float* b, const uint16_t* norm, cudaStream_t st, int blocks, bool sum2 = false,
+                         bool round2 = false) {
   const int mp = (m + kRanks - 1) / kRanks * kRanks, rq = mp / kRanks;
   float* qa = p.qa + (size_t)(r0 / kRanks) * kDim;
   float* qb = p.qb + (size_t)(r0 / kRanks) * kDim;
-  comm::reduce_scatter_rows_f32(ch, a + (size_t)r0 * kDim, kDim, qa, kDim, rq, kDim, st, blocks);
-  if (b) comm::reduce_scatter_rows_f32(ch, b + (size_t)r0 * kDim, kDim, qb, kDim, rq, kDim, st, blocks);
+  if (b && sum2) {
+    comm::reduce_scatter_rows_f32_sum2(ch, a + (size_t)r0 * kDim, b + (size_t)r0 * kDim, kDim, qa, kDim, rq, kDim, st,
+                                       blocks);
+    b = nullptr;
+  } else {
+    comm::reduce_scatter_rows_f32(ch, a + (size_t)r0 * kDim, kDim, qa, kDim, rq, kDim, st, blocks);
+    if (b) comm::reduce_scatter_rows_f32(ch, b + (size_t)r0 * kDim, kDim, qb, kDim, rq, kDim, st, blocks);
+  }
   uint16_t* hq = p.h + ((size_t)r0 + (size_t)rank * rq) * kDim;
   uint16_t* xq = p.xn + ((size_t)r0 + (size_t)rank * rq) * kDim;
-  ops::add_rows(hq, qa, b ? qb : nullptr, (size_t)rq * kDim, hq, st);
+  ops::add_rows(hq, qa, b ? qb : nullptr, (size_t)rq * kDim, hq, st, round2);  // h = bf16(res + sum) (round2: + bf16(sum))
   ::glm::rmsnorm(hq, kDim, norm, ::glm::kNormEps, kDim, xq, kDim, rq, st);
   const size_t bytes = (size_t)rq * kEmbRow;
   const comm::AgSeg s[2] = {{hq, p.h + (size_t)r0 * kDim, bytes}, {xq, p.xn + (size_t)r0 * kDim, bytes}};
@@ -182,6 +191,8 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
   const bool ov = P > 1;
   const cudaStream_t cs = ov ? p.cs : st;
   const int cb = ov ? std::clamp(opt.prefill_comm_blocks, 1, 16) : 16;
+  const bool c8 = !tune(kTuneMoeBf16Combine);  // the MoE layers' yr + ys in one reduce-scatter (decision 8)
+  const bool r2 = tune(kTuneResRound2);        // the residual adds' old double rounding (output-changing)
   auto rec = [&](cudaStream_t s) {  // a fresh event recorded on s (a ring of them, each waited on long before reuse)
     const cudaEvent_t e = p.ev[p.evi++ % Pre::kEv];
     CUDA_CHECK(cudaEventRecord(e, s));
@@ -201,7 +212,7 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
     const cudaEvent_t e = ov ? rec(st) : nullptr;
     return [=, this, &p, &done, &pcs, &rec, &after] {
       after(cs, e);
-      sublayer_end(ch, rank, p, pcs[j].r0, pcs[j].m, x, y, norm, cs, cb);
+      sublayer_end(ch, rank, p, pcs[j].r0, pcs[j].m, x, y, norm, cs, cb, c8, r2);
       done[j] = ov ? rec(cs) : nullptr;
     };
   };
