@@ -18,9 +18,6 @@
 // expert's f32 output, made before this step) and k_down only forwards it into a posted collective's buffer.
 #include <cstdio>
 
-#ifndef KUP_XPF
-#define KUP_XPF true
-#endif
 
 #include "comm/ring_dev.cuh"
 #include "common/check.h"
@@ -107,9 +104,6 @@ __device__ void build_union(Union<W>& U, const Params& a) {
   __syncthreads();
 }
 
-// k_up: load the next routed task's first blocks under the current task's epilogue (bit-neutral; docs/engine.md, "Tuning")
-constexpr bool kUpXpf = KUP_XPF;
-
 __device__ __forceinline__ float bf_round(float f) { return __bfloat162float(__float2bfloat16_rn(f)); }
 
 __device__ __forceinline__ float silu_mul(float g, float u) {  // h = bf16(bf16(silu(g)) * u), g and u bf16 values
@@ -119,7 +113,7 @@ __device__ __forceinline__ float silu_mul(float g, float u) {  // h = bf16(bf16(
 
 // ---------------------------------------------------------------------------------------------------------------
 // k_up. NT strips of gate and of up a task (64 / NT tasks an expert), WK warps along K, P blocks in flight a warp.
-template <class F, int NT, int WK, int P, bool R16, bool SHB>
+template <class F, int NT, int WK, int P, bool R16, bool SHB, bool XPF_>
 __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
   constexpr int NTL = 2 * NT, TPE = 64 / NT, PS = 2;  // tiles a task, tasks an expert, FP8 units in flight
   constexpr int kUpB = kH / F::kBK;                   // blocks of gate/up along K (12 INT4/NVFP4, 48 BF16)
@@ -177,9 +171,9 @@ __global__ void __launch_bounds__(32 * WK) k_up(Params a) {
   pdl_launch_dependents();
   const int ntask = nsh + TPE * U.n;
   // the routed tasks' blocks: warp's K range [b0, b0 + nb) of the 12 (48) blocks; rb the P blocks in flight. With
-  // XPF (kUpXpf, WK > 1) the next routed task's first P blocks are loaded under the current task's epilogue (pf: that
+  // XPF (DecodeCfg::xpf, WK > 1) the next routed task's first P blocks are loaded under the current task's epilogue (pf: that
   // task); the loads, their order and the MMAs are the same, so the same bits.
-  constexpr bool XPF = kUpXpf && WK > 1;
+  constexpr bool XPF = XPF_ && WK > 1;
   const int b0 = kUpB * warp / WK, nb = kUpB * (warp + 1) / WK - b0;
   Raw rb[P][NTL];
   int pf = -1;
@@ -629,17 +623,26 @@ int fit(K kernel, int threads, int cps) {
   CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, threads, 0));
   return cps > 0 && cps < n ? cps : n;
 }
-template <class F, int NT, int WK, int P, bool SHB>
+template <class F, int NT, int WK, int P, bool SHB, bool XPF>
 void up_launch2(const Params& p, int cps, cudaStream_t st, bool pdl) {
   if (p.M > 8)
-    launch(k_up<F, NT, WK, P, true, SHB>, num_sms() * fit(k_up<F, NT, WK, P, true, SHB>, 32 * WK, cps), 32 * WK, st, pdl, p);
+    launch(k_up<F, NT, WK, P, true, SHB, XPF>, num_sms() * fit(k_up<F, NT, WK, P, true, SHB, XPF>, 32 * WK, cps), 32 * WK,
+           st, pdl, p);
   else
-    launch(k_up<F, NT, WK, P, false, SHB>, num_sms() * fit(k_up<F, NT, WK, P, false, SHB>, 32 * WK, cps), 32 * WK, st, pdl, p);
+    launch(k_up<F, NT, WK, P, false, SHB, XPF>, num_sms() * fit(k_up<F, NT, WK, P, false, SHB, XPF>, 32 * WK, cps), 32 * WK,
+           st, pdl, p);
+}
+template <class F, int NT, int WK, int P, bool SHB>
+void up_launch1(const Params& p, int cps, cudaStream_t st, bool pdl, bool xpf) {
+  if constexpr (WK > 1) {  // (WK 1: no epilogue barrier to load under; the kernel is the same)
+    if (xpf) return up_launch2<F, NT, WK, P, SHB, true>(p, cps, st, pdl);
+  }
+  up_launch2<F, NT, WK, P, SHB, false>(p, cps, st, pdl);
 }
 template <class F, int NT, int WK, int P>
-void up_launch(const Params& p, int cps, cudaStream_t st, bool pdl) {
-  if (p.L.sh.bf16()) up_launch2<F, NT, WK, P, true>(p, cps, st, pdl);
-  else up_launch2<F, NT, WK, P, false>(p, cps, st, pdl);
+void up_launch(const Params& p, int cps, cudaStream_t st, bool pdl, bool xpf) {
+  if (p.L.sh.bf16()) up_launch1<F, NT, WK, P, true>(p, cps, st, pdl, xpf);
+  else up_launch1<F, NT, WK, P, false>(p, cps, st, pdl, xpf);
 }
 template <class F, int NT, int P>
 void down_launch(const Params& p, cudaStream_t st, bool pdl) {
@@ -657,15 +660,15 @@ template <class F>
 void decode_fmt(const Params& p, const DecodeCfg& cfg, cudaStream_t st) {
   const int cps = cfg.up_ctas_per_sm;
   if (cfg.parts & 1) switch (cfg.up) {
-    case 0: up_launch<F, 1, 6, 2>(p, cps, st, cfg.pdl); break;
-    case 1: up_launch<F, 1, 4, 2>(p, cps, st, cfg.pdl); break;
-    case 2: up_launch<F, 1, 4, 1>(p, cps, st, cfg.pdl); break;
-    case 3: up_launch<F, 2, 4, 1>(p, cps, st, cfg.pdl); break;
-    case 4: up_launch<F, 1, 2, 2>(p, cps, st, cfg.pdl); break;
-    case 5: up_launch<F, 2, 2, 1>(p, cps, st, cfg.pdl); break;
-    case 6: up_launch<F, 1, 1, 2>(p, cps, st, cfg.pdl); break;
-    case 7: up_launch<F, 1, 1, 4>(p, cps, st, cfg.pdl); break;
-    case 8: up_launch<F, 2, 1, 2>(p, cps, st, cfg.pdl); break;
+    case 0: up_launch<F, 1, 6, 2>(p, cps, st, cfg.pdl, cfg.xpf); break;
+    case 1: up_launch<F, 1, 4, 2>(p, cps, st, cfg.pdl, cfg.xpf); break;
+    case 2: up_launch<F, 1, 4, 1>(p, cps, st, cfg.pdl, cfg.xpf); break;
+    case 3: up_launch<F, 2, 4, 1>(p, cps, st, cfg.pdl, cfg.xpf); break;
+    case 4: up_launch<F, 1, 2, 2>(p, cps, st, cfg.pdl, cfg.xpf); break;
+    case 5: up_launch<F, 2, 2, 1>(p, cps, st, cfg.pdl, cfg.xpf); break;
+    case 6: up_launch<F, 1, 1, 2>(p, cps, st, cfg.pdl, cfg.xpf); break;
+    case 7: up_launch<F, 1, 1, 4>(p, cps, st, cfg.pdl, cfg.xpf); break;
+    case 8: up_launch<F, 2, 1, 2>(p, cps, st, cfg.pdl, cfg.xpf); break;
     default: die("moe_decode: up variant %d", cfg.up);
   }
   if (cfg.parts & 2) switch (cfg.down) {

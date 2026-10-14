@@ -1,6 +1,6 @@
 // Benchmarks of the routed-expert kernels on one GB10 (GPU: only through ring.sh).
 //   bench_experts --bw                                   the window's streaming read
-//   bench_experts --decode i4|b16|q4 [--rows 1,6,16] [--sweep | --ups 0,6,6,0] [--out f.tsv]
+//   bench_experts --decode i4|b16|q4 [--rows 1,6,16] [--sweep | --ups 0,6,6,0 [--xpfs 0,1,1,0]] [--out f.tsv]
 //                 (a layer of the format; --ups: those up variants in that order, e.g. the default against the
 //                 prefill-order wk1, A B B A)
 //   bench_experts --prefill i4|b16|q4 [--chunks 1024,4096,8192] [--down 0,1] [--yrkb 0] [--cq 4] [--up 0,1] [--diag]
@@ -30,6 +30,7 @@ using namespace gx;
 
 static FILE* g_out = nullptr;
 static std::vector<int> g_ups;  // --ups 0,6,6,0: decode up variants timed in this order
+static std::vector<int> g_xpfs;  // --xpfs 0,1,1,0: DecodeCfg::xpf for the --ups entries in turn
 static void result(const char* fmt, ...) {
   char buf[1024];
   va_list ap;
@@ -237,8 +238,8 @@ static void bench_decode(const std::string& fname, const std::string& rows_s, bo
     for (int s = 0; s < NS; ++s) rt(s, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
     auto line = [&](const char* what, const DecodeCfg& c, double t, double tr) {
-      result("DECODE\t%s\trows %s\tU %.1f\t%s\tup %s%s\tdown %s%s\tMB %.2f\tus %.1f\t(route %.1f)\tGB/s %.1f\t%% of 235 %.1f\t%% of window %.1f\t73 layers ms %.2f",
-             fname.c_str(), names[ri].c_str(), uavg, what, decode_up_name(c.up), c.dyn ? " dyn" : "", decode_down_name(c.down),
+      result("DECODE\t%s\trows %s\tU %.1f\t%s\tup %s%s%s\tdown %s%s\tMB %.2f\tus %.1f\t(route %.1f)\tGB/s %.1f\t%% of 235 %.1f\t%% of window %.1f\t73 layers ms %.2f",
+             fname.c_str(), names[ri].c_str(), uavg, what, decode_up_name(c.up), c.dyn ? " dyn" : "", c.xpf ? " xpf" : "", decode_down_name(c.down),
              c.pdl ? "" : " nopdl", bytes / 1e6, t, tr, bytes / t / 1e3, 100 * bytes / t / 1e3 / 235.0, 100 * bytes / t / 1e3 / g_bw,
              73 * t / 1e3);
     };
@@ -267,9 +268,10 @@ static void bench_decode(const std::string& fname, const std::string& rows_s, bo
         if (t < best_t) best_t = t, best = c;
       }
     } else if (!g_ups.empty()) {  // --ups: these up variants in this order (A B B A), each with its parts
-      for (int u : g_ups) {
+      for (size_t ui = 0; ui < g_ups.size(); ++ui) {
         DecodeCfg c;
-        c.up = u;
+        c.up = g_ups[ui];
+        if (ui < g_xpfs.size()) c.xpf = g_xpfs[ui] != 0;
         line("step", c, time_cfg(c, true), t_route);
         line("no route", c, time_cfg(c, false), t_route);
         c.parts = 1;
@@ -516,6 +518,10 @@ int main(int argc, char** argv) {
     else if (a == "--ups" && i + 1 < argc) {
       std::vector<std::string> nm;
       g_ups = parse_rows(argv[++i], nm);
+    }
+    else if (a == "--xpfs" && i + 1 < argc) {
+      std::vector<std::string> nm;
+      g_xpfs = parse_rows(argv[++i], nm);
     }
     else if (a == "--down" && i + 1 < argc) po.down = argv[++i];
     else if (a == "--yrkb" && i + 1 < argc) po.yrkb = argv[++i];

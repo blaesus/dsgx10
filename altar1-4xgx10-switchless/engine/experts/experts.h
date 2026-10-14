@@ -115,6 +115,9 @@ struct DecodeCfg {
   int up_ctas_per_sm = 0;  // 0: as many as fit
   bool pdl = true;
   bool dyn = true;         // k_up claims tasks past the first wave from a counter (load balance)
+  // k_up (WK > 1 variants): load the next routed task's first blocks under the current task's epilogue (after its
+  // partials' barrier) instead of at its start; the same loads, order and MMAs, so the same bits
+  bool xpf = true;
   int parts = 3;           // bench: 1 up only, 2 down only, 3 both
   // Fused routing: with logits (the router GEMV's f32 [M][168]) and bias set, each CTA of both kernels routes the
   // rows itself (route()'s code, the same bits) and idx / w are not read (may be null): no route() launch between

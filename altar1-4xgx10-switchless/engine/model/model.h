@@ -119,9 +119,12 @@ enum Tune : uint32_t {
   // its down in k_down, ys written there), not two GEMV launches before them; the GEMVs' bits (docs/engine.md,
   // "Tuning"). Needs kBF16T shared weights (the converter's form); row-major ones keep the GEMVs.
   kTuneShFused = 1u << 9,
+  // decode: the routed gate/up kernel loads its next task's first blocks under the current task's epilogue
+  // (gx::DecodeCfg::xpf; the same bits)
+  kTuneUpXpf = 1u << 10,
   kTuneDefault =
       kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter | kTunePfOverlap | kTunePfAttn |
-      kTuneShFused,
+      kTuneShFused | kTuneUpXpf,
   kTuneAll = 0xffffffffu,
 };
 
