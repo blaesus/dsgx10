@@ -166,3 +166,8 @@ From [reuse § 6](docs/reuse.md#6-build-plan); effort relative to the DeepSeek b
 | G8 | Hardening and ship: service.sh, soak, refhash hashes, benches against the published stacks | as ds41f's M9 list |
 
 Critical path: G0 → G1a → G2 → G3 → G4; G1b beside G2–G3; G6's front end from G0; G5 and G7 after G4.
+
+Status on 2026-10-14 (paused): G0–G7 done (experiments 1, 2, K1–K3, T1–T6, G4, G6, G6b, G7, E1, C1, Q1 in
+[experiments.md](docs/experiments.md)); G8 partly (refhash on real weights; the service started on the ring; no soak,
+no bench against the published stacks); the serving files (C2) and the KL bake-off (exp 3) wait for the master's
+download. G4's 1.25× target missed at 1.27×; G7's "faster on every prompt class" holds only by 2–26 %.

@@ -11,7 +11,11 @@ with the quantisation question, and with what "exact output" means once the weig
 
 ## Where it stands
 
-Scouting done on 2026-10-13; the plan is in [DESIGN.md](DESIGN.md). Nothing runs yet. The findings:
+Started 2026-10-13, **paused 2026-10-14** after one day of building (the user moved to other work). The plan is in
+[DESIGN.md](DESIGN.md); its milestones G0–G7 are built and G8 (end to end on real weights) is partly done. The engine
+decodes, prefills, serves and drafts on all four ranks with every routed expert at NVFP4 in the rank files, bit-exact
+to its contract; what it lacks for production is the 3.8-bit serving files (the NVFP4 fill is 101.4 GiB a rank, over
+the 87 GiB budget) and the KL bake-off that confirms their code. [Resuming](#resuming) says how to pick it up. The findings:
 
 - **Nothing published fits.** NVIDIA's NVFP4 checkpoint is 109.9 GiB a rank as shipped against a defensible
   weight budget of 87 GiB a rank (the KV cache is 52.7 KiB a token in FP8 and every rank holds it). The
@@ -54,6 +58,31 @@ Scouting done on 2026-10-13; the plan is in [DESIGN.md](DESIGN.md). Nothing runs
 | [docs/model.md](docs/model.md) | the model's exact math as the reference code defines it, the NVFP4 and FP8 formats, the comparison with DeepSeek-V4.1-Flash, the tokenizer and chat template, the reference implementations |
 | [docs/reuse.md](docs/reuse.md) | what of the DeepSeek engine carries over (~55 % by lines), what must be re-specialised, the build plan |
 | `tools/` | `tally.py` (bytes by tensor class from safetensors headers), `nvfp4_entropy.py`, `provenance.py` (NVFP4 and FP8 against the BF16 master) |
+
+## Resuming
+
+State on 2026-10-14 (branch `glm53`, not pushed):
+
+- **Rank files:** `/data/dsgb10/glm53/weights/rank0.glw` on rank 0 and `~/glm53/weights/rank{r}.glw` on ranks 1–3,
+  108,844,417,024 B each, every routed expert at NVFP4 ([layout § 8](docs/layout.md) has the hashes); the 6.9 GB
+  non-expert files beside them as `rank{r}.glw.prefill-only`. They leave 7–11 GiB a box during a job: contexts ≤ 8k,
+  one or two sessions, no disk tier; and a CPU pass on a box may hold at most 3 GB while a job can load, or
+  `earlyoom` (`-m 3 --prefer python`) kills it ([serving § 5.1](docs/serving.md)).
+- **To run it:** `OWNER=me engine/server/service.sh start` (borrows the ring from the DeepSeek service, port 18894,
+  [serving.md](docs/serving.md)); checks with `engine/model/run.sh check` and the server's `tests/ring_job.sh`.
+- **Two decisions were pending:** (1) the 9–10 h download of the BF16 master's routed experts (1.45 TB streamed
+  through rank 2, 43 MB/s with four connections) for the full KL bake-off ([reference § 10](docs/reference.md))
+  and the final files: `engine/weights/experts_fill.py --recipe mix --master DIR` ([layout § 10](docs/layout.md),
+  ~8 h of CPU, 87.12 GiB a rank); (2) whether the non-expert weights may go to NVFP4 (~7 ms of the 43.6 ms step;
+  the user chose to keep FP8 for now, [DESIGN decision 2](DESIGN.md)).
+- **Partial work with resume points:** the reference's covariance pass (layer 3) and resumable KL tracks on rank 2
+  ([reference.md](docs/reference.md) "How to resume"); G8's end-to-end runs ([engine.md](docs/engine.md), G8).
+- **Scratch that may be deleted:** rank 0 `/data/scratch/glm53-master` (37 GB of BF16 expert samples for layers 3
+  and 40, refetched in an hour), `~/dsgb10-data/glm53-*` on every rank (synthetic weights, dumps, traces; 29 GB on
+  rank 0), rank 2 `~/glm53-ref/` (the venv, 38k golden set, qcache: keep if resuming within weeks).
+- **Open misses, in order of value:** the serving files and bake-off; decode at 43.6 ms = 1.27× the floor
+  (collectives' latency, attention); drafts worth only 2–26 % against fresh expert reads per verify row; prefill
+  at 83 % of the published bar; a 256k session needs the FP8 cache or a position split.
 
 ## Memory per box
 
