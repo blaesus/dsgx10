@@ -248,6 +248,38 @@ must be re-declared for its format (mix 4,521,984 B, S3×2 4,128,768 B). Tried o
 `glw_expert_fill_test` (0 of 28,311,552 values differ) pass. `glw_kcheck` now checks every S3 descriptor's
 tables against `make_desc` and, with `--blocks`, every expert scale byte.
 
+**The converter's S3 fill (C2-prep, 2026-10-14)**: `experts_fill.py --recipe {nvfp4,mix,s3x2} --master BF16DIR`
+quantises each expert once from its BF16 with `s3x2_pack.quantise_expert` (the master's tensors checked against
+their fetch SHA-256s as they are read; the MTP layer's BF16 from NVIDIA's file) and cuts all four ranks from that
+one result (`rank_slice` → `expert_entry` / `expert_descs`), so the quantisation costs once, not four times.
+Each layer's 257 entries are re-declared for the recipe's tag (fmt, shape, `reserve_bytes`: mix 0x011, 4,521,984
+B an expert; S3×2 0x111, 4,128,768 B) before they are written; layers stream and commit one at a time and a
+rerun resumes as in the NVFP4 fill; entries carry `kLossy` and `rel_err`. The manifest gains `expert_layers`
+(per layer: recipe, tag, entry bytes, source, the subset pair, the master's shard names and the SHA-256 of its
+fetch manifest), `expert_sources` (each BF16 tensor's SHA-256), `expert_rel_err`, and a fill record with the
+recipe, subsets, the SHA-256s of `experts_fill.py`, `s3x2_pack.py` and `formats.py`, and the provenance counts.
+(The master is fetched by range, so no whole-shard SHA-256 exists to record; the per-tensor ones stand in.)
+**Provenance**: with `--provenance all.jsonl` every S3×2 tensor that quant/run.py has a record of must hash
+(run.py's `phash` of the packed dict) to the record; every NVFP4 tensor quantised from the master of layers 3–77
+is compared with NVIDIA's own bytes instead (all.jsonl's `nvfp4` records come partly from an earlier
+`nvfp4_rtn`: layer 3 expert 18's gate and up differ from NVIDIA's there and agree in `results-nvfp4v2.jsonl`).
+Without `--master`, `--recipe nvfp4` copies NVIDIA's bytes as in C1.
+
+Test on copies of the four 6.9 GB files under `/data/scratch/glm53-c2prep/` (rank 0, nice 19, 8 threads):
+- `--recipe nvfp4 --master` on layers 3 and 40: 1,536 of 1,536 NVFP4 tensors equal to NVIDIA's bytes, and the 514
+  layer-3 and layer-40 entries byte-identical to C1's (the master path and the copy path agree); 99–101 s a layer.
+- `--reset-from 3 --recipe mix` on layers 3 and 40: 884 S3×2 tensors equal to the quantiser's records, 140
+  without a record (experts it did not run), 512 NVFP4 downs equal to NVIDIA's; relative RMS error against the
+  BF16 0.085–0.144 (S3×2 gate/up ~0.14, NVFP4 down ~0.095). `glw_check` OK; `glw_kcheck --partial --layers 3,40
+  --blocks` 7,258 checks a rank, 0 bad, 1,024 S3 descriptors with the pair, every scale byte scanned (~39 % of
+  the S3 groups in subset B); `glw_expert_fill_test` on experts 0, 17, 255 of both layers and every rank, 0 of 28,311,552
+  values differ; `verify.py --crc` OK (`--indep` leaves non-NVFP4 expert entries to those two and says how many).
+  Files 7,875,493,888 B; SHA-256 rank 0 `572945d9…1dad`, 1 `59f14145…0b72`, 2 `d3574a58…70a5af`, 3 `cb8b4c8c…aafa42`.
+- **Time**: 377–381 s a layer for four ranks, 338–341 s of it reading and quantising (levelset3's search,
+  ~1.3 s an expert), 2.0 GB peak. **Projected full run** (layers 3–78): 76 × ~380 s ≈ **8 h** at 8 threads,
+  quantisation-bound (more cores or processes per layer would scale it), output 93,543,596,032 B a rank (87.12
+  GiB) with the MTP layer also in mix, +201,326,592 B if it stays NVFP4.
+
 ## 7. Verification
 
 | Check | Tool | What | Result on the four files |
@@ -340,8 +372,9 @@ glw_load FILE --rank R [--verify-crc];  glw_expert_fill_test FILE R D L E ...
   (`moe_decode`/`moe_prefill` read `SharedW`: gate, up, down in T128 with `[N/128][K/128]` scales), so that is the
   path the engine runs and the attention side's shared-expert GEMV (pack.py's interleaved T64 form) is unused.
   T128 is the default; `--shared-layout t64` still writes the other form (kcheck and verify check either).
-- The NVFP4 fill of every layer is done and installed (C1, § 6, § 8). The S3 fill from the quantiser (C2) waits for
-  the BF16 master of layers 3–77.
+- The NVFP4 fill of every layer is done and installed (C1, § 6, § 8). The S3 fill from the quantiser (C2) is ready
+  (C2-prep, § 6) and waits for the BF16 master of layers 3–77; ~8 h at 8 threads. `verify.py --indep` does not yet
+  re-derive S3 entries independently (kcheck --blocks and the fill test cover them).
 - `glw_load` on the device, in a ring window (`glw_kcheck --gpu` ran 2026-10-14, § 7).
 - `engine/attn/tools/pack.py`'s `fp8_from_master` used `amax / 448` until 2026-10-14; it now uses zai's rule
   (`amax × f32(1/448)`, § 4), checked byte for byte against the converter by `engine/attn/tools/fp8_vs_converter.py`.

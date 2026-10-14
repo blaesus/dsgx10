@@ -19,7 +19,13 @@ non-expert tensor keeps its offset, CRC and SHA-256. The manifest beside the fil
 file SHA-256. --dump-canon writes the canonical rank slices of a few experts as raw files for
 tests/expert_fill_test (layout.h's own reader against its own canonical reader).
 
-Filling must follow the TOC order (layer 3 before 4 ...), which keeps the data region in TOC order.
+Filling must follow the TOC order (layer 3 before 4 ...), which keeps the data region in TOC order; --reset-from L
+returns layers >= L to reserved and cuts the files there. Each layer is committed (data synced, then TOC, header,
+manifest) before the next, so a rerun with the same arguments resumes after the last whole layer.
+
+--recipe mix|s3x2 (with --master, the BF16 experts) quantises each expert once with s3x2_pack.py and cuts every
+rank's slice from that result; the layer's entries are re-declared for the recipe's format tag and size.
+--recipe nvfp4 copies NVIDIA's bytes, or with --master quantises by nvfp4_rtn and checks them against NVIDIA's.
 """
 import argparse, hashlib, json, os, struct, sys, time
 
