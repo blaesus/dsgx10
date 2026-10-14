@@ -1,0 +1,344 @@
+RUN	2026-10-13 21:38:23 +0100	sources sha256 adb83c670b416e0f
+MEM	total 121 GiB, used 8, available 113
+GPU	NVIDIA GB10, 611 MHz, 3003 MHz, 47, 7.64 W
+DEVICE	NVIDIA GB10	48 SMs	clock 2418 MHz
+MMA	mxf4nvf4 4X ue4m3 m16n8k64 e2m1xe2m1	expected layout (ds41f's 2X operand layout, scale byte j = K block j)	FAIL	3 of 6144 values differ (C=0), 1 of 2048 (C!=0)
+MMA	mxf4nvf4 4X layout search	no hypothesis matches; raw trials dumped for offline analysis	FAIL
+MMA	mxf4nvf4 4X scale lanes (selectors 0)	A scales read from lanes t = 0 (rows g) and t = 1 (rows g + 8), B from t = 0: other lanes' registers ignored	confirmed
+MMA	mxf4nvf4 2X ue8m0 m16n8k64 e2m1xe2m1	ds41f's layout, 32 trials (8 with C != 0)	FAIL	31 of 4096 values differ, max rel 1.19e-07
+MMA	mxf8f6f4 1X ue8m0 m16n8k32 e4m3xe4m3	ds41f's layout, 32 trials (8 with C != 0)	FAIL	1774 of 4096 values differ, max rel 1.62e-05
+MMA	mxf8f6f4 1X ue8m0 m16n8k32 e4m3xe2m1	ds41f's layout, 32 trials (8 with C != 0)	FAIL	28 of 4096 values differ, max rel 1.18e-07
+RATE	mxf4nvf4 4X ue4m3 m16n8k64 (NVFP4 x NVFP4)	4 chains 427.1 TFLOPS	8 chains 429.1 TFLOPS
+RATE	mxf4nvf4 2X ue8m0 m16n8k64 (MXFP4 x MXFP4)	4 chains 427.9 TFLOPS	8 chains 429.2 TFLOPS
+RATE	mxf8f6f4 1X m16n8k32 e4m3 x e4m3 (FP8 x FP8)	4 chains 213.6 TFLOPS	8 chains 214.5 TFLOPS
+RATE	mxf8f6f4 1X m16n8k32 e4m3 x e2m1	4 chains 213.6 TFLOPS	8 chains 214.5 TFLOPS
+RATE	m16n8k16 bf16, f32 accumulate	4 chains 106.4 TFLOPS	8 chains 107.0 TFLOPS
+RATE	m16n8k16 f16, f32 accumulate	4 chains 106.3 TFLOPS	8 chains 107.0 TFLOPS
+RATE	m16n8k16 f16, f16 accumulate	4 chains 106.4 TFLOPS	8 chains 107.1 TFLOPS
+DONE	mma
+BW	read 2 GiB	grid 96 x 256	234.0 GB/s
+BW	read 2 GiB	grid 96 x 512	231.6 GB/s
+BW	read 2 GiB	grid 192 x 256	232.1 GB/s
+BW	read 2 GiB	grid 192 x 512	233.4 GB/s
+BW	read 2 GiB	grid 384 x 256	233.3 GB/s
+BW	read 2 GiB	grid 384 x 512	233.7 GB/s
+BWBEST	q4	234.0
+CHECK	q4	decode bit-exact (expert 0 gate [512x6144] + down [6144x512], bf16 of e2m1*e4m3*2^-30)	ok	0 mismatches
+CHECK	q4	r1 up (gate+up, 8 experts) vs CPU double	ok	max |err|/sum|terms| 2.51e-08 (abs 1.30e-07), 8192 outputs
+CHECK	q4	r1 down (8 experts, weighted sum) vs CPU double from the GPU's h	ok	max |err|/sum|terms| 7.97e-08 (abs 4.28e-09), 6144 outputs
+MOE	q4	r1	U8	P2	S2	up	28311552	127.15	222.7	94.8	95.2
+MOE	q4	r1	U8	P2	S1	mid	0	1.07	0.0	0.0	0.0
+MOE	q4	r1	U8	P2	S1	down	14155776	63.64	222.4	94.7	95.1
+MOE	q4	r1	U8	P2	S1	step	42467328	192.37	220.8	93.9	94.3
+MOE	q4	r1	U8	P4	S2	up	28311552	134.33	210.8	89.7	90.1
+MOE	q4	r1	U8	P4	S1	mid	0	1.07	0.0	0.0	0.0
+MOE	q4	r1	U8	P4	S1	down	14155776	63.80	221.9	94.4	94.8
+MOE	q4	r1	U8	P4	S1	step	42467328	193.99	218.9	93.2	93.6
+CHECK	q4	r1 up (gate+up, 8 experts) vs CPU double	ok	max |err|/sum|terms| 2.64e-09 (abs 1.43e-08), 8192 outputs
+CHECK	q4	r1 down (8 experts, weighted sum) vs CPU double from the GPU's h	ok	max |err|/sum|terms| 7.97e-08 (abs 4.28e-09), 6144 outputs
+MOE	q4	r1	U8	P2	S3	up	28311552	128.94	219.6	93.4	93.8
+MOE	q4	r1	U8	P2	S1	mid	0	1.27	0.0	0.0	0.0
+MOE	q4	r1	U8	P2	S1	down	14155776	64.20	220.5	93.8	94.2
+MOE	q4	r1	U8	P2	S1	step	42467328	190.29	223.2	95.0	95.4
+MOE	q4	r1	U8	P4	S3	up	28311552	128.11	221.0	94.0	94.4
+MOE	q4	r1	U8	P4	S1	mid	0	1.27	0.0	0.0	0.0
+MOE	q4	r1	U8	P4	S1	down	14155776	63.93	221.4	94.2	94.6
+MOE	q4	r1	U8	P4	S1	step	42467328	193.82	219.1	93.2	93.6
+CHECK	q4	r1 up (gate+up, 8 experts) vs CPU double	ok	max |err|/sum|terms| 2.88e-09 (abs 2.22e-08), 8192 outputs
+CHECK	q4	r1 down (8 experts, weighted sum) vs CPU double from the GPU's h	ok	max |err|/sum|terms| 7.97e-08 (abs 4.28e-09), 6144 outputs
+MOE	q4	r1	U8	P2	S4	up	28311552	137.62	205.7	87.5	87.9
+MOE	q4	r1	U8	P2	S1	mid	0	1.14	0.0	0.0	0.0
+MOE	q4	r1	U8	P2	S1	down	14155776	68.18	207.6	88.4	88.7
+MOE	q4	r1	U8	P2	S1	step	42467328	199.61	212.8	90.5	90.9
+MOE	q4	r1	U8	P4	S4	up	28311552	131.25	215.7	91.8	92.2
+MOE	q4	r1	U8	P4	S1	mid	0	1.12	0.0	0.0	0.0
+MOE	q4	r1	U8	P4	S1	down	14155776	64.08	220.9	94.0	94.4
+MOE	q4	r1	U8	P4	S1	step	42467328	196.18	216.5	92.1	92.5
+CHECK	q4	r6 up (gate+up, 28 experts) vs CPU double	ok	max |err|/sum|terms| 1.41e-07 (abs 6.73e-07), 172032 outputs
+CHECK	q4	r6 down (28 experts, weighted sum) vs CPU double from the GPU's h	ok	max |err|/sum|terms| 3.79e-08 (abs 7.51e-09), 36864 outputs
+MOE	q4	r6	U28	P2	S1	up	99090432	434.38	228.1	97.1	97.5
+MOE	q4	r6	U28	P2	S1	mid	0	1.73	0.0	0.0	0.0
+MOE	q4	r6	U28	P2	S1	down	49545216	218.26	227.0	96.6	97.0
+MOE	q4	r6	U28	P2	S1	step	148635648	657.51	226.1	96.2	96.6
+MOE	q4	r6	U28	P4	S1	up	99090432	465.16	213.0	90.6	91.0
+MOE	q4	r6	U28	P4	S1	mid	0	1.74	0.0	0.0	0.0
+MOE	q4	r6	U28	P4	S1	down	49545216	217.63	227.7	96.9	97.3
+MOE	q4	r6	U28	P4	S1	step	148635648	685.24	216.9	92.3	92.7
+DONE	q4
+BW	read 2 GiB	grid 96 x 256	236.7 GB/s
+BW	read 2 GiB	grid 96 x 512	234.5 GB/s
+BW	read 2 GiB	grid 192 x 256	234.4 GB/s
+BW	read 2 GiB	grid 192 x 512	235.5 GB/s
+BW	read 2 GiB	grid 384 x 256	235.0 GB/s
+BW	read 2 GiB	grid 384 x 512	235.4 GB/s
+BWBEST	tk3	236.7
+CHECK	tk3	decode bit-exact vs EXL3's dq<3,0> + tensor_core_perm (expert 0 gate + down)	ok	0 mismatches
+CHECK	tk3	r1 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 98304 differ
+CHECK	tk3	r1 up (gate+up, 8 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 3.01e-07 (abs 1.94e-04), 8192 outputs
+CHECK	tk3	r1 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 4096 differ, max 0 f16 ulp
+CHECK	tk3	r1 down (8 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 4.32e-09 (abs 5.41e-03), 6144 outputs
+MOE	tk3	r1	U8	P8	S1	pre	0	1.76	0.0	0.0	0.0
+MOE	tk3	r1	U8	P8	S2	up	19087360	177.27	107.7	45.8	45.5
+MOE	tk3	r1	U8	P8	S1	mid	0	2.48	0.0	0.0	0.0
+MOE	tk3	r1	U8	P8	S1	down	9543680	87.76	108.7	46.3	45.9
+MOE	tk3	r1	U8	P8	S1	step	28631040	270.93	105.7	45.0	44.6
+MOE	tk3	r1	U8	P16	S1	pre	0	1.76	0.0	0.0	0.0
+MOE	tk3	r1	U8	P16	S2	up	19087360	197.05	96.9	41.2	40.9
+MOE	tk3	r1	U8	P16	S1	mid	0	2.50	0.0	0.0	0.0
+MOE	tk3	r1	U8	P16	S1	down	9543680	84.78	112.6	47.9	47.6
+MOE	tk3	r1	U8	P16	S1	step	28631040	288.93	99.1	42.2	41.9
+CHECK	tk3	r1 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 98304 differ
+CHECK	tk3	r1 up (gate+up, 8 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 2.15e-07 (abs 1.36e-04), 8192 outputs
+CHECK	tk3	r1 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 4096 differ, max 0 f16 ulp
+CHECK	tk3	r1 down (8 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 3.38e-09 (abs 4.23e-03), 6144 outputs
+MOE	tk3	r1	U8	P8	S1	pre	0	1.76	0.0	0.0	0.0
+MOE	tk3	r1	U8	P8	S3	up	19087360	141.79	134.6	57.3	56.9
+MOE	tk3	r1	U8	P8	S1	mid	0	2.80	0.0	0.0	0.0
+MOE	tk3	r1	U8	P8	S1	down	9543680	87.69	108.8	46.3	46.0
+MOE	tk3	r1	U8	P8	S1	step	28631040	235.11	121.8	51.8	51.4
+MOE	tk3	r1	U8	P16	S1	pre	0	1.76	0.0	0.0	0.0
+MOE	tk3	r1	U8	P16	S3	up	19087360	150.36	126.9	54.0	53.6
+MOE	tk3	r1	U8	P16	S1	mid	0	2.80	0.0	0.0	0.0
+MOE	tk3	r1	U8	P16	S1	down	9543680	84.75	112.6	47.9	47.6
+MOE	tk3	r1	U8	P16	S1	step	28631040	242.73	118.0	50.2	49.8
+CHECK	tk3	r1 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 98304 differ
+CHECK	tk3	r1 up (gate+up, 8 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 1.39e-07 (abs 9.07e-05), 8192 outputs
+CHECK	tk3	r1 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 4096 differ, max 0 f16 ulp
+CHECK	tk3	r1 down (8 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 3.59e-09 (abs 4.49e-03), 6144 outputs
+MOE	tk3	r1	U8	P8	S1	pre	0	1.76	0.0	0.0	0.0
+MOE	tk3	r1	U8	P8	S4	up	19087360	127.01	150.3	64.0	63.5
+MOE	tk3	r1	U8	P8	S1	mid	0	2.83	0.0	0.0	0.0
+MOE	tk3	r1	U8	P8	S1	down	9543680	87.68	108.8	46.3	46.0
+MOE	tk3	r1	U8	P8	S1	step	28631040	221.45	129.3	55.0	54.6
+MOE	tk3	r1	U8	P16	S1	pre	0	1.76	0.0	0.0	0.0
+MOE	tk3	r1	U8	P16	S4	up	19087360	135.40	141.0	60.0	59.6
+MOE	tk3	r1	U8	P16	S1	mid	0	2.83	0.0	0.0	0.0
+MOE	tk3	r1	U8	P16	S1	down	9543680	85.01	112.3	47.8	47.4
+MOE	tk3	r1	U8	P16	S1	step	28631040	227.60	125.8	53.5	53.1
+CHECK	tk3	r6 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 2064384 differ
+CHECK	tk3	r6 up (gate+up, 28 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 7.88e-07 (abs 5.20e-04), 172032 outputs
+CHECK	tk3	r6 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 86016 differ, max 0 f16 ulp
+CHECK	tk3	r6 down (28 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 2.53e-09 (abs 1.05e-02), 36864 outputs
+MOE	tk3	r6	U28	P8	S1	pre	0	13.69	0.0	0.0	0.0
+MOE	tk3	r6	U28	P8	S1	up	66805760	429.67	155.5	66.2	65.7
+MOE	tk3	r6	U28	P8	S1	mid	0	2.99	0.0	0.0	0.0
+MOE	tk3	r6	U28	P8	S1	down	33402880	322.93	103.4	44.0	43.7
+MOE	tk3	r6	U28	P8	S1	step	100208640	776.08	129.1	54.9	54.6
+MOE	tk3	r6	U28	P16	S1	pre	0	13.70	0.0	0.0	0.0
+MOE	tk3	r6	U28	P16	S1	up	66805760	440.47	151.7	64.5	64.1
+MOE	tk3	r6	U28	P16	S1	mid	0	3.00	0.0	0.0	0.0
+MOE	tk3	r6	U28	P16	S1	down	33402880	314.53	106.2	45.2	44.9
+MOE	tk3	r6	U28	P16	S1	step	100208640	776.95	129.0	54.9	54.5
+DONE	tk3
+BW	read 2 GiB	grid 96 x 256	235.9 GB/s
+BW	read 2 GiB	grid 96 x 512	233.9 GB/s
+BW	read 2 GiB	grid 192 x 256	233.7 GB/s
+BW	read 2 GiB	grid 192 x 512	235.0 GB/s
+BW	read 2 GiB	grid 384 x 256	234.2 GB/s
+BW	read 2 GiB	grid 384 x 512	234.3 GB/s
+BWBEST	s3	235.9
+CHECK	s3	decode bit-exact (expert 0 gate [512x6144] + down [6144x512], bf16 of subset*e4m3)	ok	0 mismatches
+CHECK	s3	r1 up (gate+up, 8 experts) vs CPU double	ok	max |err|/sum|terms| 3.76e-08 (abs 3.94e-07), 8192 outputs
+CHECK	s3	r1 down (8 experts, weighted sum) vs CPU double from the GPU's h	ok	max |err|/sum|terms| 5.79e-08 (abs 7.75e-09), 6144 outputs
+MOE	s3	r1	U8	P2	S2	up	22020096	99.88	220.5	93.8	93.5
+MOE	s3	r1	U8	P2	S1	mid	0	1.07	0.0	0.0	0.0
+MOE	s3	r1	U8	P2	S1	down	11010048	52.20	210.9	89.7	89.4
+MOE	s3	r1	U8	P2	S1	step	33030144	153.75	214.8	91.4	91.1
+MOE	s3	r1	U8	P4	S2	up	22020096	101.69	216.5	92.1	91.8
+MOE	s3	r1	U8	P4	S1	mid	0	1.07	0.0	0.0	0.0
+MOE	s3	r1	U8	P4	S1	down	11010048	52.73	208.8	88.8	88.5
+MOE	s3	r1	U8	P4	S1	step	33030144	157.03	210.3	89.5	89.2
+CHECK	s3	r1 up (gate+up, 8 experts) vs CPU double	ok	max |err|/sum|terms| 1.68e-08 (abs 1.67e-07), 8192 outputs
+CHECK	s3	r1 down (8 experts, weighted sum) vs CPU double from the GPU's h	ok	max |err|/sum|terms| 5.79e-08 (abs 7.75e-09), 6144 outputs
+MOE	s3	r1	U8	P2	S3	up	22020096	99.48	221.3	94.2	93.8
+MOE	s3	r1	U8	P2	S1	mid	0	1.26	0.0	0.0	0.0
+MOE	s3	r1	U8	P2	S1	down	11010048	52.24	210.8	89.7	89.3
+MOE	s3	r1	U8	P2	S1	step	33030144	154.90	213.2	90.7	90.4
+MOE	s3	r1	U8	P4	S3	up	22020096	101.79	216.3	92.1	91.7
+MOE	s3	r1	U8	P4	S1	mid	0	1.25	0.0	0.0	0.0
+MOE	s3	r1	U8	P4	S1	down	11010048	52.84	208.4	88.7	88.3
+MOE	s3	r1	U8	P4	S1	step	33030144	157.94	209.1	89.0	88.6
+CHECK	s3	r1 up (gate+up, 8 experts) vs CPU double	ok	max |err|/sum|terms| 6.62e-09 (abs 6.74e-08), 8192 outputs
+CHECK	s3	r1 down (8 experts, weighted sum) vs CPU double from the GPU's h	ok	max |err|/sum|terms| 5.79e-08 (abs 7.75e-09), 6144 outputs
+MOE	s3	r1	U8	P2	S4	up	22020096	114.35	192.6	81.9	81.6
+MOE	s3	r1	U8	P2	S1	mid	0	1.11	0.0	0.0	0.0
+MOE	s3	r1	U8	P2	S1	down	11010048	52.70	208.9	88.9	88.6
+MOE	s3	r1	U8	P2	S1	step	33030144	166.42	198.5	84.5	84.1
+MOE	s3	r1	U8	P4	S4	up	22020096	106.14	207.5	88.3	87.9
+MOE	s3	r1	U8	P4	S1	mid	0	1.11	0.0	0.0	0.0
+MOE	s3	r1	U8	P4	S1	down	11010048	53.44	206.0	87.7	87.3
+MOE	s3	r1	U8	P4	S1	step	33030144	161.23	204.9	87.2	86.8
+CHECK	s3	r6 up (gate+up, 28 experts) vs CPU double	ok	max |err|/sum|terms| 2.31e-07 (abs 2.65e-06), 172032 outputs
+CHECK	s3	r6 down (28 experts, weighted sum) vs CPU double from the GPU's h	ok	max |err|/sum|terms| 4.48e-08 (abs 2.05e-08), 36864 outputs
+MOE	s3	r6	U28	P2	S1	up	77070336	360.20	214.0	91.0	90.7
+MOE	s3	r6	U28	P2	S1	mid	0	1.75	0.0	0.0	0.0
+MOE	s3	r6	U28	P2	S1	down	38535168	177.70	216.9	92.3	91.9
+MOE	s3	r6	U28	P2	S1	step	115605504	530.04	218.1	92.8	92.5
+MOE	s3	r6	U28	P4	S1	up	77070336	375.01	205.5	87.5	87.1
+MOE	s3	r6	U28	P4	S1	mid	0	1.76	0.0	0.0	0.0
+MOE	s3	r6	U28	P4	S1	down	38535168	178.91	215.4	91.7	91.3
+MOE	s3	r6	U28	P4	S1	step	115605504	561.11	206.0	87.7	87.3
+DONE	s3
+BW	read 2 GiB	grid 96 x 256	236.1 GB/s
+BW	read 2 GiB	grid 96 x 512	234.7 GB/s
+BW	read 2 GiB	grid 192 x 256	234.8 GB/s
+BW	read 2 GiB	grid 192 x 512	235.6 GB/s
+BW	read 2 GiB	grid 384 x 256	235.4 GB/s
+BW	read 2 GiB	grid 384 x 512	235.7 GB/s
+BWBEST	tk4	236.1
+CHECK	tk4	decode bit-exact vs EXL3's dq<4,0> + tensor_core_perm (expert 0 gate + down)	ok	0 mismatches
+CHECK	tk4	r1 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 98304 differ
+CHECK	tk4	r1 up (gate+up, 8 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 2.73e-07 (abs 1.78e-04), 8192 outputs
+CHECK	tk4	r1 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 4096 differ, max 0 f16 ulp
+CHECK	tk4	r1 down (8 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 4.49e-09 (abs 5.69e-03), 6144 outputs
+MOE	tk4	r1	U8	P8	S1	pre	0	1.74	0.0	0.0	0.0
+MOE	tk4	r1	U8	P8	S2	up	25378816	145.07	174.9	74.4	74.1
+MOE	tk4	r1	U8	P8	S1	mid	0	2.48	0.0	0.0	0.0
+MOE	tk4	r1	U8	P8	S1	down	12689408	85.46	148.5	63.2	62.9
+MOE	tk4	r1	U8	P8	S1	step	38068224	235.55	161.6	68.8	68.5
+MOE	tk4	r1	U8	P16	S1	pre	0	1.74	0.0	0.0	0.0
+MOE	tk4	r1	U8	P16	S2	up	25378816	152.23	166.7	70.9	70.6
+MOE	tk4	r1	U8	P16	S1	mid	0	2.48	0.0	0.0	0.0
+MOE	tk4	r1	U8	P16	S1	down	12689408	83.60	151.8	64.6	64.3
+MOE	tk4	r1	U8	P16	S1	step	38068224	241.38	157.7	67.1	66.8
+CHECK	tk4	r1 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 98304 differ
+CHECK	tk4	r1 up (gate+up, 8 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 2.53e-07 (abs 1.66e-04), 8192 outputs
+CHECK	tk4	r1 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 4096 differ, max 0 f16 ulp
+CHECK	tk4	r1 down (8 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 4.13e-09 (abs 5.52e-03), 6144 outputs
+MOE	tk4	r1	U8	P8	S1	pre	0	1.74	0.0	0.0	0.0
+MOE	tk4	r1	U8	P8	S3	up	25378816	129.88	195.4	83.1	82.8
+MOE	tk4	r1	U8	P8	S1	mid	0	2.80	0.0	0.0	0.0
+MOE	tk4	r1	U8	P8	S1	down	12689408	85.49	148.4	63.2	62.9
+MOE	tk4	r1	U8	P8	S1	step	38068224	219.77	173.2	73.7	73.4
+MOE	tk4	r1	U8	P16	S1	pre	0	1.74	0.0	0.0	0.0
+MOE	tk4	r1	U8	P16	S3	up	25378816	133.85	189.6	80.7	80.3
+MOE	tk4	r1	U8	P16	S1	mid	0	2.79	0.0	0.0	0.0
+MOE	tk4	r1	U8	P16	S1	down	12689408	83.61	151.8	64.6	64.3
+MOE	tk4	r1	U8	P16	S1	step	38068224	222.60	171.0	72.8	72.4
+CHECK	tk4	r1 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 98304 differ
+CHECK	tk4	r1 up (gate+up, 8 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 1.65e-07 (abs 1.08e-04), 8192 outputs
+CHECK	tk4	r1 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 4096 differ, max 0 f16 ulp
+CHECK	tk4	r1 down (8 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 4.14e-09 (abs 4.85e-03), 6144 outputs
+MOE	tk4	r1	U8	P8	S1	pre	0	1.73	0.0	0.0	0.0
+MOE	tk4	r1	U8	P8	S4	up	25378816	124.40	204.0	86.8	86.4
+MOE	tk4	r1	U8	P8	S1	mid	0	2.86	0.0	0.0	0.0
+MOE	tk4	r1	U8	P8	S1	down	12689408	85.44	148.5	63.2	62.9
+MOE	tk4	r1	U8	P8	S1	step	38068224	215.29	176.8	75.2	74.9
+MOE	tk4	r1	U8	P16	S1	pre	0	2.06	0.0	0.0	0.0
+MOE	tk4	r1	U8	P16	S4	up	25378816	128.31	197.8	84.2	83.8
+MOE	tk4	r1	U8	P16	S1	mid	0	2.86	0.0	0.0	0.0
+MOE	tk4	r1	U8	P16	S1	down	12689408	83.55	151.9	64.6	64.3
+MOE	tk4	r1	U8	P16	S1	step	38068224	217.77	174.8	74.4	74.1
+CHECK	tk4	r6 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 2064384 differ
+CHECK	tk4	r6 up (gate+up, 28 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 7.67e-07 (abs 4.89e-04), 172032 outputs
+CHECK	tk4	r6 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 86016 differ, max 0 f16 ulp
+CHECK	tk4	r6 down (28 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 2.54e-09 (abs 1.18e-02), 36864 outputs
+MOE	tk4	r6	U28	P8	S1	pre	0	13.84	0.0	0.0	0.0
+MOE	tk4	r6	U28	P8	S1	up	88825856	429.60	206.8	88.0	87.6
+MOE	tk4	r6	U28	P8	S1	mid	0	3.15	0.0	0.0	0.0
+MOE	tk4	r6	U28	P8	S1	down	44412928	315.08	141.0	60.0	59.7
+MOE	tk4	r6	U28	P8	S1	step	133238784	762.00	174.9	74.4	74.1
+MOE	tk4	r6	U28	P16	S1	pre	0	13.76	0.0	0.0	0.0
+MOE	tk4	r6	U28	P16	S1	up	88825856	434.73	204.3	86.9	86.6
+MOE	tk4	r6	U28	P16	S1	mid	0	3.04	0.0	0.0	0.0
+MOE	tk4	r6	U28	P16	S1	down	44412928	306.93	144.7	61.6	61.3
+MOE	tk4	r6	U28	P16	S1	step	133238784	762.68	174.7	74.3	74.0
+DONE	tk4
+BW	read 2 GiB	grid 96 x 256	235.3 GB/s
+BW	read 2 GiB	grid 96 x 512	233.8 GB/s
+BW	read 2 GiB	grid 192 x 256	234.4 GB/s
+BW	read 2 GiB	grid 192 x 512	234.1 GB/s
+BW	read 2 GiB	grid 384 x 256	234.5 GB/s
+BW	read 2 GiB	grid 384 x 512	235.2 GB/s
+BWBEST	dense	235.3
+CHECK	bf16	q_b r1 [4096x2048] vs CPU double	ok	max |err|/sum|terms| 2.16e-07 (abs 9.09e-07)
+DENSE	bf16	q_b	r1	P4	16777216	78.58	213.5	90.8	90.7
+DENSE	bf16	q_b	r1	P8	16777216	78.13	214.7	91.4	91.3
+CHECK	bf16	q_b r6 [4096x2048] vs CPU double	ok	max |err|/sum|terms| 2.65e-07 (abs 1.08e-06)
+DENSE	bf16	q_b	r6	P4	16777216	78.89	212.7	90.5	90.4
+DENSE	bf16	q_b	r6	P8	16777216	78.22	214.5	91.3	91.2
+CHECK	fp8	q_b r1 [4096x2048] vs CPU double	ok	max |err|/sum|terms| 7.22e-08 (abs 8.23e-04)
+DENSE	fp8	q_b	r1	P4	8390656	37.27	225.2	95.8	95.7
+DENSE	fp8	q_b	r1	P8	8390656	39.48	212.5	90.4	90.3
+CHECK	fp8	q_b r6 [4096x2048] vs CPU double	ok	max |err|/sum|terms| 7.22e-08 (abs 8.23e-04)
+DENSE	fp8	q_b	r6	P4	8390656	37.26	225.2	95.8	95.7
+DENSE	fp8	q_b	r6	P8	8390656	38.51	217.9	92.7	92.6
+CHECK	bf16	o_proj r1 [6144x4096] vs CPU double	ok	max |err|/sum|terms| 4.54e-07 (abs 3.81e-06)
+DENSE	bf16	o_proj	r1	P4	50331648	229.08	219.7	93.5	93.4
+DENSE	bf16	o_proj	r1	P8	50331648	228.73	220.0	93.6	93.5
+CHECK	bf16	o_proj r6 [6144x4096] vs CPU double	ok	max |err|/sum|terms| 4.96e-07 (abs 4.11e-06)
+DENSE	bf16	o_proj	r6	P4	50331648	231.66	217.3	92.5	92.4
+DENSE	bf16	o_proj	r6	P8	50331648	229.03	219.8	93.5	93.4
+CHECK	fp8	o_proj r1 [6144x4096] vs CPU double	ok	max |err|/sum|terms| 5.29e-08 (abs 9.87e-04)
+DENSE	fp8	o_proj	r1	P4	25171968	109.42	230.1	97.9	97.8
+DENSE	fp8	o_proj	r1	P8	25171968	111.18	226.4	96.3	96.2
+CHECK	fp8	o_proj r6 [6144x4096] vs CPU double	ok	max |err|/sum|terms| 5.29e-08 (abs 9.87e-04)
+DENSE	fp8	o_proj	r6	P4	25171968	109.52	229.8	97.8	97.7
+DENSE	fp8	o_proj	r6	P8	25171968	110.57	227.6	96.9	96.8
+DONE	dense
+BW	read 2 GiB	grid 96 x 256	235.6 GB/s
+BW	read 2 GiB	grid 96 x 512	233.7 GB/s
+BW	read 2 GiB	grid 192 x 256	232.5 GB/s
+BW	read 2 GiB	grid 192 x 512	234.7 GB/s
+BW	read 2 GiB	grid 384 x 256	234.3 GB/s
+BW	read 2 GiB	grid 384 x 512	232.0 GB/s
+BWBEST	tk3m	235.6
+CHECK	tk3m	decode bit-exact vs EXL3's dq<3,2> + tensor_core_perm (expert 0 gate + down)	ok	0 mismatches
+CHECK	tk3m	r1 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 98304 differ
+CHECK	tk3m	r1 up (gate+up, 8 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 3.01e-07 (abs 1.60e-04), 8192 outputs
+CHECK	tk3m	r1 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 4096 differ, max 0 f16 ulp
+CHECK	tk3m	r1 down (8 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 3.26e-09 (abs 2.46e-03), 6144 outputs
+MOE	tk3m	r1	U8	P8	S1	pre	0	1.73	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P8	S2	up	19087360	169.54	112.6	47.9	47.8
+MOE	tk3m	r1	U8	P8	S1	mid	0	2.48	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P8	S1	down	9543680	87.37	109.2	46.5	46.4
+MOE	tk3m	r1	U8	P8	S1	step	28631040	260.99	109.7	46.7	46.6
+MOE	tk3m	r1	U8	P16	S1	pre	0	1.73	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P16	S2	up	19087360	190.34	100.3	42.7	42.6
+MOE	tk3m	r1	U8	P16	S1	mid	0	2.48	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P16	S1	down	9543680	84.25	113.3	48.2	48.1
+MOE	tk3m	r1	U8	P16	S1	step	28631040	281.16	101.8	43.3	43.2
+CHECK	tk3m	r1 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 98304 differ
+CHECK	tk3m	r1 up (gate+up, 8 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 1.89e-07 (abs 9.81e-05), 8192 outputs
+CHECK	tk3m	r1 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 4096 differ, max 0 f16 ulp
+CHECK	tk3m	r1 down (8 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 3.24e-09 (abs 2.07e-03), 6144 outputs
+MOE	tk3m	r1	U8	P8	S1	pre	0	1.73	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P8	S3	up	19087360	138.50	137.8	58.6	58.5
+MOE	tk3m	r1	U8	P8	S1	mid	0	2.80	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P8	S1	down	9543680	87.44	109.1	46.4	46.3
+MOE	tk3m	r1	U8	P8	S1	step	28631040	232.01	123.4	52.5	52.4
+MOE	tk3m	r1	U8	P16	S1	pre	0	1.73	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P16	S3	up	19087360	146.87	130.0	55.3	55.2
+MOE	tk3m	r1	U8	P16	S1	mid	0	2.80	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P16	S1	down	9543680	84.28	113.2	48.2	48.1
+MOE	tk3m	r1	U8	P16	S1	step	28631040	237.49	120.6	51.3	51.2
+CHECK	tk3m	r1 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 98304 differ
+CHECK	tk3m	r1 up (gate+up, 8 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 1.53e-07 (abs 8.10e-05), 8192 outputs
+CHECK	tk3m	r1 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 4096 differ, max 0 f16 ulp
+CHECK	tk3m	r1 down (8 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 3.27e-09 (abs 1.86e-03), 6144 outputs
+MOE	tk3m	r1	U8	P8	S1	pre	0	1.73	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P8	S4	up	19087360	125.21	152.4	64.9	64.7
+MOE	tk3m	r1	U8	P8	S1	mid	0	2.82	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P8	S1	down	9543680	87.44	109.1	46.4	46.3
+MOE	tk3m	r1	U8	P8	S1	step	28631040	218.93	130.8	55.7	55.5
+MOE	tk3m	r1	U8	P16	S1	pre	0	1.73	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P16	S4	up	19087360	132.76	143.8	61.2	61.0
+MOE	tk3m	r1	U8	P16	S1	mid	0	2.82	0.0	0.0	0.0
+MOE	tk3m	r1	U8	P16	S1	down	9543680	84.20	113.3	48.2	48.1
+MOE	tk3m	r1	U8	P16	S1	step	28631040	224.23	127.7	54.3	54.2
+CHECK	tk3m	r6 input transform had(x*su)/sqrt128 -> f16 vs CPU same order	ok	0 of 2064384 differ
+CHECK	tk3m	r6 up (gate+up, 28 experts) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 7.93e-07 (abs 4.17e-04), 172032 outputs
+CHECK	tk3m	r6 mid (had, sv, SwiGLU, bf16, su, had -> f16) vs CPU f32 same order	ok	0 of 86016 differ, max 0 f16 ulp
+CHECK	tk3m	r6 down (28 experts, had + sv + weighted sum) vs CPU double from the GPU's xh	ok	max |err|/sum|terms| 2.61e-09 (abs 7.02e-03), 36864 outputs
+MOE	tk3m	r6	U28	P8	S1	pre	0	13.77	0.0	0.0	0.0
+MOE	tk3m	r6	U28	P8	S1	up	66805760	435.20	153.5	65.3	65.1
+MOE	tk3m	r6	U28	P8	S1	mid	0	3.01	0.0	0.0	0.0
+MOE	tk3m	r6	U28	P8	S1	down	33402880	323.58	103.2	43.9	43.8
+MOE	tk3m	r6	U28	P8	S1	step	100208640	782.44	128.1	54.5	54.4
+MOE	tk3m	r6	U28	P16	S1	pre	0	13.70	0.0	0.0	0.0
+MOE	tk3m	r6	U28	P16	S1	up	66805760	434.71	153.7	65.4	65.2
+MOE	tk3m	r6	U28	P16	S1	mid	0	2.99	0.0	0.0	0.0
+MOE	tk3m	r6	U28	P16	S1	down	33402880	314.94	106.1	45.1	45.0
+MOE	tk3m	r6	U28	P16	S1	step	100208640	769.22	130.3	55.4	55.3
+DONE	tk3m
+GPUEND	2184 MHz, 52, 25.36 W	2026-10-13 21:38:52 +0100
