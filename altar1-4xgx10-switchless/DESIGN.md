@@ -150,5 +150,11 @@ From [reuse § 9](docs/reuse.md#9-build-plan); effort relative to glm53's own mi
 
 Critical path: the download → A2 → A4; A0 → A3e → A4. A1 beside A2–A3 on rank 3's CPU; A5 and A7 after A4; A8 last.
 
-Status on 2026-10-14: scouting and the budget done (S1, S2 in [experiments.md](docs/experiments.md)); the front-end
-done; the checkpoint arriving on rank 3; A0–A3 starting.
+Status on 2026-10-14, evening: A0–A8 done on the four installed rank files, each with its rows in
+[experiments.md](docs/experiments.md): the engine within the reference's two-order variance on all four golden sets,
+bit-stable (refhash pins in [engine.md](docs/engine.md) § 10), 45.70 ms a step at one row (1.23× the floor), drafts
+exact at 27.9–29.9 tok/s, the service handing the ring over with the DeepSeek service. Two contract deviations
+inherited from glm53's engine were found and fixed the same day (the MoE combine and the residual rounding, engine.md
+§ 9.1). Open: the layer-0 hidden state is not bit-equal to the reference (A9, in progress); prefill 973 tok/s at
+2,600 is under the A5 target; the 256k session needs rank 2's memory back from the CPU reference; `glw_kcheck --gpu`
+for the new layouts; the NVFP4 drafter. The reference ran on rank 2, not rank 3 as the A1 row says.
