@@ -120,7 +120,8 @@ enum Tune : uint32_t {
   // "Tuning"). Needs kBF16T shared weights (the converter's form); row-major ones keep the GEMVs.
   kTuneShFused = 1u << 9,
   kTuneDefault =
-      kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter | kTunePfOverlap | kTunePfAttn,
+      kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter | kTunePfOverlap | kTunePfAttn |
+      kTuneShFused,
   kTuneAll = 0xffffffffu,
 };
 
