@@ -97,8 +97,10 @@ inline const char* layout_name(Layout l) {
 }
 
 // The routed experts' formats (experts/experts.h Fmt). An expert entry's (and its layer's desc entry's) `fmt` is
-// one nibble a matrix: gate | up << 4 | down << 8 (all NVFP4 = 0); every other entry has None.
-enum class ExpertFmt : uint32_t { NVFP4 = 0, S3 = 1, None = 0xFFFFFFFFu };
+// one nibble a matrix: gate | up << 4 | down << 8 (a layer is single-format: altar-1 stores INT4 = 0x222 on layers
+// 4-76 and BF16 = 0x333 on 3, 77, 78; NVFP4 = 0 is kept for the MTP layer's option); every other entry has None.
+// 1 was GLM-5.3's S3, retired: readers refuse it as any unknown nibble.
+enum class ExpertFmt : uint32_t { NVFP4 = 0, INT4 = 2, BF16 = 3, None = 0xFFFFFFFFu };
 inline uint32_t expert_matrix_fmt(uint32_t tag, int m) { return (tag >> (4 * m)) & 15; }  // m: 0 gate, 1 up, 2 down
 
 enum Flags : uint32_t {
