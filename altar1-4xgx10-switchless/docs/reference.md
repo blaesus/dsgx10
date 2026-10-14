@@ -3,8 +3,9 @@
 altar-1's golden data: glm53's layer-streaming torch reference ([glm53 reference](../../glm53-4xgx10-switchless/docs/reference.md),
 cited below as *glm53 § n*) adapted to altar-1's checkpoint, run teacher-forced on rank 2's CPU. This page is a
 **delta** from glm53's: what is identical, what changed, the checks (A1a), the golden files and the level-3
-comparison against GLM-5.3 (A1b, A1c), the second order's numbers (A1d), timings, and how to resume. Written
-2026-10-14; everything was measured on that date (times +0100) unless marked *estimate*.
+comparison against GLM-5.3 (A1b, A1c), the second order's numbers (A1d), the golden sets re-made in the absorbed
+attention of DESIGN decision 12 (A1e, A1f), timings, and how to resume. Written 2026-10-14; everything was measured on
+that date (times +0100) unless marked *estimate*.
 
 ## Contents
 
@@ -22,14 +23,17 @@ comparison against GLM-5.3 (A1b, A1c), the second order's numbers (A1d), timings
 ## 1. What is identical to glm53's reference
 
 The math and the numerics contract, line for line (`glmref.py`'s docstring): BF16 activations, f32 accumulation
-with one output rounding, RMSNorm, interleaved RoPE, the expanded MLA in query blocks of 256 with eager numerics,
+with one output rounding, RMSNorm, interleaved RoPE, the expanded MLA in query blocks of 256 with eager numerics
+(glm53's only form; here kept as `--attn expanded`, and the contract's form is now the absorbed one, § 2.2),
 the DSA indexer and its top-2048 (sets saved ascending, the boundary margin saved), the f32 router (bias for
 selection only, top-8 sorted by biased score, normalised, × 2.5), f32 logits, the MTP layer at position t with the
 embedding zeroed at position 0 (glm53 § 2). The two rounding orders are kept:
 
 - `--combine f32` (**the contract**, glm53 DESIGN decision 8): o_proj, the dense MLP's down projection, each routed
   expert's weighted down projection and the shared expert's down projection stay f32, are summed in f32 (routed
-  experts in expert-id order, then the shared expert) and rounded once with the residual. Runs `all-f32`, `a1a-f32`.
+  experts in expert-id order, then the shared expert) and rounded once with the residual. Runs `all-f32`,
+  `a1a-f32` (expanded attention) and **`all-f32-abs`, `a1a-f32-abs`** (absorbed attention: the contract's order
+  since DESIGN decision 12, § 2.2).
 - `--combine bf16` (transformers' order): each of those GEMMs rounded to bf16, the routed experts weighted and summed
   in f32 and rounded, the shared expert and the residual added in bf16. Runs `all`, `a1a-bf16`, `doc`.
 
@@ -55,6 +59,7 @@ these runs unchanged with a path change.
 | tracks | `--track`, `ne:` presets, `--master`, `--qcache`, `--cov-out`, `qprep.py`, `check_nvfp4_rtn.py` | **dropped** (nothing to choose: the served weights are the checkpoint's bytes, DESIGN decision 1) |
 | MTP experts at NVFP4 | `--mtp-from RUN --mtp-experts nvfp4_rtn` | kept (DESIGN decision 5's lever): glm53's `quant/formats.py` `nvfp4_rtn`, imported from `glm53-4xgx10-switchless/quant/` |
 | summaries | 256 experts, top-64 | 168 experts, top quarter = 42 |
+| attention | the expanded form, eager numerics | **`--attn absorbed`, the contract's form since DESIGN decision 12** (§ 2.2); `--attn expanded` (glm53's) stays the flag's default for `check_layer.py` and the earlier runs; the form is recorded in `manifest.json` and the resume state, and a resume must keep it |
 
 ### 2.1 The INT4 weight
 
@@ -76,18 +81,60 @@ bits 4i), s = `weight_scale` (BF16 [N, K/32]), viewed [N, K/32, 32]; and asserts
 `weight_shape`. So W = bf16_rne((q − z) · s), as [model.md § 4.2](model.md#42-dequantisation) derives and A0a
 ([attention.md § 3](attention.md#3-the-int4-contract-and-its-rounding-point)) found on the attention tensors.
 
+### 2.2 The attention form (DESIGN decision 12, A1e)
+
+A9 ([engine.md § 11](engine.md#11-layer-0-against-the-contract-a9)) found that the expanded form's two extra
+roundings (bf16 scores, P = bf16(softmax) normalised) were artefacts of transformers' eager path, and DESIGN
+decision 12 made the engine's absorbed form the contract's: per head q_lat = bf16(q_nope · W_UK); scores (q_lat · c +
+q_rope · k_rope) · 1/16 in f32, never rounded; the row's keys (0..p, or its 2,048 selected positions ascending) in
+blocks of 64 with an online softmax (running max m, p = exp(s − m) in f32, P = bf16(p) unnormalised, l and O in f32
+with the rescale exp(m − m′)); u = bf16(O / l); o_h = bf16(W_UV · u). `glmref.py --attn absorbed` (`absorbed_keys`,
+`absorbed_attn`; A9's prototype) is that arithmetic, with f32 sums in torch's order. The golden sets in the
+contract's order are re-made with it: `a1a-f32-abs` and `all-f32-abs` (A1f, § 8). The expanded sets stay as they
+were.
+
+**Complete for every layer type.** The form is chosen inside `attention()`, which every layer calls: the dense
+layers 0–2, the MoE layers with a full indexer (their own top-2048) or a shared one (the last full layer's sets, also
+on resume from disk), and the MTP layer 78 (its own indexer, over the n − 1 MTP rows). Nothing after `attention()`
+depends on the form. Two changes for the passes (2026-10-14, A1e): under `--attn absorbed` the per-position K and V
+(kv_b's output; 1.8 GB at 26.8k rows) are no longer built, since the form reads only the cache's c and k_rope (a dump
+still builds them); and the form is recorded in `manifest.json` (`"attn"`) and `state/progress.json`, a resume with
+the other form refusing to start (runs without the key count as expanded).
+
+**Checks** (rank 2, 17:29–17:36; `~/altar1-ref/logs/a1e.sh`, `a1e*.txt`/`.log`; 8 threads, nice 19, cores 10–19):
+
+| Check | Result |
+|---|---|
+| layer 0 with the edited `glmref.py` (`--layers 1 --no-mtp --attn absorbed --dump-ops`) against A9's dumps of the prototype, `short` and `prose2400` | **all 22 tensors bit-equal** on both (`a1e-eqdump-*.txt`) |
+| K and V skipped: a plain absorbed run's layer-0 hidden (`checks/time-abs-short`) against the dump run's `h_out`, `short` | bit-equal, 291 × 6,144 |
+| `cmp_ops.py`, the engine's A9 dumps against the absorbed reference, `short` / `prose2400` (`a1e-cmp-*.txt`, `ops/a1e_cmp_ops_*.json`) | A9's numbers to the digit: layer 0's output 82.78 / 81.81 % bit-equal, rel **0.112 / 0.114 %** (against the expanded golden 0.182 / 0.168 %); on the engine's own inputs u **99.978 / 99.947 %**, o 99.975 / 99.975 %, q_lat 99.996 %; the index sets 341 / 352 equal, 11 one-position swaps at near-ties, as A9 |
+| batch invariance of the absorbed form: `short` alone (`short-f32-abs`, every layer, the head and the MTP layer) against `short` in `a1a-f32-abs` (`cmp_bits.py`) | run inside A1f (it needs whole passes), 18:14: **every hidden state of layers 0–77, the final logits and per-row outputs, layer 78 and the MTP head bit-equal** (291 rows); `route_w` differs on one row (the last) in 2 of 75 layers by ≤ 6.0e-8, the routed sets equal (`a1f-bits-short-alone.txt`), as the expanded control below |
+
+Its control on the expanded
+form, `cmp_bits.py all-f32 a1a-f32` (`~/altar1-ref/logs/a1e-bits-expanded-*.txt`): `short` all 316 comparisons
+bit-equal (78 layers' hidden, 75 layers' routes, the final and MTP logits and per-row outputs); the first 2,400
+positions of `prose` against `prose2400` bit-equal in every hidden state at the 43 common sample rows, every index
+set, the logits and the MTP layer, but `route_w` differs on one row in each of 9 layers (L04, 07, 18, 20, 21, 24,
+41, 47, 52) by one f32 ulp (≤ 3.0e-8; the routed sets equal): the row-count-dependent f32 order of the router's
+GEMM or the weights' sum (not isolated), too small to move a bf16 hidden state at the saved rows. So batch
+invariance, in either form, is exact in every bf16 hidden state and every logit checked, and holds to an f32 ulp of a
+routing weight (`route_w.npy`) on about one row in 300–2,400 in a few layers.
+
 ## 3. Files and how to run it
 
 | File | What |
 |---|---|
-| [`ref/glmref.py`](../ref/glmref.py) | the reference (§ 1–2); `--dump-ops DIR` writes one layer's intermediates of the first sequence, `--attn absorbed` computes the attention in the engine's absorbed form (a prototype, off by default; [engine.md § 11](engine.md#11-layer-0-against-the-contract-a9)) |
-| [`ref/passes.sh`](../ref/passes.sh) | the passes in order (`a1a-bf16`, `a1a-f32`, `all-f32`, `all`, `mtp-nvfp4`), each resumable and retried after a kill; a finished pass is skipped |
+| [`ref/glmref.py`](../ref/glmref.py) | the reference (§ 1–2); `--attn absorbed` is the contract's attention (DESIGN decision 12, § 2.2; `expanded` the flag's default); `--dump-ops DIR` writes one layer's intermediates of the first sequence ([engine.md § 11](engine.md#11-layer-0-against-the-contract-a9)) |
+| [`ref/passes.sh`](../ref/passes.sh) | the passes in order (`a1a-bf16`, `a1a-f32`, `all-f32`, `all`, `mtp-nvfp4` in the expanded form; `a1a-f32-abs`, `short-f32-abs` (a check, into `~/altar1-ref/checks`), `all-f32-abs` in the absorbed one), each resumable and retried after a kill; a finished pass is skipped |
+| [`ref/guard.sh`](../ref/guard.sh) | the 8 GiB guard run beside `passes.sh` (A1f): SIGTERMs the pass's python if its RSS passes 8 GiB or MemAvailable falls under 8 GiB; `passes.sh` then resumes it |
+| [`ref/a1f.sh`](../ref/a1f.sh) | A1f's analyses: `check` (batch invariance, the a1a pair's form change, short against the engine) and `finish` (summary, SHA256SUMS, the four sequences, the MTP, `gold_prep.py`, A8's comparisons against `all-f32-abs`) |
+| [`ref/cmp_bits.py`](../ref/cmp_bits.py) | one sequence's saved outputs in two runs, byte for byte (every layer's hidden state, routes, index sets, final and MTP logits and per-row outputs): batch invariance |
 | [`ref/check_int4.py`](../ref/check_int4.py) | `int4_dequant` against compressed-tensors' `PackedQuantizationCompressor.decompress` with the checkpoint's scheme, bit for bit, on named tensors or all experts of a layer |
 | [`ref/cmp_ops.py`](../ref/cmp_ops.py) | one layer op by op: the engine's `--dump-ops` against `glmref.py --dump-ops` (expanded and `--attn absorbed`), each op on the engine's own inputs, the attention's variants ([engine.md § 11](engine.md#11-layer-0-against-the-contract-a9)) |
 | [`ref/check_layer.py`](../ref/check_layer.py) | one real layer against transformers' GlmMoeDsa modules + compressed-tensors (§ 4.3) |
 | [`ref/check_router.py`](../ref/check_router.py) | DESIGN decision 10: the kept router rows and biases against the parent's (§ 4.4) |
 | [`ref/check_tokens.py`](../ref/check_tokens.py) | the token files re-rendered with altar-1's template (§ 4.1) |
-| [`ref/mtp_accept.py`](../ref/mtp_accept.py) | the MTP acceptance by tokens of `all-f32`, `all`, `mtp-nvfp4` and their drafts against `all-f32`'s (§ 6.1, § 8) |
+| [`ref/mtp_accept.py`](../ref/mtp_accept.py) | the MTP acceptance by tokens of `all-f32`, `all`, `mtp-nvfp4` and their drafts against `all-f32`'s (§ 6.1, § 8); other runs by name (`mtp_accept.py ROOT all-f32-abs all-f32-abs,all-f32,all`) |
 | [`ref/level3.py`](../ref/level3.py) | level 3: argmax agreement, top-5 containment and KL against GLM-5.3's golden runs, with both models' order floors (§ 7) |
 | [`ref/summarize.py`](../ref/summarize.py), [`ref/cmp_runs.py`](../ref/cmp_runs.py), [`ref/make_tokens.py`](../ref/make_tokens.py), [`ref/tokens/`](../ref/tokens) | glm53's, with 168 experts in `summarize.py`; the tokens unchanged |
 
@@ -105,6 +152,9 @@ python3 -m venv ~/altar1-ref/venv
 # every process: oom_score_adj 1000, cores 10-19, nice 19, idle I/O
 cd ~/altar1-ref/code/altar1-4xgx10-switchless/ref
 OMP_NUM_THREADS=8 setsid nohup taskset -c 10-19 nice -n 19 ionice -c3 ./passes.sh >> ~/altar1-ref/logs/passes.log 2>&1 < /dev/null &
+# A1f (absorbed attention): the three passes and the guard; ~/altar1-ref/logs/launch-abs.sh does exactly this
+OMP_NUM_THREADS=8 PASSES="a1a-f32-abs short-f32-abs all-f32-abs" setsid nohup taskset -c 10-19 nice -n 19 ionice -c3 ./passes.sh >> ~/altar1-ref/logs/passes-abs.log 2>&1 < /dev/null &
+setsid nohup ./guard.sh >> ~/altar1-ref/logs/guard.log 2>&1 < /dev/null &
 
 ~/altar1-ref/venv/bin/python -I check_int4.py --ckpt ~/altar-1 --verified ~/altar-1/verify.log [--tensors] [--all-experts 4 40 76]
 ~/altar1-ref/venv/bin/python -I check_layer.py --ckpt ~/altar-1 --run ~/altar1-ref/golden/a1a-bf16 --layer L --group 12
@@ -215,6 +265,20 @@ pinned to cores 10–19, nice 19, `ionice -c3`, `oom_score_adj` 1000.
 | `all-f32` | 37,993 | median 124.6 s (119–141 s; attention 82–101 s of it) | **~10,870 s (3 h 1 min)**: layers 0–4 ~600 s in the first attempt, then 10,265 s for layers 5–77 (11:19:55–14:06), head 125 s, MTP 263 s (its layer 132 s) | **7.9 GiB** (7.3–7.6 in the layers, 7.6 in the head stage) |
 | `all` | 37,993 | median 125.1 s (99–170 s; attention median 92.9 s, 73–131 s); dense layers 0–2 103 s | **10,241 s (2 h 51 min)**, one invocation 14:11:00–17:01:41: layers 9,821 s, head 125.6 s, MTP 261.9 s (its layer 112.0 s) | **7.4 GiB** (6.5–6.8 in the layers and the head stage, 7.4 at the pass's end: the MTP stage) |
 | `mtp-nvfp4` (`--mtp-from all-f32 --mtp-experts nvfp4_rtn`, layer 78 only) | 37,993 | layer 78: 208.0 s (attention 133.9 s) | **350 s**, 17:01:41–17:07:31 (MTP stage 346.8 s) | not logged (the MTP replay prints no `hwm`) |
+| `a1a-f32-abs` (absorbed attention) | 2,691 | 12.9 s dense (attention 10.9–11.0 s), MoE median 19.5 s (19.2–20.2; attention 10.2–10.9 s) | **~1,580 s**: layers 0–1 17:35:06–17:35:32 in a first invocation (stopped, § 10), then 1,527 s 17:36:09–18:01:36 (head 11.4 s, MTP 32.5 s, its layer 20.5 s) | 5.4 GiB (the head stage; 2.2 in the layers) |
+| `short-f32-abs` (a check, `short` alone) | 291 | 1.4 s dense, MoE median 6.5 s (5.8–12.2) | layers 0–66 18:01:38–18:08:48 (stopped by the guard, § 10), then 89 s 18:12:12–18:13:41 | 3.4 GiB |
+| `all-f32-abs` | 37,993 | layers 0–4 (18:13:42–18:34:54): dense 258.3 / 252.5 / 252.0 s (attention 229.8–236.1 s), MoE shared 251.2 / 254.9 s (attention 217 s) | **running**; projected ~20,600 s, finish ~00:00 on 2026-10-15 *estimate* (layers 5–77: 18 full × ~268 s + 55 shared × ~254 s, head ~125 s, MTP ~400 s) | 5.4 GiB through layer 4 |
+
+**The absorbed form's cost (A1e).** Layer 0 of each of `all-f32`'s sequences alone under `--attn absorbed` (rank
+2, 17:30–17:34, `--layers 1 --no-mtp`, `~/altar1-ref/logs/a1e-time-*.log`): short 1.4 s (attention 0.8 s), prose
+28.1 s (25.0), python 37.5 s (33.5), **agentic 185.5 s (attention 169.4 s, peak RSS 4.6 GiB)**. The attention of a
+full layer over the four is 229 s against `all-f32`'s 96.6 s (expanded; layer 0 of the batch): the absorbed loop
+costs ~2.4× the expanded attention although agentic's rows above 2,048 score only their 2,048 keys, because it runs
+per block of 64 keys in small batched matmuls. Projected pass (A1e's estimate): dense layers 229 + 24 s, MoE layers
+with a full indexer ~229 + 39 s, shared ones ~216 + 39 s (`all-f32`'s indexer ~13 s and MoE part 38.8 s a layer,
+from its `timing.json`), MTP and the heads ~520 s: **~20,600 s (5.7 h)**, under the 14 h at which the per-block
+loop was to be vectorised; so it was not changed. Under `--attn absorbed` K and V are not built, so the pass needs
+less memory than `all-f32` (7.9 GiB).
 
 The first `all-f32` attempt (11:06–11:17) peaked at **8.4 GiB** in its fifth layer (the 26,834-row `agentic`
 attention with full-size q_b/kv_b outputs and f32 temporaries) and RSS stayed 4–5 GiB between layers. It was
@@ -320,6 +384,30 @@ Routing mass (the normalised weights) per expert over the 37,993 rows of `all-f3
 - The router margins are as thin as GLM-5.3's (a quarter of rows under 1e-3, glm53 § 6.5): the engine's routing will
   flip against golden where its f32 sum order differs, so tolerances come from the order variance, not a bit match.
 
+### 6.4 The contract's attention: `a1a-f32-abs` (A1f)
+
+`a1a-f32-abs` is `a1a-f32` with `--attn absorbed` (finished 18:01:36; `a1f.sh check`, 18:14–18:15,
+`~/altar1-ref/logs/a1f-*.txt`). Teacher-forced (`summarize.py`): top-1 `short` 0.538 / `prose2400` 0.425 (mean log p
+−2.580 / −3.128); MTP == main argmax at t+1 0.647 / 0.518. **The attention form alone moves the outputs as much as
+the rounding order does** (`cmp_runs.py a1a-f32-abs a1a-f32`; the same input and combine):
+
+| Sequence | Argmax equal | KL(abs ‖ expanded) mean / max | max \|Δ logit\| | hidden rel, layer 0 / 10 / 40 / 77 |
+|---|---:|---|---:|---|
+| `short` | 0.887 | 0.086 / 1.77 | 6.3 | 0.18 % / 0.87 % / 11.0 % / 19.8 % |
+| `prose2400` | 0.865 | 0.164 / 14.0 | 16.8 | 0.17 % / 0.88 % / 10.9 % / 16.8 % |
+
+(against § 6.2's bf16-against-f32 pair: 0.869 / 0.098 / 7.6 and 0.874 / 0.160 / 14.7). From layer ~15 the routing
+flips (a quarter of rows within 1e-3 at the 8th expert, § 6.3) turn any difference into the same chaos.
+
+**The engine against it** (A8's fixed-engine prefill dump of `short`, `compare_golden.py g8 --runs
+a1a-f32-abs,a1a-f32 --seqs short`, `~/altar1-ref/logs/a1f-g8-a1a-short.{txt,json}`): the hidden state's median
+relative error after layer 0 is **0.112 %** (against `a1a-f32` 0.182 %; A9's prediction 0.11 %, the f32-order
+floor), then 0.212 / 0.253 / 0.310 / 0.385 / 0.488 / 0.775 % at layers 1, 2, 3, 4, 6, 10 (against 0.289 / 0.322 /
+0.390 / 0.473 / 0.565 / 0.808 %): 38 % closer at layer 0, 4 % by layer 10, the same ~20 % by layer 77. The logits: argmax
+0.873 against `a1a-f32-abs` (0.869 against `a1a-f32`), KL mean 0.112 (0.095), max |Δ logit| 7.5 (6.3), against the
+two forms' own 0.887 / 0.086 / 6.3: inside the same envelope. The four-sequence comparisons are A8's, against
+`all-f32-abs` (§ 10).
+
 ## 7. Level 3: altar-1 against GLM-5.3
 
 `level3.py --altar ~/altar1-ref/golden --glm ~/glm53-ref/golden` (rank 2, 2026-10-14 14:20; rerun 17:07:27 with
@@ -381,14 +469,21 @@ and the MTP layer 78 on `short` are every position (`short` is under 1,024 token
 | **`all-f32`** (the level-2 golden set) | `--combine f32` (contract, prefill) | short, prose, python, agentic (37,993 rows; 634 sample rows) | 6.0 GB: `layers/` 4.4 GB, `final/` 381 MB, `mtp/` 379 MB, `state/` 891 MB (resume; `hfinal.pt` for `gold_prep.py`) | `SHA256SUMS` (615 files, outside `state/`) `d5911e345f7f7889…`; `final/argmax.npy` `1cf67680d1f7dfe5…`; `mtp/argmax.npy` `32e48b0c5faaff89…` |
 | `all` | `--combine bf16` (transformers) | the same | 6.0 GB (6,384,595,339 bytes incl. `SHA256SUMS`): `layers/` 4.4 GB, `final/` 381 MB, `mtp/` 379 MB, `state/` 891 MB | `SHA256SUMS` (615 files, outside `state/`, written 17:07:55) `06eeff766fb42bbf…`; `final/argmax.npy` `5ff1d5e42a59b7a5…`; `mtp/argmax.npy` `61af0ab519c26694…`; `summary.json` `045568089b2565b4…` |
 | `mtp-nvfp4` | the MTP layer only, `all-f32`'s inputs, routed experts NVFP4 round-to-nearest (glm53 `nvfp4_rtn`) | the same | 524 MB own (`layers/L78` 146 MB, `mtp/` 379 MB); `final/` is a symlink to `all-f32/final` | `mtp/argmax.npy` `3b9514563d823d55…` |
-| `a1a-bf16`, `a1a-f32` | bf16 / f32 | short + prose2400 (2,691 rows, **every position saved**: the layer checks' inputs) | 8.6 GB each | |
+| **`all-f32-abs`** (the level-2 golden set in the contract's order since DESIGN decision 12) | `--combine f32 --attn absorbed` | the four sequences, as `all-f32` | ~6 GB *estimate* (`all-f32`'s layout) | **running**: launched 18:13:42, projected ~00:00 on 2026-10-15; `SHA256SUMS` by `a1f.sh finish` (§ 10) |
+| **`a1a-f32-abs`** | `--combine f32 --attn absorbed` | short + prose2400, every position saved | 8.6 GB | `SHA256SUMS` (outside `state/`, 18:15) `a2bf82cf936b64e0…` |
+| `a1a-bf16`, `a1a-f32` | bf16 / f32 (expanded attention) | short + prose2400 (2,691 rows, **every position saved**: the layer checks' inputs) | 8.6 GB each | |
+| `short-f32-abs` (a check, in `~/altar1-ref/checks/`, not a golden set) | as `a1a-f32-abs` | short alone | 1.3 GB | batch invariance (§ 2.2) |
 | `doc` | bf16, no MTP | doc, docchat | 0.9 GB | |
 | `check_layer_L{00,03,04,77}.json`, `router_check.json`, `level3.json` | | | | |
 
 `gold_prep.py`'s raw copies of `all-f32` for the engine's `mtpgold` and `spec` modes are in `~/altar1-ref/gold/`
 (`all-f32.{hfinal,l78}.bf16`, `.tokens.i32`, `.argmax.i32`, `.mtp_argmax.i32`, `.seqs.txt`, 0.93 GB). For the engine's
 G8-style comparison (`compare_golden.py g8 ROOT ...`) ROOT is `~/altar1-ref/golden` (or a copy), with `--runs
-all-f32,all`.
+all-f32,all`. Since DESIGN decision 12 the contract-order set is `all-f32-abs`: its raw copies are to be
+`~/altar1-ref/gold/all-f32-abs.*` (the same six files, `a1f.sh finish`), and the comparison `--runs all-f32-abs,all`
+(the engine against the contract, and `all` against `all-f32-abs` as the reference's own order variance, the 2×
+bar's scale). The engine's `run.sh` reads `GOLD` = `~/dsgb10-data/altar1-model/gold/all` on every box: until those
+are replaced by the `all-f32-abs` copies (the engine agent's step), its `mtpgold` and `spec` runs use the expanded set.
 
 **The NVFP4 drafter (`mtp-nvfp4`, DESIGN decision 5's lever).** Layer 78's routed experts rounded to NVFP4 (glm53's
 `nvfp4_rtn`), everything else and the inputs `all-f32`'s (`summarize.py` 17:07:48,
@@ -431,3 +526,39 @@ All on rank 2, from `~/altar1-ref/code/altar1-4xgx10-switchless/ref`, every proc
    - verify a copy: `cd golden/all && sha256sum -c SHA256SUMS` (and the same in `all-f32`).
 3. The layer checks and the router check are done (`check_layer_L*.json`, `router_check.json`); rerun them with the
    commands of § 3 if the code changes.
+4. **A1f, the absorbed-attention passes** (DESIGN decision 12; log `~/altar1-ref/logs/passes-abs.log`, guard log
+   `~/altar1-ref/logs/guard.log`). `passes.sh` now starts a try only with MemAvailable ≥ 16 GiB (`START_KIB`;
+   the 8 GiB floor plus a pass's peak) and waits otherwise, and `guard.sh` beside it SIGTERMs a running try whose RSS
+   passes 8 GiB or when MemAvailable falls under 8 GiB; the next try resumes from the last finished layer. The
+   default `PASSES` list now ends with the three A1f passes. Rank 2's `~/altar1-ref/code/altar1-4xgx10-switchless/ref`
+   is byte-equal to this repository's `ref/` (SHA-256 of every `.py` and `.sh`, 18:36; `glmref.py` `6c3e2302…`,
+   `passes.sh` `7bc7cc12…`, `guard.sh` `75c74643…`, `a1f.sh` `0884a032…`), and `~/altar1-ref/code/compare_golden.py`
+   to `engine/model/tools/compare_golden.py` (`b3b393e2…`; the old copy differed in its docstring only).
+   - Done: `a1a-f32-abs` (exit 0 18:01:36), `short-f32-abs` (exit 0 18:13:41), `a1f.sh check` (18:14–18:15, § 2.2,
+     § 6.4). `a1a-f32-abs` was stopped once by hand at layer 2 (17:35:35: its first launch was in a systemd user scope
+     with `MemoryMax=8G`, which rank 2's non-lingering user manager would kill at the last logout) and resumed
+     17:36:09; `short-f32-abs` was stopped by the guard at layer 67 (18:08:48: the altar-1 service started on rank 2
+     and MemAvailable fell to 8.09 GiB) and, after the service was restarted with its pool capped at 17 GiB a rank,
+     resumed 18:12:12. A resume is the same bits as a run straight through (§ 2's chunking check; the state is the
+     residual after a finished layer).
+   - **Running: `all-f32-abs`**, launched 18:13:42 (try 1). Its progress: `grep -E "layer|head|MTP|exit"
+     ~/altar1-ref/logs/passes-abs.log | tail`. If it stopped (no `passes.sh` in `pgrep -af passes.sh`, the log's
+     last line not `passes done`), relaunch the chain, which skips the finished passes and resumes this one:
+     `~/altar1-ref/logs/launch-abs.sh` (the two `setsid nohup` lines of § 3). To stop it: `kill -TERM -- -PGID` with
+     `PGID` the process group of `passes.sh` (`ps -o pgid= -p $(pgrep -f '^/bin/bash ./passes.sh')`); the guard exits
+     by itself.
+   - **When the log says `pass all-f32-abs exit 0`** (and `passes done`), run alone: `./a1f.sh finish >
+     ~/altar1-ref/logs/a1f-finish.log 2>&1` (~30 min *estimate*). It writes `all-f32-abs/summary.json`, then
+     `all-f32-abs/SHA256SUMS` (outside `state/`); checks batch invariance inside the set (`cmp_bits.py` of `short`,
+     and of `prose`'s first 2,400 positions, against `a1a-f32-abs`); measures the form's effect (`cmp_runs.py
+     all-f32-abs all-f32`) and the new order-variance pair (`cmp_runs.py all all-f32-abs` and the reverse) on the four
+     sequences; the MTP acceptance (`mtp_accept.py ~/altar1-ref/golden all-f32-abs all-f32-abs,all-f32,all`);
+     `gold_prep.py ~/altar1-ref/golden/all-f32-abs ~/altar1-ref/gold/all-f32-abs --l78` and the copies' SHA-256; and
+     A8's comparisons (engine.md § 10.3) of the fixed engine's prefill (four sequences) and decode (short, python)
+     dumps against `all-f32-abs` with `all` as the order partner (`compare_golden.py g8 ~/altar1-ref/golden
+     ~/dsgb10-data/altar1-g8/g8/prefill-fix --runs all-f32-abs,all --mtp-runs all-f32-abs,all-f32`, the same for
+     `decode-fix --seqs short,python`), JSON in `~/altar1-ref/logs/a1f-g8-*-abs.json`. Each step's output is
+     `~/altar1-ref/logs/a1f-<step>.txt`, its time and peak RSS `.time`.
+   - Then: the numbers into § 5, § 6.4, § 8 and engine.md § 10.3 / § 11.7 (the 2× ratios against `all` vs
+     `all-f32-abs`), experiments.md A1f's status; the engine agent copies `~/altar1-ref/gold/all-f32-abs.*` to every
+     box (its `GOLD`), SHA-256 equal, if `mtpgold`/`spec` are to read the new set.

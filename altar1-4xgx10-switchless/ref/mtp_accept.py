@@ -1,7 +1,8 @@
 """MTP draft acceptance by tokens (draft at row t == the main argmax at t+1) for the runs all-f32, all and mtp-nvfp4
-under GOLDEN_ROOT, and each run's drafts against all-f32's (A1d).
+under GOLDEN_ROOT, and each run's drafts against all-f32's (A1d). REF and RUNS name other runs of the same tokens
+(A1f: REF all-f32-abs, RUNS all-f32-abs,all-f32).
 
-  python3 -I mtp_accept.py GOLDEN_ROOT
+  python3 -I mtp_accept.py GOLDEN_ROOT [REF [RUNS]]
 """
 import json
 import os
@@ -22,8 +23,10 @@ def load(run):
     return man, am, mtp, rows, tok
 
 
-ref = load("all-f32")
-for run in ("all-f32", "all", "mtp-nvfp4"):
+REF = sys.argv[2] if len(sys.argv) > 2 else "all-f32"
+RUNS = sys.argv[3].split(",") if len(sys.argv) > 3 else ["all-f32", "all", "mtp-nvfp4"]
+ref = load(REF)
+for run in RUNS:
     man, am, mtp, rows, tok = load(run)
     print(run, "mtp", mtp.shape, mtp.dtype, "rows_main", None if rows is None else rows.shape)
     hit = n = 0
@@ -36,6 +39,6 @@ for run in ("all-f32", "all", "mtp-nvfp4"):
         acc = d == am[o + 1:o + k - 1]
         same = (mtp[moff:moff + k - 1] == ref[2][moff:moff + k - 1]).mean()
         moff += k - 1
-        print(f"  {s['name']:8s} accept {acc.mean():.4f}  draft == all-f32's draft {same:.4f}")
+        print(f"  {s['name']:8s} accept {acc.mean():.4f}  draft == {REF}'s draft {same:.4f}")
         hit += int(acc.sum()); n += acc.size
     print(f"  by tokens {hit / n:.4f} ({hit}/{n})")

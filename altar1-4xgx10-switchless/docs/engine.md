@@ -910,8 +910,9 @@ pass. A8's comparisons are then repeated against the new set; layer 0 is expecte
 
 ### 11.6 What remains, and failures
 
-- **A decision** (coordinator): adopt the wording above (or keep the expanded form and accept the 0.07 % attention
-  term at layer 0); then the golden passes with `--attn absorbed` and A8's comparison again.
+- ~~**A decision** (coordinator): adopt the wording above (or keep the expanded form and accept the 0.07 % attention
+  term at layer 0); then the golden passes with `--attn absorbed` and A8's comparison again.~~ Adopted as DESIGN
+  decision 12 the same evening; the re-make is § 11.7.
 - **Decode** was not dumped: prefill already showed the arithmetic. Decode's sparse attention runs split-K 16 at 1–2
   rows and 8 above by default (`model.cu`: `opt.attn_splits ? … : R <= 2 ? 16 : 8`), so its P is rounded against each
   split's own running maximum: a third order, and one that changes between 2 and 3 rows unless `--splits` fixes it
@@ -921,3 +922,24 @@ pass. A8's comparisons are then repeated against the new set; layer 0 is expecte
 - **Failures**: none of the two ring jobs or the reference runs failed. The first index-set count in `cmp_ops.py`
   compared the sorted lists element by element and reported 6,916 differing positions (an off-by-one shift after each
   swap); replaced by set differences: 11 positions, one a row.
+
+### 11.7 Decision 12 adopted: the golden sets re-made (A1e, A1f)
+
+The wording of § 11.5 is DESIGN decision 12 (2026-10-14). The engine does not change; the reference's contract-order
+sets are re-made with `glmref.py --attn absorbed` beside the old ones on rank 2 ([reference.md § 2.2, § 6.4,
+§ 10](reference.md#22-the-attention-form-design-decision-12-a1e); experiments A1e, A1f):
+
+- **A1e (17:27–17:36)**: the prototype is complete for every layer type (dense, MoE with a full or shared indexer,
+  the MTP layer) and, after the passes' two changes (K and V no longer built in this form; the form recorded and
+  checked on resume), still A9's arithmetic: its layer-0 dumps are bit-equal to A9's (22 / 22 tensors, `short` and
+  `prose2400`) and `cmp_ops.py` gives § 11.2's numbers to the digit (layer 0 0.112 / 0.114 %, isolated u 99.978 /
+  99.947 %). Layer 0 of each sequence alone: 1.4 / 28.1 / 37.5 / 185.5 s (short, prose, python, agentic).
+- **`a1a-f32-abs`** finished 18:01:36 (~26 min); **`short` alone is bit-identical to `short` inside it** (every
+  hidden state, the logits, the MTP layer). Against it **the fixed engine's layer 0 is at 0.112 %** (0.182 % against
+  `a1a-f32`), A9's predicted floor; layers 1–10 at 0.21–0.78 % (0.29–0.81 % before), and the logits of `short`
+  within the same envelope (argmax 0.873, KL 0.112; the two attention forms differ from each other by argmax 0.887,
+  KL 0.086).
+- **`all-f32-abs`** was launched at 18:13:42 (layer 0, the dense layer over all four sequences: 258.3 s, attention
+  236.1 s); layers 1–4 252.5 / 252.0 / 251.2 / 254.9 s, peak 5.4 GiB so far; projected finish ~00:00 on 2026-10-15 (~5.7 h, A1e's estimate). A8's four-sequence comparisons against it (§ 10.3's table, with `all`
+  against `all-f32-abs` as the order-variance bar) are the last step of `ref/a1f.sh finish`
+  (reference.md § 10).

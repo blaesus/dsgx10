@@ -28,9 +28,17 @@ gives the deltas):
 - RMSNorm: f32 normalisation, cast to bf16, then a bf16 weight multiply (§ 2.2); eps 1e-5, 1e-6 for the
   two latent norms.
 - RoPE interleaved, bf16 arithmetic with bf16 cos/sin, output de-interleaved (§ 2.4.1).
-- Attention in the reference's expanded form, eager numerics: bf16 QK^T, scaled by 1/16, masked,
-  f32 softmax rounded to bf16, bf16 PV (§ 2.4). Query p attends to all causal keys when p < 2048, else
-  to the indexer's top-2048 (§ 2.5).
+- Attention (--attn): query p attends to all causal keys when p < 2048, else to the indexer's top-2048
+  (§ 2.5), in one of two forms. --attn absorbed is **the contract's** (altar-1 DESIGN decision 12, from
+  docs/engine.md § 11): q_lat = bf16(q_nope . W_UK), scores (q_lat . c + q_rope . k_rope) * 1/16 in f32
+  (never rounded), an online softmax over the row's keys (0..p, or its 2,048 selected positions ascending) in
+  blocks of 64 (the running max m, p = exp(s - m) in f32, P = bf16(p) unnormalised, l = l * exp(m_old - m) +
+  sum p in f32, O = O * exp(m_old - m) + P . c in f32), u = bf16(O / l), o_h = bf16(W_UV_h . u_h); then
+  o_proj as below. Golden data in the contract's order is made with it (a1a-f32-abs, all-f32-abs). --attn
+  expanded (the flag's default, kept so the earlier runs resume and check_layer.py matches transformers) is
+  the reference's earlier form, transformers' eager numerics: bf16 QK^T, scaled by 1/16, masked, f32 softmax
+  rounded to bf16, bf16 PV (§ 2.4); the runs a1a-f32, all-f32, all, a1a-bf16, doc used it. The form is
+  recorded in the manifest and the resume state, and a resume must keep it.
 - Indexer: q, k bf16 (k through a LayerNorm with bias), RoPE on the first 64; f32 scores, ReLU, f32 head
   weights from an f32 GEMM of fp32(x); top-2048 by torch.topk (ties unspecified, § 2.5). Shared layers
   reuse the last full layer's sets.
@@ -43,12 +51,8 @@ gives the deltas):
   --combine bf16 is transformers' order instead (each GEMM output rounded to bf16; routed experts weighted
   and summed in f32, rounded; shared expert and residual added in bf16). Both are one forward from position
   0 (prefill); the engine's decode sums a strip's K in another order by default (glm53 DESIGN decision 11).
-- --attn absorbed (a diagnosis prototype, off by default; docs/engine.md § 11): the engine's attention arithmetic
-  instead of the expanded form: q_lat = bf16(q_nope . W_UK), scores (q_lat . c + q_rope . k_rope) * 1/16 in f32
-  (not rounded), an online softmax over the row's keys in blocks of 64 (the running max m, p = exp(s - m) in f32,
-  P = bf16(p) unnormalised, l = l * exp(m_old - m) + sum p in f32, O = O * exp(m_old - m) + P . c in f32),
-  u = bf16(O / l), o_h = bf16(W_UV_h . u_h); then o_proj as above. --dump-ops DIR writes one layer's
-  intermediate tensors of the first sequence (--dump-ops-layer, default 0) as .npy files.
+- --dump-ops DIR writes one layer's intermediate tensors of the first sequence (--dump-ops-layer, default 0)
+  as .npy files (docs/engine.md § 11).
 - Logits are kept in f32 (bf16 hidden x bf16 head, f32 accumulation, no output rounding); transformers'
   bf16 logits are bf16() of them up to summation order.
 - MTP (§ 3): e = enorm(embed(token t+1)) (zeroed at position 0), g = hnorm(post-final-norm hidden of row t),
@@ -235,7 +239,7 @@ def linear(x, w):
 # h = bf16(f32(h) + Σ f32 partials). "bf16": transformers' order (each GEMM output rounded to bf16; routed
 # experts summed in f32 and rounded; + shared expert in bf16; + residual in bf16).
 COMBINE = "f32"
-ATTN = "expanded"  # --attn: "expanded" (transformers' form, the default) or "absorbed" (the engine's, a prototype)
+ATTN = "expanded"  # --attn: "absorbed" (the contract's, DESIGN decision 12) or "expanded" (transformers' form, the default)
 OPS = None         # --dump-ops: a dict the layer being dumped fills with its intermediate tensors
 
 
@@ -358,21 +362,29 @@ def attention(x, W, full, prev_topk, cos, sin, args):
     # q, K and V are built in row chunks (a GEMM's rows are independent: batch invariance, glm53 reference
     # § 6.5), so the full q_b and kv_b outputs (0.9 and 1.5 GB at 26.8k rows) never exist at once.
     Wqb, Wkvb = W("self_attn.q_b_proj.weight"), W("self_attn.kv_b_proj.weight")
+    # The absorbed form never reads K or V (only the cache's c and k_rope), so they are built only for the
+    # expanded form or a dump (1.8 GB at 26.8k rows; no other tensor depends on them).
+    need_kv = ATTN != "absorbed" or OPS is not None
     q = torch.empty(S, NH, DQK, dtype=BF16)
-    K = torch.empty(NH, S, DQK, dtype=BF16)
-    V = torch.empty(NH, S, DV, dtype=BF16)
+    if need_kv:
+        K = torch.empty(NH, S, DQK, dtype=BF16)
+        V = torch.empty(NH, S, DV, dtype=BF16)
     for r0 in range(0, S, ROW_CHUNK):
         r1 = min(S, r0 + ROW_CHUNK)
         qc = linear(cq[r0:r1], Wqb).view(r1 - r0, NH, DQK)
         if OPS is not None:
             OPS["q_raw"] = qc.clone() if r0 == 0 else torch.cat([OPS["q_raw"], qc])
         q[r0:r1] = torch.cat([qc[..., :DN], rope(qc[..., DN:], cos[r0:r1, None], sin[r0:r1, None])], dim=-1)
-        kv = linear(c[r0:r1], Wkvb).view(r1 - r0, NH, DN + DV)
-        K[:, r0:r1, :DN] = kv[:, :, :DN].transpose(0, 1)
-        V[:, r0:r1] = kv[:, :, DN:].transpose(0, 1)
-        del qc, kv
-    K[:, :, DN:] = k_rot.unsqueeze(0)
-    op("q", q), op("K", K), op("V", V)
+        if need_kv:
+            kv = linear(c[r0:r1], Wkvb).view(r1 - r0, NH, DN + DV)
+            K[:, r0:r1, :DN] = kv[:, :, :DN].transpose(0, 1)
+            V[:, r0:r1] = kv[:, :, DN:].transpose(0, 1)
+            del kv
+        del qc
+    op("q", q)
+    if need_kv:
+        K[:, :, DN:] = k_rot.unsqueeze(0)
+        op("K", K), op("V", V)
     if ATTN == "absorbed":
         Wkv = Wkvb.view(NH, DN + DV, RKV)
         Wuk, Wuv = Wkv[:, :DN], Wkv[:, DN:]                                              # [64, 192 | 256, 512]
@@ -690,7 +702,7 @@ class Run:
     def write_manifest(self):
         m = {"ckpt": os.path.basename(os.path.normpath(self.args.ckpt)), "model": "AikidoSec/altar-1",
              "sequences": [{k: s[k] for k in ("name", "off", "n")} for s in self.seqs],
-             "rows": self.N, "contract": "glmref.py docstring", "combine": COMBINE,
+             "rows": self.N, "contract": "glmref.py docstring", "combine": COMBINE, "attn": ATTN,
              "order": ("prefill, one forward from position 0; --combine " + COMBINE +
                        (" (the contract: f32 sublayer sums, one rounding)" if COMBINE == "f32" else
                         " (transformers: per-GEMM bf16 rounding)")),
@@ -713,7 +725,7 @@ class Run:
             torch.save(v, os.path.join(self.state, k + ".tmp"))
             os.replace(os.path.join(self.state, k + ".tmp"), os.path.join(self.state, k + ".pt"))
         with open(os.path.join(self.state, "progress.tmp"), "w") as f:
-            json.dump({"next": nxt, "combine": COMBINE}, f)
+            json.dump({"next": nxt, "combine": COMBINE, "attn": ATTN}, f)
         os.replace(os.path.join(self.state, "progress.tmp"), os.path.join(self.state, "progress.json"))
 
     def load_state(self, k):
@@ -855,6 +867,7 @@ class Run:
         prog = self.progress()
         if prog["next"] != 0:  # a resume must keep the run's rounding order
             assert prog.get("combine") == COMBINE, f"this run used --combine {prog.get('combine')}"
+            assert prog.get("attn", "expanded") == ATTN, f"this run used --attn {prog.get('attn', 'expanded')}"
         nxt = prog["next"]
         last = a.layers if a.layers is not None else NL
         if nxt == 0:
@@ -1009,8 +1022,8 @@ def main():
                     help="f32: sublayer outputs summed in f32 and rounded once with the residual (the contract, TP=4 "
                          "engine order); bf16: transformers' per-GEMM rounding")
     ap.add_argument("--attn", choices=("expanded", "absorbed"), default="expanded",
-                    help="expanded: transformers' attention arithmetic (the default); absorbed: the engine's (a "
-                         "diagnosis prototype, docs/engine.md § 11)")
+                    help="absorbed: the contract's attention (DESIGN decision 12, the engine's arithmetic; golden data "
+                         "is made with it); expanded: transformers' eager arithmetic (the default, the earlier runs')")
     ap.add_argument("--dump-ops", default=None, help="write one layer's intermediate tensors of the first sequence here")
     ap.add_argument("--dump-ops-layer", type=int, default=0)
     ap.add_argument("--attn-block", type=int, default=256, help="query rows per attention block")
