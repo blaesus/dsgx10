@@ -42,6 +42,44 @@ __device__ __forceinline__ void fp8x4_to_bf16(uint32_t v, uint32_t& o0, uint32_t
   o1 = bmul2(((r1 << 4) & 0x07F007F0u) | ((r1 << 8) & 0x80008000u), k);
 }
 
+// ---- INT4 (compressed-tensors, group 32, asymmetric): the contract's weight per element -----------------------
+// W = bf16_rne((nib - znib) * s) (docs/model.md § 4.2). A nibble u becomes the bf16 128 + u exactly (0x4300 | u: the
+// ulp is 1 in [128, 256)); the bf16 subtraction of 128 + znib is exact (an integer in [-15, 15]); the one bf16
+// multiply by the scale rounds the exact product to nearest even, as torch's bf16 multiply in compressed-tensors'
+// _dequantize (attn_tests D compares every scale pattern with the host's f32-product rounding, which equals torch's:
+// tools/int4_check.py).
+__device__ __forceinline__ uint32_t bsub2(uint32_t a, uint32_t b) {
+  __nv_bfloat162 r = __hsub2(*reinterpret_cast<__nv_bfloat162*>(&a), *reinterpret_cast<__nv_bfloat162*>(&b));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+// (a & 0x00FF00FF) | 0x43004300
+__device__ __forceinline__ uint32_t or4300(uint32_t a) {
+  uint32_t r;
+  asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(r) : "r"(a), "r"(0x00FF00FFu), "r"(0x43004300u));
+  return r;
+}
+// zz: the zero point as bf16 128 + znib in both halves; ss: the bf16 scale in both halves
+__device__ __forceinline__ uint32_t int4_zz(uint32_t znib) { return (znib | (znib << 16)) | 0x43004300u; }
+// 16 nibbles (lo: values 0..7, hi: 8..15, value 2i in byte i's low nibble: the checkpoint's order) -> 8 bf16x2
+// words, word m = W of values (2m, 2m + 1)
+__device__ __forceinline__ void int4x16_to_bf16(uint32_t lo, uint32_t hi, uint32_t zz, uint32_t ss, uint32_t (&o)[8]) {
+  const uint32_t v[2] = {lo, hi};
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const uint32_t e = v[h] & 0x0F0F0F0Fu, d = (v[h] >> 4) & 0x0F0F0F0Fu;  // even / odd values, a byte each
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+      const uint32_t w = or4300(prmt(e, d, (uint32_t)(m | (4 + m) << 8)));  // (128 + v[2m], 128 + v[2m+1])
+      o[4 * h + m] = bmul2(bsub2(w, zz), ss);
+    }
+  }
+}
+__device__ __forceinline__ uint32_t ldg_stream32(const void* p) {
+  uint32_t r;
+  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(r) : "l"(p));
+  return r;
+}
+
 __device__ __forceinline__ void mma_bf16(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"

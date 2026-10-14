@@ -1,6 +1,7 @@
-// The attention side of GLM-5.3 for one rank at TP=4 (16 of the 64 heads), sm_121a: the FP8 projections
-// (zai's 128x128 block FP8, BF16 activations, f32 accumulation), norms, RoPE, the cache writes, the DSA
-// indexer (f32 scores, exact top-2048), absorbed sparse MLA attention, and the BF16 head and FP8 MLP GEMVs.
+// The attention side of altar-1 (GLM-5.3's math, docs/model.md) for one rank at TP=4 (16 of the 64 heads),
+// sm_121a: the projections in BF16 and compressed-tensors INT4 (group 32, asymmetric; glm53's FP8 kept), BF16
+// activations, f32 accumulation, norms, RoPE, the cache writes, the DSA indexer (f32 scores, exact top-2048),
+// absorbed sparse MLA attention, and the head and dense MLP GEMVs.
 // Layouts, the per-rank split and the measurements: docs/attention.md. The math: docs/model.md § 2.
 //
 // Rows are query tokens. Every row carries its absolute position (pos[r]) and its session's cache slot
@@ -47,7 +48,7 @@ constexpr bool full_indexer(int l) { return ((l - 2 > 0 ? l - 2 : 0) % 4) == 0; 
 // the full layer whose top-k layer l uses (itself when full)
 constexpr int index_source(int l) { return full_indexer(l) ? l : index_source(l - 1); }
 
-// ---- this rank's x-projection: one FP8 GEMV of the normed layer input (docs/attention.md § split) -----------
+// ---- this rank's x-projection: one BF16 GEMV of the normed layer input (docs/attention.md § split) ----------
 // Rank r's rows, in order: q_a rows [512r, +512), kv_a latent rows [128r, +128), kv_a rope rows [512+16r, +16),
 // and on full-indexer layers the indexer's wk rows [32r, +32). After the all-gather the four ranks' blocks lie
 // in rank order: [rows][4][kXRows] (shared layers: kXRowsShared, the same without wk).
@@ -55,12 +56,31 @@ inline constexpr int kXQa = kQLora / kTP, kXKv = kKvLora / kTP, kXRope = kRope /
 inline constexpr int kXRowsShared = kXQa + kXKv + kXRope;  // 656
 inline constexpr int kXRows = kXRowsShared + kXWk;         // 688
 
-// ---- FP8 / BF16 GEMV, 1..16 rows ---------------------------------------------------------------------------
-// y[r][n] = sum_k x[r][k] W[n][k]. FP8 weights in the engine tile layout [N/8][K/64][32 lanes][16 B] (lane
-// (g, t) holds row 8i+g, k = 64j + 16t + b at byte b), e4m3 values; f32 scales [N/rs][K/ks] (rs, ks in
-// {16, 64, 128}: zai's 128x128 blocks re-cut so that every 8-row x 64-k chunk lies in one block). BF16 weights
-// row-major [N][K] (no scales). x is bf16 [rows][ldx]. Accumulation: bf16 x bf16 MMAs with f32 accumulation
-// over each 64-k chunk, times the chunk's scale, added in k order; split-K partials added in a fixed order.
+// ---- GEMV (1..16 rows) and GEMM (prefill) over BF16, INT4 and FP8 weights ------------------------------------
+// y[r][n] = sum_k x[r][k] W[n][k], x bf16 [rows][ldx]. Every segment names its weight format (docs/attention.md § 2):
+//  * kBF16: row-major [N][K] bf16 (no scales).
+//  * kINT4: altar-1's compressed-tensors INT4 (group 32 along K, asymmetric) in the engine tile: blocks of 8 rows x
+//    512 k, 2,368 bytes, block (n8, b) at ((n8 * K / 512) + b) * 2368 (tools/pack.py `int4_tiles`: the values as the
+//    checkpoint's nibbles (+8 kept), the bf16 scales and the zero-point nibbles of the lanes' groups beside them).
+//    The weight is the contract's W = bf16_rne((nib - znib) * s) (docs/model.md § 4.2), computed per element in the
+//    kernel: nibbles to bf16 128 + u exactly, an exact bf16 subtraction, one bf16 multiply (round to nearest even).
+//  * kFP8: glm53's FP8 tiles [N/8][K/64][32 lanes][16 B] (lane (g, t) holds row 8i+g, k = 64j + 16t + b at byte b),
+//    e4m3 values, f32 scales [N/rs][K/ks] (rs, ks in {16, 64, 128}).
+// Accumulation: bf16 x bf16 MMAs with f32 accumulation. BF16 and INT4: the four MMAs of each 64-k chunk accumulate
+// straight into the sum, k in order, so **an INT4 GEMV's output equals the BF16 GEMV's on the dequantised matrix bit
+// for bit** (the same lane map, MMAs and order; attn_tests D). FP8: each 64-k chunk's MMAs start from zero and the
+// chunk's f32 result is scaled and added in k order. Split-K partials are added in a fixed order.
+enum class WFmt : int {
+  kNone = 0,  // unset: refused (a format is never guessed)
+  kBF16 = 1,
+  kINT4 = 2,
+  kFP8 = 3,
+};
+inline constexpr int kInt4BlkK = 512, kInt4Blk = 2368;  // the INT4 tile's block: 8 rows x 512 k, its bytes
+// a matrix's bytes in its format (FP8: the codes only)
+constexpr size_t weight_bytes(WFmt f, size_t N, size_t K) {
+  return f == WFmt::kBF16 ? N * K * 2 : f == WFmt::kINT4 ? N / 8 * (K / kInt4BlkK) * kInt4Blk : f == WFmt::kFP8 ? N * K : 0;
+}
 enum class GemvOut : int {
   kBF16 = 0,    // y bf16 [rows][ldy]: a bf16 F.linear
   kF32 = 1,     // y f32 [rows][ldy] (o_proj and down partials before the all-reduce; weights_proj)
@@ -69,8 +89,9 @@ enum class GemvOut : int {
                 // rs counts intermediates (gate block row, then up's)
 };
 struct GemvSeg {
-  const void* w = nullptr;   // e4m3 tiles or bf16 rows
-  const float* s = nullptr;  // FP8 scales (null for BF16)
+  WFmt fmt = WFmt::kNone;
+  const void* w = nullptr;   // bf16 rows, INT4 tiles or e4m3 tiles
+  const float* s = nullptr;  // FP8 scales (null otherwise)
   int n = 0;                 // rows (multiple of 8)
   int rs = 128, ks = 128;    // FP8 scale block (rows, k)
   void* y = nullptr;
@@ -79,37 +100,47 @@ struct GemvSeg {
   int group_rows = 0, x_group = 0;
 };
 inline constexpr int kMaxSegs = 4;
-// fp8: true for FP8 tiles, false for BF16 rows. K: multiple of 64. splitk in {1, 2, 4}: warps of a CTA share a
-// tile's k range (for small N). All segments share K, x and the output kind.
-// The index weights (index_weights() below) fused into the x-projection's launch: its own CTAs after the
-// GEMV's, the same arithmetic bit for bit. FP8 bf16-out GEMV of K = 6144 only (the x-projection of a full layer).
+// K: multiple of 64 (INT4: of 512, and K / 512 a multiple of splitk). splitk in {1, 2, 4}: warps of a CTA share a
+// tile's k range (for small N). All segments share K, x and the output kind; segments of different formats run as
+// one launch a format, in the order BF16, INT4, FP8 (outputs do not depend on it).
+// The index weights (index_weights() below) fused into the x-projection's launch: its own CTAs after the GEMV's, the
+// same arithmetic bit for bit. A BF16 or FP8 bf16-out GEMV of K = 6144 (the x-projection of a full layer).
 struct GemvIw {
   const uint16_t* wproj = nullptr;  // BF16 [nh][6144]
   int nh = 0;
   float* w = nullptr;               // [rows][ldw] f32
   int ldw = 0;
 };
+void gemv(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
+          cudaStream_t s, bool pdl = false, const GemvIw* iw = nullptr);
+// glm53's form, kept while the runner is adapted: segments whose fmt is kNone are taken as FP8 (fp8) or BF16.
 void gemv(bool fp8, const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out,
           int splitk, cudaStream_t s, bool pdl = false, const GemvIw* iw = nullptr);
-// bench knob: the FP8 GEMV's loads in flight a lane and warps a CTA (-1, the default: by shape, 1 for the grouped
-// W_UV and 4 otherwise; 0: 8 and 4; 1: 16, 4; 2: 24, 4; 3: 8, 2; 4: 8, 8; 5: 16, 2; configurations a split-K does
-// not fit use 0). Outputs do not depend on it.
+// bench knob: the GEMV launch shape (-1, the default: by shape and format; outputs never depend on it).
+//  FP8: loads in flight a lane and warps a CTA: 0: 8, 4; 1: 16, 4; 2: 24, 4; 3: 8, 2; 4: 8, 8; 5: 16, 2 (a split-K
+//       a configuration does not fit uses 0); default 1 for the grouped W_UV, else 4.
+//  BF16: 64-k chunks in flight a lane and warps a CTA: 0: 4, 4; 1: 8, 4; 2: 4, 8; 3: 8, 8; 4: 16, 4; 5: 2, 8.
+//  INT4: 512-k blocks in flight a lane and warps a CTA: 0: 1, 4; 1: 2, 4; 2: 1, 8; 3: 2, 8; 4: 3, 4; 5: 4, 4.
 void gemv_config(int cfg);
 
-// FP8 GEMM for prefill chunks (any number of rows; the BF16 path stays GEMV-only): the same segments, output
-// kinds and split-K as gemv(), and every output equals gemv()'s at the same splitk bit for bit (the same MMAs from
-// zero over each 64-k chunk, acc += s * c in k order, split-K parts added in part order). Tiles of 128 x 128 rows
-// x columns (split-K: 128 x 64); a group (group_rows) must hold whole column tiles.
+// GEMM for prefill chunks (any number of rows): the same segments, output kinds and split-K as gemv(), and every
+// output equals gemv()'s at the same splitk bit for bit (FP8: the same MMAs from zero over each 64-k chunk,
+// acc += s * c in k order; BF16: the GEMV's MMAs accumulating in k order; split-K parts added in part order).
+// INT4 segments are dequantised (dequant_int4, the GEMV's own element arithmetic) into `scratch` (bf16, at least
+// the largest INT4 segment's N x K elements) and run as BF16: equal to the INT4 GEMV by construction.
+// Tiles: FP8 128 x 128 rows x columns (split-K: 128 x 64), BF16 128 x 64; a group (group_rows) must hold whole
+// column tiles. Segments of different formats: one launch a format, as gemv().
 void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
-          cudaStream_t s, bool pdl = false);
-// bench knob: the GEMM tile configuration (-1, the default: 4 for a split-K, else 0; 0-5: gemm.cu). Outputs do not
-// depend on it.
+          cudaStream_t s, bool pdl = false, uint16_t* scratch = nullptr, size_t scratch_elems = 0);
+// bench knob: the FP8 GEMM tile configuration (-1, the default: 4 for a split-K, else 0; 0-5: gemm.cu). Outputs do
+// not depend on it.
 void gemm_config(int cfg);
-// The same for BF16 weights (row-major [N][K], no scales; the router, the head): every output equals
-// gemv(false, ...)'s at the same splitk bit for bit (the GEMV's MMAs accumulating in k order, split-K parts added
-// in part order). Outputs kBF16 and kF32; one tile shape (128 x 64; gemm_config does not apply).
+// BF16 weights only (the router, the head): gemm() with every segment taken as BF16 (kNone allowed).
 void gemm_bf16(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
                cudaStream_t s, bool pdl = false);
+// An INT4 tile [N][K] -> the contract's bf16 weight, row-major [N][K] (ld elements a row): the GEMV's dequantisation
+// element for element (attn_tests D: = tools/pack.py int4_dequant = compressed-tensors' decompress).
+void dequant_int4(const void* tiles, int N, int K, uint16_t* out, size_t ld, cudaStream_t s, bool pdl = false);
 
 // ---- norms, RoPE, cache entries ------------------------------------------------------------------------------
 // RMSNorm as the reference: bf16(w * bf16(x * rsqrt(mean(x^2) + eps))), fp32 statistics. [rows][D] bf16.

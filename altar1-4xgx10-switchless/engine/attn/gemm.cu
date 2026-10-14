@@ -336,36 +336,25 @@ int gemm_args(GArgs& a, const uint16_t* x, int ldx, int rows, int K, const GemvS
   return c0;
 }
 
-}  // namespace
 
-void gemm_config(int cfg) { g_gemm_cfg = cfg; }
-
-void gemm_bf16(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
-               cudaStream_t s, bool pdl) {
-  if (rows < 1) die("gemm_bf16: %d rows", rows);
-  if (K % 64 || nseg < 1 || nseg > kMaxSegs) die("gemm_bf16: K %d, %d segments", K, nseg);
-  if (splitk != 1 && splitk != 2 && splitk != 4) die("gemm_bf16: splitk %d", splitk);
-  if (K / 64 < splitk) die("gemm_bf16: K %d for split-K %d", K, splitk);
-  if (out == GemvOut::kSwiGLU) die("gemm_bf16: no SwiGLU output");
-  // one tile shape: 128 x 64, 3 stages (72 KiB: a stage's bf16 weights take twice the FP8 bytes); warps 64 x 16
-  // for a split-K (the FP8 split-K default's), 32 x 32 otherwise
+// BF16 weights: one tile shape, 128 x 64, 3 stages (72 KiB: a stage's bf16 weights take twice the FP8 bytes); warps
+// 64 x 16 for a split-K (the FP8 split-K default's), 32 x 32 otherwise. SwiGLU: the GEMV's epilogue (gate/up rows
+// interleaved within each 8-row n-tile).
+void gemm_bf16_run(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
+                   cudaStream_t s, bool pdl) {
   GArgs a;
   const int c0 = gemm_args(a, x, ldx, rows, K, segs, nseg, out, splitk, 64, false);
-  if (out == GemvOut::kBF16) {
-    if (splitk > 1) launch_gemm<(int)GemvOut::kBF16, true, 128, 64, 64, 16, 3, true>(a, c0, s, pdl);
-    else launch_gemm<(int)GemvOut::kBF16, false, 128, 64, 32, 32, 3, true>(a, c0, s, pdl);
-  } else {
-    if (splitk > 1) launch_gemm<(int)GemvOut::kF32, true, 128, 64, 64, 16, 3, true>(a, c0, s, pdl);
-    else launch_gemm<(int)GemvOut::kF32, false, 128, 64, 32, 32, 3, true>(a, c0, s, pdl);
-  }
+#define GB(O)                                                                       \
+  if (splitk > 1) launch_gemm<(int)O, true, 128, 64, 64, 16, 3, true>(a, c0, s, pdl); \
+  else launch_gemm<(int)O, false, 128, 64, 32, 32, 3, true>(a, c0, s, pdl);
+  if (out == GemvOut::kBF16) { GB(GemvOut::kBF16) }
+  else if (out == GemvOut::kF32) { GB(GemvOut::kF32) }
+  else { GB(GemvOut::kSwiGLU) }
+#undef GB
 }
 
-void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
-          cudaStream_t s, bool pdl) {
-  if (rows < 1) die("gemm: %d rows", rows);
-  if (K % 64 || nseg < 1 || nseg > kMaxSegs) die("gemm: K %d, %d segments", K, nseg);
-  if (splitk != 1 && splitk != 2 && splitk != 4) die("gemm: splitk %d", splitk);
-  if (K / 64 < splitk) die("gemm: K %d for split-K %d", K, splitk);
+void gemm_fp8_run(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
+                  cudaStream_t s, bool pdl) {
   // tile configurations (CTA rows x columns, warp tile, stages): 0: 128 x 128, 64 x 32, 4 (split-K: 128 x 64,
   // 64 x 16); 1: 64 x 128, 32 x 32, 4; 2: 128 x 64, 32 x 32, 4; 3: 128 x 128, 32 x 64, 4 (split-K: 128 x 64,
   // 32 x 32, 3); 4: as 0 with 3 stages; 5: 128 x 128, 32 x 32 (16 warps), 4 (split-K: 3)
@@ -395,6 +384,52 @@ void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int 
   else { CFGS(GemvOut::kSwiGLU) }
 #undef CFGS
 #undef GO
+}
+
+void gemm_check(const char* who, int rows, int K, int nseg, int splitk) {
+  if (rows < 1) die("%s: %d rows", who, rows);
+  if (K % 64 || nseg < 1 || nseg > kMaxSegs) die("%s: K %d, %d segments", who, K, nseg);
+  if (splitk != 1 && splitk != 2 && splitk != 4) die("%s: splitk %d", who, splitk);
+  if (K / 64 < splitk) die("%s: K %d for split-K %d", who, K, splitk);
+}
+
+}  // namespace
+
+void gemm_config(int cfg) { g_gemm_cfg = cfg; }
+
+void gemm_bf16(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
+               cudaStream_t s, bool pdl) {
+  gemm_check("gemm_bf16", rows, K, nseg, splitk);
+  for (int i = 0; i < nseg; ++i)
+    if (segs[i].fmt != WFmt::kNone && segs[i].fmt != WFmt::kBF16) die("gemm_bf16: segment %d is not BF16", i);
+  gemm_bf16_run(x, ldx, rows, K, segs, nseg, out, splitk, s, pdl);
+}
+
+void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
+          cudaStream_t s, bool pdl, uint16_t* scratch, size_t scratch_elems) {
+  gemm_check("gemm", rows, K, nseg, splitk);
+  GemvSeg b[kMaxSegs], f[kMaxSegs];
+  int nb = 0, nf = 0;
+  for (int i = 0; i < nseg; ++i) {
+    const GemvSeg& g = segs[i];
+    if (g.fmt == WFmt::kBF16) b[nb++] = g;
+    else if (g.fmt == WFmt::kFP8) f[nf++] = g;
+    else if (g.fmt != WFmt::kINT4) die("gemm: segment %d has no weight format (%d)", i, (int)g.fmt);
+  }
+  if (nb) gemm_bf16_run(x, ldx, rows, K, b, nb, out, splitk, s, pdl);
+  for (int i = 0; i < nseg; ++i) {  // INT4: the GEMV's dequantisation into the scratch, then the BF16 GEMM
+    const GemvSeg& g = segs[i];
+    if (g.fmt != WFmt::kINT4) continue;
+    if (K % kInt4BlkK || (K / kInt4BlkK) % splitk) die("gemm: INT4 K %d for split-K %d", K, splitk);
+    if (!scratch || scratch_elems < (size_t)g.n * K) die("gemm: INT4 [%d][%d] needs a bf16 scratch of %zu elements (%zu given)",
+                                                         g.n, K, (size_t)g.n * K, scratch_elems);
+    dequant_int4(g.w, g.n, K, scratch, K, s, pdl);
+    GemvSeg d = g;
+    d.fmt = WFmt::kBF16;
+    d.w = scratch;
+    gemm_bf16_run(x, ldx, rows, K, &d, 1, out, splitk, s, pdl);
+  }
+  if (nf) gemm_fp8_run(x, ldx, rows, K, f, nf, out, splitk, s, pdl);
 }
 
 }  // namespace glm

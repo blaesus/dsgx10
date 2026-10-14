@@ -100,7 +100,11 @@ void rows16(int M, F f) {
 void detail::pf_proj(bool use_gemm, const uint16_t* x, int ldx, int M, int K, const GemvSeg* segs, int nseg, GemvOut out,
              int splitk, cudaStream_t st, bool pdl) {
   if (use_gemm && M > kMaxRows) {
-    ::glm::gemm(x, ldx, M, K, segs, nseg, out, splitk, st, pdl);
+    // glm53's binding is FP8 throughout; attn's gemm() now takes each segment's format (altar1: the runner passes
+    // BF16/INT4 and a scratch for INT4, docs/attention.md § 7)
+    GemvSeg s[::glm::kMaxSegs];
+    for (int i = 0; i < nseg; ++i) s[i] = segs[i], s[i].fmt = s[i].fmt == ::glm::WFmt::kNone ? ::glm::WFmt::kFP8 : s[i].fmt;
+    ::glm::gemm(x, ldx, M, K, s, nseg, out, splitk, st, pdl);
     return;
   }
   const size_t es = out == GemvOut::kF32 ? 4 : 2;
