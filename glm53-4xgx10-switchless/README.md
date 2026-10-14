@@ -55,9 +55,10 @@ the 87 GiB budget) and the KL bake-off that confirms their code. [Resuming](#res
 - **The expert code is in the kernels (E1, 2026-10-14):** the two-subset 3-bit code for gate/up with NVFP4 down
   (3.83 bits a weight) decodes at 89–95 % of bandwidth, bit-exact to its definition, with the packer and the
   loader's checks ([docs/experts.md](docs/experts.md) § 13, [docs/quantiser.md](docs/quantiser.md)).
-- **Not yet:** the routed experts in the rank files (disk: the fill is ~96 GiB a rank at NVFP4, ~80 at the
-  mixture), the quantiser's 3-bit fill and the KL bake-off against the master, the drafts' acceptance on real text (G7's speculative decoding is in and exact, [docs/engine.md](docs/engine.md#drafts-g7-2026-10-14)),
-  the end-to-end check of logits against the golden data.
+- **Not yet:** the serving files at the mixture (the NVFP4 fill of 2026-10-14 is 101.4 GiB a rank, over the
+  87 GiB budget; the mixture is 87.12), the quantiser's 3-bit fill and the KL bake-off against the master, the
+  drafts' acceptance on real text (G7's speculative decoding is in and exact,
+  [docs/engine.md](docs/engine.md#drafts-g7-2026-10-14)), and G8's draft configurations through the front-end.
 | | |
 |---|---|
 | [DESIGN.md](DESIGN.md) | target, budgets, decisions, risks, the experiments in order, milestones |
