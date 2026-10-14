@@ -1,8 +1,10 @@
 // glw_load: time loading a rank's weight file onto the GPU, optionally checking every tensor's CRC on the device
 // copy (the DeepSeek engine's dsw_load).
 //
-//   glw_load FILE [--threads 4] [--chunk-mib 64] [--limit-gib G] [--only SUBSTR] [--verify-crc] [--rank R]
+//   glw_load FILE [--threads 4] [--chunk-mib 64] [--limit-gib G] [--only SUBSTR] [--verify-crc] [--rank R] [--host]
 // --rank R: refuse the file unless it is rank R of 4's, as the engine does.
+// --host: no device: the loader opens the file (header, rank, TOC CRC, every extent) and reads every tensor
+// through WeightFile::read_host, which checks its CRC32C (what a load does before any device work).
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -19,6 +21,7 @@ int main(int argc, char** argv) {
   std::string file = argv[1], only;
   LoadOptions opt;
   int rank = -1;
+  bool host = false;
   for (int i = 2; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -31,10 +34,26 @@ int main(int argc, char** argv) {
     else if (a == "--verify-crc") opt.verify_crc = true;
     else if (a == "--only") only = next();
     else if (a == "--rank") rank = std::stoi(next());
+    else if (a == "--host") host = true;
     else die("unknown argument %s", a.c_str());
   }
   if (!only.empty()) opt.select = [&](const DeviceTensor& t) { return t.name.find(only) != std::string::npos; };
   WeightFile wf(file, rank, 4);  // header and TOC first: a wrong rank fails before any device work
+  if (host) {
+    const double t0 = now_s();
+    uint64_t bytes = 0;
+    size_t n = 0, reserved = 0;
+    for (auto& t : wf.tensors()) {
+      if (t.reserved()) { reserved++; continue; }
+      if (!only.empty() && t.name.find(only) == std::string::npos) continue;
+      bytes += wf.read_host(t).size();  // dies on a CRC mismatch
+      n++;
+    }
+    const Header& h = wf.header();
+    std::printf("%s: rank %u/%u, %u tensors (%zu reserved); host read of %zu tensors, %.3f GiB: every CRC32C OK "
+                "(%.1f s)\n", file.c_str(), h.rank, h.world, h.n_tensors, reserved, n, bytes / 1073741824.0, now_s() - t0);
+    return reserved ? 1 : 0;
+  }
   CUDA_CHECK(cudaSetDevice(0));
   CUDA_CHECK(cudaFree(nullptr));  // context creation outside the timing
   const Header& h = wf.header();
