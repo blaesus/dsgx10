@@ -3,8 +3,8 @@
 altar-1's golden data: glm53's layer-streaming torch reference ([glm53 reference](../../glm53-4xgx10-switchless/docs/reference.md),
 cited below as *glm53 § n*) adapted to altar-1's checkpoint, run teacher-forced on rank 2's CPU. This page is a
 **delta** from glm53's: what is identical, what changed, the checks (A1a), the golden files and the level-3
-comparison against GLM-5.3 (A1b), timings, and how to resume. Written 2026-10-14; everything was measured on that
-date unless marked *estimate*.
+comparison against GLM-5.3 (A1b, A1c), the second order's numbers (A1d), timings, and how to resume. Written
+2026-10-14; everything was measured on that date (times +0100) unless marked *estimate*.
 
 ## Contents
 
@@ -86,6 +86,7 @@ bits 4i), s = `weight_scale` (BF16 [N, K/32]), viewed [N, K/32, 32]; and asserts
 | [`ref/check_layer.py`](../ref/check_layer.py) | one real layer against transformers' GlmMoeDsa modules + compressed-tensors (§ 4.3) |
 | [`ref/check_router.py`](../ref/check_router.py) | DESIGN decision 10: the kept router rows and biases against the parent's (§ 4.4) |
 | [`ref/check_tokens.py`](../ref/check_tokens.py) | the token files re-rendered with altar-1's template (§ 4.1) |
+| [`ref/mtp_accept.py`](../ref/mtp_accept.py) | the MTP acceptance by tokens of `all-f32`, `all`, `mtp-nvfp4` and their drafts against `all-f32`'s (§ 6.1, § 8) |
 | [`ref/level3.py`](../ref/level3.py) | level 3: argmax agreement, top-5 containment and KL against GLM-5.3's golden runs, with both models' order floors (§ 7) |
 | [`ref/summarize.py`](../ref/summarize.py), [`ref/cmp_runs.py`](../ref/cmp_runs.py), [`ref/make_tokens.py`](../ref/make_tokens.py), [`ref/tokens/`](../ref/tokens) | glm53's, with 168 experts in `summarize.py`; the tokens unchanged |
 
@@ -211,7 +212,8 @@ pinned to cores 10–19, nice 19, `ionice -c3`, `oom_score_adj` 1000.
 | `a1a-f32` | 2,691 | 11.6–13 s MoE | 936 s | 5.4 GiB |
 | `doc` (`--no-mtp`) | 4,248 | | 906 s | 4.0 GiB |
 | `all-f32` | 37,993 | median 124.6 s (119–141 s; attention 82–101 s of it) | **~10,870 s (3 h 1 min)**: layers 0–4 ~600 s in the first attempt, then 10,265 s for layers 5–77 (11:19:55–14:06), head 125 s, MTP 263 s (its layer 132 s) | **7.9 GiB** (7.3–7.6 in the layers, 7.6 in the head stage) |
-| `all` (started 14:11:00, running at this writing) | 37,993 | ~103 s dense | ~2.5 h (*estimate*) | 6.6 GiB in the first layers |
+| `all` | 37,993 | median 125.1 s (99–170 s; attention median 92.9 s, 73–131 s); dense layers 0–2 103 s | **10,241 s (2 h 51 min)**, one invocation 14:11:00–17:01:41: layers 9,821 s, head 125.6 s, MTP 261.9 s (its layer 112.0 s) | **7.4 GiB** (6.5–6.8 in the layers and the head stage, 7.4 at the pass's end: the MTP stage) |
+| `mtp-nvfp4` (`--mtp-from all-f32 --mtp-experts nvfp4_rtn`, layer 78 only) | 37,993 | layer 78: 208.0 s (attention 133.9 s) | **350 s**, 17:01:41–17:07:31 (MTP stage 346.8 s) | not logged (the MTP replay prints no `hwm`) |
 
 The first `all-f32` attempt (11:06–11:17) peaked at **8.4 GiB** in its fifth layer (the 26,834-row `agentic`
 attention with full-size q_b/kv_b outputs and f32 temporaries) and RSS stayed 4–5 GiB between layers. It was
@@ -220,7 +222,9 @@ stopped, the chunking of § 2 added and checked bit-identical, and the pass resu
 stayed ~4 GiB (the residual stream, the index sets, glibc's arenas). Against glm53's 6,739 s (bf16) and 12,733 s
 (f32, re-pinned mid-run) on the same box class, the attention of the 26.8k-row sequence dominates here (~70 % of a
 layer). By 14:16 the DeepSeek service no longer held its memory on rank 2 (MemAvailable ~95–110 GiB), so the `all`
-pass's per-layer times are not comparable with `all-f32`'s.
+pass's per-layer times are not comparable with `all-f32`'s; the engine's A8 ring jobs (14:44–16:37) ran beside it.
+Source of every time and peak in this table: `~/altar1-ref/logs/passes.log` on rank 2 (the per-layer lines,
+`pass done (… s this invocation) hwm …` and the `pass … exit 0` stamps).
 
 ## 6. Results
 
@@ -243,13 +247,46 @@ the two prose sequences, where GLM-5.3 recites memorised text, it is 9–28 poin
 experts chosen by weight norm ([model.md § 7](model.md#7-layers-3-and-77-and-the-mtp-layer)), keeps its parent's
 acceptance on python and agentic (0.698 vs 0.688, 0.438 vs 0.454) and loses 6–14 points on prose.
 
+**`all`** (transformers' order; `summarize.py`, 17:07:16, `~/altar1-ref/logs/a1d-summarize-all.txt`): top-1 0.541 /
+0.427 / 0.688 / 0.474, mean log p −2.605 / −3.109 / −1.561 / −3.540; MTP == main argmax at t+1 0.661 / 0.515 /
+0.701 / 0.441, **0.494 by tokens** (18,764 / 37,985; `all-f32` 18,690 / 37,985 = 0.492; `~/altar1-ref/logs/a1d-mtp.txt`).
+The order moves top-1 by at most 1.3 points (`short`) and the acceptance by at most 0.7. `short` inside `all` is
+bit-identical to `short` in `a1a-bf16` (argmax, log p, the full logits at all 291 rows, every layer's routed sets
+and hidden state; `cmp_runs.py`, 17:10, `~/altar1-ref/logs/a1d-cmp-all-a1abf16-short.txt`), so batch invariance
+holds in both orders.
+
 **Batch invariance.** `short` inside the 38k-row `all-f32` and `short` in `a1a-f32` (with `prose2400`) are
 bit-identical: argmax, log p and the full logits at all 291 rows (`cmp_runs.py`, max |Δ logit| 0). `gold_prep.py`
 reads the run unchanged: `hfinal` (37,993 rows) bit-equal to `final_hidden_sample` at the 634 sample rows.
 
-### 6.2 The reference's own order variance (A1a, `short` and `prose2400`)
+### 6.2 The reference's own order variance
 
-`cmp_runs.py a1a-bf16 a1a-f32` (the same input, the two rounding orders):
+**The four sequences (A1d).** `cmp_runs.py all all-f32 --seq S` and the reverse (rank 2, 17:07–17:08,
+`~/altar1-ref/logs/a1d-cmp-S.txt` and `a1d-cmp-rev-S.txt`), KL over the full logits at the sample rows, its median
+from `level3.py` (§ 7, the `altar all | altar all-f32` row):
+
+| Sequence | Rows (KL rows) | Argmax equal | KL(all ‖ all-f32) mean / median / max | KL(all-f32 ‖ all) mean / max | max \|Δ logit\| | \|Δ log p(next)\| mean |
+|---|---:|---:|---|---|---:|---:|
+| `short` | 291 (291) | 0.8694 | 0.098 / 0.029 / 1.86 | 0.092 / 2.10 | 7.61 | 0.320 |
+| `prose` | 4,762 (84) | 0.8696 | 0.048 / 0.013 / 0.43 | 0.048 / 0.72 | 4.80 | 0.323 |
+| `python` | 6,106 (89) | 0.9147 | 0.150 / 0.011 / 2.26 | 0.205 / 4.40 | 10.49 | 0.241 |
+| `agentic` | 26,834 (170) | 0.7703 | 0.297 / 0.019 / 10.1 | 0.365 / 9.15 | 14.61 | 0.558 |
+| by tokens | 37,993 | **0.8067** | mean of the four 0.148 | 0.178 | | |
+
+GLM-5.3's same pair (glm53 § 10.2, recomputed by `level3.py`): argmax 0.935 / 0.844 / 0.898 / 0.755 (0.790 by
+tokens), KL mean 0.052 / 0.070 / 0.410 / 0.318. altar-1 is more order-sensitive on `short` (13 % of argmaxes
+against 6.5 %) and less on prose, python and agentic; over all rows the two models' floors are alike (0.807
+against 0.790). Routed sets on `short` differ on 6 % of rows at layer 3 and on 68–76 % by layers 70–77, the hidden
+state's median relative difference grows from 0.32 % at layer 0 to 20 % at layer 77 (`a1d-cmp-short.txt`).
+
+**Agreement with A8.** The end-to-end milestone's "orders" rows ([engine.md § 10.3](engine.md#10-end-to-end-on-real-weights-a8),
+KL(all-f32 ‖ all), compared by `compare_golden.py g8`) are the same numbers: short 0.869 / 0.092 / 7.6, python
+0.915 / 0.205 / 10.5, prose 0.870 / 0.048 / 4.8 (argmax / KL mean / max |Δ logit|), equal to the reverse column
+above to the digits shown. Its agentic row (0.736 / 0.323 / 13.0) covers the first 8,000 tokens only (65 sample
+rows), so it is not the whole-sequence 0.770 / 0.365 / 14.6 here; and KL's direction matters on python (0.150 one
+way, 0.205 the other).
+
+**A1a's pair** (`short` and `prose2400`), `cmp_runs.py a1a-bf16 a1a-f32` (the same input, the two rounding orders):
 
 | Sequence | Argmax equal | KL(bf16 ‖ f32) mean / max | max \|Δ logit\| | \|Δ log p(next)\| mean | GLM-5.3, same comparison (glm53 § 10.2) |
 |---|---:|---|---:|---:|---|
@@ -258,8 +295,7 @@ reads the run unchanged: `hfinal` (37,993 rows) bit-equal to `final_hidden_sampl
 
 The hidden state already differs by 0.3 % (relative, median) after layer 0, since the dense layers round o_proj and
 the MLP down projection differently in the two orders, and 0.75 % by layer 7; routed sets differ on 6–13 % of rows
-in layers 3–7. altar-1 is more order-sensitive than GLM-5.3 on `short` (13 % against 6.5 % of argmaxes). The full
-four-sequence variance comes with the `all` pass (§ 10).
+in layers 3–7. altar-1 is more order-sensitive than GLM-5.3 on `short` (13 % against 6.5 % of argmaxes).
 
 ### 6.3 Expert usage at 168
 
@@ -278,12 +314,16 @@ Routing mass (the normalised weights) per expert over the 37,993 rows of `all-f3
 - The hot set transfers no better than at 256: the 42 experts with the most mass on the other three sequences carry
   0.330 of `agentic`'s mass (minimum 0.278), its own top 42 carry 0.456.
 - The MTP layer (78): 43 / 125 / 162 experts for 50 / 90 / 99 %, top-quarter share 0.498.
+- `all` (transformers' order) routes alike: 35–67 / 116–143 / 156–165 experts for 50 / 90 / 99 % over layers 3–78,
+  top-quarter share mean 0.439 (0.337–0.555), none unused; `agentic` on the others' hot 42: 0.330 (minimum 0.280).
 - The router margins are as thin as GLM-5.3's (a quarter of rows under 1e-3, glm53 § 6.5): the engine's routing will
   flip against golden where its f32 sum order differs, so tolerances come from the order variance, not a bit match.
 
 ## 7. Level 3: altar-1 against GLM-5.3
 
-`level3.py --altar ~/altar1-ref/golden --glm ~/glm53-ref/golden` (rank 2, 2026-10-14 14:20). Argmax over every
+`level3.py --altar ~/altar1-ref/golden --glm ~/glm53-ref/golden` (rank 2, 2026-10-14 14:20; rerun 17:07:27 with
+`all` finished, `~/altar1-ref/logs/a1d-level3.txt` and `~/altar1-ref/golden/level3.json`, the `all-f32` rows
+unchanged to the digit; the 14:20 JSON kept as `~/altar1-ref/logs/level3.before-a1d.json`). Argmax over every
 row; KL(GLM-5.3 ‖ altar-1) over the 154,856 used vocabulary ids at the sample rows (all 291 of `short`; 84, 89 and
 170 of the others); "in top-5" = altar-1's argmax differs from GLM-5.3's but is among GLM-5.3's top 5. The noise
 floor is GLM-5.3's own two orders (`all` against `all-f32`).
@@ -311,8 +351,22 @@ floor is GLM-5.3's own two orders (`all` against `all-f32`).
 - On its own targets altar-1 loses little on code and the agentic transcript (top-1 −0.9 and −1.4 points, mean
   log p +0.01 and −0.10) and most on memorised prose (top-1 −27.9 points on `short`, −8.9 on `prose`; § 6.1); the
   document diagnostic (§ 4.5) shows memorisation of a code file is mostly kept (0.971 against 0.984).
-- `all` (altar-1 in transformers' order) is not finished at this writing: the `altar all | glm all` row and
-  altar-1's own four-sequence floor are added by rerunning `level3.py` when it is (§ 10).
+- **In transformers' order (A1d)**, both models in `all`, with altar-1's own two-order floor beside GLM-5.3's:
+
+| Sequence | altar-1 `all` vs GLM-5.3 `all`: argmax equal | differs, in GLM top-5 | differs, outside | KL mean / median / p99 / max | altar-1 floor (`all` vs `all-f32`): argmax / KL mean / median | GLM-5.3 floor: argmax / KL mean / median |
+|---|---:|---:|---:|---|---|---|
+| `short` | 0.605 | 0.203 | 0.192 | 1.615 / 0.522 / 10.8 / 12.2 | 0.869 / 0.098 / 0.029 | 0.935 / 0.052 / 0.001 |
+| `prose` | 0.591 | 0.257 | 0.153 | 0.807 / 0.415 / 3.8 / 3.9 | 0.870 / 0.048 / 0.013 | 0.844 / 0.070 / 0.011 |
+| `python` | 0.785 | 0.149 | 0.066 | 0.918 / 0.133 / 8.3 / 16.0 | 0.915 / 0.150 / 0.011 | 0.898 / 0.410 / 0.015 |
+| `agentic` | 0.597 | 0.178 | 0.225 | 0.785 / 0.228 / 7.7 / 12.4 | 0.770 / 0.297 / 0.019 | 0.755 / 0.318 / 0.017 |
+| all rows, by tokens | **0.627** | **0.184** | 0.190 | mean of the four **1.03** | **0.807** / 0.148 | 0.790 / 0.213 |
+
+  The same picture as in the contract's order: 62.7 % top-1 agreement in both orders (0.6267 / 0.6272), KL means
+  1.03 against 1.07, medians 0.13–0.52 nats against the floors' 0.001–0.029. altar-1's own floor is of the parent's
+  size (0.807 against 0.790 argmax by tokens; KL mean 0.148 against 0.213), so the distance between the models is
+  2–31× either floor in KL mean and 9–400× in median (12–33× against altar-1's own floor). The cross-order pairs
+  (altar-1 `all` against GLM-5.3 `all-f32`, and the reverse: KL means 1.60–1.62 / 0.75–0.77 / 0.97–1.08 /
+  0.77–0.85) lie within 0.02 nats of the range of the same-order pairs.
 
 ## 8. The golden files
 
@@ -324,7 +378,8 @@ and the MTP layer 78 on `short` are every position (`short` is under 1,024 token
 | Run | Order | Sequences | Size | Hashes (sha256) |
 |---|---|---|---|---|
 | **`all-f32`** (the level-2 golden set) | `--combine f32` (contract, prefill) | short, prose, python, agentic (37,993 rows; 634 sample rows) | 6.0 GB: `layers/` 4.4 GB, `final/` 381 MB, `mtp/` 379 MB, `state/` 891 MB (resume; `hfinal.pt` for `gold_prep.py`) | `SHA256SUMS` (615 files, outside `state/`) `d5911e345f7f7889…`; `final/argmax.npy` `1cf67680d1f7dfe5…`; `mtp/argmax.npy` `32e48b0c5faaff89…` |
-| `all` | `--combine bf16` (transformers) | the same | running | |
+| `all` | `--combine bf16` (transformers) | the same | 6.0 GB (6,384,595,339 bytes incl. `SHA256SUMS`): `layers/` 4.4 GB, `final/` 381 MB, `mtp/` 379 MB, `state/` 891 MB | `SHA256SUMS` (615 files, outside `state/`, written 17:07:55) `06eeff766fb42bbf…`; `final/argmax.npy` `5ff1d5e42a59b7a5…`; `mtp/argmax.npy` `61af0ab519c26694…`; `summary.json` `045568089b2565b4…` |
+| `mtp-nvfp4` | the MTP layer only, `all-f32`'s inputs, routed experts NVFP4 round-to-nearest (glm53 `nvfp4_rtn`) | the same | 524 MB own (`layers/L78` 146 MB, `mtp/` 379 MB); `final/` is a symlink to `all-f32/final` | `mtp/argmax.npy` `3b9514563d823d55…` |
 | `a1a-bf16`, `a1a-f32` | bf16 / f32 | short + prose2400 (2,691 rows, **every position saved**: the layer checks' inputs) | 8.6 GB each | |
 | `doc` | bf16, no MTP | doc, docchat | 0.9 GB | |
 | `check_layer_L{00,03,04,77}.json`, `router_check.json`, `level3.json` | | | | |
@@ -332,12 +387,19 @@ and the MTP layer 78 on `short` are every position (`short` is under 1,024 token
 `gold_prep.py`'s raw copies of `all-f32` for the engine's `mtpgold` and `spec` modes are in `~/altar1-ref/gold/`
 (`all-f32.{hfinal,l78}.bf16`, `.tokens.i32`, `.argmax.i32`, `.mtp_argmax.i32`, `.seqs.txt`, 0.93 GB). For the engine's
 G8-style comparison (`compare_golden.py g8 ROOT ...`) ROOT is `~/altar1-ref/golden` (or a copy), with `--runs
-all-f32,all` once `all` exists.
+all-f32,all`.
+
+**The NVFP4 drafter (`mtp-nvfp4`, DESIGN decision 5's lever).** Layer 78's routed experts rounded to NVFP4 (glm53's
+`nvfp4_rtn`), everything else and the inputs `all-f32`'s (`summarize.py` 17:07:48,
+`~/altar1-ref/logs/a1d-summarize-mtp-nvfp4.txt`; `~/altar1-ref/logs/a1d-mtp.txt` 17:08): MTP == main argmax at t+1
+0.664 / 0.522 / 0.698 / 0.437, **0.4915 by tokens** (18,670 / 37,985) against BF16 experts' 0.4920 (18,690): 20
+fewer accepted drafts in 37,985. Its drafts equal the BF16 drafter's on 97.2 / 97.7 / 98.7 / 97.3 % of rows. The
+NVFP4 drafter keeps the acceptance to 0.05 points; it changes the drafts, never the main model's tokens.
 
 ## 9. Open questions
 
-1. **`all` and `mtp-nvfp4`** are running/queued (§ 10): the four-sequence order variance (the engine's 2× criterion
-   needs it) and DESIGN decision 5's NVFP4-drafter acceptance.
+1. ~~`all` and `mtp-nvfp4`~~: done 17:01:41 and 17:07:31 (A1d): the four-sequence order variance (§ 6.2) and the
+   NVFP4 drafter's acceptance (§ 8, 0.4915 against 0.4920).
 2. **The independent stack is transformers' modules on single layers**, not a whole model: no released transformers
    loads altar-1 (model.md § 4.4) and vLLM was not run. The document diagnostic is the end-to-end evidence.
 3. **Router margins** at layers 3–5 (77–96 % of rows under 1e-3): as glm53 § 8.4, the engine's tolerance must come
@@ -351,18 +413,20 @@ all-f32,all` once `all` exists.
 All on rank 2, from `~/altar1-ref/code/altar1-4xgx10-switchless/ref`, every process at `oom_score_adj` 1000, cores
 10–19, nice 19, idle I/O, 8 threads; keep MemAvailable ≥ 8 GiB (the engine's ring jobs load ~77 GiB there):
 
-1. **The pass chain** (`passes.sh`, log `~/altar1-ref/logs/passes.log`): `a1a-bf16`, `a1a-f32` and `all-f32` are
-   done; `all` started 14:11:00 (~2.5 h), then `mtp-nvfp4` (~5 min). If it was killed, rerun the same command:
-   finished passes are skipped, `all` resumes at its next layer from `golden/all/state/`:
+1. **The pass chain is finished** (`passes.sh`, log `~/altar1-ref/logs/passes.log`): `a1a-bf16`, `a1a-f32`,
+   `all-f32`, `all` (exit 0 at 17:01:41) and `mtp-nvfp4` (exit 0 at 17:07:31), `passes done` at 17:07:31. Rerunning
+   `passes.sh` skips every finished pass; to redo one, move its directory aside first:
    `OMP_NUM_THREADS=8 setsid nohup taskset -c 10-19 nice -n 19 ionice -c3 ./passes.sh >> ~/altar1-ref/logs/passes.log 2>&1 < /dev/null &`
-2. **When `all` is done:**
-   - `python -I summarize.py ~/altar1-ref/golden/all --json ~/altar1-ref/golden/all/summary.json`
-   - `python -I cmp_runs.py ~/altar1-ref/golden/all ~/altar1-ref/golden/all-f32 --seq S` for S in short, prose,
-     python, agentic: altar-1's order variance (§ 6.2's table for all four);
-   - `python -I level3.py --altar ~/altar1-ref/golden --glm ~/glm53-ref/golden --json ~/altar1-ref/golden/level3.json`:
-     adds `altar all | glm all` and `altar all | altar all-f32 (floor)`;
-   - `SHA256SUMS` over `golden/all` as for `all-f32` (`find . -path ./state -prune -o -type f ! -name SHA256SUMS -print | sort | xargs sha256sum`).
-3. **When `mtp-nvfp4` is done:** `python -I summarize.py ~/altar1-ref/golden/mtp-nvfp4` (its `final/` links to
-   `all-f32`'s) for the acceptance with NVFP4 MTP experts; compare `mtp/argmax.npy` with `all-f32`'s.
-4. The layer checks and the router check are done (`check_layer_L*.json`, `router_check.json`); rerun them with the
+2. **The analyses of A1d are done** (17:07–17:08, all numpy, ≤ 1.6 GiB RSS, under `ulimit -v` 8 GiB, nice 19, cores
+   10–19; driver `~/altar1-ref/logs/a1d.sh`, outputs `~/altar1-ref/logs/a1d-*.txt`). To redo them:
+   - `python -I summarize.py ~/altar1-ref/golden/all --tokenizer ~/altar-1/tokenizer.json --json ~/altar1-ref/golden/all/summary.json`
+     (`summary.json` is in `all`'s `SHA256SUMS`, as in `all-f32`'s);
+   - `python -I cmp_runs.py ~/altar1-ref/golden/all ~/altar1-ref/golden/all-f32 --seq S` and the reverse, for S in
+     short, prose, python, agentic (§ 6.2);
+   - `python -I level3.py --altar ~/altar1-ref/golden --glm ~/glm53-ref/golden --json ~/altar1-ref/golden/level3.json` (§ 7);
+   - `python -I summarize.py ~/altar1-ref/golden/mtp-nvfp4` (its `final/` links to `all-f32`'s; the JSON is kept
+     outside the golden directory, `~/altar1-ref/logs/a1d-summary-mtp-nvfp4.json`) and `python -I mtp_accept.py
+     ~/altar1-ref/golden` (acceptance by tokens and the drafts against `all-f32`'s);
+   - verify a copy: `cd golden/all && sha256sum -c SHA256SUMS` (and the same in `all-f32`).
+3. The layer checks and the router check are done (`check_layer_L*.json`, `router_check.json`); rerun them with the
    commands of § 3 if the code changes.
