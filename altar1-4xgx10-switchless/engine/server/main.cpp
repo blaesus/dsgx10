@@ -26,7 +26,7 @@
 //   unused for --keep-days (7).
 // Drafts (speculative decoding with the MTP layer, docs/serving.md "Drafts"): on by default, up to --spec-drafts K
 //   (3, at most 5) a session a step, as many as its gate's acceptance pays for under --spec-cost C1,DROW (ms: a
-//   step's first row with draft pass 1, each row more with its pass; default 52.4,13.0: altar-1's fit, docs/serving.md
+//   step's first row with draft pass 1, each row more with its pass; default 49.4,14.2: altar-1's fit, docs/serving.md
 //   § 3.1); --no-spec: plain decoding (the
 //   same tokens). The model's Options::drafts is K (0 with --no-spec: no MTP work at all). --spec-force N (tests):
 //   N drafts every step whatever the gate says; --spec-oracle (tests): a request identical to an earlier one (prompt,
@@ -119,7 +119,7 @@ struct Args {
   bool spec = true;
   int spec_drafts = 3, spec_force = 0;
   bool spec_oracle = false;
-  float spec_c1 = 52.4f, spec_drow = 13.0f;
+  float spec_c1 = 49.4f, spec_drow = 14.2f;
 };
 
 // What a kept session's caches depend on: this binary's bytes, the weights (path, size, time), the synthetic
