@@ -261,6 +261,7 @@ void ab(Model& m, comm::Ring& ring) {
       }
       ratio.push_back(blk[1] / blk[0]);
     }
+    m.set_tune(cfg[1]);  // (an even number of rounds ends on A)
     const SampleOut o = m.wait(m.launch(b));  // B's bits again after the rounds
     const uint64_t hb = step_hash(m, o, R, A.ctx + R);
     auto med = [](std::vector<double> v) {
