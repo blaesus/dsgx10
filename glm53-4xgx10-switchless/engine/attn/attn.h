@@ -207,5 +207,8 @@ struct AttnScratch {
 void sparse_attn(const uint16_t* q_lat, const uint16_t* q, const int* pos, const int* slot, const uint32_t* rope,
                  KvCache kv, const int* topk, int rows, int splits, AttnScratch sc, uint16_t* out, cudaStream_t s,
                  bool pdl = false);
+// test/bench knob: the kernel for splits == 1 (-1, the default: k_attn_pf, the gathers pipelined; 0: k_attn, the split
+// kernel at one split). Outputs do not depend on it.
+void sparse_attn_config(int cfg);
 
 }  // namespace glm

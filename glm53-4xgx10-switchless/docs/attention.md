@@ -146,12 +146,14 @@ list order = position order, so the merge equals the replicated result bit for b
 blocks of 64 gathered by cp.async (one entry = 1152 B), S over 36 k-steps (latent 512 then rope 64), online
 softmax in f32 with P rounded to bf16, O += P·V over the 512 latent dims (a warp per 128). Softmax scale
 256^-0.5 (qk_head_dim), keys = the 2048 selected or 0..p. Splits: the 32 key blocks divide over `splits` CTAs a
-row; `k_attn_combine` merges (m, l, O) in split order. Shared memory 96.5 KB, one CTA an SM.
+row; `k_attn_combine` merges (m, l, O) in split order. Shared memory 96.5 KB, one CTA an SM. At one split (prefill,
+and decode pinned to one split) `k_attn_pf` runs instead (since 2026-10-14, § 5 "T6"): `k_attn`'s arithmetic bit
+for bit with the next key block's gathers in flight under the current block's compute.
 
 **Prefill** runs the projections as GEMMs (`gemm()`), the indexer as `k_q_stage` (each row's RoPE'd query
 staged once) and `k_score_pf` (256 keys in registers a CTA, the rows' queries streamed; scores = `k_score`'s bit
 for bit, 52–66 TFLOPS), the selection as a sampled threshold (`k_sel_thresh`) and one compaction launch
-(`k_sel_compact`, the exact top-2048 from the candidates), and `k_attn` with one row a CTA set. Chunking a prompt does not change any bit
+(`k_sel_compact`, the exact top-2048 from the candidates), and `k_attn_pf` (`k_attn` before T6) with one row a CTA set. Chunking a prompt does not change any bit
 (tested: two chunks = one, for cache, keys, top-k and attention output).
 
 ## 4. Numerics and tests
@@ -182,6 +184,7 @@ sources sha256 `d9fc5ba302e33670`: **30 + 51 checks pass, 0 fail**; compute-sani
 | layer chain (norm → o_proj, own projections) vs the reference | rel L2 2.5e-2, of which 2.1e-2 is the attention outputs' difference (the reference's bf16 attention) |
 | slot tables (2 sessions in one call) | indexer, attention, cache writes = each row alone, bit for bit |
 | determinism | a second run is bit-identical |
+| (2026-10-14, T6) `k_attn_pf` | = `k_attn` at one split bit for bit, 300 rows dense and sparse; decode calls of 1, 6, 16 rows at one split = the prefill rows |
 | dense / shared MLP chained | rel L2 4.6e-4 / 2.5e-4 |
 
 ## 5. Measurements
@@ -379,11 +382,78 @@ with thousands of rows a call, keeps the merged compaction (the tail is per row 
 ncu is not available (GPU performance counters are not permitted for this user), so kernel-level attributions
 above come from nsys timelines and A/B builds only.
 
+### 2026-10-14 (T6): prefill sparse attention, `k_attn_pf`
+
+Rank 0's GB10 through `ring.sh`, 2026-10-14 03:18–05:29 (+0100); final bench and tests on sources sha256
+`1178708d35bca344` (`tools/run.sh`'s hash). `bench_attn --only pattn`: 8,192 rows at positions 24,576–32,767 of a
+32,768-entry cache, 2,048 keys a row in three patterns (`rand`: sorted random 2,048 of 0..p; `win`: random 2,048
+of the last 4,096; `same`: every row the same list), and the dense rows 0..2,047. A graph of one launch, median of 7.
+
+**Where `k_attn`'s time goes.** Its FLOPs (584 GFLOP a layer at 8,192 rows) take 5.5 ms at 107 TFLOPS; its time
+is 28–33 ms. A kernel that only gathers the same entries in `k_attn`'s shape (48 CTAs' worth of 64-key steps, each
+waited for) takes 32–34 ms on `rand`: the gathers alone are `k_attn`'s time, latency-bound, not bandwidth-bound.
+With more gathers in flight the same bytes move faster: 32 keys a step on 96 CTAs 17.4–18.9 ms, 16 keys on 192
+CTAs 11.2–11.8 ms (1.6–1.7 TB/s, far above DRAM bandwidth: 19.3 GB a layer gathered from a 37.7 MB cache, mostly L2 hits). Shared memory
+(101,376 B opt-in) admits one 74 KB block an SM, so the gathers have to be overlapped inside the CTA.
+
+**The kernel.** `k_attn_pf` (sparse_attn.cu): 8 warps; a block's 64 keys lie in 4 slots of 16 keys. Warp s (0–3)
+computes S on slot s exactly as `k_attn`'s warp s (the same keys, MMAs, masking, reductions); the softmax state is
+`k_attn`'s; P·V is split over the 8 warps by 64 latent dims, each output the same chain of MMAs over the block's 4
+key slices. Each warp copies its P·V operands of a block (its 64 dims of the 64 keys, `k_attn`'s `ldmatrix.trans`
+fragments: 64 registers) out of shared memory as soon as each slot lands and then releases the slot (mbarrier
+`empty[s]`, 8 arrivals); warp s then gathers the next block's slice into it, 16 bulk copies (`cp.async.bulk`, one
+1,152-byte entry each; masked keys from a zero entry) completing on mbarrier `full[s]`. The next block's gathers fly
+under the other slots' S, the softmax and P·V, with no CTA-wide wait between a slot's landing and its regathering.
+Every output is `k_attn`'s bit for bit. `sparse_attn_config(0)` selects `k_attn` again; the model's `kTunePfAttn`
+(0x100, in `kTuneDefault`) does that for prefill.
+
+| 8,192 rows at 24,576 (ms, A B A B) | `k_attn` | `k_attn_pf` | speed |
+|---|---:|---:|---:|
+| `rand` | 32.34 / 33.39 | 29.74 / 30.71 | 1.09× |
+| `win` | 28.15 / 28.15 | 21.88 / 21.95 | 1.28× |
+| `same` | 29.47 / 28.82 | 22.13 / 21.98 | 1.32× |
+| dense rows 0..2,047 | 3.71 / 3.72 | 2.72 / 2.69 | 1.37× |
+
+All four with the same bits as `k_attn`. In the model's prefill (`pftrace`, 8,192 rows at 24,576, two pieces
+beside the ring's collectives) the attention kernel went 3,355 → 2,990 ms a chunk on rank 0 (3,096–3,355 →
+2,788–2,990 on the four ranks): 11 %, not the bench's 9–37 %, because beside the ring's copies every gather is
+slower (21.5 ms a 4,096-row piece for `k_attn` there against ~15 alone).
+
+**A race found on the way.** The first `k_attn_pf` gave the same bits as `k_attn` in every bench but not always in
+the model's overlapped prefill: one row in a few thousand, a band of 32–128 output dims of all 16 heads (one warp's
+P·V fragments), always a dense row. Inputs hashed after the fact were the same, and rerunning the kernel on them
+gave the right bits. The cause: a warp's `mbarrier.arrive` on `empty[s]` issued before its `ldmatrix` loads of the
+slot had returned (the registers are first used at P·V, much later), so the regather's bulk copy could land first.
+The arrive now takes the XOR of one register of each of its four loads as an operand (it waits for them), and the
+regathering warp issues `fence.proxy.async.shared::cta` after its wait. After the fix: the model's `pfab` the same
+bits as `k_attn` in every run (below and docs/engine.md). A bench that runs the attention beside copy kernels
+(`pstress`, low and high priority streams, copies arriving mid-launch) never reproduced the race, before or after.
+
+**Variants tried** (all bit-identical to `k_attn` unless said; `rand` / `win` / dense ms):
+
+| Variant | ms | |
+|---|---|---|
+| cp.async, 2 warps a slot (the first version) | 44 / – / – | slower; its bits differed (a key-position staging bug, fixed in the next) |
+| bulk copies, 8 warps, named barriers per slot | 29.6 / 22.5 / 3.05 | |
+| cp.async by all warps | 30.5 / 26.2 / 3.43 | |
+| cp.async by the S warps, mbarrier no-increment arrivals | 29.5 / 26.1 / 3.42 | |
+| + L2 prefetch of the next block | 31.3 / 29.0 / – | slower |
+| all operands in registers, S split over 8 warps, cp.async | 41.7–56.8 / 54.5–55.1 / 6.44 | slower (the first build 54–57 ms on every pattern, a later one 41.7 on `rand`) |
+| the same with bulk copies | 32.9 / 30.4 / 2.92 | |
+| **kept: bulk copies, V operands in registers, full / empty mbarriers per slot** | 28.0–30.7 / 21.6–22.0 / 2.66–2.81 | |
+
+A gather-only ring of 4 slots of 16 keys a CTA (no compute) moves the `rand` entries in 19.6–26.8 ms by either
+copy kind and `win`/`same` in 11.7–12.2 (cp.async) or 22.6–22.9 ms (bulk copies, which top out near 850 GB/s);
+the compute alone of the kept structure takes 12.3–12.5 ms. So `rand` stays bound by its gathers.
+
 ## 6. What remains
 
 - **Prefill projections** (2026-10-14: GEMM at 48–60 % of 107 TFLOPS on the large shapes): the last points to
   60 % on the x-projection and shared gate/up (split-K 4 shapes) and dense gate/up; the small-K projections
   (W_UK, W_UV, shared down) need a fused attention-side kernel rather than a faster GEMM.
+- **Prefill sparse attention** (T6: `k_attn_pf`, 1.09–1.37× `k_attn`): random selections over a long context are
+  still bound by gathers in flight (one 74 KB CTA an SM). More in flight needs less shared memory a CTA (e.g. the
+  V operands streamed from L2 rather than staged) or two rows a CTA sharing their keys where selections overlap.
 - **Prefill indexer** at 49–62 % of peak: the remaining time is the score MMAs; a further step is keeping two
   key tiles a warp to raise MMA issue rate.
 - **Small-GEMV tails:** x-projection at ~86 % in every launch shape (86 tiles for 48 SMs); its index weights now

@@ -19,6 +19,7 @@ contract, how it was tested and what it measured. Written 2026-10-13. The math i
 9. [Experiment log](#9-experiment-log)
 10. [What remains](#10-what-remains)
 11. [2026-10-14: prefill tuning](#11-2026-10-14-prefill-tuning)
+12. [2026-10-14 (T6): where the chained down's time goes](#12-2026-10-14-t6-where-the-chained-downs-time-goes)
 
 ## 1. What is built
 
@@ -165,7 +166,8 @@ nt2 wk2 p1}; down {nt2 p1 (default), nt1 p2, nt1 p3, nt2 p2, nt1 p4}.
 4. **Combine** (`k_combine`): per row and column, its picks in expert-id order, acc = fmaf(s2 · fmt_k · w, c,
    acc). This is the decode step's arithmetic, so a row's routed output equals decode's up to the order of the K
    sums inside each pick (tested).
-5. **Shared expert** (`k_pup<true>`, since 2026-10-14 `k_pup_ws<true>`; `k_pdown<true>`): dense over the chunk's rows, FP8 → bf16 tiles, each 128-k
+5. **Shared expert** (`k_pup<true>`, since 2026-10-14 `k_pup_ws<true>`; `k_pdown<true>`, since T6 at 128-row
+   tiles, `PrefillCfg::sh_rows`, § 12): dense over the chunk's rows, FP8 → bf16 tiles, each 128-k
    unit summed apart and added × its block scale (as decode).
 
 **The FP4-activation path** (`PrefillCfg::fp4`, with `in_scale_gu` and `in_scale_dn` the layer's static
@@ -375,8 +377,11 @@ All runs: one GPU (rank 0), `run.sh` steps through `ring.sh`, results in `~/dsgb
     and the waits between a row's picks. Next: fewer, larger column passes with yr held in shared memory
     per row block (needs tiles grouped by row, not by expert), or the down's MMAs at 128-row × 256-column
     CTAs to halve the yr traffic per MAC.
-  - The gate/up kernel is 3.3 ms over its MMA-only time; the shared expert (4.6 ms, 33 TFLOPS) still uses
-    64-row tiles.
+  - The gate/up kernel is 3.3 ms over its MMA-only time; the shared expert (4.6 ms, 33 TFLOPS) runs its
+    gate/up at 64-row tiles (its down at 128 since T6).
+  - T6 (§ 12) located the down's cost: the ordered adds' stores, drained by the fence before each release
+    while the SM's only CTA waits. Going further needs the adds off the MMA warps' path (an asynchronous
+    epilogue or two CTAs an SM), which the 80 KB of shared memory and 248 registers a thread leave no room for.
   - A split K or bf16 per-pick sums would go further but change outputs (not done: exact-output rule).
 - **Decode at 1 row** varies by run (S3 92–96 %). It needs pinned-clock repeats and a look at the fixed costs
   (route, the PDL handover, the up wave's tail).
@@ -502,3 +507,110 @@ is one `ring.sh` job on rank 0's GPU. All runs are NVFP4 unless noted.
 
 **Not done.** A split K for the down's or the gate/up's K sums: it changes the summation order, so it is
 outside the rule.
+
+## 12. 2026-10-14 (T6): where the chained down's time goes
+
+**Goal:** the routed-expert prefill faster with every yr and ys value bit-identical (prefill task T6, lever 2).
+**Result:** one exact change, the shared expert's down at 128-row tiles (`PrefillCfg::sh_rows`, default 128):
+the shared phase 0.1–0.2 ms faster at 1k–8k rows (A B B A below), within the whole call's spread. The chained
+down, the largest phase, was taken apart (below), and five exact variants of its epilogue were tested and
+dropped: none was faster.
+
+All runs: one `ring.sh` job each on rank 0's GPU, NVFP4 at 8k rows unless noted. Results are in
+`~/dsgb10-data/glm53-pfk-moe/*.tsv` (not in the repo); the source hashes are the install's `SOURCES`.
+
+### The chained down, parts switched off
+
+`PrefillCfg::ddiag` (bench only, wrong results) switches parts of `k_pdown_c` off, as `diag` does for the
+gate/up (`bench_experts --prefill q4 --diag`). Sources `cb1a8b40` (d2.tsv), `yr_kb` default:
+
+| `k_pdown_c` at 8k | cq 1 | cq 2 | cq 4 |
+|---|---|---|---|
+| everything | 17.8 ms | 16.8 | 17.5 |
+| no adds into yr (no waits, loads, stores, tickets) | 6.0 | 6.3 | 4.6 |
+| no waits (adds unordered, no tickets) | 13.9 | 13.3 | 15.8 |
+| no waits, no yr loads (stores only) | 11.0 | 10.9 | 11.5 |
+| no waits, no yr stores (loads only) | 6.0 | 5.9 | 4.4 |
+| no weights | 15.6 | 15.4 | 14.6 |
+| no MMAs | 16.8 | 16.5 | 17.1 |
+| no A (h) loads | 12.6 | 12.8 | 14.7 |
+
+- The MMAs, weights and h loads without the adds take 4.6–6.3 ms; the adds cost 10.5–12.9 ms on top.
+- Of the adds, the stores cost most: 4.6–6.9 ms over no adds. After its stores each warp fences (`__threadfence`) before
+  releasing its rows' tickets, so it waits for every store to land. One CTA a SM (80 KB of shared memory,
+  248 registers a thread) then waits at the next `__syncthreads`, and nothing else can run on the SM.
+- Loads without stores cost nothing: nothing waits for their values.
+- The waits for the lower-rank picks cost 1.7–3.9 ms.
+
+### What the L2 holds
+
+`l2w` (a microbenchmark, scratch, not in the repo; 192 CTAs × 512 threads over a buffer of S MB, repeated):
+
+| S, MB | 2 | 4 | 8 | 12 | 16 | 24 | 64 | 512 |
+|---|---|---|---|---|---|---|---|---|
+| store GB/s | 851 | 917 | 898 | 913 | 564 | 348 | 178 | 187 |
+| load GB/s | 900 | 866 | 882 | 854 | 876 | 784 | 266 | 213 |
+| read-modify-write GB/s | 1478 | 1402 | 1347 | 729 | 534 | 441 | 228 | 204 |
+
+The L2 (24 MB) holds about 12 MB of written data. The chained down's yr in flight is `chain_q` passes ×
+T × 256 columns × 4 B, 16–32 MB at 8k. A smaller hot set does not help, though: with 256-column passes
+and cq 2 (hs.tsv, d3.tsv) the adds cost about the same per row at T = 2048 (4 MB of yr in flight;
+1.1 µs a row), 4096 (8 MB; 1.7 µs) and 8192 (16 MB; 1.5 µs). The bound is the drain of each warp's
+stores before its release, not where they land.
+
+### Variants tried (all bit-identical, all dropped)
+
+`k_pdown_p` (`down = 3`; removed from the code afterwards), a copy of `k_pdown_c` with one change each, tested against the 2026-10-13 kernels
+at T = 1, 37, 300, 2500 (0 outputs differ). 8k NVFP4, both orders in one job, ms of the down phase:
+
+| Variant | Down, ms | k_pdown_c in the same job | Sources, results |
+|---|---|---|---|
+| a column block's rows waited for and their yr loaded at k-step 0 of the block (registers), added after it | 29.9–30.1 (cq 4) | 16.7–17.3 (cq 4) | `0b0c83ec`, p1.tsv |
+| the same at k-step 4 | 22.2–22.4 (cq 4) | | |
+| L2 hints: weights evict-first, a row's last add (rank 7) stored evict-first | 16.7–17.5 (cq 4) | | |
+| fences `fence.acq_rel.gpu` instead of `__threadfence` | 16.8–17.6 (cq 2, 4) | 17.2–17.8 (cq 2, 4) | `18f4058e`, p2.tsv |
+| a block's rows released after the next block's MMAs (the fence finds the stores landed) | 48.9–50.7 (cq 2), 28.2–28.8 (cq 4) | | |
+| an epilogue's 32 yr loads a lane all issued before its first add | 17.0–17.8 (cq 2, 4) | 16.4–17.3 (cq 2, 4) | `f978e0ea`, p3.tsv |
+
+- Early loads must wait for the tickets earlier, so the waits grow (the CTA stalls at each wait), and the
+  k-step-0 form spills 88 bytes.
+- The deferred release delays every dependent pick by a column block; the waits grow far more than the fences
+  shrink.
+- The 2026-10-14 runs had already tried the yr budget (`yr_kb`) and passes in flight (`chain_q`); hs.tsv repeats the
+  sweep at 2k–8k: the defaults (16 MB, cq 4; cq 2 is equal within the spread) stay.
+- Not tried, too large for this task: an asynchronous epilogue (the MMA warps hand a column block's sums to
+  epilogue warps through shared memory: 64 KB a 128 × 128 block, against 101 KB in all with the 80 KB of A and
+  B stages), and two CTAs a SM (each ≤ 50 KB and ≤ 128 registers a thread; the accumulators and the raw
+  weight blocks alone take about 136).
+
+### The shared expert's down at 128-row tiles
+
+`k_pdown<true, 4>` (`sh_rows = 128`, the default) decodes each FP8 weight strip once for 128 rows of the chunk
+instead of 64; the same MMAs, unit sums and scaling a row, so the same bits (tested against the 64-row
+kernel: the 2026-10-13 reference of § 7 now runs with `sh_rows = 64`; all checks pass, `bc6bb3df`).
+Its gate/up at 128-row tiles (`k_pup<true, 4>`, 256 threads) was no faster than `k_pup_ws<true>` at 64
+(`417d9553`, p4.tsv) and was dropped.
+
+A B B A in one job (`bc6bb3df`, f1.tsv), A = 64-row tiles, B = 128; the shared phase, then the whole call:
+
+| Format, rows | shared, ms: A / B / B / A | whole call, ms: A / B / B / A |
+|---|---|---|
+| NVFP4, 1k | 0.68 / 0.58 / 0.59 / 0.69 | 9.23 / 8.92 / 9.06 / 8.77 |
+| NVFP4, 4k | 2.34 / 2.22 / 2.25 / 2.48 | 19.97 / 19.92 / 19.98 / 19.84 |
+| NVFP4, 8k | 4.79 / 4.69 / 4.65 / 4.67 | 38.52 / 38.70 / 38.57 / 38.90 |
+| S3, 1k | 0.69 / 0.62 / 0.60 / 0.66 | 8.14 / 8.01 / 8.35 / 8.02 |
+| S3, 4k | 2.44 / 2.24 / 2.24 / 2.38 | 18.94 / 18.99 / 19.12 / 19.28 |
+| S3, 8k | 4.87 / 4.68 / 4.66 / 4.88 | 37.15 / 36.96 / 37.15 / 37.11 |
+| mix, 1k | 0.66 / 0.60 / 0.58 / 0.68 | 8.09 / 8.12 / 8.16 / 8.21 |
+| mix, 4k | 2.32 / 2.25 / 2.36 / 2.50 | 19.22 / 18.76 / 19.08 / 19.19 |
+| mix, 8k | 4.75 / 4.57 / 4.61 / 4.82 | 37.42 / 37.21 / 37.24 / 37.14 |
+
+The shared phase gains 0.06–0.2 ms (2–14 %); the whole call moves within its spread (±0.3 ms). The phases at
+8k NVFP4 in this job: bucketing 0.05 ms, gate/up 15.6–16.4, chained down 17.3–17.7, shared 4.65–4.79; the whole
+call 38.5–38.9 ms, 36.0–36.1 TFLOPS, 33.4–33.8 % of the bf16 peak (§ 11's r8 job measured 36.5–36.6 ms with
+the same kernels; the 2 ms between the jobs is not explained here).
+
+### Checks
+
+`test_experts` (`run.sh test`) on every build of this section: all pass, 0 failed (f1.log: the final sources;
+p1–p4.log: the dropped variants' checks as well).

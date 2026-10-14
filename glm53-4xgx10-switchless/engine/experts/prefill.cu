@@ -825,7 +825,9 @@ __device__ __forceinline__ float2 ld_yr(const float* p, uint64_t pol) {
 __device__ __forceinline__ void st_yr(float* p, float2 v, uint64_t pol) {
   asm volatile("st.global.L2::cache_hint.v2.f32 [%0], {%1,%2}, %3;" ::"l"(p), "f"(v.x), "f"(v.y), "l"(pol) : "memory");
 }
-template <int MT>
+// DG (bench diagnostics, wrong results): 1 no weights, 2 no MMAs, 4 no A loads, 8 no adds into yr (no waits, loads,
+// stores or tickets), 16 no waits (the adds unordered, no tickets), 32 no yr loads, 64 no yr stores
+template <int MT, int DG = 0>
 __global__ void __launch_bounds__(256, 1) k_pdown_c(PArgs a) {
   extern __shared__ __align__(16) uint8_t smem[];
   __shared__ int s_task, s_row[kTM], s_rank[kTM];
@@ -874,6 +876,7 @@ __global__ void __launch_bounds__(256, 1) k_pdown_c(PArgs a) {
       for (int i = 0; i < 2; ++i) load_blk(rb[buf][i], wb + (size_t)(16 * c + i) * bs, fmt, lane);
     };
     auto decode = [&](uint8_t* sb, int step, int ph) {  // ph = step % 16, compile-time
+      if (DG & 1) return;
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         uint32_t o[8];
@@ -887,11 +890,10 @@ __global__ void __launch_bounds__(256, 1) k_pdown_c(PArgs a) {
     for (int i = 0; i < MT; ++i)
 #pragma unroll
       for (int j = 0; j < 4; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
-    load_raw(0, 0);
-    load_raw(1, 1);
+    if (!(DG & 1)) load_raw(0, 0), load_raw(1, 1);
 #pragma unroll
     for (int j = 0; j < kNA - 1; ++j) {
-      load_a_co<4, 256, kI>(sA + j * kStageA, a.w.h, ri, 64 * j, tid);
+      if (!(DG & 4)) load_a_co<4, 256, kI>(sA + j * kStageA, a.w.h, ri, 64 * j, tid);
       cp_commit();
     }
     decode(sB, 0, 0);
@@ -904,14 +906,14 @@ __global__ void __launch_bounds__(256, 1) k_pdown_c(PArgs a) {
       for (int ii = 0; ii < 16; ++ii) {
         const int i = i0 + ii, s = ii & 1;
         const int sa_ld = sa_cur == 0 ? kNA - 1 : sa_cur - 1;
-        if (i + kNA - 1 < NK) load_a_co<4, 256, kI>(sA + sa_ld * kStageA, a.w.h, ri, 64 * ((i + kNA - 1) & 7), tid);
+        if (!(DG & 4) && i + kNA - 1 < NK) load_a_co<4, 256, kI>(sA + sa_ld * kStageA, a.w.h, ri, 64 * ((i + kNA - 1) & 7), tid);
         cp_commit();
         if (i + 1 < NK) decode(sB + (s ^ 1) * kStageB, i + 1, (ii + 1) & 15);
-        mma_step<MT>(acc, sA + sa_cur * kStageA, sB + s * kStageB, wm, sj, n, lane);
+        if (!(DG & 2)) mma_step<MT>(acc, sA + sa_cur * kStageA, sB + s * kStageB, wm, sj, n, lane);
         sa_cur = sa_cur == kNA - 1 ? 0 : sa_cur + 1;
         if ((ii & 7) == 7) {  // column block i >> 3 done: each warp adds its 64 rows x 32 columns into yr
           const int cb = i >> 3, r0 = 64 * wm;
-          if (r0 < n) {
+          if (!(DG & 8) && r0 < n) {
             int* tick = a.w.tick + (size_t)((c0 + 128 * cb) / 32 + wn) * kMaxChunk;
             // wait until the rows' lower picks are in (lane l polls rows r0 + l, r0 + l + 32; relaxed loads,
             // then a fence)
@@ -919,7 +921,7 @@ __global__ void __launch_bounds__(256, 1) k_pdown_c(PArgs a) {
 #pragma unroll
             for (int m = 0; m < 2; ++m)
               if (r0 + lane + 32 * m < n && s_rank[r0 + lane + 32 * m] > 0) pend |= 1u << m;
-            if (__any_sync(0xffffffffu, pend)) {
+            if (!(DG & 16) && __any_sync(0xffffffffu, pend)) {
               uint32_t ns = 64;
               for (uint32_t spin = 0;; ++spin) {
 #pragma unroll
@@ -946,13 +948,13 @@ __global__ void __launch_bounds__(256, 1) k_pdown_c(PArgs a) {
                 const int r = 16 * (MT * wm + x) + g + 8 * hh;
                 live[hh] = r < n;
                 yrow[hh] = a.yr + (size_t)s_row[live[hh] ? r : 0] * kH + c0 + 128 * cb + 2 * t;
-                const bool rd = live[hh] && s_rank[live[hh] ? r : 0] > 0;
+                const bool rd = !(DG & 32) && live[hh] && s_rank[live[hh] ? r : 0] > 0;
 #pragma unroll
                 for (int j = 0; j < 4; ++j) v[hh][j] = rd ? ld_yr(yrow[hh] + 8 * sj[j], pol) : make_float2(0.f, 0.f);
               }
 #pragma unroll
               for (int hh = 0; hh < 2; ++hh)
-                if (live[hh]) {
+                if (!(DG & 64) && live[hh]) {
                   const float k0 = s_k0[16 * (MT * wm + x) + g + 8 * hh];
 #pragma unroll
                   for (int j = 0; j < 4; ++j)
@@ -966,7 +968,7 @@ __global__ void __launch_bounds__(256, 1) k_pdown_c(PArgs a) {
 #pragma unroll
             for (int m = 0; m < 2; ++m) {
               const int r = r0 + lane + 32 * m;
-              if (r < n) st_relaxed(tick + s_row[r], s_rank[r] == kTopK - 1 ? 0 : s_rank[r] + 1);
+              if (!(DG & 16) && r < n) st_relaxed(tick + s_row[r], s_rank[r] == kTopK - 1 ? 0 : s_rank[r] + 1);
             }
           }
 #pragma unroll
@@ -1639,6 +1641,15 @@ void moe_prefill_phases(const LayerW& L, const __nv_bfloat16* x, const int* idx,
     set_smem(k_pup<true, 2>, kSmem);
     set_smem(k_pdown_r<4>, kSmem);
     set_smem(k_pdown_c<4>, kSmem);
+    set_smem(k_pdown_c<4, 1>, kSmem);
+    set_smem(k_pdown_c<4, 2>, kSmem);
+    set_smem(k_pdown_c<4, 4>, kSmem);
+    set_smem(k_pdown_c<4, 8>, kSmem);
+    set_smem(k_pdown_c<4, 16>, kSmem);
+    set_smem(k_pdown_c<4, 15>, kSmem);
+    set_smem(k_pdown_c<4, 11>, kSmem);
+    set_smem(k_pdown_c<4, 48>, kSmem);
+    set_smem(k_pdown_c<4, 80>, kSmem);
     set_smem(k_pdown_cw, kWsSmem);
     set_smem(k_pup_ws<false, 0>, kWsSmem);
     set_smem(k_pup_ws<true>, kWsSmemSh);
@@ -1656,6 +1667,7 @@ void moe_prefill_phases(const LayerW& L, const __nv_bfloat16* x, const int* idx,
     set_smem(k_pup_ws<false, 5>, kWsSmem);
     set_smem(k_pup_ws<false, 6>, kWsSmem);
     set_smem(k_pdown<true, 2>, kSmem);
+    set_smem(k_pdown<true, 4>, kSmem);
     set_smem(k_pup_f4<4>, kF4Smem);
     set_smem(k_pdown_f4<4>, kF4Smem);
     int dev;
@@ -1687,7 +1699,8 @@ void moe_prefill_phases(const LayerW& L, const __nv_bfloat16* x, const int* idx,
     else k_pup<true, 2><<<(T + 63) / 64 * kUpNB, 256, kSmem, ss>>>(b);
     for (int p = 0; p < b.w.npass; ++p) {
       b.c0 = p * b.w.cp;
-      k_pdown<true, 2><<<(T + 63) / 64 * (b.w.cp / 128), 256, kSmem, ss>>>(b);
+      if (cfg.sh_rows == 128) k_pdown<true, 4><<<(T + 127) / 128 * (b.w.cp / 128), 256, kSmem, ss>>>(b);
+      else k_pdown<true, 2><<<(T + 63) / 64 * (b.w.cp / 128), 256, kSmem, ss>>>(b);
     }
     if (fork) CUDA_CHECK(cudaEventRecord(ev[1], cfg.side));
   }
@@ -1741,7 +1754,22 @@ void moe_prefill_phases(const LayerW& L, const __nv_bfloat16* x, const int* idx,
   if (chain) {
     if (ph & kPhDown) {
       if (cfg.down == 2) k_pdown_cw<<<std::min(nsm, maxt * a.npc), 512, kWsSmem, st>>>(a);
-      else k_pdown_c<4><<<std::min(nsm, maxt * a.npc), 256, kSmem, st>>>(a);
+      else {
+        const int g = std::min(nsm, maxt * a.npc);
+        switch (cfg.ddiag) {
+          case 0: k_pdown_c<4><<<g, 256, kSmem, st>>>(a); break;
+          case 1: k_pdown_c<4, 1><<<g, 256, kSmem, st>>>(a); break;
+          case 2: k_pdown_c<4, 2><<<g, 256, kSmem, st>>>(a); break;
+          case 4: k_pdown_c<4, 4><<<g, 256, kSmem, st>>>(a); break;
+          case 8: k_pdown_c<4, 8><<<g, 256, kSmem, st>>>(a); break;
+          case 16: k_pdown_c<4, 16><<<g, 256, kSmem, st>>>(a); break;
+          case 15: k_pdown_c<4, 15><<<g, 256, kSmem, st>>>(a); break;
+          case 11: k_pdown_c<4, 11><<<g, 256, kSmem, st>>>(a); break;
+          case 48: k_pdown_c<4, 48><<<g, 256, kSmem, st>>>(a); break;
+          case 80: k_pdown_c<4, 80><<<g, 256, kSmem, st>>>(a); break;
+          default: die("moe_prefill: ddiag %d", cfg.ddiag);
+        }
+      }
     }
   } else {
     for (int p = 0; p < a.w.npass; ++p) {

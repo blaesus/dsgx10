@@ -9,11 +9,12 @@ DeepSeek service through its `ring.sh` (jobs of 15 s to 2 min).
 routed experts, layer 3 also with its real NVFP4 experts. Decode step at 1 row **46.4 ms** (21.6 tok/s) against
 a 34.2 ms bandwidth floor (1.35×); after the 2026-10-14 decode-gap pass 43.6 ms (1.27×) in the interleaved A/B, ~44 ms
 on undisturbed ranks, the MoE at its floor and the rest the collectives' latency and attention ([Closing the
-decode gap](#closing-the-decode-gap-2026-10-14)); prefill **1,084 / 1,086 / 860 tok/s** for chunks of 2,600 and
-8,192 from 0 and the last 8,192 of 32,768 tokens, **968 tok/s** for a whole 32,768-token prompt, with the ring's
-collectives overlapped with the compute ([Prefill overlap](#prefill-overlap-2026-10-14); 854 / 794 / 698 and 753
-before, after the tensor-core GEMMs of [Prefill GEMMs](#prefill-gemms-2026-10-14); 381 / 374 / 350 on the 16-row
-GEMVs), 79 % of the published 1,374 tok/s at 8k. Against the
+decode gap](#closing-the-decode-gap-2026-10-14)); prefill **1,106 / 1,145 / 908 tok/s** for chunks of 2,600 and
+8,192 from 0 and the last 8,192 of 32,768 tokens, **1,027 tok/s** for a whole 32,768-token prompt, after the
+pipelined prefill attention and 4 comm blocks ([Prefill kernels](#prefill-kernels-t6-2026-10-14); 1,084 / 1,086 /
+860 and 968 with the collectives overlapped, [Prefill overlap](#prefill-overlap-2026-10-14); 854 / 794 / 698 and
+753 after the tensor-core GEMMs of [Prefill GEMMs](#prefill-gemms-2026-10-14); 381 / 374 / 350 on the 16-row
+GEMVs), 83 % of the published 1,374 tok/s at 8k. Against the
 reference's golden data the residual stream after layers 0–3 agrees to cosine 0.9998 (mean), relative error
 1.2–2.1 %, the size the FP8 requantisation predicts (each FP8 tensor 2.6 % relative error). Every
 self-consistency check passes (below).
@@ -165,7 +166,7 @@ of the 12 ms gap to the floor is the MoE at ~83 % of its bytes' floor at one row
 
 **Prefill** (synthetic, from position 0): 414 / 434 / 419 / 403 / 400 tok/s for chunks of 512 / 1,024 / 2,048
 / 4,096 / 8,192 rows (1.24 s to 20.5 s a chunk), after the expert prefill tuning (6cb6fce); 397–416 before. With
-the prefill GEMMs (2026-10-14): 854 / 802 / 704 tok/s at 2,600 / 8,192 / 32,768 tokens; with the collectives overlapped (T5, 2026-10-14) 1,084 / 1,086 / 860, a whole 32,768-token prompt 968; below.
+the prefill GEMMs (2026-10-14): 854 / 802 / 704 tok/s at 2,600 / 8,192 / 32,768 tokens; with the collectives overlapped (T5, 2026-10-14) 1,084 / 1,086 / 860, a whole 32,768-token prompt 968; with T6's kernels 1,106 / 1,145 / 908 and 1,027; below.
 
 ## Closing the decode gap (2026-10-14)
 
@@ -487,6 +488,114 @@ routed experts (with two pieces the MoE end already runs during the other piece'
 all-gather after the reduce-scatter, the ring's copies with fewer bytes (the producer writing its partials straight
 into the send buffers, as decode's posted partials do; a chunk's partials are far beyond the 4 MiB buffers).
 
+## Prefill kernels (T6, 2026-10-14)
+
+T6 asked for faster prefill compute with every output bit unchanged, in three levers: the sparse attention, the
+MoE prefill, and the compute's slowdown beside the ring's copies. Ring jobs of 1–9 minutes, 2026-10-14
+03:18–06:22 (+0100), synthetic weights except `tf` and the server's tests; final sources: `glm_run`
+302106db81ca4448, attn's tests 1178708d35bca344, experts bc6bb3dfa0c29884, `glm53_rank` 3eb552ac51afccb9.
+
+**What changed.**
+
+1. **Attention** (attn's `k_attn_pf`, [attention.md § 5 "T6"](attention.md)): the unsplit sparse attention with the
+   next key block's gathers (bulk copies, mbarriers per 16-key slot) in flight under the current block's compute,
+   `k_attn`'s arithmetic bit for bit; dense rows (positions under 2,048) included. It runs wherever
+   `sparse_attn` has one split; a `Tune` bit `kTunePfAttn` (0x100, now in `kTuneDefault` = 0x1f7) selects it for
+   prefill (off: `k_attn`). Alone, on rank 0: 1.09× (random selections over 32k) to 1.37× (dense rows).
+2. **The ring's collectives with 4 blocks** (`Options::prefill_comm_blocks`, 8 → 4): fewer SMs and less memory
+   traffic beside the compute.
+3. **MoE** ([experts.md § 12](experts.md)): the shared expert's down at 128-row tiles (`PrefillCfg::sh_rows`); the
+   chained down, the largest phase, located but not made faster.
+
+**Lever 1, A B B A in one job** (`pfab` 0xf7, `k_attn`, against 0x1f7, `k_attn_pf`; 8 comm blocks, sources
+c906f863893c4064 with the arrival fix, 04:52–04:56):
+
+| Tokens (chunk at) | `k_attn` ms | tok/s | `k_attn_pf` ms | tok/s | B/A |
+|---|---:|---:|---:|---:|---:|
+| 2,600 (0) | 2,448.7 / 2,456.1 | 1,060 | 2,391.2 / 2,390.1 | 1,088 | 1.026 |
+| 8,192 (0) | 7,624.1 / 7,608.7 | 1,076 | 7,314.7 / 7,318.8 | 1,120 | 1.041 |
+| 8,192 at 24,576 | 9,457.2 / 9,390.4 | 869 | 9,060.8 / 9,071.3 | 904 | 1.039 |
+| a whole 32,768-token prompt | 33,874.2 / 34,007.2 | 965 | 32,787.6 / 32,797.1 | 999 | 1.035 |
+
+**Lever 3: comm blocks** (0x1f7 against itself, each a `pfab` A B B A; the cells give its four runs' tok/s range;
+jobs in the order shown):
+
+| Blocks | 8,192 at 24,576 (order 8 4 6 6 4 8) | 8,192 at 0 (order 8 4 2 2 4 8) | 2,600 at 0 |
+|---:|---:|---:|---:|
+| 8 | 889–898 (mean 9,166 ms) | 1,111–1,117 | 1,079–1,080 |
+| 6 | 901–912 (9,042 ms) | | |
+| 4 | **901–918 (8,979 ms)** | **1,151–1,153** | 1,077–1,095 |
+| 2 | | 1,126–1,130 | 1,080–1,086 |
+
+T5 had found 8 best with `k_attn` (892 against 882 at 24,576); beside `k_attn_pf` 4 is 2 % faster at 24,576 and
+3 % at 8,192 from 0. Three pieces instead of two (4 blocks, order 2 3 3 2): 1,115–1,133 against 1,140–1,145 at
+8,192 from 0, 912–915 against 911–919 at 24,576; two kept. Bits the same at every setting.
+
+**The final tree, A B B A in one job** (`pfab` 0xf7 against 0x1f7, both with the new defaults otherwise: 4 comm
+blocks and the MoE change; 05:59–06:06):
+
+| Tokens (chunk at) | 0xf7 ms | tok/s | 0x1f7 ms | tok/s | B/A | T5 (0xf7, 8 blocks) |
+|---|---:|---:|---:|---:|---:|---:|
+| 2,600 (0) | 2,425.6 / 2,434.2 | 1,070 | 2,359.9 / 2,342.9 | **1,106** | 1.033 | 1,084 |
+| 8,192 (0) | 7,444.3 / 7,457.6 | 1,099 | 7,167.2 / 7,144.0 | **1,145** | 1.041 | 1,086 |
+| 8,192 at 24,576 | 9,345.3 / 9,420.5 | 873 | 8,958.3 / 9,077.9 | **908** | 1.040 | 860 |
+| a whole 32,768-token prompt | 33,560.3 / 33,099.0 | 983 | 31,903.9 / 31,907.1 | **1,027** | 1.045 | 968 |
+
+Against T5's published figures (other jobs): +2.0 % / +5.4 % / +5.6 % / +6.1 %. **Against the published bar**
+(1,374 tok/s cold at 8k): 1,145 tok/s is 83 % of it; the 8,192-row chunk takes 7.16 s where the bar needs 5.96.
+
+**Where a chunk goes now** (`pftrace`, 8,192 rows at 24,576, 0xf7 and 0x1f7, 8 comm blocks, sources
+c906f863893c4064, 05:00; ms; rank 0, the four ranks' range in brackets; `step_profile.py --prefill`):
+
+| | 0xf7 (`k_attn`): 9,406–9,433 ms | 0x1f7 (`k_attn_pf`): 9,036–9,061 ms |
+|---|---:|---:|
+| compute stream busy | 9,106 (8,337–9,106) | **8,749** (8,069–8,749) |
+| … attention (the kernel; with `k_prep`) | 3,355 (3,096–3,355); 3,394 | **2,990** (2,788–2,990); 3,028 |
+| … MoE prefill | 3,361 (3,040–3,361) | 3,368 (3,069–3,368) |
+| … projections | 1,379 (1,237–1,379) | 1,370 (1,248–1,370) |
+| … indexer | 951 (873–951) | 960 (878–960) |
+| compute stream idle | 300 (300–1,095) | 293 (293–992) |
+| collectives' stream busy | 4,787 (4,787–5,568) | 4,724 (4,724–5,443) |
+
+The attention kernel is 11 % faster in the chunk, against 9–37 % alone: beside the ring's copies each 4,096-row
+piece takes 19.2 ms (`k_attn` 21.5; alone about 11–15 and 14–16.5). The MoE (a third of the chunk) and the ring's
+interference are now the largest items.
+
+**MoE** (experts.md § 12, a subagent's A B B A on rank 0): the shared down at 128-row tiles saves 0.06–0.2 ms of
+the shared phase at 1k–8k rows, within the whole call's spread (38.5–38.9 ms at 8k NVFP4). The chained down
+(17.3–17.7 ms at 8k) is bound by its ordered adds into yr: the MMAs, weight and h loads alone take 4.6–6.3 ms;
+the stores' drain behind the fence before each ticket release costs 4.6–6.9 ms with one CTA an SM, the waits for
+lower-ranked picks 1.7–3.9. Five exact variants (yr loads earlier, cache hints, lighter fences, later ticket
+release, batched loads) gave nothing or lost; going further needs the adds off the MMA warps' path (an
+asynchronous epilogue or two CTAs an SM), a redesign.
+
+**A race found and fixed.** The first `k_attn_pf` matched `k_attn` in every bench but not in the overlapped
+prefill: `pfab` 0x1f7 against itself differed from run to run (first differing cache layer 1–2), while one piece
+(`--pf-pieces 1`) or the overlap off (0x177) passed. A debug build compared the kernel's output with `k_attn`'s on
+the same inputs after each launch (layers 0–2): one row in a few thousand differed, a band of 32–128 output dims of
+all 16 heads, always a dense row. The warp's `mbarrier.arrive` releasing a slot issued before its `ldmatrix` loads
+of the slot had returned, so the next bulk copy could overwrite them. With the arrival made dependent on the
+loaded registers (and a proxy fence before the regather) every `pfab` passes. Copy kernels beside the attention in
+a bench (`bench_attn --only pstress`) did not reproduce the race.
+
+**Exactness** (the final tree): `pfab` A and B the same bits at every size, on every rank (the T4/T5 hashes
+f561aaa161f5703e, b5d2be0e85c00e60, 01f4fa4803ca445f, 8ee634566afdf576), and 0x1f7 against itself before at
+8,192 and 2,600 twice; `run.sh check` passes (chunking, decode = prefill, 16 rows = 16 one-row steps, graph =
+eager, ranks agree, sampling); `tf` via prefill on the real rank files (the 291-token `short` sequence) gives all
+20 dump files byte-identical to the 2026-10-13 `short-prefill` dump, with one piece and with `--pf-min-piece 64`
+(two pieces); attn's tests 48 pass at S = 300 (with the new checks: `k_attn_pf` = `k_attn` at one split for every
+row; decode calls of 1, 6, 16 rows at one split = the prefill rows), 100 at S = 4,600, memcheck 45 + 33 checks 0
+errors; `test_experts` all pass; the server's ring tests (serve, batch, front, kept, spec record / forced / gate)
+pass on a `glm53_rank` from this tree. **Decode is unchanged**: at its default split-K the step runs `k_attn` as
+before; `ab` 0xf7 against 0x1f7 46.51 / 46.21 ms at 1 row, 98.18 / 97.91 at 6, the same bits.
+
+**What failed or was not done.** The first `k_attn_pf` (the race above); attention variants slower than the kept
+one (attention.md); five chained-down variants (experts.md § 12); 6 and 2 comm blocks, 3 pieces. Memcheck once
+failed with an out-of-memory error from `cudaMalloc` while another tenant held memory; it passed on rerun. Not
+tried: the ring's copies through the copy engine (`cudaMemcpyAsync`) or paced copies (the copy kernels pipeline
+pieces against the NIC proxy's flags, so a copy-engine path is a protocol change); two attention CTAs an SM (needs
+under 50 KB of shared memory a CTA).
+
 ## Drafts (G7, 2026-10-14)
 
 Speculative decoding with the model's own MTP layer, in the decode step and the server, the tokens unchanged.
@@ -622,12 +731,13 @@ cost model is one session's; with 4 sessions a row costs ~10 ms, not 15.5).
 
 ## What remains
 
-- **Prefill** (1,086 tok/s at 8k after the 2026-10-14 overlap, 79 % of the published 1,374): the compute now
-  runs 20–27 % slower beside the ring's copies (their memory traffic; [Prefill
-  overlap](#prefill-overlap-2026-10-14)): fewer bytes through memory per collective (a fused residual + norm +
-  all-gather, the producers writing into the send buffers) would give that back; the compute stream still waits
-  0.25–1.1 s a chunk, mostly for the short x-projection all-gathers; then `sparse_attn` at prefill (no split,
-  ~18 TFLOPS alone) and the expert GEMMs, a third of the chunk each. The slowest rank (2) sets the chunk. The
+- **Prefill** (1,145 tok/s at 8k after T6, 83 % of the published 1,374): the compute runs 20–27 % slower beside
+  the ring's copies (their memory traffic; [Prefill overlap](#prefill-overlap-2026-10-14)): fewer bytes through
+  memory per collective (a fused residual + norm + all-gather, the producers writing into the send buffers) would
+  give that back; the compute stream still waits 0.3–1.0 s a chunk, mostly for the short x-projection all-gathers;
+  then the expert GEMMs (the chained down bound by its ordered yr adds, experts.md § 12) and `sparse_attn`
+  (`k_attn_pf`, gather-bound on random selections: [Prefill kernels](#prefill-kernels-t6-2026-10-14)), a third of
+  the chunk each. The slowest rank (2) sets the chunk. The
   indexer's batches shrink to 512 rows at a 256k `max_ctx` (512 MiB scratch).
 - **The decode gap** (1.27–1.30× at 1 row after the 2026-10-14 pass, ~1.29× on undisturbed ranks; G4's target
   1.25×): fewer collectives (merge the x-projection all-gather into the previous all-reduce's epilogue, the

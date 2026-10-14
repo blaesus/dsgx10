@@ -76,15 +76,17 @@ void bench_prefill(const std::string& fname, const std::string& chunks_s, bool f
   for (size_t ci = 0; ci < chunks.size(); ++ci)
     for (int uv : ups)
     for (int dn : downs)
+      for (int shv : int_list(o.sh))
       for (int yk : yrkbs)
         for (int q : cqs)
         for (int sd : sides) {
           if (dn == 0 && (yk != yrkbs[0] || q != cqs[0])) continue;  // budget and cq apply to the chained down only
           const int T = chunks[ci];
           cfg.up = uv, cfg.down = dn, cfg.yr_kb = yk, cfg.chain_q = q, cfg.side = sd ? side : nullptr;
+          cfg.sh_rows = shv;
           char tag[128];
-          snprintf(tag, sizeof tag, "%s%s\tT %d\tup %d down %d yrkb %d cq %d side %d", fname.c_str(), fp4 ? " fp4" : "", T, uv, dn, yk,
-                   q, sd);
+          snprintf(tag, sizeof tag, "%s%s\tT %d\tup %d down %d yrkb %d cq %d side %d sh %d", fname.c_str(), fp4 ? " fp4" : "", T, uv, dn, yk, q,
+                   sd, shv);
           const double mac = (double)T * kI * kH * 3, fl_r = 2 * mac * kTopK, fl_s = 2 * mac;
           auto run = [&](int ph) {
             return time_graph(3, [&](int, cudaStream_t st) { moe_prefill_phases(L, dx, di, dw, T, ws, dyr, dys, st, cfg, ph); }, 5);
@@ -110,6 +112,24 @@ void bench_prefill(const std::string& fname, const std::string& chunks_s, bool f
       const double us = time_graph(3, [&](int, cudaStream_t st) { moe_prefill_phases(L, dx, di, dw, T, ws, dyr, dys, st, c, kPhUp); }, 5);
       result("PREFILL\t%s\tT %d\tup %d kernel diag %d (%s%s%s)\tus %.0f", fname.c_str(), T, uv, dg, dg & 1 ? "no weights " : "",
              dg & 2 ? "no MMAs " : "", dg & 4 ? "no A loads" : "", us);
+    }
+  }
+  // where the chained down's time goes (bf16 path, the largest chunk): parts switched off
+  if (!fp4 && o.diag) {
+    const int T = TM;
+    for (int q : int_list(o.cq))
+    for (int yk : yrkbs)
+    for (int dg : {0, 8, 16, 48, 80, 1, 2, 4, 11, 15}) {
+      PrefillCfg c = cfg;
+      c.ddiag = dg;
+      c.down = 1;
+      c.chain_q = q, c.yr_kb = yk;
+      moe_prefill_phases(L, dx, di, dw, T, ws, dyr, dys, 0, c, kPhBucket | kPhUp);
+      CUDA_CHECK(cudaDeviceSynchronize());
+      const double us = time_graph(3, [&](int, cudaStream_t st) { moe_prefill_phases(L, dx, di, dw, T, ws, dyr, dys, st, c, kPhDown); }, 5);
+      result("PREFILL\t%s\tT %d\tcq %d yrkb %d chained down diag %d (%s%s%s%s%s%s%s)\tus %.0f", fname.c_str(), T, q, yk, dg,
+             dg & 1 ? "no weights " : "", dg & 2 ? "no MMAs " : "", dg & 4 ? "no A loads " : "", dg & 8 ? "no adds " : "",
+             dg & 16 ? "no waits " : "", dg & 32 ? "no yr loads " : "", dg & 64 ? "no yr stores" : "", us);
     }
   }
   cudaStreamDestroy(side);

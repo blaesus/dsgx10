@@ -610,6 +610,25 @@ void test_attention(int S, int nd) {
                    [&](size_t i) { return (double)ex[(size_t)kTopK * kHeadsAll * kVDim + i]; });
     T(a <= 2 * b, "F sparse rows (p >= 2048, 2048 selected keys): rel L2 vs exact %.2e, the reference's %.2e", a, b);
   }
+  // the unsplit kernel (k_attn_pf, the default at one split) = k_attn at one split, bit for bit: the whole sequence
+  // in one call (dense rows, sparse rows) and decode calls of 1 / 6 / 16 rows at one split
+  {
+    sparse_attn_config(0);
+    Dev<uint16_t> ok((size_t)S * kHeadsAll * kVDim);
+    run_attention(q, cache, topk, 0, S, ok, 1);
+    sparse_attn_config(-1);
+    auto hk = ok.down();
+    T(hk == h1, "F the pipelined unsplit kernel (k_attn_pf) = k_attn at one split, %d rows (dense and sparse), bit for bit", S);
+    for (int rows : {1, 6, 16}) {
+      if (rows > nd) continue;
+      Dev<uint16_t> od((size_t)S * kHeadsAll * kVDim);
+      for (int a = S - nd; a < S; a += rows) run_attention(q, cache, topk, a, std::min(S, a + rows), od, 1);
+      auto hd = od.down();
+      const size_t off = (size_t)(S - nd) * kHeadsAll * kVDim;
+      T(std::memcmp(hd.data() + off, h1.data() + off, (size_t)nd * kHeadsAll * kVDim * 2) == 0,
+        "F decode calls of %d rows at one split = the prefill rows, bit for bit", rows);
+    }
+  }
   // split-K (decode's 32 splits) agrees within the tolerance; decode rows = prefill rows bit for bit at equal splits
   run_attention(q, cache, topk, 0, S, o32, 32);
   auto h32 = o32.down();
