@@ -20,6 +20,7 @@ ran. The golden comparisons, `tf`, `refhash` and the profile on the installed ra
 8. [Runs, failures and what remains](#8-runs-failures-and-what-remains)
 9. [Tuning: the fused shared expert and the routed gate/up's prefetch](#9-tuning-the-fused-shared-expert-and-the-routed-gateups-prefetch)
 10. [End to end on real weights (A8)](#10-end-to-end-on-real-weights-a8)
+11. [Layer 0 against the contract (A9)](#11-layer-0-against-the-contract-a9)
 
 ## 1. What is identical
 
@@ -615,7 +616,7 @@ Python's rows give the same through layer 10 (fixed 0.18 / 0.28 / 0.40 / 0.83 % 
 bf16 order's side to the contract's**, and it now sits closer to `all-f32` than the reference's other order does,
 by 25–45 % in layers 0–10. **It is not bit-equal to the contract even at layer 0**: 0.18 % median relative error after
 a dense layer with BF16 weights on both sides is more than f32 accumulation order alone would flip; some rounding
-point inside the attention or the dense MLP still differs (§ 10.7). From layer ~15 routing flips (a quarter of rows
+point inside the attention or the dense MLP still differs (§ 10.7; A9 found it in the attention, § 11). From layer ~15 routing flips (a quarter of rows
 have their 8th and 9th scores within 1e-3, reference.md § 6.3) amplify every difference, and engine and orders
 reach the same ~20 % by layer 77.
 
@@ -718,9 +719,205 @@ the fix changes one rounding in `sublayer_end`, not a GEMM (python's 6,106-token
 
 - The `prefill-kTwo`, `prefill-fix` and `decode-fix` comparisons against `all` are in `g8-*-all.json`; reference.md
   § 10's own steps for `all` (summary, `cmp_runs.py`, `level3.py`, SHA256SUMS) are the reference agent's.
-- **Layer 0 is not bit-equal to the contract** (0.18 % median relative error after a dense layer, § 10.3): a
-  per-operation comparison of layer 0 (attention's intermediate roundings, the dense MLP's SwiGLU, the norms)
-  against `a1a-f32`'s every-position dumps would find the rounding point that differs.
+- **Layer 0 is not bit-equal to the contract** (0.18 % median relative error after a dense layer, § 10.3): found in
+  A9 ([§ 11](#11-layer-0-against-the-contract-a9)): the attention core, the reference's expanded form against the
+  engine's absorbed one; every other op of layer 0 agrees to the f32 summation order.
 - `glw_kcheck`'s device half for INT4 tiles and kBF16T (§ 10.1).
 - Prefill on real weights is 17 % below the synthetic figure at 2,600 tokens; drafts on real text through the server
   (the serving agent's); an interleaved A/B for the fix's step gain.
+
+## 11. Layer 0 against the contract (A9)
+
+**The question** (§ 10.7): after the two contract fixes the engine's layer-0 hidden state is 0.18 % (median relative
+error over the rows of `short`) from `a1a-f32`, the reference's contract-order golden data, although layer 0 is a dense
+BF16 layer with no experts. Which operation's rounding point or summation order differs, and what should the
+contract say? Done 2026-10-14 (+0100), 17:05–17:40, op by op from dumps; no engine or reference numerics changed.
+
+**Answer.** The first operation that differs is **the attention core**, between q_b's output and o_proj's input: the
+reference computes transformers' *expanded* form with eager numerics, the engine the *absorbed* form with an online
+softmax, and the two round at different points. Every other operation of layer 0 (x-projection, both latent RMSNorms,
+RoPE, q_b, o_proj, the residual adds, the post-attention RMSNorm, the dense MLP's gate/up with the SwiGLU, its down
+projection) computes the same arithmetic on both sides: on the engine's own inputs the reference's arithmetic gives
+the engine's outputs bit for bit, or, for a GEMM, up to the f32 summation order inside the dot products (below). The
+contract is silent on the attention's form; glm53's model.md § 2.4 already noted that "exact agreement with the
+reference at bf16 is not available to any engine that absorbs". The recommendation (§ 11.5) is that **the reference
+changes**: the contract's attention is the engine's absorbed form, which `glmref.py --attn absorbed` now implements
+(off by default); with it the engine's layer 0 is at the floor that f32 summation order alone leaves.
+
+| | reference (`glmref.py`, expanded, eager) | engine (`sparse_attn.cu`, absorbed) |
+|---|---|---|
+| keys and values | K_nope = bf16(c · W_UKᵀ), V = bf16(c · W_UVᵀ) per head and position | the cache's c (bf16, 512) and k_rope; q_lat = bf16(q_nope · W_UK) |
+| scores | s = bf16(Q · K) (torch's bf16 matmul rounds its output) × 1/16 (exact) | s = f32(q_lat · c + q_rope · k_rope) × 1/16, never rounded |
+| softmax | P = bf16(softmax_f32(s)), normalised, over all keys at once | blocks of 64 keys, running max m: p = exp(s − m) in f32, P = bf16(p) **unnormalised**, l = l · exp(m_old − m) + Σ p (f32, the unrounded p), O = O · exp(m_old − m) + Σ P c (f32) |
+| output | o_h = bf16(Σ_j P_j V_j) (f32 accumulation) | u_h = bf16(O / l); o_h = bf16(W_UV_h · u_h) (f32 accumulation) |
+
+So three choices differ at once: the form (rounding K and V per position, or q_lat and u per query), the scores'
+rounding (bf16 or none), and P's (normalised then rounded, or rounded unnormalised against the running max with l in
+f32). Each moves o by about as much as the others (§ 11.3), and the gap closes only when all three match.
+
+### 11.1 How
+
+- **Engine side** (`engine/model/prefill.cu`, `glm_run --dump-ops DIR --dump-ops-layer L`; Options::dump_ops_*):
+  in a prefill of one chunk and one piece from position 0, every rank writes layer L's intermediates as raw files
+  `DIR/r<rank>.<name>.bin` after a stream synchronise: the residual and normed input, the gathered x-projection, the
+  normed q latent, the cache entries (c, k_rope), q_b's output, q_lat, the attention's u, W_UV's output o, o_proj's f32
+  partial, the post-attention residual and norm, the SwiGLU's h, the down projection's f32 partial, the layer's output,
+  and on full-indexer layers the index sets. The dumps only read; the tf hash, top-1 and the dumped layer-0 hidden equal
+  a plain run's (below). Two ring jobs through `ring.sh` (OWNER altar1-l0, preemptible, run.sh's `g8` step on the four
+  installed rank files, every expert from the file, tune 0x7f7): **17:12:53** `short` (291 rows, chunk 2,048,
+  binaries sources `c9ba3e19c870df33`) and **17:17:47** `prose`'s first 2,400 tokens (`--pf-pieces 1`, chunk 4,096,
+  sources `2eec1bf2bdc58b69`: the same plus the index-set dump), about a minute each, neither preempted, all four ranks
+  passed. Built with `install.sh` (DATA_NAME=altar1-l0, nice 19, -j4) on top of altar1 `ea36efc`, the binaries copied
+  to `~/dsgb10-data/altar1-l0/bin` on every rank. MemAvailable after the load ≥ 34.3 GiB on every rank.
+- **Reference side** (`ref/glmref.py --dump-ops DIR [--dump-ops-layer L] [--attn absorbed]`): one layer's
+  intermediates of the first sequence as .npy; `--attn absorbed` is the engine's attention arithmetic (the table
+  above, `absorbed_keys` and `absorbed_attn`: the row's keys, positions 0..p or its 2,048 selected ones ascending, in
+  blocks of 64). Run on rank 2 with `--layers 1 --no-mtp`, CPU, nice 19, 8 threads, peak RSS ≤ 2.9 GiB, outputs under
+  `~/altar1-ref/ops/`: expanded and absorbed, on `short` and `prose` cut to 2,400 (`--max-tokens 2400`, the
+  `prose2400` of A1a). **The expanded dump's layer-0 output equals `a1a-f32`'s layer 0 bit for bit on every row of
+  both sequences** (291 and 2,400 rows), so the dump is the golden data's arithmetic.
+- **Comparison** (`ref/cmp_ops.py`, on rank 2): (1) each engine tensor against the reference's, along the layer;
+  (2) **each op on the engine's own inputs** by the reference's arithmetic (glmref.py's functions; the attention by
+  the absorbed prototype), which separates an op's own arithmetic from what it inherits; (3) on `short`, six attention
+  variants computed from the engine's own q and cache entries, each changing one choice of the table above; (4) a
+  worked element. Bit-equal is the share of equal elements; "rel" the median over rows of ‖Δ‖ / ‖reference‖ (A8's
+  measure). Results: `~/dsgb10-data/altar1-l0/cmp_ops_short.json`, `cmp_ops_prose2400.json` and the logs beside them
+  on rank 0, the dumps under `~/altar1-ref/ops/` on rank 2.
+
+### 11.2 Op by op
+
+The engine against the reference's expanded form (the golden data's arithmetic), then against `--attn absorbed`; bit-equal / rel
+(f32 outputs, the sublayers' summed partials, cannot be bit-equal across summation orders: rel only). `short` (291
+rows) / `prose2400` (2,400 rows):
+
+| Tensor | vs expanded (golden) | | vs `--attn absorbed` | |
+|---|---|---|---|---|
+| input h, its RMSNorm | 100 % / 100 % | 0 | | |
+| q_a, kv_a (x-projection) | 99.92 / 99.91 %; 99.92 / 99.92 % | ≤ 0.0003 % | | |
+| q latent after its norm; c; k_rope | 99.92 / 99.91; 99.92 / 99.93; 99.94 / 99.89 % | ≤ 0.0001 % | | |
+| q (q_b's output) | 99.46 / 99.43 % | 0.0072 / 0.0077 % | (the same) | |
+| q_lat; u | — | | 99.22 / 99.15 %; 98.99 / 98.54 % | 0.010 / 0.014 %; 0.026 / 0.027 % |
+| **o (attention output, o_proj's input)** | **67.27 / 70.78 %** | **0.197 / 0.183 %** | 97.07 / 96.36 % | 0.034 / 0.040 % |
+| o_proj (f32, summed over ranks) | — | 0.044 / 0.032 % | — | 0.0054 / 0.0062 % |
+| h after attention | 85.15 / 87.93 % | 0.102 / 0.088 % | 96.64 / 96.41 % | 0.035 / 0.038 % |
+| its RMSNorm | 87.17 / 89.68 % | 0.129 / 0.107 % | 97.13 / 96.95 % | 0.038 / 0.041 % |
+| MLP h = SwiGLU(gate, up) | 61.91 / 65.58 % | 0.279 / 0.253 % | 81.66 / 80.84 % | 0.147 / 0.155 % |
+| MLP down (f32, summed) | — | 0.161 / 0.144 % | — | 0.077 / 0.081 % |
+| **layer 0's output** | **69.72 / 71.93 %** | **0.182 / 0.168 %** | **82.78 / 81.81 %** | **0.112 / 0.114 %** |
+
+Against `a1a-f32` itself the engine's output is 0.1824 % on `short` (A8's 0.18 %) and 0.1681 % on `prose2400`, and the
+tf dump of the same job equals the op dump bit for bit. Up to q every difference comes from a GEMM's f32 order (0.08 %
+of q_a's and kv_a's elements, carried through the norms; q 0.54 %); the four ranks' replicated tensors are identical.
+The jump is at o.
+
+**Each op on the engine's own inputs** (the reference's arithmetic; `short` / `prose2400`):
+
+| Op | bit-equal | rel | what differs |
+|---|---|---|---|
+| q_a, kv_a GEMMs (K 6,144) | 99.92 / 99.91 %; 99.92 / 99.92 % | 0.0002 / 0.0003 % | f32 sum order only |
+| q_a_layernorm, kv_a_layernorm, RoPE of k_rope | **100 / 100 %** | 0 | nothing |
+| q_b GEMM (K 2,048) | 99.91 / 99.91 % | 0.007 % | f32 sum order |
+| W_UK (q_lat) | 99.996 / 99.996 % | 0.0001 % | f32 sum order |
+| attention core (absorbed prototype) → u | 99.98 / 99.95 % | 0.003 / 0.009 % | f32 sum order (the MMAs', torch's), expf against torch.exp |
+| W_UV (o) | 99.975 / 99.975 % | 0.003 % | f32 sum order |
+| o_proj (f32) | — | 0.0005 % (max 0.0005 %) | f32 sum order |
+| residual add h = bf16(f32(res) + Σ) | **100 / 100 %** | 0 | nothing |
+| post-attention RMSNorm | **100 %** / 99.9997 % | 0 | `prose2400`: ~44 elements, the mean's f32 order |
+| gate/up GEMMs + SwiGLU, h = bf16(bf16(silu(bf16 g)) · bf16 u) | 99.59 / 99.59 % | 0.028 % | f32 sum order of g and u (K 6,144) |
+| down (f32) | — | 0.0003 % (max 0.0004 %) | f32 sum order |
+| residual add | **100 / 100 %** | 0 | nothing |
+
+So the norms (f32 statistics, bf16(x · rstd) then a bf16 weight multiply), RoPE (bf16 products and sum, torch's
+table), the residual's one rounding and the SwiGLU's three roundings are the same on both sides; the dense MLP is not
+a suspect. The one op whose *arithmetic* differs is the attention core, and the absorbed prototype reproduces it to
+the f32 order.
+
+### 11.3 Inside the attention: which rounding
+
+From the engine's own q (q_b's output) and cache entries on `short`, o by six arithmetics (`cmp_ops.py`'s
+variants), against the engine's o:
+
+| Variant | o vs the engine's o | layer 0's output (rest as the reference) vs the reference's |
+|---|---|---|
+| expanded, bf16 scores, P = bf16(softmax) (the reference) | 67.29 %, rel 0.196 % | 83.93 %, rel **0.107 %** |
+| expanded, f32 scores | 70.05 %, 0.188 % | 71.17 %, 0.175 % |
+| expanded, f32 scores, online P | 71.56 %, 0.175 % | 71.40 %, 0.172 % |
+| absorbed, bf16 scores, P = bf16(softmax) | 71.01 %, 0.164 % | 73.86 %, 0.160 % |
+| absorbed, f32 scores, P = bf16(softmax) | 77.01 %, 0.143 % | 69.62 %, 0.186 % |
+| **absorbed, f32 scores, online P (the engine's)** | **99.83 %, 0.0065 %** (u 99.98 %, 0.0030 %) | 69.76 %, 0.182 % |
+
+One choice at a time (o of two variants that differ in it): the form 71.56 %, rel 0.175 %; the scores' rounding
+0.165 % (absorbed) and 0.149 % (expanded); P's rounding point 0.143 % (absorbed) and 0.129 % (expanded). The three
+are of one size, so no single rounding explains the gap; with all three the engine's o is reproduced to 0.0065 %.
+
+**The floor.** The first row's last column is the reference's own arithmetic fed the engine's q and cache, which
+differ from the reference's only by GEMM summation order (0.54 % of q's elements): its layer output is 0.107 % from
+the reference's. That is what f32 order alone leaves after one layer, because every bf16 rounding downstream turns a
+small change of its f32 input into flips: in the engine against the absorbed prototype, 2.9 % of o's elements differ,
+then 3.4 % of h after attention (o_proj spreads each change over the whole row), 2.9 % of its norm, 18 % of the MLP's
+h (two 6,144-long GEMMs and three roundings; a flip there is 0.4–0.8 % of the element) and 17 % of the output. The
+engine against the absorbed prototype, 0.112 % / 0.114 %, sits on this floor; against the expanded form it is
+0.182 % / 0.168 %.
+
+**A worked element** (`short`, row 1, head 8, value column 17; the largest |Δ| in o): the row sees keys 0 and 1.
+Scores: the reference's bf16 3.21875 and 2.328125 (unrounded f32 3.2172759 and 2.3341813), the engine's f32 3.2172768
+and 2.3341832, so the gap is 0.890625 against 0.8830936. The reference's P = bf16(softmax) = 0.7109375 and
+0.29101562 (of 0.7090191 and 0.29098085; they sum to 1.0019531). The engine's p₁ = exp(−0.8830936) = 0.4135017,
+P₁ = bf16 = 0.4140625, l = 1.4135017 (the unrounded p), so its weights are 0.70746285 and 0.29293385 (sum 1.0003967).
+o: the reference's f32 −0.0043288469 → bf16 −0.00433349609375, the engine's (W_UV · u, f32) −0.0042872992 →
+−0.0042724609375: two bf16 ulps (6.1e-5) apart, from the scores' rounding (0.0075 on the gap) and P's.
+
+**The indexer** (`prose2400`, the 352 rows at positions ≥ 2048): the engine's index sets equal `a1a-f32`'s on 341
+rows (the four ranks' identical); each of the other 11 swaps exactly one position at the boundary, and all 11 are
+near-ties: the golden 2048th-minus-2049th margins 3.5e-5 – 1.5e-3, all in the lowest 22 % of the rows (median margin
+4.8e-3). That is the input noise above acting on near-ties, not a different arithmetic, but it was not isolated: the
+indexer's q, keys and head weights were not dumped. `short` has no sparse rows, so it does not enter A8's 0.18 %.
+
+### 11.4 Not bit-equal, and why it cannot be
+
+The absorbed prototype does not make layer 0 bit-equal (82.8 % of the output's elements): every GEMM's dot products
+sum in another order on the CPU (torch's blocking) than in the MMAs (m16n8k16 tiles, split-K, the tensor core's own
+accumulation), flipping 0.1 % of a GEMM's bf16 outputs, and layer 0 amplifies those to the 0.11 % floor above. The
+contract fixes rounding points, not the order inside a dot product (decision 2 says "f32 accumulation"), and the
+MMAs' internal order is not reproducible in torch. So "bit-equal to the contract" is reachable per op (§ 11.2's
+isolated table: the elementwise ops 100 %, every GEMM to its f32 order), not through a layer; the comparable bar
+through the model stays decision 2's: within 2× the reference's own order variance.
+
+### 11.5 Recommendation: the contract's attention is the engine's
+
+**Change the reference, not the engine.** Decision 8's intent is that the contract is the engine's reduction order
+with f32 accumulation and one rounding per sublayer output; the expanded form's two extra roundings are artefacts of
+transformers' eager path (torch rounds a bf16 matmul's output, so the scores are rounded; it normalises before
+rounding P), not choices of the model. The absorbed form is the same function (glm53 model.md § 2.4), it is what
+every MLA engine runs (and what this engine's decode and prefill share), and changing the engine instead would
+materialise K and V per position (64 KiB a position a layer against the latent entry's 1,152 B) or round the
+scores and P, for no gain in fidelity. Proposed wording, an addition to DESIGN decision 2 (and glm53 decision 8, which says nothing on attention):
+
+> **Attention is computed in the absorbed form, in one pass over the row's keys.** Per head, q_lat = bf16(q_nope ·
+> W_UK) with f32 accumulation; the scores s_j = (q_lat · c_j + q_rope · k_rope_j) · 1/16 are f32 and never rounded;
+> the row's keys (positions 0..p when p < 2048, else its 2,048 selected positions in ascending order) are taken in
+> blocks of 64: with the running maximum m (initially −1e30) updated to m′ = max(m, max s over the block), p_j =
+> exp(s_j − m′) in f32, P_j = bf16(p_j), l ← l · exp(m − m′) + Σ p_j and O ← O · exp(m − m′) + Σ P_j c_j, both in f32;
+> u = bf16(O / l); o_h = bf16(W_UV · u) with f32 accumulation. The order of the f32 sums inside a dot product (the
+> MMAs') is not part of the contract. Decode with a split-K of S > 1 is a second order (each split's own running max,
+> the splits merged in f32 in split order before one division and rounding), as decision 11 is for the experts.
+
+Then the golden data is re-made in that order: `a1a-f32` (936 s) and `all-f32` (~3 h, attention 70 % of a layer at
+26.8k rows) with `--attn absorbed`. The prototype's per-block loop cost 4× the expanded attention on `prose2400`'s
+layer 0 (10.3 s against 2.5 s); on the 26.8k-row sequence it scores only each row's 2,048 keys where the expanded
+form scores every causal key, so its cost there is not known: time one layer of `all-f32`'s sequences before the
+pass. A8's comparisons are then repeated against the new set; layer 0 is expected at ~0.11 %, the f32-order floor.
+
+### 11.6 What remains, and failures
+
+- **A decision** (coordinator): adopt the wording above (or keep the expanded form and accept the 0.07 % attention
+  term at layer 0); then the golden passes with `--attn absorbed` and A8's comparison again.
+- **Decode** was not dumped: prefill already showed the arithmetic. Decode's sparse attention runs split-K 16 at 1–2
+  rows and 8 above by default (`model.cu`: `opt.attn_splits ? … : R <= 2 ? 16 : 8`), so its P is rounded against each
+  split's own running maximum: a third order, and one that changes between 2 and 3 rows unless `--splits` fixes it
+  (the checks run `--splits 1`; a verify step already requires a fixed split). Read from the code, not measured here.
+- **The indexer's arithmetic** is not isolated (dump its q, keys and weights to do so); its 11 boundary swaps at
+  near-ties are consistent with input noise.
+- **Failures**: none of the two ring jobs or the reference runs failed. The first index-set count in `cmp_ops.py`
+  compared the sorted lists element by element and reported 6,916 differing positions (an off-by-one shift after each
+  swap); replaced by set differences: 11 positions, one a row.

@@ -43,6 +43,12 @@ gives the deltas):
   --combine bf16 is transformers' order instead (each GEMM output rounded to bf16; routed experts weighted
   and summed in f32, rounded; shared expert and residual added in bf16). Both are one forward from position
   0 (prefill); the engine's decode sums a strip's K in another order by default (glm53 DESIGN decision 11).
+- --attn absorbed (a diagnosis prototype, off by default; docs/engine.md § 11): the engine's attention arithmetic
+  instead of the expanded form: q_lat = bf16(q_nope . W_UK), scores (q_lat . c + q_rope . k_rope) * 1/16 in f32
+  (not rounded), an online softmax over the row's keys in blocks of 64 (the running max m, p = exp(s - m) in f32,
+  P = bf16(p) unnormalised, l = l * exp(m_old - m) + sum p in f32, O = O * exp(m_old - m) + P . c in f32),
+  u = bf16(O / l), o_h = bf16(W_UV_h . u_h); then o_proj as above. --dump-ops DIR writes one layer's
+  intermediate tensors of the first sequence (--dump-ops-layer, default 0) as .npy files.
 - Logits are kept in f32 (bf16 hidden x bf16 head, f32 accumulation, no output rounding); transformers'
   bf16 logits are bf16() of them up to summation order.
 - MTP (§ 3): e = enorm(embed(token t+1)) (zeroed at position 0), g = hnorm(post-final-norm hidden of row t),
@@ -229,6 +235,13 @@ def linear(x, w):
 # h = bf16(f32(h) + Σ f32 partials). "bf16": transformers' order (each GEMM output rounded to bf16; routed
 # experts summed in f32 and rounded; + shared expert in bf16; + residual in bf16).
 COMBINE = "f32"
+ATTN = "expanded"  # --attn: "expanded" (transformers' form, the default) or "absorbed" (the engine's, a prototype)
+OPS = None         # --dump-ops: a dict the layer being dumped fills with its intermediate tensors
+
+
+def op(name, t):
+    if OPS is not None:
+        OPS[name] = t.clone()
 
 
 def out_linear(x, w):
@@ -335,10 +348,13 @@ def indexer_topk(x, cq, W, cos, sin, block):
 def attention(x, W, full, prev_topk, cos, sin, args):
     """MLA over one sequence (positions 0..S-1). Returns (out [S, D] bf16 or f32, topk, margin)."""
     S = x.shape[0]
-    cq = rms_norm(linear(x, W("self_attn.q_a_proj.weight")), W("self_attn.q_a_layernorm.weight"), 1e-6)
+    qa = linear(x, W("self_attn.q_a_proj.weight"))
+    cq = rms_norm(qa, W("self_attn.q_a_layernorm.weight"), 1e-6)
     ckv = linear(x, W("self_attn.kv_a_proj_with_mqa.weight"))
     c = rms_norm(ckv[:, :RKV], W("self_attn.kv_a_layernorm.weight"), 1e-6)
     k_rot = rope(ckv[:, RKV:], cos, sin)                                                 # [S, 64]
+    op("qa", qa), op("cq", cq), op("ckv", ckv), op("c", c), op("k_rot", k_rot)
+    del qa
     # q, K and V are built in row chunks (a GEMM's rows are independent: batch invariance, glm53 reference
     # § 6.5), so the full q_b and kv_b outputs (0.9 and 1.5 GB at 26.8k rows) never exist at once.
     Wqb, Wkvb = W("self_attn.q_b_proj.weight"), W("self_attn.kv_b_proj.weight")
@@ -348,12 +364,19 @@ def attention(x, W, full, prev_topk, cos, sin, args):
     for r0 in range(0, S, ROW_CHUNK):
         r1 = min(S, r0 + ROW_CHUNK)
         qc = linear(cq[r0:r1], Wqb).view(r1 - r0, NH, DQK)
+        if OPS is not None:
+            OPS["q_raw"] = qc.clone() if r0 == 0 else torch.cat([OPS["q_raw"], qc])
         q[r0:r1] = torch.cat([qc[..., :DN], rope(qc[..., DN:], cos[r0:r1, None], sin[r0:r1, None])], dim=-1)
         kv = linear(c[r0:r1], Wkvb).view(r1 - r0, NH, DN + DV)
         K[:, r0:r1, :DN] = kv[:, :, :DN].transpose(0, 1)
         V[:, r0:r1] = kv[:, :, DN:].transpose(0, 1)
         del qc, kv
     K[:, :, DN:] = k_rot.unsqueeze(0)
+    op("q", q), op("K", K), op("V", V)
+    if ATTN == "absorbed":
+        Wkv = Wkvb.view(NH, DN + DV, RKV)
+        Wuk, Wuv = Wkv[:, :DN], Wkv[:, DN:]                                              # [64, 192 | 256, 512]
+        Kc = torch.cat([c, k_rot], dim=-1)                                               # [S, 576] bf16: the cache
     del ckv, c
     margin = None
     if full:
@@ -366,6 +389,10 @@ def attention(x, W, full, prev_topk, cos, sin, args):
     if COMBINE == "f32":
         Wo = Wo.to(F32)
     B, G = args.attn_block, args.head_group
+    if OPS is not None:
+        o_all = torch.empty(S, NH * DV, dtype=BF16)
+        if ATTN == "absorbed":
+            qlat_all, u_all = torch.empty(S, NH, RKV, dtype=BF16), torch.empty(S, NH, RKV, dtype=BF16)
     for i0 in range(0, S, B):
         i1 = min(S, i0 + B)
         pos = torch.arange(i0, i1)
@@ -378,15 +405,75 @@ def attention(x, W, full, prev_topk, cos, sin, args):
         blocked = ~allowed
         qb = q[i0:i1].transpose(0, 1)                                                     # [H, B, 256]
         o = torch.empty(NH, i1 - i0, DV, dtype=BF16)
+        if ATTN == "absorbed":
+            keys = absorbed_keys(i0, i1, topk)                                           # [B, Lk], -1: none
         for h0 in range(0, NH, G):
+            if ATTN == "absorbed":
+                qlat = torch.matmul(qb[h0:h0 + G, :, :DN], Wuk[h0:h0 + G])               # [G, B, 512] bf16
+                u = absorbed_attn(qlat, qb[h0:h0 + G, :, DN:], Kc, keys)                 # [G, B, 512] bf16
+                o[h0:h0 + G] = torch.matmul(u, Wuv[h0:h0 + G].transpose(1, 2))          # [G, B, 256] bf16
+                if OPS is not None:
+                    qlat_all[i0:i1, h0:h0 + G] = qlat.transpose(0, 1)
+                    u_all[i0:i1, h0:h0 + G] = u.transpose(0, 1)
+                del qlat, u
+                continue
             s = torch.matmul(qb[h0:h0 + G], K[h0:h0 + G, :i1].transpose(1, 2)) * ATT_SCALE   # bf16
             s.masked_fill_(blocked, float("-inf"))
             p = torch.softmax(s, dim=-1, dtype=F32).to(BF16)
             del s
             o[h0:h0 + G] = torch.matmul(p, V[h0:h0 + G, :i1])
             del p
+        if OPS is not None:
+            o_all[i0:i1] = o.transpose(0, 1).reshape(i1 - i0, NH * DV)
         out[i0:i1] = out_linear(o.transpose(0, 1).reshape(i1 - i0, NH * DV), Wo)
+    if OPS is not None:
+        op("o", o_all), op("attn_out", out)
+        if ATTN == "absorbed":
+            op("qlat", qlat_all), op("u", u_all)
     return out, topk, margin
+
+
+KBLK = 64  # keys a block of the engine's online softmax (engine/attn/sparse_attn.cu kBlk)
+
+
+def absorbed_keys(i0, i1, topk):
+    """The engine's key list of each query row in [i0, i1): positions 0..p (p < 2048, padded with -1 to a multiple
+    of 64), or the row's 2048 selected positions, ascending (p >= 2048)."""
+    pos = torch.arange(i0, i1)
+    Lk = TOPK if i1 > TOPK else (i1 + KBLK - 1) // KBLK * KBLK
+    ar = torch.arange(Lk)
+    keys = torch.where(ar[None, :] <= pos[:, None], ar[None, :], torch.full((), -1)).to(torch.int64)
+    if topk is not None and i1 > TOPK:
+        r0 = max(i0, TOPK)
+        keys[r0 - i0:] = topk[r0 - TOPK:i1 - TOPK].long()
+    return keys
+
+
+def absorbed_attn(qlat, qrope, Kc, keys):
+    """The engine's sparse_attn for G heads of B rows (engine/attn/sparse_attn.cu k_attn, one split): f32 scores of
+    [q_lat ; q_rope] against the cache entries [c ; k_rope], x 1/16, then per block of 64 keys the online softmax with
+    P rounded to bf16 before P . c, and u = bf16(O / l). f32 sums in torch's order, not the MMAs'."""
+    G, B = qlat.shape[0], qlat.shape[1]
+    Q = torch.cat([qlat, qrope], dim=-1).to(F32)                                         # [G, B, 576]
+    m = torch.full((G, B, 1), -1e30, dtype=F32)
+    l = torch.zeros(G, B, 1, dtype=F32)
+    O = torch.zeros(G, B, RKV, dtype=F32)
+    for k0 in range(0, keys.shape[1], KBLK):
+        kb = keys[:, k0:k0 + KBLK]                                                       # [B, 64]
+        if (kb < 0).all():
+            continue                                                                     # the engine stops (same bits)
+        valid = kb >= 0
+        ent = Kc[kb.clamp(min=0)].to(F32)                                                # [B, 64, 576]
+        s = torch.einsum("gbd,bkd->gbk", Q, ent) * ATT_SCALE
+        s = s.masked_fill(~valid[None], float("-inf"))
+        mn = torch.maximum(m, s.amax(dim=-1, keepdim=True))
+        p = torch.exp(s - mn)
+        al = torch.exp(m - mn)
+        l = l * al + p.sum(dim=-1, keepdim=True)
+        P = p.to(BF16).to(F32)
+        O = O * al + torch.einsum("gbk,bkd->gbd", P, ent[..., :RKV])
+        m = mn
+    return (O / l).to(BF16)
 
 
 def bf16_mlp(x, W, p, chunk=2048, add_to=None):
@@ -399,6 +486,14 @@ def bf16_mlp(x, W, p, chunk=2048, add_to=None):
     out = add_to if add_to is not None else torch.empty(x.shape, dtype=F32 if COMBINE == "f32" else BF16)
     for i in range(0, x.shape[0], chunk):
         xi = x[i:i + chunk]
+        if OPS is not None and add_to is None:
+            gg, uu = linear(xi, g), linear(xi, u)
+            hh = silu_mul(gg, uu)
+            y = out_linear(hh, d)
+            for k, v in (("mlp_g", gg), ("mlp_u", uu), ("mlp_h", hh), ("mlp_out", y)):
+                OPS[k] = v.clone() if i == 0 else torch.cat([OPS[k], v])
+            out[i:i + chunk] = y
+            continue
         y = out_linear(silu_mul(linear(xi, g), linear(xi, u)), d)
         if add_to is not None:
             out[i:i + chunk] += y
@@ -640,17 +735,24 @@ class Run:
 
     # -- one decoder layer over all sequences
     def layer(self, l, h, prev, seqs, src=None):
+        global OPS
         W = LayerW(self.ck, l)
         t0 = time.time()
         x = rms_norm(h, W("input_layernorm.weight"), 1e-5)
         h1 = torch.empty_like(h)
         topk, saved = {}, {}
+        dump = self.args.dump_ops and l == self.args.dump_ops_layer
         for s in seqs:
             r0, n = s["off"], s["n"]
             cos, sin = self.rope[:n], self.rope_s[:n]
+            if dump and s is seqs[0]:
+                OPS = {"h_in": h[r0:r0 + n].clone(), "xn_in": x[r0:r0 + n].clone()}
             a, tk, mg = attention(x[r0:r0 + n], W, self.full[l] if l != MTP else True,
                                   prev.get(s["name"]), cos, sin, self.args)
             h1[r0:r0 + n] = add_residual(h[r0:r0 + n], a)
+            if OPS is not None:
+                ops, OPS = OPS, None
+                ops["h_attn"] = h1[r0:r0 + n].clone()
             del a
             topk[s["name"]] = tk
             if mg is not None:
@@ -660,6 +762,16 @@ class Run:
         del h1, x
         x = rms_norm(h, W("post_attention_layernorm.weight"), 1e-5)
         route = calib = None
+        if dump and l < 3:
+            r0, n = seqs[0]["off"], seqs[0]["n"]
+            ops["xn_mlp"] = x[r0:r0 + n].clone()
+            OPS = {}
+            m0 = bf16_mlp(x[r0:r0 + n], W, "mlp")
+            ops.update(OPS)
+            OPS = None
+            ops["h_out"] = add_residual(h[r0:r0 + n], m0)
+            self.write_ops(ops, seqs[0]["name"], l)
+            del m0
         if l < 3:
             m = bf16_mlp(x, W, "mlp")
         else:
@@ -667,6 +779,18 @@ class Run:
         h = add_residual(h, m)
         del m, x
         return h, topk, saved, route, calib, t_att, time.time() - t0
+
+    def write_ops(self, ops, name, l):
+        d = os.path.join(self.args.dump_ops, f"{name}-L{l:02d}")
+        os.makedirs(d, exist_ok=True)
+        for k, v in ops.items():
+            a = v.contiguous()
+            np.save(os.path.join(d, k + ".npy"), a.view(torch.int16).numpy() if a.dtype == BF16 else a.numpy())
+        with open(os.path.join(d, "ops.json"), "w") as f:
+            json.dump({"attn": ATTN, "combine": COMBINE, "layer": l, "sequence": name,
+                       "bf16_as_int16": [k for k, v in ops.items() if v.dtype == BF16],
+                       "shapes": {k: list(v.shape) for k, v in ops.items()}}, f, indent=1)
+        log(f"dumped {len(ops)} tensors of layer {l} to {d}")
 
     def write_layer(self, l, h, saved, route, calib, times, rows_map=None):
         d = self.ldir(l)
@@ -884,6 +1008,11 @@ def main():
     ap.add_argument("--combine", choices=("f32", "bf16"), default="f32",
                     help="f32: sublayer outputs summed in f32 and rounded once with the residual (the contract, TP=4 "
                          "engine order); bf16: transformers' per-GEMM rounding")
+    ap.add_argument("--attn", choices=("expanded", "absorbed"), default="expanded",
+                    help="expanded: transformers' attention arithmetic (the default); absorbed: the engine's (a "
+                         "diagnosis prototype, docs/engine.md § 11)")
+    ap.add_argument("--dump-ops", default=None, help="write one layer's intermediate tensors of the first sequence here")
+    ap.add_argument("--dump-ops-layer", type=int, default=0)
     ap.add_argument("--attn-block", type=int, default=256, help="query rows per attention block")
     ap.add_argument("--head-group", type=int, default=16, help="heads per attention matmul")
     ap.add_argument("--index-block", type=int, default=128, help="query rows per indexer block")
@@ -893,8 +1022,9 @@ def main():
     torch.set_num_threads(args.threads)
     torch.set_grad_enabled(False)
     torch.use_deterministic_algorithms(True)  # raises on any op without a deterministic implementation
-    global COMBINE
+    global COMBINE, ATTN
     COMBINE = args.combine
+    ATTN = args.attn
     log("args", vars(args))
     Run(args).run()
 
