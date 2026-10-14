@@ -1,0 +1,270 @@
+// Model::Impl, shared by the model's translation units: model.cu (binding, the decode step, launch and wait),
+// prefill.cu (chunks), mtp.cu (the MTP layer's fill and draft passes), synth.cu (synthetic weights).
+#pragma once
+#include <algorithm>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include "attn/attn.h"
+#include "comm/glmcoll.h"
+#include "common/check.h"
+#include "experts/experts.h"
+#include "model/model.h"
+#include "model/ops.h"
+
+namespace glm::model {
+namespace detail {
+
+template <class T>
+T* dalloc(size_t n) {  // zeroed before it returns (cudaMemset runs on the legacy stream)
+  void* p = nullptr;
+  CUDA_CHECK(cudaMalloc(&p, n * sizeof(T) + 256));
+  CUDA_CHECK(cudaMemset(p, 0, n * sizeof(T) + 256));
+  CUDA_CHECK(cudaDeviceSynchronize());
+  return static_cast<T*>(p);
+}
+template <class T>
+T* halloc(size_t n) {  // pinned, mapped host memory
+  void* p = nullptr;
+  CUDA_CHECK(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocMapped));
+  std::memset(p, 0, n * sizeof(T));
+  return static_cast<T*>(p);
+}
+
+// A projection's weight: its format (attn.h WFmt: BF16 row-major, kBF16T or the INT4 tile; altar-1 has no FP8
+// weight), its bytes and the matrix's natural shape [n][k]. Bound per layer from the file's layouts (bind.cu): the
+// format is a property of the binding, never guessed (attn refuses a kNone segment).
+struct Proj {
+  ::glm::WFmt fmt = ::glm::WFmt::kNone;
+  const void* w = nullptr;
+  int n = 0, k = 0;
+  size_t bytes() const { return w ? ::glm::weight_bytes(fmt, (size_t)n, (size_t)k) : 0; }
+  // a GEMV / GEMM segment of this weight writing y (row stride ldy elements)
+  ::glm::GemvSeg seg(void* y, int ldy) const {
+    ::glm::GemvSeg s;
+    s.fmt = fmt, s.w = w, s.n = n, s.y = y, s.ldy = ldy;
+    return s;
+  }
+};
+// Per layer (docs/engine.md, "What the runner binds"): q_b, W_UV, o_proj INT4 tiles on layers 4-76 and BF16 on
+// 0-3, 77, 78; everything else BF16 (kBF16T as the converter writes it, or row-major); W_UK^T always BF16 (an INT4
+// layer's is the contract's exact dequantisation); the routed experts INT4 on 4-76 and BF16 on 3, 77, 78
+// (gx::LayerW::fmt, checked against every descriptor); the shared expert BF16 through attn's GEMV / GEMM (gate/up
+// interleaved with the SwiGLU epilogue, then down to f32 partials), outside the routed kernels.
+struct LayerW {
+  const uint16_t *attn_norm = nullptr, *ffn_norm = nullptr, *q_norm = nullptr, *kv_norm = nullptr;
+  const uint16_t *k_norm_w = nullptr, *k_norm_b = nullptr;  // full layers
+  Proj xproj, q_b, w_uk, w_uv, o_proj, iq_b;                 // iq_b: the indexer's wq_b (full layers)
+  const uint16_t* wproj = nullptr;                            // the indexer's weights_proj rows [8][6144], row-major
+  Proj gate_up, down;                                         // dense layers 0-2: gate/up interleaved, down
+  Proj sh_gate_up, sh_down;                                   // MoE: the shared expert [1024][6144], [6144][512]
+  const uint16_t* router = nullptr;                           // MoE: BF16 [168][6144], row-major
+  const float* router_bias = nullptr;
+  gx::LayerW moe{};                                           // MoE: the routed pool, descriptors and format
+  double exp_bytes = 0;                                       // MoE: one routed expert's bytes (gate, up, down)
+};
+// A projection of M rows, the segments' y at row 0 (prefill.cu): attn's prefill gemm() in one launch when use_gemm
+// and M > 16 (each output the 16-row GEMV's bits at the same split-K, attn's test P; INT4 segments dequantised into
+// `scratch`, bf16 of at least the largest INT4 segment's n x k elements), else 16-row GEMV launches. Every segment
+// carries its format.
+void pf_proj(bool use_gemm, const uint16_t* x, int ldx, int M, int K, const ::glm::GemvSeg* segs, int nseg,
+             ::glm::GemvOut out, int splitk, cudaStream_t st, bool pdl, uint16_t* scratch = nullptr,
+             size_t scratch_elems = 0);
+// The INT4 scratch prefill's GEMMs need: the largest INT4 projection, o_proj [6144][4096] (50.3 MB; attention.md § 8)
+inline constexpr size_t kInt4ScratchElems = (size_t)::glm::kDim * ::glm::kOProjK;
+
+struct MtpW {
+  const uint16_t *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
+  Proj eh;  // [1536][12288] rows of this rank, BF16
+};
+
+// The next weights the step reads, for the paced L2 prefetch (l2pf.cu): a layer's tensors in read order.
+enum { kPfXproj, kPfQb, kPfUk, kPfUv, kPfOproj, kPfFfn0, kPfFfn1, kPfTargets };
+struct PfTarget {
+  const void* p[4];
+  size_t n[4];
+};
+struct PfState {  // device: how far a layer's windows got
+  int layer;
+  uint32_t chunk;
+};
+// Window w of layer `layer` (1: the FFN all-reduce before it, 2: its x-projection's all-gather, 3: its attention,
+// 4: its o_proj all-reduce): prefetch from the window's first unread target on, budget_us at the pace; ends early
+// once the window's collective has arrived (arrived, finished: the channel's counters; null for the attention).
+void l2pf_window(const PfTarget (&t)[kPfTargets], int layer, int window, float budget_us,
+                 const unsigned long long* arrived, const unsigned long long* finished, PfState* state, cudaStream_t s);
+
+// Synthetic weights (bind.cu): allocations kept here so the model can free them.
+struct Synth;
+struct SynthFree {
+  void operator()(Synth* s) const;  // bind.cu
+};
+
+}  // namespace detail
+
+struct Model::Impl {
+  using bf16 = __nv_bfloat16;
+  int rank;
+  Options opt;
+  cudaStream_t st = nullptr;
+  comm::DevChannel ch{};
+  bool bound = false;
+  size_t wbytes = 0;
+  bool l2pf_on = true;
+  std::unique_ptr<detail::Synth, detail::SynthFree> synth;
+
+  // weights
+  detail::LayerW lw[kCacheLayers];
+  detail::MtpW mtp;
+  const uint16_t *embed = nullptr, *norm_w = nullptr;  // the embedding row-major [38720][6144] (a row lookup)
+  detail::Proj head;                                          // [38720][6144] BF16
+  const uint32_t* rope = nullptr;
+  int rope_positions = 0;
+
+  // caches: per layer [slots][stride][576] bf16; per full layer the index keys (stride: Options::page, or max_ctx)
+  uint16_t* kv[kCacheLayers] = {};
+  ::glm::IdxCache ik[kIdxCaches] = {};
+  size_t stride = 0;
+  size_t pool_positions() const { return (size_t)opt.slots * stride; }
+  void alloc_caches();  // kv, ik, the MTP pending rows for opt.slots slots (freed first if there were any)
+  uint32_t* ctl_h = nullptr;  // rank 0's control word (mapped host memory, read by the sampler)
+  ::glm::KvCache kv_of(int l) const { return ::glm::KvCache{kv[l], stride}; }
+  ::glm::IdxCache ik_of(int l) const { return full_layer(l) ? ik[l == kMtpLayer ? kIdxCaches - 1 : idx_slot(l)] : ::glm::IdxCache{}; }
+
+  // decode step buffers (kMaxRows rows)
+  uint16_t *h, *xn, *xg, *qr, *q, *iq, *qlat, *u, *o, *hm, *ebuf, *hfin;
+  float *iw, *part, *yr, *gl, *rw, *logits;  // yr: [2][kMaxRows][6144], ys = yr + R rows (contiguous)
+  int *ridx, *topk;
+  uint32_t* idx_work;
+  float* idx_scores;
+  size_t idx_ld = 0;
+  float *att_o, *att_ml;
+  void* moe_ws = nullptr;
+  // the MTP's draft passes (decode)
+  uint16_t *m_x12, *m_xg, *m_h, *m_xn;  // [R][12288], eh_proj gathered [R][4][1536], residual, normed
+  int32_t *m_tok, *m_pos;               // pass 1's tokens and positions, a row each
+  int* m_topk;                          // pass 1's top-2048, a row each
+  comm::glm::Cand *m_cand, *m_best;     // local top-1 and the exchanged draft, per row
+  comm::glm::Cand* m_all;               // Model::mtp_forced: pass 1's draft of every row
+  int32_t* m_draft;                     // [kMaxDrafts][kMaxSess]
+  int32_t *m_sel, *m_acc;               // per session: its chain row, its accepted drafts (ops::mtp_tokens)
+  // the chain, a row a session (ops::mtp_select): hidden (the MTP's output), normed rows, top-2048 (pass 1's,
+  // shared), tokens, positions, slots
+  uint16_t *c_h, *c_xn;
+  int* c_topk;
+  int32_t *c_tok, *c_pos, *c_slot;
+
+  // step inputs and results
+  ops::StepIn *in_h, *in_d;
+  uint32_t* in_ctr;
+  int32_t* fb;  // the last step's sampled tokens
+  SampleOut* out_h;
+  uint32_t* samp_ctr;
+  uint64_t n_steps = 0, n_done = 0;
+  double host_us = 0;  // the last launch's host time, without waiting for a free input slot
+  cudaEvent_t ev_beg[ops::kOutSlots], ev_end[ops::kOutSlots], ev_pf[2];
+  // by (tune, passes, sessions, rows): a lever set's graphs are kept across set_tune; the sessions count only with
+  // draft passes (the chain's rows)
+  std::map<uint64_t, cudaGraphExec_t> graphs;
+  std::map<uint64_t, bool> warm;
+  int step_nsess = 1, step_passes = 0;  // the step being launched (its graph's key)
+  uint64_t gkey(int R) const {
+    return (uint64_t)opt.tune << 32 | (uint64_t)step_passes << 16 | (uint64_t)(step_passes ? step_nsess : 0) << 8 |
+           (uint64_t)R;
+  }
+
+  // side streams: l2pf (sc); events for fork/join
+  cudaStream_t sc = nullptr;
+  cudaEvent_t ev_fork, ev_join;
+  detail::PfState* pfs = nullptr;
+  bool forked = false;  // the step being built has side-stream work to join
+  void fork(cudaStream_t s) {
+    forked = true;
+    CUDA_CHECK(cudaEventRecord(ev_fork, st));
+    CUDA_CHECK(cudaStreamWaitEvent(s, ev_fork, 0));
+  }
+  void join(cudaStream_t s) {
+    CUDA_CHECK(cudaEventRecord(ev_join, s));
+    CUDA_CHECK(cudaStreamWaitEvent(st, ev_join, 0));
+  }
+
+  // per-kernel-class profiling (Model::profile): events between classes on the main stream
+  bool prof = false;
+  bool in_mtp = false;  // marks inside the draft passes count as kKMtp
+  std::vector<cudaEvent_t> pev;
+  std::vector<std::pair<int, int>> pmarks;  // (class, layer) of the work since the previous mark
+  void mark(int cls, int layer);
+
+  // the launch flags of the step being built: PDL unless profiling
+  bool pdl() const { return opt.pdl && !prof; }
+  bool tune(uint32_t bit) const { return (opt.tune & bit) != 0; }
+
+  // MTP pending rows: per slot, the last prefilled row's final hidden waits for the token after it
+  uint16_t* m_pend = nullptr;  // [slots][6144]
+  std::vector<int> pend_pos;   // per slot: that row's position, -1: none
+
+  // prefill
+  struct Pre;
+  struct PreFree {
+    void operator()(Pre* p) const;  // prefill.cu
+  };
+  std::unique_ptr<Pre, PreFree> pre;
+
+  Impl(int r, const Options& opts);
+  ~Impl();
+  void bind_common(comm::Ring& ring);
+  void bind_file(glw::WeightFile& wf, const SynthOptions* fill);
+  // synthetic routed-expert pools of format fmt (INT4 or BF16) in the kernels' layouts: SynthOptions::expert_pools
+  // of them (BF16: bf16_pools), a layer using pool i % n of its format's; returns an expert's bytes
+  struct SynthPools {
+    std::vector<const uint8_t*> pool;
+    std::vector<const gx::MatDesc*> desc;
+    double exp_bytes = 0;
+  };
+  SynthPools synth_pools(const SynthOptions& so, uint32_t fmt);
+  bool synth_experts = false;
+  int real_expert_layers = 0;  // MoE layers bound to the file's routed experts (the rest synthetic: fill_experts)
+  void bind_synth(const SynthOptions& so);
+
+  // ---- the decode step (model.cu) ----
+  // one layer for R rows of the step: on entry xn = input_layernorm(h) of the rows; on exit h is the layer's
+  // output and xn the next layer's normed input (or the final norm's / the MTP head norm's output)
+  void layer(int l, int R, const int32_t* pos, const int32_t* slot, uint16_t* h_, uint16_t* xn_, int* topk_,
+             const uint16_t* next_norm, bool index_on, Sink* sink, uint32_t flags);
+  void forward(int R, uint32_t flags, Sink* sink);
+  cudaGraphExec_t graph(int R);
+  void l2pf(int window, int l, int R);
+  void embed_rows(const int32_t* tok, const int32_t* pos, int R, bool zero_pos0, uint16_t* out);
+  void dump_rows(Sink* sink, int L, const char* name, const int32_t* pos_dev, int R, const void* dev, size_t row_bytes);
+  void gather_logits(Sink* sink, const float* lg, const int32_t* pos_dev, int R, bool mtp);
+  uint64_t launch(const Batch& b, Sink* sink);
+  const SampleOut& wait(uint64_t n);
+
+  // ---- the MTP layer (mtp.cu) ----
+  // the draft passes of a step's rows after its sample (decode): pass 1 at each row's position with the token
+  // after it (every row's MTP cache entry), the head at each session's chain row, the next passes chained on it; then
+  // the step published. drafts(R, flags, sink): prefill's one-row step (one session, Options::drafts passes).
+  void drafts(int R, uint32_t flags, Sink* sink);
+  void drafts(int R, int nsess, int passes, uint32_t flags, Sink* sink, bool publish);
+  // the head on n normed rows, its greedy top-1 exchanged into m_best
+  void mtp_top1(int n, const uint16_t* xn_rows);
+  // the MTP layer's input for n rows: x = eh_proj([enorm(e) | hnorm(hid)]) all-gathered into out [n][6144] (x12
+  // [n][12288] scratch); e, hid [n][6144] bf16. Decode (n <= 16: a GEMV) or prefill (pf_proj).
+  void mtp_project(int n, const uint16_t* e, const uint16_t* hid, uint16_t* x12, uint16_t* out);
+  // prefill: the MTP cache entries of rows t in [t0, t1) of a chunk at a (embedding rows of tokens t + 1 in emb at
+  // row t + 1 - a; hidden rows of the main model's final output at row t - a, or the slot's pending row)
+  void mtp_fill(int slot, int a, int M);
+
+  // ---- prefill (prefill.cu) ----
+  void prefill_alloc();
+  uint64_t prefill(int slot, int a, int M, const int32_t* tokens, const Sampling* sp, uint32_t flags, Sink* sink);
+  void prefill_chunk(int slot, int a, int M, const int32_t* tokens, bool last, uint32_t flags, Sink* sink);
+};
+
+}  // namespace glm::model

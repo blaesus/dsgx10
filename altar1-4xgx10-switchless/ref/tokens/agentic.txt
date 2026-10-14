@@ -1,0 +1,2545 @@
+[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"name": "list_directory", "description": "List the entries of a directory with their sizes.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute directory path"}}, "required": ["path"]}}
+{"name": "read_file", "description": "Read a text file and return its full contents.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute file path"}}, "required": ["path"]}}
+{"name": "run_command", "description": "Run a shell command in the workspace and return its combined output.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command line"}, "timeout": {"type": "integer", "description": "Seconds before the command is killed"}}, "required": ["command"]}}
+{"name": "search_code", "description": "Search files under a path for a regular expression; returns matching lines.", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "Regular expression"}, "path": {"type": "string", "description": "File or directory to search"}}, "required": ["pattern", "path"]}}
+</tools>
+
+For each function call, output the function name and arguments within the following XML format:
+<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a careful software engineering agent working in a Linux workspace. Use the tools to inspect code and run commands before answering. Quote file paths and line numbers when you refer to code. Keep answers precise and grounded in what you read.<|user|>A service of ours round-trips configuration through Python's json module and we see two oddities: very large floats come back as `Infinity`, and some keys change order between versions. The interpreter's standard library is under /usr/lib/python3.12. Please read the json package and explain exactly how floats are parsed and serialised, which code path (C accelerator or pure Python) is used, and where key ordering is decided.<|assistant|><think>Start by listing the package to see which modules exist.</think><tool_call>list_directory<arg_key>path</arg_key><arg_value>/usr/lib/python3.12/json</arg_value></tool_call><|observation|><tool_response>file   14020  __init__.py
+dir        -  __pycache__
+file   12473  decoder.py
+file   16070  encoder.py
+file    2425  scanner.py
+file    3339  tool.py</tool_response><|assistant|><think>The package entry point wires dumps/loads to the encoder and decoder; read it first.</think><tool_call>read_file<arg_key>path</arg_key><arg_value>/usr/lib/python3.12/json/__init__.py</arg_value></tool_call><|observation|><tool_response>r"""JSON (JavaScript Object Notation) <https://json.org> is a subset of
+JavaScript syntax (ECMA-262 3rd edition) used as a lightweight data
+interchange format.
+
+:mod:`json` exposes an API familiar to users of the standard library
+:mod:`marshal` and :mod:`pickle` modules.  It is derived from a
+version of the externally maintained simplejson library.
+
+Encoding basic Python object hierarchies::
+
+    >>> import json
+    >>> json.dumps(['foo', {'bar': ('baz', None, 1.0, 2)}])
+    '["foo", {"bar": ["baz", null, 1.0, 2]}]'
+    >>> print(json.dumps("\"foo\bar"))
+    "\"foo\bar"
+    >>> print(json.dumps('\u1234'))
+    "\u1234"
+    >>> print(json.dumps('\\'))
+    "\\"
+    >>> print(json.dumps({"c": 0, "b": 0, "a": 0}, sort_keys=True))
+    {"a": 0, "b": 0, "c": 0}
+    >>> from io import StringIO
+    >>> io = StringIO()
+    >>> json.dump(['streaming API'], io)
+    >>> io.getvalue()
+    '["streaming API"]'
+
+Compact encoding::
+
+    >>> import json
+    >>> mydict = {'4': 5, '6': 7}
+    >>> json.dumps([1,2,3,mydict], separators=(',', ':'))
+    '[1,2,3,{"4":5,"6":7}]'
+
+Pretty printing::
+
+    >>> import json
+    >>> print(json.dumps({'4': 5, '6': 7}, sort_keys=True, indent=4))
+    {
+        "4": 5,
+        "6": 7
+    }
+
+Decoding JSON::
+
+    >>> import json
+    >>> obj = ['foo', {'bar': ['baz', None, 1.0, 2]}]
+    >>> json.loads('["foo", {"bar":["baz", null, 1.0, 2]}]') == obj
+    True
+    >>> json.loads('"\\"foo\\bar"') == '"foo\x08ar'
+    True
+    >>> from io import StringIO
+    >>> io = StringIO('["streaming API"]')
+    >>> json.load(io)[0] == 'streaming API'
+    True
+
+Specializing JSON object decoding::
+
+    >>> import json
+    >>> def as_complex(dct):
+    ...     if '__complex__' in dct:
+    ...         return complex(dct['real'], dct['imag'])
+    ...     return dct
+    ...
+    >>> json.loads('{"__complex__": true, "real": 1, "imag": 2}',
+    ...     object_hook=as_complex)
+    (1+2j)
+    >>> from decimal import Decimal
+    >>> json.loads('1.1', parse_float=Decimal) == Decimal('1.1')
+    True
+
+Specializing JSON object encoding::
+
+    >>> import json
+    >>> def encode_complex(obj):
+    ...     if isinstance(obj, complex):
+    ...         return [obj.real, obj.imag]
+    ...     raise TypeError(f'Object of type {obj.__class__.__name__} '
+    ...                     f'is not JSON serializable')
+    ...
+    >>> json.dumps(2 + 1j, default=encode_complex)
+    '[2.0, 1.0]'
+    >>> json.JSONEncoder(default=encode_complex).encode(2 + 1j)
+    '[2.0, 1.0]'
+    >>> ''.join(json.JSONEncoder(default=encode_complex).iterencode(2 + 1j))
+    '[2.0, 1.0]'
+
+
+Using json.tool from the shell to validate and pretty-print::
+
+    $ echo '{"json":"obj"}' | python -m json.tool
+    {
+        "json": "obj"
+    }
+    $ echo '{ 1.2:3.4}' | python -m json.tool
+    Expecting property name enclosed in double quotes: line 1 column 3 (char 2)
+"""
+__version__ = '2.0.9'
+__all__ = [
+    'dump', 'dumps', 'load', 'loads',
+    'JSONDecoder', 'JSONDecodeError', 'JSONEncoder',
+]
+
+__author__ = 'Bob Ippolito <bob@redivi.com>'
+
+from .decoder import JSONDecoder, JSONDecodeError
+from .encoder import JSONEncoder
+import codecs
+
+_default_encoder = JSONEncoder(
+    skipkeys=False,
+    ensure_ascii=True,
+    check_circular=True,
+    allow_nan=True,
+    indent=None,
+    separators=None,
+    default=None,
+)
+
+def dump(obj, fp, *, skipkeys=False, ensure_ascii=True, check_circular=True,
+        allow_nan=True, cls=None, indent=None, separators=None,
+        default=None, sort_keys=False, **kw):
+    """Serialize ``obj`` as a JSON formatted stream to ``fp`` (a
+    ``.write()``-supporting file-like object).
+
+    If ``skipkeys`` is true then ``dict`` keys that are not basic types
+    (``str``, ``int``, ``float``, ``bool``, ``None``) will be skipped
+    instead of raising a ``TypeError``.
+
+    If ``ensure_ascii`` is false, then the strings written to ``fp`` can
+    contain non-ASCII characters if they appear in strings contained in
+    ``obj``. Otherwise, all such characters are escaped in JSON strings.
+
+    If ``check_circular`` is false, then the circular reference check
+    for container types will be skipped and a circular reference will
+    result in an ``RecursionError`` (or worse).
+
+    If ``allow_nan`` is false, then it will be a ``ValueError`` to
+    serialize out of range ``float`` values (``nan``, ``inf``, ``-inf``)
+    in strict compliance of the JSON specification, instead of using the
+    JavaScript equivalents (``NaN``, ``Infinity``, ``-Infinity``).
+
+    If ``indent`` is a non-negative integer, then JSON array elements and
+    object members will be pretty-printed with that indent level. An indent
+    level of 0 will only insert newlines. ``None`` is the most compact
+    representation.
+
+    If specified, ``separators`` should be an ``(item_separator, key_separator)``
+    tuple.  The default is ``(', ', ': ')`` if *indent* is ``None`` and
+    ``(',', ': ')`` otherwise.  To get the most compact JSON representation,
+    you should specify ``(',', ':')`` to eliminate whitespace.
+
+    ``default(obj)`` is a function that should return a serializable version
+    of obj or raise TypeError. The default simply raises TypeError.
+
+    If *sort_keys* is true (default: ``False``), then the output of
+    dictionaries will be sorted by key.
+
+    To use a custom ``JSONEncoder`` subclass (e.g. one that overrides the
+    ``.default()`` method to serialize additional types), specify it with
+    the ``cls`` kwarg; otherwise ``JSONEncoder`` is used.
+
+    """
+    # cached encoder
+    if (not skipkeys and ensure_ascii and
+        check_circular and allow_nan and
+        cls is None and indent is None and separators is None and
+        default is None and not sort_keys and not kw):
+        iterable = _default_encoder.iterencode(obj)
+    else:
+        if cls is None:
+            cls = JSONEncoder
+        iterable = cls(skipkeys=skipkeys, ensure_ascii=ensure_ascii,
+            check_circular=check_circular, allow_nan=allow_nan, indent=indent,
+            separators=separators,
+            default=default, sort_keys=sort_keys, **kw).iterencode(obj)
+    # could accelerate with writelines in some versions of Python, at
+    # a debuggability cost
+    for chunk in iterable:
+        fp.write(chunk)
+
+
+def dumps(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True,
+        allow_nan=True, cls=None, indent=None, separators=None,
+        default=None, sort_keys=False, **kw):
+    """Serialize ``obj`` to a JSON formatted ``str``.
+
+    If ``skipkeys`` is true then ``dict`` keys that are not basic types
+    (``str``, ``int``, ``float``, ``bool``, ``None``) will be skipped
+    instead of raising a ``TypeError``.
+
+    If ``ensure_ascii`` is false, then the return value can contain non-ASCII
+    characters if they appear in strings contained in ``obj``. Otherwise, all
+    such characters are escaped in JSON strings.
+
+    If ``check_circular`` is false, then the circular reference check
+    for container types will be skipped and a circular reference will
+    result in an ``RecursionError`` (or worse).
+
+    If ``allow_nan`` is false, then it will be a ``ValueError`` to
+    serialize out of range ``float`` values (``nan``, ``inf``, ``-inf``) in
+    strict compliance of the JSON specification, instead of using the
+    JavaScript equivalents (``NaN``, ``Infinity``, ``-Infinity``).
+
+    If ``indent`` is a non-negative integer, then JSON array elements and
+    object members will be pretty-printed with that indent level. An indent
+    level of 0 will only insert newlines. ``None`` is the most compact
+    representation.
+
+    If specified, ``separators`` should be an ``(item_separator, key_separator)``
+    tuple.  The default is ``(', ', ': ')`` if *indent* is ``None`` and
+    ``(',', ': ')`` otherwise.  To get the most compact JSON representation,
+    you should specify ``(',', ':')`` to eliminate whitespace.
+
+    ``default(obj)`` is a function that should return a serializable version
+    of obj or raise TypeError. The default simply raises TypeError.
+
+    If *sort_keys* is true (default: ``False``), then the output of
+    dictionaries will be sorted by key.
+
+    To use a custom ``JSONEncoder`` subclass (e.g. one that overrides the
+    ``.default()`` method to serialize additional types), specify it with
+    the ``cls`` kwarg; otherwise ``JSONEncoder`` is used.
+
+    """
+    # cached encoder
+    if (not skipkeys and ensure_ascii and
+        check_circular and allow_nan and
+        cls is None and indent is None and separators is None and
+        default is None and not sort_keys and not kw):
+        return _default_encoder.encode(obj)
+    if cls is None:
+        cls = JSONEncoder
+    return cls(
+        skipkeys=skipkeys, ensure_ascii=ensure_ascii,
+        check_circular=check_circular, allow_nan=allow_nan, indent=indent,
+        separators=separators, default=default, sort_keys=sort_keys,
+        **kw).encode(obj)
+
+
+_default_decoder = JSONDecoder(object_hook=None, object_pairs_hook=None)
+
+
+def detect_encoding(b):
+    bstartswith = b.startswith
+    if bstartswith((codecs.BOM_UTF32_BE, codecs.BOM_UTF32_LE)):
+        return 'utf-32'
+    if bstartswith((codecs.BOM_UTF16_BE, codecs.BOM_UTF16_LE)):
+        return 'utf-16'
+    if bstartswith(codecs.BOM_UTF8):
+        return 'utf-8-sig'
+
+    if len(b) >= 4:
+        if not b[0]:
+            # 00 00 -- -- - utf-32-be
+            # 00 XX -- -- - utf-16-be
+            return 'utf-16-be' if b[1] else 'utf-32-be'
+        if not b[1]:
+            # XX 00 00 00 - utf-32-le
+            # XX 00 00 XX - utf-16-le
+            # XX 00 XX -- - utf-16-le
+            return 'utf-16-le' if b[2] or b[3] else 'utf-32-le'
+    elif len(b) == 2:
+        if not b[0]:
+            # 00 XX - utf-16-be
+            return 'utf-16-be'
+        if not b[1]:
+            # XX 00 - utf-16-le
+            return 'utf-16-le'
+    # default
+    return 'utf-8'
+
+
+def load(fp, *, cls=None, object_hook=None, parse_float=None,
+        parse_int=None, parse_constant=None, object_pairs_hook=None, **kw):
+    """Deserialize ``fp`` (a ``.read()``-supporting file-like object containing
+    a JSON document) to a Python object.
+
+    ``object_hook`` is an optional function that will be called with the
+    result of any object literal decode (a ``dict``). The return value of
+    ``object_hook`` will be used instead of the ``dict``. This feature
+    can be used to implement custom decoders (e.g. JSON-RPC class hinting).
+
+    ``object_pairs_hook`` is an optional function that will be called with the
+    result of any object literal decoded with an ordered list of pairs.  The
+    return value of ``object_pairs_hook`` will be used instead of the ``dict``.
+    This feature can be used to implement custom decoders.  If ``object_hook``
+    is also defined, the ``object_pairs_hook`` takes priority.
+
+    To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
+    kwarg; otherwise ``JSONDecoder`` is used.
+    """
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+
+
+def loads(s, *, cls=None, object_hook=None, parse_float=None,
+        parse_int=None, parse_constant=None, object_pairs_hook=None, **kw):
+    """Deserialize ``s`` (a ``str``, ``bytes`` or ``bytearray`` instance
+    containing a JSON document) to a Python object.
+
+    ``object_hook`` is an optional function that will be called with the
+    result of any object literal decode (a ``dict``). The return value of
+    ``object_hook`` will be used instead of the ``dict``. This feature
+    can be used to implement custom decoders (e.g. JSON-RPC class hinting).
+
+    ``object_pairs_hook`` is an optional function that will be called with the
+    result of any object literal decoded with an ordered list of pairs.  The
+    return value of ``object_pairs_hook`` will be used instead of the ``dict``.
+    This feature can be used to implement custom decoders.  If ``object_hook``
+    is also defined, the ``object_pairs_hook`` takes priority.
+
+    ``parse_float``, if specified, will be called with the string
+    of every JSON float to be decoded. By default this is equivalent to
+    float(num_str). This can be used to use another datatype or parser
+    for JSON floats (e.g. decimal.Decimal).
+
+    ``parse_int``, if specified, will be called with the string
+    of every JSON int to be decoded. By default this is equivalent to
+    int(num_str). This can be used to use another datatype or parser
+    for JSON integers (e.g. float).
+
+    ``parse_constant``, if specified, will be called with one of the
+    following strings: -Infinity, Infinity, NaN.
+    This can be used to raise an exception if invalid JSON numbers
+    are encountered.
+
+    To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
+    kwarg; otherwise ``JSONDecoder`` is used.
+    """
+    if isinstance(s, str):
+        if s.startswith('\ufeff'):
+            raise JSONDecodeError("Unexpected UTF-8 BOM (decode using utf-8-sig)",
+                                  s, 0)
+    else:
+        if not isinstance(s, (bytes, bytearray)):
+            raise TypeError(f'the JSON object must be str, bytes or bytearray, '
+                            f'not {s.__class__.__name__}')
+        s = s.decode(detect_encoding(s), 'surrogatepass')
+
+    if (cls is None and object_hook is None and
+            parse_int is None and parse_float is None and
+            parse_constant is None and object_pairs_hook is None and not kw):
+        return _default_decoder.decode(s)
+    if cls is None:
+        cls = JSONDecoder
+    if object_hook is not None:
+        kw['object_hook'] = object_hook
+    if object_pairs_hook is not None:
+        kw['object_pairs_hook'] = object_pairs_hook
+    if parse_float is not None:
+        kw['parse_float'] = parse_float
+    if parse_int is not None:
+        kw['parse_int'] = parse_int
+    if parse_constant is not None:
+        kw['parse_constant'] = parse_constant
+    return cls(**kw).decode(s)
+</tool_response><|assistant|><think>Now the decoder and the scanner, which together implement parsing.</think><tool_call>read_file<arg_key>path</arg_key><arg_value>/usr/lib/python3.12/json/decoder.py</arg_value></tool_call><tool_call>read_file<arg_key>path</arg_key><arg_value>/usr/lib/python3.12/json/scanner.py</arg_value></tool_call><|observation|><tool_response>"""Implementation of JSONDecoder
+"""
+import re
+
+from json import scanner
+try:
+    from _json import scanstring as c_scanstring
+except ImportError:
+    c_scanstring = None
+
+__all__ = ['JSONDecoder', 'JSONDecodeError']
+
+FLAGS = re.VERBOSE | re.MULTILINE | re.DOTALL
+
+NaN = float('nan')
+PosInf = float('inf')
+NegInf = float('-inf')
+
+
+class JSONDecodeError(ValueError):
+    """Subclass of ValueError with the following additional properties:
+
+    msg: The unformatted error message
+    doc: The JSON document being parsed
+    pos: The start index of doc where parsing failed
+    lineno: The line corresponding to pos
+    colno: The column corresponding to pos
+
+    """
+    # Note that this exception is used from _json
+    def __init__(self, msg, doc, pos):
+        lineno = doc.count('\n', 0, pos) + 1
+        colno = pos - doc.rfind('\n', 0, pos)
+        errmsg = '%s: line %d column %d (char %d)' % (msg, lineno, colno, pos)
+        ValueError.__init__(self, errmsg)
+        self.msg = msg
+        self.doc = doc
+        self.pos = pos
+        self.lineno = lineno
+        self.colno = colno
+
+    def __reduce__(self):
+        return self.__class__, (self.msg, self.doc, self.pos)
+
+
+_CONSTANTS = {
+    '-Infinity': NegInf,
+    'Infinity': PosInf,
+    'NaN': NaN,
+}
+
+
+STRINGCHUNK = re.compile(r'(.*?)(["\\\x00-\x1f])', FLAGS)
+BACKSLASH = {
+    '"': '"', '\\': '\\', '/': '/',
+    'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t',
+}
+
+def _decode_uXXXX(s, pos):
+    esc = s[pos + 1:pos + 5]
+    if len(esc) == 4 and esc[1] not in 'xX':
+        try:
+            return int(esc, 16)
+        except ValueError:
+            pass
+    msg = "Invalid \\uXXXX escape"
+    raise JSONDecodeError(msg, s, pos)
+
+def py_scanstring(s, end, strict=True,
+        _b=BACKSLASH, _m=STRINGCHUNK.match):
+    """Scan the string s for a JSON string. End is the index of the
+    character in s after the quote that started the JSON string.
+    Unescapes all valid JSON string escape sequences and raises ValueError
+    on attempt to decode an invalid string. If strict is False then literal
+    control characters are allowed in the string.
+
+    Returns a tuple of the decoded string and the index of the character in s
+    after the end quote."""
+    chunks = []
+    _append = chunks.append
+    begin = end - 1
+    while 1:
+        chunk = _m(s, end)
+        if chunk is None:
+            raise JSONDecodeError("Unterminated string starting at", s, begin)
+        end = chunk.end()
+        content, terminator = chunk.groups()
+        # Content is contains zero or more unescaped string characters
+        if content:
+            _append(content)
+        # Terminator is the end of string, a literal control character,
+        # or a backslash denoting that an escape sequence follows
+        if terminator == '"':
+            break
+        elif terminator != '\\':
+            if strict:
+                #msg = "Invalid control character %r at" % (terminator,)
+                msg = "Invalid control character {0!r} at".format(terminator)
+                raise JSONDecodeError(msg, s, end)
+            else:
+                _append(terminator)
+                continue
+        try:
+            esc = s[end]
+        except IndexError:
+            raise JSONDecodeError("Unterminated string starting at",
+                                  s, begin) from None
+        # If not a unicode escape sequence, must be in the lookup table
+        if esc != 'u':
+            try:
+                char = _b[esc]
+            except KeyError:
+                msg = "Invalid \\escape: {0!r}".format(esc)
+                raise JSONDecodeError(msg, s, end)
+            end += 1
+        else:
+            uni = _decode_uXXXX(s, end)
+            end += 5
+            if 0xd800 <= uni <= 0xdbff and s[end:end + 2] == '\\u':
+                uni2 = _decode_uXXXX(s, end + 1)
+                if 0xdc00 <= uni2 <= 0xdfff:
+                    uni = 0x10000 + (((uni - 0xd800) << 10) | (uni2 - 0xdc00))
+                    end += 6
+            char = chr(uni)
+        _append(char)
+    return ''.join(chunks), end
+
+
+# Use speedup if available
+scanstring = c_scanstring or py_scanstring
+
+WHITESPACE = re.compile(r'[ \t\n\r]*', FLAGS)
+WHITESPACE_STR = ' \t\n\r'
+
+
+def JSONObject(s_and_end, strict, scan_once, object_hook, object_pairs_hook,
+               memo=None, _w=WHITESPACE.match, _ws=WHITESPACE_STR):
+    s, end = s_and_end
+    pairs = []
+    pairs_append = pairs.append
+    # Backwards compatibility
+    if memo is None:
+        memo = {}
+    memo_get = memo.setdefault
+    # Use a slice to prevent IndexError from being raised, the following
+    # check will raise a more specific ValueError if the string is empty
+    nextchar = s[end:end + 1]
+    # Normally we expect nextchar == '"'
+    if nextchar != '"':
+        if nextchar in _ws:
+            end = _w(s, end).end()
+            nextchar = s[end:end + 1]
+        # Trivial empty object
+        if nextchar == '}':
+            if object_pairs_hook is not None:
+                result = object_pairs_hook(pairs)
+                return result, end + 1
+            pairs = {}
+            if object_hook is not None:
+                pairs = object_hook(pairs)
+            return pairs, end + 1
+        elif nextchar != '"':
+            raise JSONDecodeError(
+                "Expecting property name enclosed in double quotes", s, end)
+    end += 1
+    while True:
+        key, end = scanstring(s, end, strict)
+        key = memo_get(key, key)
+        # To skip some function call overhead we optimize the fast paths where
+        # the JSON key separator is ": " or just ":".
+        if s[end:end + 1] != ':':
+            end = _w(s, end).end()
+            if s[end:end + 1] != ':':
+                raise JSONDecodeError("Expecting ':' delimiter", s, end)
+        end += 1
+
+        try:
+            if s[end] in _ws:
+                end += 1
+                if s[end] in _ws:
+                    end = _w(s, end + 1).end()
+        except IndexError:
+            pass
+
+        try:
+            value, end = scan_once(s, end)
+        except StopIteration as err:
+            raise JSONDecodeError("Expecting value", s, err.value) from None
+        pairs_append((key, value))
+        try:
+            nextchar = s[end]
+            if nextchar in _ws:
+                end = _w(s, end + 1).end()
+                nextchar = s[end]
+        except IndexError:
+            nextchar = ''
+        end += 1
+
+        if nextchar == '}':
+            break
+        elif nextchar != ',':
+            raise JSONDecodeError("Expecting ',' delimiter", s, end - 1)
+        end = _w(s, end).end()
+        nextchar = s[end:end + 1]
+        end += 1
+        if nextchar != '"':
+            raise JSONDecodeError(
+                "Expecting property name enclosed in double quotes", s, end - 1)
+    if object_pairs_hook is not None:
+        result = object_pairs_hook(pairs)
+        return result, end
+    pairs = dict(pairs)
+    if object_hook is not None:
+        pairs = object_hook(pairs)
+    return pairs, end
+
+def JSONArray(s_and_end, scan_once, _w=WHITESPACE.match, _ws=WHITESPACE_STR):
+    s, end = s_and_end
+    values = []
+    nextchar = s[end:end + 1]
+    if nextchar in _ws:
+        end = _w(s, end + 1).end()
+        nextchar = s[end:end + 1]
+    # Look-ahead for trivial empty array
+    if nextchar == ']':
+        return values, end + 1
+    _append = values.append
+    while True:
+        try:
+            value, end = scan_once(s, end)
+        except StopIteration as err:
+            raise JSONDecodeError("Expecting value", s, err.value) from None
+        _append(value)
+        nextchar = s[end:end + 1]
+        if nextchar in _ws:
+            end = _w(s, end + 1).end()
+            nextchar = s[end:end + 1]
+        end += 1
+        if nextchar == ']':
+            break
+        elif nextchar != ',':
+            raise JSONDecodeError("Expecting ',' delimiter", s, end - 1)
+        try:
+            if s[end] in _ws:
+                end += 1
+                if s[end] in _ws:
+                    end = _w(s, end + 1).end()
+        except IndexError:
+            pass
+
+    return values, end
+
+
+class JSONDecoder(object):
+    """Simple JSON <https://json.org> decoder
+
+    Performs the following translations in decoding by default:
+
+    +---------------+-------------------+
+    | JSON          | Python            |
+    +===============+===================+
+    | object        | dict              |
+    +---------------+-------------------+
+    | array         | list              |
+    +---------------+-------------------+
+    | string        | str               |
+    +---------------+-------------------+
+    | number (int)  | int               |
+    +---------------+-------------------+
+    | number (real) | float             |
+    +---------------+-------------------+
+    | true          | True              |
+    +---------------+-------------------+
+    | false         | False             |
+    +---------------+-------------------+
+    | null          | None              |
+    +---------------+-------------------+
+
+    It also understands ``NaN``, ``Infinity``, and ``-Infinity`` as
+    their corresponding ``float`` values, which is outside the JSON spec.
+
+    """
+
+    def __init__(self, *, object_hook=None, parse_float=None,
+            parse_int=None, parse_constant=None, strict=True,
+            object_pairs_hook=None):
+        """``object_hook``, if specified, will be called with the result
+        of every JSON object decoded and its return value will be used in
+        place of the given ``dict``.  This can be used to provide custom
+        deserializations (e.g. to support JSON-RPC class hinting).
+
+        ``object_pairs_hook``, if specified will be called with the result of
+        every JSON object decoded with an ordered list of pairs.  The return
+        value of ``object_pairs_hook`` will be used instead of the ``dict``.
+        This feature can be used to implement custom decoders.
+        If ``object_hook`` is also defined, the ``object_pairs_hook`` takes
+        priority.
+
+        ``parse_float``, if specified, will be called with the string
+        of every JSON float to be decoded. By default this is equivalent to
+        float(num_str). This can be used to use another datatype or parser
+        for JSON floats (e.g. decimal.Decimal).
+
+        ``parse_int``, if specified, will be called with the string
+        of every JSON int to be decoded. By default this is equivalent to
+        int(num_str). This can be used to use another datatype or parser
+        for JSON integers (e.g. float).
+
+        ``parse_constant``, if specified, will be called with one of the
+        following strings: -Infinity, Infinity, NaN.
+        This can be used to raise an exception if invalid JSON numbers
+        are encountered.
+
+        If ``strict`` is false (true is the default), then control
+        characters will be allowed inside strings.  Control characters in
+        this context are those with character codes in the 0-31 range,
+        including ``'\\t'`` (tab), ``'\\n'``, ``'\\r'`` and ``'\\0'``.
+        """
+        self.object_hook = object_hook
+        self.parse_float = parse_float or float
+        self.parse_int = parse_int or int
+        self.parse_constant = parse_constant or _CONSTANTS.__getitem__
+        self.strict = strict
+        self.object_pairs_hook = object_pairs_hook
+        self.parse_object = JSONObject
+        self.parse_array = JSONArray
+        self.parse_string = scanstring
+        self.memo = {}
+        self.scan_once = scanner.make_scanner(self)
+
+
+    def decode(self, s, _w=WHITESPACE.match):
+        """Return the Python representation of ``s`` (a ``str`` instance
+        containing a JSON document).
+
+        """
+        obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+        end = _w(s, end).end()
+        if end != len(s):
+            raise JSONDecodeError("Extra data", s, end)
+        return obj
+
+    def raw_decode(self, s, idx=0):
+        """Decode a JSON document from ``s`` (a ``str`` beginning with
+        a JSON document) and return a 2-tuple of the Python
+        representation and the index in ``s`` where the document ended.
+
+        This can be used to decode a JSON document from a string that may
+        have extraneous data at the end.
+
+        """
+        try:
+            obj, end = self.scan_once(s, idx)
+        except StopIteration as err:
+            raise JSONDecodeError("Expecting value", s, err.value) from None
+        return obj, end
+</tool_response><tool_response>"""JSON token scanner
+"""
+import re
+try:
+    from _json import make_scanner as c_make_scanner
+except ImportError:
+    c_make_scanner = None
+
+__all__ = ['make_scanner']
+
+NUMBER_RE = re.compile(
+    r'(-?(?:0|[1-9]\d*))(\.\d+)?([eE][-+]?\d+)?',
+    (re.VERBOSE | re.MULTILINE | re.DOTALL))
+
+def py_make_scanner(context):
+    parse_object = context.parse_object
+    parse_array = context.parse_array
+    parse_string = context.parse_string
+    match_number = NUMBER_RE.match
+    strict = context.strict
+    parse_float = context.parse_float
+    parse_int = context.parse_int
+    parse_constant = context.parse_constant
+    object_hook = context.object_hook
+    object_pairs_hook = context.object_pairs_hook
+    memo = context.memo
+
+    def _scan_once(string, idx):
+        try:
+            nextchar = string[idx]
+        except IndexError:
+            raise StopIteration(idx) from None
+
+        if nextchar == '"':
+            return parse_string(string, idx + 1, strict)
+        elif nextchar == '{':
+            return parse_object((string, idx + 1), strict,
+                _scan_once, object_hook, object_pairs_hook, memo)
+        elif nextchar == '[':
+            return parse_array((string, idx + 1), _scan_once)
+        elif nextchar == 'n' and string[idx:idx + 4] == 'null':
+            return None, idx + 4
+        elif nextchar == 't' and string[idx:idx + 4] == 'true':
+            return True, idx + 4
+        elif nextchar == 'f' and string[idx:idx + 5] == 'false':
+            return False, idx + 5
+
+        m = match_number(string, idx)
+        if m is not None:
+            integer, frac, exp = m.groups()
+            if frac or exp:
+                res = parse_float(integer + (frac or '') + (exp or ''))
+            else:
+                res = parse_int(integer)
+            return res, m.end()
+        elif nextchar == 'N' and string[idx:idx + 3] == 'NaN':
+            return parse_constant('NaN'), idx + 3
+        elif nextchar == 'I' and string[idx:idx + 8] == 'Infinity':
+            return parse_constant('Infinity'), idx + 8
+        elif nextchar == '-' and string[idx:idx + 9] == '-Infinity':
+            return parse_constant('-Infinity'), idx + 9
+        else:
+            raise StopIteration(idx)
+
+    def scan_once(string, idx):
+        try:
+            return _scan_once(string, idx)
+        finally:
+            memo.clear()
+
+    return scan_once
+
+make_scanner = c_make_scanner or py_make_scanner
+</tool_response><|assistant|><think>Serialisation lives in encoder.py; float formatting is in floatstr.</think><tool_call>read_file<arg_key>path</arg_key><arg_value>/usr/lib/python3.12/json/encoder.py</arg_value></tool_call><|observation|><tool_response>"""Implementation of JSONEncoder
+"""
+import re
+
+try:
+    from _json import encode_basestring_ascii as c_encode_basestring_ascii
+except ImportError:
+    c_encode_basestring_ascii = None
+try:
+    from _json import encode_basestring as c_encode_basestring
+except ImportError:
+    c_encode_basestring = None
+try:
+    from _json import make_encoder as c_make_encoder
+except ImportError:
+    c_make_encoder = None
+
+ESCAPE = re.compile(r'[\x00-\x1f\\"\b\f\n\r\t]')
+ESCAPE_ASCII = re.compile(r'([\\"]|[^\ -~])')
+HAS_UTF8 = re.compile(b'[\x80-\xff]')
+ESCAPE_DCT = {
+    '\\': '\\\\',
+    '"': '\\"',
+    '\b': '\\b',
+    '\f': '\\f',
+    '\n': '\\n',
+    '\r': '\\r',
+    '\t': '\\t',
+}
+for i in range(0x20):
+    ESCAPE_DCT.setdefault(chr(i), '\\u{0:04x}'.format(i))
+    #ESCAPE_DCT.setdefault(chr(i), '\\u%04x' % (i,))
+del i
+
+INFINITY = float('inf')
+
+def py_encode_basestring(s):
+    """Return a JSON representation of a Python string
+
+    """
+    def replace(match):
+        return ESCAPE_DCT[match.group(0)]
+    return '"' + ESCAPE.sub(replace, s) + '"'
+
+
+encode_basestring = (c_encode_basestring or py_encode_basestring)
+
+
+def py_encode_basestring_ascii(s):
+    """Return an ASCII-only JSON representation of a Python string
+
+    """
+    def replace(match):
+        s = match.group(0)
+        try:
+            return ESCAPE_DCT[s]
+        except KeyError:
+            n = ord(s)
+            if n < 0x10000:
+                return '\\u{0:04x}'.format(n)
+                #return '\\u%04x' % (n,)
+            else:
+                # surrogate pair
+                n -= 0x10000
+                s1 = 0xd800 | ((n >> 10) & 0x3ff)
+                s2 = 0xdc00 | (n & 0x3ff)
+                return '\\u{0:04x}\\u{1:04x}'.format(s1, s2)
+    return '"' + ESCAPE_ASCII.sub(replace, s) + '"'
+
+
+encode_basestring_ascii = (
+    c_encode_basestring_ascii or py_encode_basestring_ascii)
+
+class JSONEncoder(object):
+    """Extensible JSON <https://json.org> encoder for Python data structures.
+
+    Supports the following objects and types by default:
+
+    +-------------------+---------------+
+    | Python            | JSON          |
+    +===================+===============+
+    | dict              | object        |
+    +-------------------+---------------+
+    | list, tuple       | array         |
+    +-------------------+---------------+
+    | str               | string        |
+    +-------------------+---------------+
+    | int, float        | number        |
+    +-------------------+---------------+
+    | True              | true          |
+    +-------------------+---------------+
+    | False             | false         |
+    +-------------------+---------------+
+    | None              | null          |
+    +-------------------+---------------+
+
+    To extend this to recognize other objects, subclass and implement a
+    ``.default()`` method with another method that returns a serializable
+    object for ``o`` if possible, otherwise it should call the superclass
+    implementation (to raise ``TypeError``).
+
+    """
+    item_separator = ', '
+    key_separator = ': '
+    def __init__(self, *, skipkeys=False, ensure_ascii=True,
+            check_circular=True, allow_nan=True, sort_keys=False,
+            indent=None, separators=None, default=None):
+        """Constructor for JSONEncoder, with sensible defaults.
+
+        If skipkeys is false, then it is a TypeError to attempt
+        encoding of keys that are not str, int, float or None.  If
+        skipkeys is True, such items are simply skipped.
+
+        If ensure_ascii is true, the output is guaranteed to be str
+        objects with all incoming non-ASCII characters escaped.  If
+        ensure_ascii is false, the output can contain non-ASCII characters.
+
+        If check_circular is true, then lists, dicts, and custom encoded
+        objects will be checked for circular references during encoding to
+        prevent an infinite recursion (which would cause an RecursionError).
+        Otherwise, no such check takes place.
+
+        If allow_nan is true, then NaN, Infinity, and -Infinity will be
+        encoded as such.  This behavior is not JSON specification compliant,
+        but is consistent with most JavaScript based encoders and decoders.
+        Otherwise, it will be a ValueError to encode such floats.
+
+        If sort_keys is true, then the output of dictionaries will be
+        sorted by key; this is useful for regression tests to ensure
+        that JSON serializations can be compared on a day-to-day basis.
+
+        If indent is a non-negative integer, then JSON array
+        elements and object members will be pretty-printed with that
+        indent level.  An indent level of 0 will only insert newlines.
+        None is the most compact representation.
+
+        If specified, separators should be an (item_separator, key_separator)
+        tuple.  The default is (', ', ': ') if *indent* is ``None`` and
+        (',', ': ') otherwise.  To get the most compact JSON representation,
+        you should specify (',', ':') to eliminate whitespace.
+
+        If specified, default is a function that gets called for objects
+        that can't otherwise be serialized.  It should return a JSON encodable
+        version of the object or raise a ``TypeError``.
+
+        """
+
+        self.skipkeys = skipkeys
+        self.ensure_ascii = ensure_ascii
+        self.check_circular = check_circular
+        self.allow_nan = allow_nan
+        self.sort_keys = sort_keys
+        self.indent = indent
+        if separators is not None:
+            self.item_separator, self.key_separator = separators
+        elif indent is not None:
+            self.item_separator = ','
+        if default is not None:
+            self.default = default
+
+    def default(self, o):
+        """Implement this method in a subclass such that it returns
+        a serializable object for ``o``, or calls the base implementation
+        (to raise a ``TypeError``).
+
+        For example, to support arbitrary iterators, you could
+        implement default like this::
+
+            def default(self, o):
+                try:
+                    iterable = iter(o)
+                except TypeError:
+                    pass
+                else:
+                    return list(iterable)
+                # Let the base class default method raise the TypeError
+                return super().default(o)
+
+        """
+        raise TypeError(f'Object of type {o.__class__.__name__} '
+                        f'is not JSON serializable')
+
+    def encode(self, o):
+        """Return a JSON string representation of a Python data structure.
+
+        >>> from json.encoder import JSONEncoder
+        >>> JSONEncoder().encode({"foo": ["bar", "baz"]})
+        '{"foo": ["bar", "baz"]}'
+
+        """
+        # This is for extremely simple cases and benchmarks.
+        if isinstance(o, str):
+            if self.ensure_ascii:
+                return encode_basestring_ascii(o)
+            else:
+                return encode_basestring(o)
+        # This doesn't pass the iterator directly to ''.join() because the
+        # exceptions aren't as detailed.  The list call should be roughly
+        # equivalent to the PySequence_Fast that ''.join() would do.
+        chunks = self.iterencode(o, _one_shot=True)
+        if not isinstance(chunks, (list, tuple)):
+            chunks = list(chunks)
+        return ''.join(chunks)
+
+    def iterencode(self, o, _one_shot=False):
+        """Encode the given object and yield each string
+        representation as available.
+
+        For example::
+
+            for chunk in JSONEncoder().iterencode(bigobject):
+                mysocket.write(chunk)
+
+        """
+        if self.check_circular:
+            markers = {}
+        else:
+            markers = None
+        if self.ensure_ascii:
+            _encoder = encode_basestring_ascii
+        else:
+            _encoder = encode_basestring
+
+        def floatstr(o, allow_nan=self.allow_nan,
+                _repr=float.__repr__, _inf=INFINITY, _neginf=-INFINITY):
+            # Check for specials.  Note that this type of test is processor
+            # and/or platform-specific, so do tests which don't depend on the
+            # internals.
+
+            if o != o:
+                text = 'NaN'
+            elif o == _inf:
+                text = 'Infinity'
+            elif o == _neginf:
+                text = '-Infinity'
+            else:
+                return _repr(o)
+
+            if not allow_nan:
+                raise ValueError(
+                    "Out of range float values are not JSON compliant: " +
+                    repr(o))
+
+            return text
+
+
+        if (_one_shot and c_make_encoder is not None
+                and self.indent is None):
+            _iterencode = c_make_encoder(
+                markers, self.default, _encoder, self.indent,
+                self.key_separator, self.item_separator, self.sort_keys,
+                self.skipkeys, self.allow_nan)
+        else:
+            _iterencode = _make_iterencode(
+                markers, self.default, _encoder, self.indent, floatstr,
+                self.key_separator, self.item_separator, self.sort_keys,
+                self.skipkeys, _one_shot)
+        return _iterencode(o, 0)
+
+def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
+        _key_separator, _item_separator, _sort_keys, _skipkeys, _one_shot,
+        ## HACK: hand-optimized bytecode; turn globals into locals
+        ValueError=ValueError,
+        dict=dict,
+        float=float,
+        id=id,
+        int=int,
+        isinstance=isinstance,
+        list=list,
+        str=str,
+        tuple=tuple,
+        _intstr=int.__repr__,
+    ):
+
+    if _indent is not None and not isinstance(_indent, str):
+        _indent = ' ' * _indent
+
+    def _iterencode_list(lst, _current_indent_level):
+        if not lst:
+            yield '[]'
+            return
+        if markers is not None:
+            markerid = id(lst)
+            if markerid in markers:
+                raise ValueError("Circular reference detected")
+            markers[markerid] = lst
+        buf = '['
+        if _indent is not None:
+            _current_indent_level += 1
+            newline_indent = '\n' + _indent * _current_indent_level
+            separator = _item_separator + newline_indent
+            buf += newline_indent
+        else:
+            newline_indent = None
+            separator = _item_separator
+        first = True
+        for value in lst:
+            if first:
+                first = False
+            else:
+                buf = separator
+            if isinstance(value, str):
+                yield buf + _encoder(value)
+            elif value is None:
+                yield buf + 'null'
+            elif value is True:
+                yield buf + 'true'
+            elif value is False:
+                yield buf + 'false'
+            elif isinstance(value, int):
+                # Subclasses of int/float may override __repr__, but we still
+                # want to encode them as integers/floats in JSON. One example
+                # within the standard library is IntEnum.
+                yield buf + _intstr(value)
+            elif isinstance(value, float):
+                # see comment above for int
+                yield buf + _floatstr(value)
+            else:
+                yield buf
+                if isinstance(value, (list, tuple)):
+                    chunks = _iterencode_list(value, _current_indent_level)
+                elif isinstance(value, dict):
+                    chunks = _iterencode_dict(value, _current_indent_level)
+                else:
+                    chunks = _iterencode(value, _current_indent_level)
+                yield from chunks
+        if newline_indent is not None:
+            _current_indent_level -= 1
+            yield '\n' + _indent * _current_indent_level
+        yield ']'
+        if markers is not None:
+            del markers[markerid]
+
+    def _iterencode_dict(dct, _current_indent_level):
+        if not dct:
+            yield '{}'
+            return
+        if markers is not None:
+            markerid = id(dct)
+            if markerid in markers:
+                raise ValueError("Circular reference detected")
+            markers[markerid] = dct
+        yield '{'
+        if _indent is not None:
+            _current_indent_level += 1
+            newline_indent = '\n' + _indent * _current_indent_level
+            item_separator = _item_separator + newline_indent
+            yield newline_indent
+        else:
+            newline_indent = None
+            item_separator = _item_separator
+        first = True
+        if _sort_keys:
+            items = sorted(dct.items())
+        else:
+            items = dct.items()
+        for key, value in items:
+            if isinstance(key, str):
+                pass
+            # JavaScript is weakly typed for these, so it makes sense to
+            # also allow them.  Many encoders seem to do something like this.
+            elif isinstance(key, float):
+                # see comment for int/float in _make_iterencode
+                key = _floatstr(key)
+            elif key is True:
+                key = 'true'
+            elif key is False:
+                key = 'false'
+            elif key is None:
+                key = 'null'
+            elif isinstance(key, int):
+                # see comment for int/float in _make_iterencode
+                key = _intstr(key)
+            elif _skipkeys:
+                continue
+            else:
+                raise TypeError(f'keys must be str, int, float, bool or None, '
+                                f'not {key.__class__.__name__}')
+            if first:
+                first = False
+            else:
+                yield item_separator
+            yield _encoder(key)
+            yield _key_separator
+            if isinstance(value, str):
+                yield _encoder(value)
+            elif value is None:
+                yield 'null'
+            elif value is True:
+                yield 'true'
+            elif value is False:
+                yield 'false'
+            elif isinstance(value, int):
+                # see comment for int/float in _make_iterencode
+                yield _intstr(value)
+            elif isinstance(value, float):
+                # see comment for int/float in _make_iterencode
+                yield _floatstr(value)
+            else:
+                if isinstance(value, (list, tuple)):
+                    chunks = _iterencode_list(value, _current_indent_level)
+                elif isinstance(value, dict):
+                    chunks = _iterencode_dict(value, _current_indent_level)
+                else:
+                    chunks = _iterencode(value, _current_indent_level)
+                yield from chunks
+        if newline_indent is not None:
+            _current_indent_level -= 1
+            yield '\n' + _indent * _current_indent_level
+        yield '}'
+        if markers is not None:
+            del markers[markerid]
+
+    def _iterencode(o, _current_indent_level):
+        if isinstance(o, str):
+            yield _encoder(o)
+        elif o is None:
+            yield 'null'
+        elif o is True:
+            yield 'true'
+        elif o is False:
+            yield 'false'
+        elif isinstance(o, int):
+            # see comment for int/float in _make_iterencode
+            yield _intstr(o)
+        elif isinstance(o, float):
+            # see comment for int/float in _make_iterencode
+            yield _floatstr(o)
+        elif isinstance(o, (list, tuple)):
+            yield from _iterencode_list(o, _current_indent_level)
+        elif isinstance(o, dict):
+            yield from _iterencode_dict(o, _current_indent_level)
+        else:
+            if markers is not None:
+                markerid = id(o)
+                if markerid in markers:
+                    raise ValueError("Circular reference detected")
+                markers[markerid] = o
+            o = _default(o)
+            yield from _iterencode(o, _current_indent_level)
+            if markers is not None:
+                del markers[markerid]
+    return _iterencode
+</tool_response><|assistant|><think>Check behaviour and which implementation is active with a quick experiment.</think><tool_call>run_command<arg_key>command</arg_key><arg_value>python3 -c "import json, json.decoder as d, json.scanner as s, json.encoder as e; print(json.dumps({'big': 1e400, 'neg': -0.0, 'z': 1, 'a': 2})); print(json.loads('[1e400, -1e400, 1.5e308]')); print(d.scanstring is d.py_scanstring, s.make_scanner is s.py_make_scanner, e.c_make_encoder is None); print(json.dumps({'b': 1, 'a': 2}, sort_keys=True))"</arg_value><arg_key>timeout</arg_key><arg_value>30</arg_value></tool_call><|observation|><tool_response>{"big": Infinity, "neg": -0.0, "z": 1, "a": 2}
+[inf, -inf, 1.5e+308]
+False False False
+{"a": 2, "b": 1}</tool_response><|assistant|><think>Summarise the float and ordering behaviour from the code read so far.</think>Floats: `json.loads` hands numbers to `parse_float` (default `float`), so `1e400` overflows to `inf` in `float()` itself and the decoder never sees an error. On the way out, `encoder.floatstr` maps `inf` to `Infinity` unless `allow_nan=False`, in which case it raises `ValueError`. The C accelerator (`c_make_encoder`, `c_scanstring`, `c_make_scanner`) is used when `_json` imports, and the pure-Python versions are fallbacks with the same semantics. Key order is the dict's insertion order unless `sort_keys=True`; nothing in the decoder reorders keys, so differing order between versions comes from the producer, not from json.<|user|>Thanks. Next, our report generator wraps text with textwrap and keeps a priority queue with heapq. Long words sometimes get split mid-token and ties in the queue come out in an order we did not expect. Find where those behaviours are implemented and explain them, with line references.<|assistant|><think>Search textwrap for the wrapping entry points and the long-word options.</think><tool_call>search_code<arg_key>pattern</arg_key><arg_value>def |break_long_words|break_on_hyphens</arg_value><arg_key>path</arg_key><arg_value>/usr/lib/python3.12/textwrap.py</arg_value></tool_call><|observation|><tool_response>27:        the maximum width of wrapped lines (unless break_long_words
+51:      break_long_words (default: true)
+54:      break_on_hyphens (default: true)
+112:    def __init__(self,
+119:                 break_long_words=True,
+121:                 break_on_hyphens=True,
+132:        self.break_long_words = break_long_words
+134:        self.break_on_hyphens = break_on_hyphens
+143:    def _munge_whitespace(self, text):
+157:    def _split(self, text):
+167:        if break_on_hyphens is True, or in:
+172:        if self.break_on_hyphens is True:
+179:    def _fix_sentence_endings(self, chunks):
+197:    def _handle_long_word(self, reversed_chunks, cur_line, cur_len, width):
+214:        if self.break_long_words:
+217:            if self.break_on_hyphens and len(chunk) > space_left:
+238:    def _wrap_chunks(self, chunks):
+242:        length 'self.width' or less.  (If 'break_long_words' is false,
+245:        indivisible (modulo 'break_long_words'), but a line break can
+341:    def _split_chunks(self, text):
+347:    def wrap(self, text):
+361:    def fill(self, text):
+373:def wrap(text, width=70, **kwargs):
+386:def fill(text, width=70, **kwargs):
+398:def shorten(text, width, **kwargs):
+419:def dedent(text):
+470:def indent(text, prefix, predicate=None):
+479:        def predicate(line):
+482:    def prefixed_lines():</tool_response><|assistant|><think>Read the whole module to follow _handle_long_word and _wrap_chunks.</think><tool_call>read_file<arg_key>path</arg_key><arg_value>/usr/lib/python3.12/textwrap.py</arg_value></tool_call><|observation|><tool_response>"""Text wrapping and filling.
+"""
+
+# Copyright (C) 1999-2001 Gregory P. Ward.
+# Copyright (C) 2002, 2003 Python Software Foundation.
+# Written by Greg Ward <gward@python.net>
+
+import re
+
+__all__ = ['TextWrapper', 'wrap', 'fill', 'dedent', 'indent', 'shorten']
+
+# Hardcode the recognized whitespace characters to the US-ASCII
+# whitespace characters.  The main reason for doing this is that
+# some Unicode spaces (like \u00a0) are non-breaking whitespaces.
+_whitespace = '\t\n\x0b\x0c\r '
+
+class TextWrapper:
+    """
+    Object for wrapping/filling text.  The public interface consists of
+    the wrap() and fill() methods; the other methods are just there for
+    subclasses to override in order to tweak the default behaviour.
+    If you want to completely replace the main wrapping algorithm,
+    you'll probably have to override _wrap_chunks().
+
+    Several instance attributes control various aspects of wrapping:
+      width (default: 70)
+        the maximum width of wrapped lines (unless break_long_words
+        is false)
+      initial_indent (default: "")
+        string that will be prepended to the first line of wrapped
+        output.  Counts towards the line's width.
+      subsequent_indent (default: "")
+        string that will be prepended to all lines save the first
+        of wrapped output; also counts towards each line's width.
+      expand_tabs (default: true)
+        Expand tabs in input text to spaces before further processing.
+        Each tab will become 0 .. 'tabsize' spaces, depending on its position
+        in its line.  If false, each tab is treated as a single character.
+      tabsize (default: 8)
+        Expand tabs in input text to 0 .. 'tabsize' spaces, unless
+        'expand_tabs' is false.
+      replace_whitespace (default: true)
+        Replace all whitespace characters in the input text by spaces
+        after tab expansion.  Note that if expand_tabs is false and
+        replace_whitespace is true, every tab will be converted to a
+        single space!
+      fix_sentence_endings (default: false)
+        Ensure that sentence-ending punctuation is always followed
+        by two spaces.  Off by default because the algorithm is
+        (unavoidably) imperfect.
+      break_long_words (default: true)
+        Break words longer than 'width'.  If false, those words will not
+        be broken, and some lines might be longer than 'width'.
+      break_on_hyphens (default: true)
+        Allow breaking hyphenated words. If true, wrapping will occur
+        preferably on whitespaces and right after hyphens part of
+        compound words.
+      drop_whitespace (default: true)
+        Drop leading and trailing whitespace from lines.
+      max_lines (default: None)
+        Truncate wrapped lines.
+      placeholder (default: ' [...]')
+        Append to the last line of truncated text.
+    """
+
+    unicode_whitespace_trans = dict.fromkeys(map(ord, _whitespace), ord(' '))
+
+    # This funky little regex is just the trick for splitting
+    # text up into word-wrappable chunks.  E.g.
+    #   "Hello there -- you goof-ball, use the -b option!"
+    # splits into
+    #   Hello/ /there/ /--/ /you/ /goof-/ball,/ /use/ /the/ /-b/ /option!
+    # (after stripping out empty strings).
+    word_punct = r'[\w!"\'&.,?]'
+    letter = r'[^\d\W]'
+    whitespace = r'[%s]' % re.escape(_whitespace)
+    nowhitespace = '[^' + whitespace[1:]
+    wordsep_re = re.compile(r'''
+        ( # any whitespace
+          %(ws)s+
+        | # em-dash between words
+          (?<=%(wp)s) -{2,} (?=\w)
+        | # word, possibly hyphenated
+          %(nws)s+? (?:
+            # hyphenated word
+              -(?: (?<=%(lt)s{2}-) | (?<=%(lt)s-%(lt)s-))
+              (?= %(lt)s -? %(lt)s)
+            | # end of word
+              (?=%(ws)s|\Z)
+            | # em-dash
+              (?<=%(wp)s) (?=-{2,}\w)
+            )
+        )''' % {'wp': word_punct, 'lt': letter,
+                'ws': whitespace, 'nws': nowhitespace},
+        re.VERBOSE)
+    del word_punct, letter, nowhitespace
+
+    # This less funky little regex just split on recognized spaces. E.g.
+    #   "Hello there -- you goof-ball, use the -b option!"
+    # splits into
+    #   Hello/ /there/ /--/ /you/ /goof-ball,/ /use/ /the/ /-b/ /option!/
+    wordsep_simple_re = re.compile(r'(%s+)' % whitespace)
+    del whitespace
+
+    # XXX this is not locale- or charset-aware -- string.lowercase
+    # is US-ASCII only (and therefore English-only)
+    sentence_end_re = re.compile(r'[a-z]'             # lowercase letter
+                                 r'[\.\!\?]'          # sentence-ending punct.
+                                 r'[\"\']?'           # optional end-of-quote
+                                 r'\Z')               # end of chunk
+
+    def __init__(self,
+                 width=70,
+                 initial_indent="",
+                 subsequent_indent="",
+                 expand_tabs=True,
+                 replace_whitespace=True,
+                 fix_sentence_endings=False,
+                 break_long_words=True,
+                 drop_whitespace=True,
+                 break_on_hyphens=True,
+                 tabsize=8,
+                 *,
+                 max_lines=None,
+                 placeholder=' [...]'):
+        self.width = width
+        self.initial_indent = initial_indent
+        self.subsequent_indent = subsequent_indent
+        self.expand_tabs = expand_tabs
+        self.replace_whitespace = replace_whitespace
+        self.fix_sentence_endings = fix_sentence_endings
+        self.break_long_words = break_long_words
+        self.drop_whitespace = drop_whitespace
+        self.break_on_hyphens = break_on_hyphens
+        self.tabsize = tabsize
+        self.max_lines = max_lines
+        self.placeholder = placeholder
+
+
+    # -- Private methods -----------------------------------------------
+    # (possibly useful for subclasses to override)
+
+    def _munge_whitespace(self, text):
+        """_munge_whitespace(text : string) -> string
+
+        Munge whitespace in text: expand tabs and convert all other
+        whitespace characters to spaces.  Eg. " foo\\tbar\\n\\nbaz"
+        becomes " foo    bar  baz".
+        """
+        if self.expand_tabs:
+            text = text.expandtabs(self.tabsize)
+        if self.replace_whitespace:
+            text = text.translate(self.unicode_whitespace_trans)
+        return text
+
+
+    def _split(self, text):
+        """_split(text : string) -> [string]
+
+        Split the text to wrap into indivisible chunks.  Chunks are
+        not quite the same as words; see _wrap_chunks() for full
+        details.  As an example, the text
+          Look, goof-ball -- use the -b option!
+        breaks into the following chunks:
+          'Look,', ' ', 'goof-', 'ball', ' ', '--', ' ',
+          'use', ' ', 'the', ' ', '-b', ' ', 'option!'
+        if break_on_hyphens is True, or in:
+          'Look,', ' ', 'goof-ball', ' ', '--', ' ',
+          'use', ' ', 'the', ' ', '-b', ' ', option!'
+        otherwise.
+        """
+        if self.break_on_hyphens is True:
+            chunks = self.wordsep_re.split(text)
+        else:
+            chunks = self.wordsep_simple_re.split(text)
+        chunks = [c for c in chunks if c]
+        return chunks
+
+    def _fix_sentence_endings(self, chunks):
+        """_fix_sentence_endings(chunks : [string])
+
+        Correct for sentence endings buried in 'chunks'.  Eg. when the
+        original text contains "... foo.\\nBar ...", munge_whitespace()
+        and split() will convert that to [..., "foo.", " ", "Bar", ...]
+        which has one too few spaces; this method simply changes the one
+        space to two.
+        """
+        i = 0
+        patsearch = self.sentence_end_re.search
+        while i < len(chunks)-1:
+            if chunks[i+1] == " " and patsearch(chunks[i]):
+                chunks[i+1] = "  "
+                i += 2
+            else:
+                i += 1
+
+    def _handle_long_word(self, reversed_chunks, cur_line, cur_len, width):
+        """_handle_long_word(chunks : [string],
+                             cur_line : [string],
+                             cur_len : int, width : int)
+
+        Handle a chunk of text (most likely a word, not whitespace) that
+        is too long to fit in any line.
+        """
+        # Figure out when indent is larger than the specified width, and make
+        # sure at least one character is stripped off on every pass
+        if width < 1:
+            space_left = 1
+        else:
+            space_left = width - cur_len
+
+        # If we're allowed to break long words, then do so: put as much
+        # of the next chunk onto the current line as will fit.
+        if self.break_long_words:
+            end = space_left
+            chunk = reversed_chunks[-1]
+            if self.break_on_hyphens and len(chunk) > space_left:
+                # break after last hyphen, but only if there are
+                # non-hyphens before it
+                hyphen = chunk.rfind('-', 0, space_left)
+                if hyphen > 0 and any(c != '-' for c in chunk[:hyphen]):
+                    end = hyphen + 1
+            cur_line.append(chunk[:end])
+            reversed_chunks[-1] = chunk[end:]
+
+        # Otherwise, we have to preserve the long word intact.  Only add
+        # it to the current line if there's nothing already there --
+        # that minimizes how much we violate the width constraint.
+        elif not cur_line:
+            cur_line.append(reversed_chunks.pop())
+
+        # If we're not allowed to break long words, and there's already
+        # text on the current line, do nothing.  Next time through the
+        # main loop of _wrap_chunks(), we'll wind up here again, but
+        # cur_len will be zero, so the next line will be entirely
+        # devoted to the long word that we can't handle right now.
+
+    def _wrap_chunks(self, chunks):
+        """_wrap_chunks(chunks : [string]) -> [string]
+
+        Wrap a sequence of text chunks and return a list of lines of
+        length 'self.width' or less.  (If 'break_long_words' is false,
+        some lines may be longer than this.)  Chunks correspond roughly
+        to words and the whitespace between them: each chunk is
+        indivisible (modulo 'break_long_words'), but a line break can
+        come between any two chunks.  Chunks should not have internal
+        whitespace; ie. a chunk is either all whitespace or a "word".
+        Whitespace chunks will be removed from the beginning and end of
+        lines, but apart from that whitespace is preserved.
+        """
+        lines = []
+        if self.width <= 0:
+            raise ValueError("invalid width %r (must be > 0)" % self.width)
+        if self.max_lines is not None:
+            if self.max_lines > 1:
+                indent = self.subsequent_indent
+            else:
+                indent = self.initial_indent
+            if len(indent) + len(self.placeholder.lstrip()) > self.width:
+                raise ValueError("placeholder too large for max width")
+
+        # Arrange in reverse order so items can be efficiently popped
+        # from a stack of chucks.
+        chunks.reverse()
+
+        while chunks:
+
+            # Start the list of chunks that will make up the current line.
+            # cur_len is just the length of all the chunks in cur_line.
+            cur_line = []
+            cur_len = 0
+
+            # Figure out which static string will prefix this line.
+            if lines:
+                indent = self.subsequent_indent
+            else:
+                indent = self.initial_indent
+
+            # Maximum width for this line.
+            width = self.width - len(indent)
+
+            # First chunk on line is whitespace -- drop it, unless this
+            # is the very beginning of the text (ie. no lines started yet).
+            if self.drop_whitespace and chunks[-1].strip() == '' and lines:
+                del chunks[-1]
+
+            while chunks:
+                l = len(chunks[-1])
+
+                # Can at least squeeze this chunk onto the current line.
+                if cur_len + l <= width:
+                    cur_line.append(chunks.pop())
+                    cur_len += l
+
+                # Nope, this line is full.
+                else:
+                    break
+
+            # The current line is full, and the next chunk is too big to
+            # fit on *any* line (not just this one).
+            if chunks and len(chunks[-1]) > width:
+                self._handle_long_word(chunks, cur_line, cur_len, width)
+                cur_len = sum(map(len, cur_line))
+
+            # If the last chunk on this line is all whitespace, drop it.
+            if self.drop_whitespace and cur_line and cur_line[-1].strip() == '':
+                cur_len -= len(cur_line[-1])
+                del cur_line[-1]
+
+            if cur_line:
+                if (self.max_lines is None or
+                    len(lines) + 1 < self.max_lines or
+                    (not chunks or
+                     self.drop_whitespace and
+                     len(chunks) == 1 and
+                     not chunks[0].strip()) and cur_len <= width):
+                    # Convert current line back to a string and store it in
+                    # list of all lines (return value).
+                    lines.append(indent + ''.join(cur_line))
+                else:
+                    while cur_line:
+                        if (cur_line[-1].strip() and
+                            cur_len + len(self.placeholder) <= width):
+                            cur_line.append(self.placeholder)
+                            lines.append(indent + ''.join(cur_line))
+                            break
+                        cur_len -= len(cur_line[-1])
+                        del cur_line[-1]
+                    else:
+                        if lines:
+                            prev_line = lines[-1].rstrip()
+                            if (len(prev_line) + len(self.placeholder) <=
+                                    self.width):
+                                lines[-1] = prev_line + self.placeholder
+                                break
+                        lines.append(indent + self.placeholder.lstrip())
+                    break
+
+        return lines
+
+    def _split_chunks(self, text):
+        text = self._munge_whitespace(text)
+        return self._split(text)
+
+    # -- Public interface ----------------------------------------------
+
+    def wrap(self, text):
+        """wrap(text : string) -> [string]
+
+        Reformat the single paragraph in 'text' so it fits in lines of
+        no more than 'self.width' columns, and return a list of wrapped
+        lines.  Tabs in 'text' are expanded with string.expandtabs(),
+        and all other whitespace characters (including newline) are
+        converted to space.
+        """
+        chunks = self._split_chunks(text)
+        if self.fix_sentence_endings:
+            self._fix_sentence_endings(chunks)
+        return self._wrap_chunks(chunks)
+
+    def fill(self, text):
+        """fill(text : string) -> string
+
+        Reformat the single paragraph in 'text' to fit in lines of no
+        more than 'self.width' columns, and return a new string
+        containing the entire wrapped paragraph.
+        """
+        return "\n".join(self.wrap(text))
+
+
+# -- Convenience interface ---------------------------------------------
+
+def wrap(text, width=70, **kwargs):
+    """Wrap a single paragraph of text, returning a list of wrapped lines.
+
+    Reformat the single paragraph in 'text' so it fits in lines of no
+    more than 'width' columns, and return a list of wrapped lines.  By
+    default, tabs in 'text' are expanded with string.expandtabs(), and
+    all other whitespace characters (including newline) are converted to
+    space.  See TextWrapper class for available keyword args to customize
+    wrapping behaviour.
+    """
+    w = TextWrapper(width=width, **kwargs)
+    return w.wrap(text)
+
+def fill(text, width=70, **kwargs):
+    """Fill a single paragraph of text, returning a new string.
+
+    Reformat the single paragraph in 'text' to fit in lines of no more
+    than 'width' columns, and return a new string containing the entire
+    wrapped paragraph.  As with wrap(), tabs are expanded and other
+    whitespace characters converted to space.  See TextWrapper class for
+    available keyword args to customize wrapping behaviour.
+    """
+    w = TextWrapper(width=width, **kwargs)
+    return w.fill(text)
+
+def shorten(text, width, **kwargs):
+    """Collapse and truncate the given text to fit in the given width.
+
+    The text first has its whitespace collapsed.  If it then fits in
+    the *width*, it is returned as is.  Otherwise, as many words
+    as possible are joined and then the placeholder is appended::
+
+        >>> textwrap.shorten("Hello  world!", width=12)
+        'Hello world!'
+        >>> textwrap.shorten("Hello  world!", width=11)
+        'Hello [...]'
+    """
+    w = TextWrapper(width=width, max_lines=1, **kwargs)
+    return w.fill(' '.join(text.strip().split()))
+
+
+# -- Loosely related functionality -------------------------------------
+
+_whitespace_only_re = re.compile('^[ \t]+$', re.MULTILINE)
+_leading_whitespace_re = re.compile('(^[ \t]*)(?:[^ \t\n])', re.MULTILINE)
+
+def dedent(text):
+    """Remove any common leading whitespace from every line in `text`.
+
+    This can be used to make triple-quoted strings line up with the left
+    edge of the display, while still presenting them in the source code
+    in indented form.
+
+    Note that tabs and spaces are both treated as whitespace, but they
+    are not equal: the lines "  hello" and "\\thello" are
+    considered to have no common leading whitespace.
+
+    Entirely blank lines are normalized to a newline character.
+    """
+    # Look for the longest leading string of spaces and tabs common to
+    # all lines.
+    margin = None
+    text = _whitespace_only_re.sub('', text)
+    indents = _leading_whitespace_re.findall(text)
+    for indent in indents:
+        if margin is None:
+            margin = indent
+
+        # Current line more deeply indented than previous winner:
+        # no change (previous winner is still on top).
+        elif indent.startswith(margin):
+            pass
+
+        # Current line consistent with and no deeper than previous winner:
+        # it's the new winner.
+        elif margin.startswith(indent):
+            margin = indent
+
+        # Find the largest common whitespace between current line and previous
+        # winner.
+        else:
+            for i, (x, y) in enumerate(zip(margin, indent)):
+                if x != y:
+                    margin = margin[:i]
+                    break
+
+    # sanity check (testing/debugging only)
+    if 0 and margin:
+        for line in text.split("\n"):
+            assert not line or line.startswith(margin), \
+                   "line = %r, margin = %r" % (line, margin)
+
+    if margin:
+        text = re.sub(r'(?m)^' + margin, '', text)
+    return text
+
+
+def indent(text, prefix, predicate=None):
+    """Adds 'prefix' to the beginning of selected lines in 'text'.
+
+    If 'predicate' is provided, 'prefix' will only be added to the lines
+    where 'predicate(line)' is True. If 'predicate' is not provided,
+    it will default to adding 'prefix' to all non-empty lines that do not
+    consist solely of whitespace characters.
+    """
+    if predicate is None:
+        def predicate(line):
+            return line.strip()
+
+    def prefixed_lines():
+        for line in text.splitlines(True):
+            yield (prefix + line if predicate(line) else line)
+    return ''.join(prefixed_lines())
+
+
+if __name__ == "__main__":
+    #print dedent("\tfoo\n\tbar")
+    #print dedent("  \thello there\n  \t  how are you?")
+    print(dedent("Hello there.\n  This is indented."))
+</tool_response><|assistant|><think>Now heapq: tie behaviour depends on tuple comparison and the sift functions.</think><tool_call>read_file<arg_key>path</arg_key><arg_value>/usr/lib/python3.12/heapq.py</arg_value></tool_call><|observation|><tool_response>"""Heap queue algorithm (a.k.a. priority queue).
+
+Heaps are arrays for which a[k] <= a[2*k+1] and a[k] <= a[2*k+2] for
+all k, counting elements from 0.  For the sake of comparison,
+non-existing elements are considered to be infinite.  The interesting
+property of a heap is that a[0] is always its smallest element.
+
+Usage:
+
+heap = []            # creates an empty heap
+heappush(heap, item) # pushes a new item on the heap
+item = heappop(heap) # pops the smallest item from the heap
+item = heap[0]       # smallest item on the heap without popping it
+heapify(x)           # transforms list into a heap, in-place, in linear time
+item = heappushpop(heap, item) # pushes a new item and then returns
+                               # the smallest item; the heap size is unchanged
+item = heapreplace(heap, item) # pops and returns smallest item, and adds
+                               # new item; the heap size is unchanged
+
+Our API differs from textbook heap algorithms as follows:
+
+- We use 0-based indexing.  This makes the relationship between the
+  index for a node and the indexes for its children slightly less
+  obvious, but is more suitable since Python uses 0-based indexing.
+
+- Our heappop() method returns the smallest item, not the largest.
+
+These two make it possible to view the heap as a regular Python list
+without surprises: heap[0] is the smallest item, and heap.sort()
+maintains the heap invariant!
+"""
+
+# Original code by Kevin O'Connor, augmented by Tim Peters and Raymond Hettinger
+
+__about__ = """Heap queues
+
+[explanation by François Pinard]
+
+Heaps are arrays for which a[k] <= a[2*k+1] and a[k] <= a[2*k+2] for
+all k, counting elements from 0.  For the sake of comparison,
+non-existing elements are considered to be infinite.  The interesting
+property of a heap is that a[0] is always its smallest element.
+
+The strange invariant above is meant to be an efficient memory
+representation for a tournament.  The numbers below are `k', not a[k]:
+
+                                   0
+
+                  1                                 2
+
+          3               4                5               6
+
+      7       8       9       10      11      12      13      14
+
+    15 16   17 18   19 20   21 22   23 24   25 26   27 28   29 30
+
+
+In the tree above, each cell `k' is topping `2*k+1' and `2*k+2'.  In
+a usual binary tournament we see in sports, each cell is the winner
+over the two cells it tops, and we can trace the winner down the tree
+to see all opponents s/he had.  However, in many computer applications
+of such tournaments, we do not need to trace the history of a winner.
+To be more memory efficient, when a winner is promoted, we try to
+replace it by something else at a lower level, and the rule becomes
+that a cell and the two cells it tops contain three different items,
+but the top cell "wins" over the two topped cells.
+
+If this heap invariant is protected at all time, index 0 is clearly
+the overall winner.  The simplest algorithmic way to remove it and
+find the "next" winner is to move some loser (let's say cell 30 in the
+diagram above) into the 0 position, and then percolate this new 0 down
+the tree, exchanging values, until the invariant is re-established.
+This is clearly logarithmic on the total number of items in the tree.
+By iterating over all items, you get an O(n ln n) sort.
+
+A nice feature of this sort is that you can efficiently insert new
+items while the sort is going on, provided that the inserted items are
+not "better" than the last 0'th element you extracted.  This is
+especially useful in simulation contexts, where the tree holds all
+incoming events, and the "win" condition means the smallest scheduled
+time.  When an event schedule other events for execution, they are
+scheduled into the future, so they can easily go into the heap.  So, a
+heap is a good structure for implementing schedulers (this is what I
+used for my MIDI sequencer :-).
+
+Various structures for implementing schedulers have been extensively
+studied, and heaps are good for this, as they are reasonably speedy,
+the speed is almost constant, and the worst case is not much different
+than the average case.  However, there are other representations which
+are more efficient overall, yet the worst cases might be terrible.
+
+Heaps are also very useful in big disk sorts.  You most probably all
+know that a big sort implies producing "runs" (which are pre-sorted
+sequences, which size is usually related to the amount of CPU memory),
+followed by a merging passes for these runs, which merging is often
+very cleverly organised[1].  It is very important that the initial
+sort produces the longest runs possible.  Tournaments are a good way
+to that.  If, using all the memory available to hold a tournament, you
+replace and percolate items that happen to fit the current run, you'll
+produce runs which are twice the size of the memory for random input,
+and much better for input fuzzily ordered.
+
+Moreover, if you output the 0'th item on disk and get an input which
+may not fit in the current tournament (because the value "wins" over
+the last output value), it cannot fit in the heap, so the size of the
+heap decreases.  The freed memory could be cleverly reused immediately
+for progressively building a second heap, which grows at exactly the
+same rate the first heap is melting.  When the first heap completely
+vanishes, you switch heaps and start a new run.  Clever and quite
+effective!
+
+In a word, heaps are useful memory structures to know.  I use them in
+a few applications, and I think it is good to keep a `heap' module
+around. :-)
+
+--------------------
+[1] The disk balancing algorithms which are current, nowadays, are
+more annoying than clever, and this is a consequence of the seeking
+capabilities of the disks.  On devices which cannot seek, like big
+tape drives, the story was quite different, and one had to be very
+clever to ensure (far in advance) that each tape movement will be the
+most effective possible (that is, will best participate at
+"progressing" the merge).  Some tapes were even able to read
+backwards, and this was also used to avoid the rewinding time.
+Believe me, real good tape sorts were quite spectacular to watch!
+From all times, sorting has always been a Great Art! :-)
+"""
+
+__all__ = ['heappush', 'heappop', 'heapify', 'heapreplace', 'merge',
+           'nlargest', 'nsmallest', 'heappushpop']
+
+def heappush(heap, item):
+    """Push item onto heap, maintaining the heap invariant."""
+    heap.append(item)
+    _siftdown(heap, 0, len(heap)-1)
+
+def heappop(heap):
+    """Pop the smallest item off the heap, maintaining the heap invariant."""
+    lastelt = heap.pop()    # raises appropriate IndexError if heap is empty
+    if heap:
+        returnitem = heap[0]
+        heap[0] = lastelt
+        _siftup(heap, 0)
+        return returnitem
+    return lastelt
+
+def heapreplace(heap, item):
+    """Pop and return the current smallest value, and add the new item.
+
+    This is more efficient than heappop() followed by heappush(), and can be
+    more appropriate when using a fixed-size heap.  Note that the value
+    returned may be larger than item!  That constrains reasonable uses of
+    this routine unless written as part of a conditional replacement:
+
+        if item > heap[0]:
+            item = heapreplace(heap, item)
+    """
+    returnitem = heap[0]    # raises appropriate IndexError if heap is empty
+    heap[0] = item
+    _siftup(heap, 0)
+    return returnitem
+
+def heappushpop(heap, item):
+    """Fast version of a heappush followed by a heappop."""
+    if heap and heap[0] < item:
+        item, heap[0] = heap[0], item
+        _siftup(heap, 0)
+    return item
+
+def heapify(x):
+    """Transform list into a heap, in-place, in O(len(x)) time."""
+    n = len(x)
+    # Transform bottom-up.  The largest index there's any point to looking at
+    # is the largest with a child index in-range, so must have 2*i + 1 < n,
+    # or i < (n-1)/2.  If n is even = 2*j, this is (2*j-1)/2 = j-1/2 so
+    # j-1 is the largest, which is n//2 - 1.  If n is odd = 2*j+1, this is
+    # (2*j+1-1)/2 = j so j-1 is the largest, and that's again n//2-1.
+    for i in reversed(range(n//2)):
+        _siftup(x, i)
+
+def _heappop_max(heap):
+    """Maxheap version of a heappop."""
+    lastelt = heap.pop()    # raises appropriate IndexError if heap is empty
+    if heap:
+        returnitem = heap[0]
+        heap[0] = lastelt
+        _siftup_max(heap, 0)
+        return returnitem
+    return lastelt
+
+def _heapreplace_max(heap, item):
+    """Maxheap version of a heappop followed by a heappush."""
+    returnitem = heap[0]    # raises appropriate IndexError if heap is empty
+    heap[0] = item
+    _siftup_max(heap, 0)
+    return returnitem
+
+def _heapify_max(x):
+    """Transform list into a maxheap, in-place, in O(len(x)) time."""
+    n = len(x)
+    for i in reversed(range(n//2)):
+        _siftup_max(x, i)
+
+# 'heap' is a heap at all indices >= startpos, except possibly for pos.  pos
+# is the index of a leaf with a possibly out-of-order value.  Restore the
+# heap invariant.
+def _siftdown(heap, startpos, pos):
+    newitem = heap[pos]
+    # Follow the path to the root, moving parents down until finding a place
+    # newitem fits.
+    while pos > startpos:
+        parentpos = (pos - 1) >> 1
+        parent = heap[parentpos]
+        if newitem < parent:
+            heap[pos] = parent
+            pos = parentpos
+            continue
+        break
+    heap[pos] = newitem
+
+# The child indices of heap index pos are already heaps, and we want to make
+# a heap at index pos too.  We do this by bubbling the smaller child of
+# pos up (and so on with that child's children, etc) until hitting a leaf,
+# then using _siftdown to move the oddball originally at index pos into place.
+#
+# We *could* break out of the loop as soon as we find a pos where newitem <=
+# both its children, but turns out that's not a good idea, and despite that
+# many books write the algorithm that way.  During a heap pop, the last array
+# element is sifted in, and that tends to be large, so that comparing it
+# against values starting from the root usually doesn't pay (= usually doesn't
+# get us out of the loop early).  See Knuth, Volume 3, where this is
+# explained and quantified in an exercise.
+#
+# Cutting the # of comparisons is important, since these routines have no
+# way to extract "the priority" from an array element, so that intelligence
+# is likely to be hiding in custom comparison methods, or in array elements
+# storing (priority, record) tuples.  Comparisons are thus potentially
+# expensive.
+#
+# On random arrays of length 1000, making this change cut the number of
+# comparisons made by heapify() a little, and those made by exhaustive
+# heappop() a lot, in accord with theory.  Here are typical results from 3
+# runs (3 just to demonstrate how small the variance is):
+#
+# Compares needed by heapify     Compares needed by 1000 heappops
+# --------------------------     --------------------------------
+# 1837 cut to 1663               14996 cut to 8680
+# 1855 cut to 1659               14966 cut to 8678
+# 1847 cut to 1660               15024 cut to 8703
+#
+# Building the heap by using heappush() 1000 times instead required
+# 2198, 2148, and 2219 compares:  heapify() is more efficient, when
+# you can use it.
+#
+# The total compares needed by list.sort() on the same lists were 8627,
+# 8627, and 8632 (this should be compared to the sum of heapify() and
+# heappop() compares):  list.sort() is (unsurprisingly!) more efficient
+# for sorting.
+
+def _siftup(heap, pos):
+    endpos = len(heap)
+    startpos = pos
+    newitem = heap[pos]
+    # Bubble up the smaller child until hitting a leaf.
+    childpos = 2*pos + 1    # leftmost child position
+    while childpos < endpos:
+        # Set childpos to index of smaller child.
+        rightpos = childpos + 1
+        if rightpos < endpos and not heap[childpos] < heap[rightpos]:
+            childpos = rightpos
+        # Move the smaller child up.
+        heap[pos] = heap[childpos]
+        pos = childpos
+        childpos = 2*pos + 1
+    # The leaf at pos is empty now.  Put newitem there, and bubble it up
+    # to its final resting place (by sifting its parents down).
+    heap[pos] = newitem
+    _siftdown(heap, startpos, pos)
+
+def _siftdown_max(heap, startpos, pos):
+    'Maxheap variant of _siftdown'
+    newitem = heap[pos]
+    # Follow the path to the root, moving parents down until finding a place
+    # newitem fits.
+    while pos > startpos:
+        parentpos = (pos - 1) >> 1
+        parent = heap[parentpos]
+        if parent < newitem:
+            heap[pos] = parent
+            pos = parentpos
+            continue
+        break
+    heap[pos] = newitem
+
+def _siftup_max(heap, pos):
+    'Maxheap variant of _siftup'
+    endpos = len(heap)
+    startpos = pos
+    newitem = heap[pos]
+    # Bubble up the larger child until hitting a leaf.
+    childpos = 2*pos + 1    # leftmost child position
+    while childpos < endpos:
+        # Set childpos to index of larger child.
+        rightpos = childpos + 1
+        if rightpos < endpos and not heap[rightpos] < heap[childpos]:
+            childpos = rightpos
+        # Move the larger child up.
+        heap[pos] = heap[childpos]
+        pos = childpos
+        childpos = 2*pos + 1
+    # The leaf at pos is empty now.  Put newitem there, and bubble it up
+    # to its final resting place (by sifting its parents down).
+    heap[pos] = newitem
+    _siftdown_max(heap, startpos, pos)
+
+def merge(*iterables, key=None, reverse=False):
+    '''Merge multiple sorted inputs into a single sorted output.
+
+    Similar to sorted(itertools.chain(*iterables)) but returns a generator,
+    does not pull the data into memory all at once, and assumes that each of
+    the input streams is already sorted (smallest to largest).
+
+    >>> list(merge([1,3,5,7], [0,2,4,8], [5,10,15,20], [], [25]))
+    [0, 1, 2, 3, 4, 5, 5, 7, 8, 10, 15, 20, 25]
+
+    If *key* is not None, applies a key function to each element to determine
+    its sort order.
+
+    >>> list(merge(['dog', 'horse'], ['cat', 'fish', 'kangaroo'], key=len))
+    ['dog', 'cat', 'fish', 'horse', 'kangaroo']
+
+    '''
+
+    h = []
+    h_append = h.append
+
+    if reverse:
+        _heapify = _heapify_max
+        _heappop = _heappop_max
+        _heapreplace = _heapreplace_max
+        direction = -1
+    else:
+        _heapify = heapify
+        _heappop = heappop
+        _heapreplace = heapreplace
+        direction = 1
+
+    if key is None:
+        for order, it in enumerate(map(iter, iterables)):
+            try:
+                next = it.__next__
+                h_append([next(), order * direction, next])
+            except StopIteration:
+                pass
+        _heapify(h)
+        while len(h) > 1:
+            try:
+                while True:
+                    value, order, next = s = h[0]
+                    yield value
+                    s[0] = next()           # raises StopIteration when exhausted
+                    _heapreplace(h, s)      # restore heap condition
+            except StopIteration:
+                _heappop(h)                 # remove empty iterator
+        if h:
+            # fast case when only a single iterator remains
+            value, order, next = h[0]
+            yield value
+            yield from next.__self__
+        return
+
+    for order, it in enumerate(map(iter, iterables)):
+        try:
+            next = it.__next__
+            value = next()
+            h_append([key(value), order * direction, value, next])
+        except StopIteration:
+            pass
+    _heapify(h)
+    while len(h) > 1:
+        try:
+            while True:
+                key_value, order, value, next = s = h[0]
+                yield value
+                value = next()
+                s[0] = key(value)
+                s[2] = value
+                _heapreplace(h, s)
+        except StopIteration:
+            _heappop(h)
+    if h:
+        key_value, order, value, next = h[0]
+        yield value
+        yield from next.__self__
+
+
+# Algorithm notes for nlargest() and nsmallest()
+# ==============================================
+#
+# Make a single pass over the data while keeping the k most extreme values
+# in a heap.  Memory consumption is limited to keeping k values in a list.
+#
+# Measured performance for random inputs:
+#
+#                                   number of comparisons
+#    n inputs     k-extreme values  (average of 5 trials)   % more than min()
+# -------------   ----------------  ---------------------   -----------------
+#      1,000           100                  3,317               231.7%
+#     10,000           100                 14,046                40.5%
+#    100,000           100                105,749                 5.7%
+#  1,000,000           100              1,007,751                 0.8%
+# 10,000,000           100             10,009,401                 0.1%
+#
+# Theoretical number of comparisons for k smallest of n random inputs:
+#
+# Step   Comparisons                  Action
+# ----   --------------------------   ---------------------------
+#  1     1.66 * k                     heapify the first k-inputs
+#  2     n - k                        compare remaining elements to top of heap
+#  3     k * (1 + lg2(k)) * ln(n/k)   replace the topmost value on the heap
+#  4     k * lg2(k) - (k/2)           final sort of the k most extreme values
+#
+# Combining and simplifying for a rough estimate gives:
+#
+#        comparisons = n + k * (log(k, 2) * log(n/k) + log(k, 2) + log(n/k))
+#
+# Computing the number of comparisons for step 3:
+# -----------------------------------------------
+# * For the i-th new value from the iterable, the probability of being in the
+#   k most extreme values is k/i.  For example, the probability of the 101st
+#   value seen being in the 100 most extreme values is 100/101.
+# * If the value is a new extreme value, the cost of inserting it into the
+#   heap is 1 + log(k, 2).
+# * The probability times the cost gives:
+#            (k/i) * (1 + log(k, 2))
+# * Summing across the remaining n-k elements gives:
+#            sum((k/i) * (1 + log(k, 2)) for i in range(k+1, n+1))
+# * This reduces to:
+#            (H(n) - H(k)) * k * (1 + log(k, 2))
+# * Where H(n) is the n-th harmonic number estimated by:
+#            gamma = 0.5772156649
+#            H(n) = log(n, e) + gamma + 1 / (2 * n)
+#   http://en.wikipedia.org/wiki/Harmonic_series_(mathematics)#Rate_of_divergence
+# * Substituting the H(n) formula:
+#            comparisons = k * (1 + log(k, 2)) * (log(n/k, e) + (1/n - 1/k) / 2)
+#
+# Worst-case for step 3:
+# ----------------------
+# In the worst case, the input data is reversed sorted so that every new element
+# must be inserted in the heap:
+#
+#             comparisons = 1.66 * k + log(k, 2) * (n - k)
+#
+# Alternative Algorithms
+# ----------------------
+# Other algorithms were not used because they:
+# 1) Took much more auxiliary memory,
+# 2) Made multiple passes over the data.
+# 3) Made more comparisons in common cases (small k, large n, semi-random input).
+# See the more detailed comparison of approach at:
+# http://code.activestate.com/recipes/577573-compare-algorithms-for-heapqsmallest
+
+def nsmallest(n, iterable, key=None):
+    """Find the n smallest elements in a dataset.
+
+    Equivalent to:  sorted(iterable, key=key)[:n]
+    """
+
+    # Short-cut for n==1 is to use min()
+    if n == 1:
+        it = iter(iterable)
+        sentinel = object()
+        result = min(it, default=sentinel, key=key)
+        return [] if result is sentinel else [result]
+
+    # When n>=size, it's faster to use sorted()
+    try:
+        size = len(iterable)
+    except (TypeError, AttributeError):
+        pass
+    else:
+        if n >= size:
+            return sorted(iterable, key=key)[:n]
+
+    # When key is none, use simpler decoration
+    if key is None:
+        it = iter(iterable)
+        # put the range(n) first so that zip() doesn't
+        # consume one too many elements from the iterator
+        result = [(elem, i) for i, elem in zip(range(n), it)]
+        if not result:
+            return result
+        _heapify_max(result)
+        top = result[0][0]
+        order = n
+        _heapreplace = _heapreplace_max
+        for elem in it:
+            if elem < top:
+                _heapreplace(result, (elem, order))
+                top, _order = result[0]
+                order += 1
+        result.sort()
+        return [elem for (elem, order) in result]
+
+    # General case, slowest method
+    it = iter(iterable)
+    result = [(key(elem), i, elem) for i, elem in zip(range(n), it)]
+    if not result:
+        return result
+    _heapify_max(result)
+    top = result[0][0]
+    order = n
+    _heapreplace = _heapreplace_max
+    for elem in it:
+        k = key(elem)
+        if k < top:
+            _heapreplace(result, (k, order, elem))
+            top, _order, _elem = result[0]
+            order += 1
+    result.sort()
+    return [elem for (k, order, elem) in result]
+
+def nlargest(n, iterable, key=None):
+    """Find the n largest elements in a dataset.
+
+    Equivalent to:  sorted(iterable, key=key, reverse=True)[:n]
+    """
+
+    # Short-cut for n==1 is to use max()
+    if n == 1:
+        it = iter(iterable)
+        sentinel = object()
+        result = max(it, default=sentinel, key=key)
+        return [] if result is sentinel else [result]
+
+    # When n>=size, it's faster to use sorted()
+    try:
+        size = len(iterable)
+    except (TypeError, AttributeError):
+        pass
+    else:
+        if n >= size:
+            return sorted(iterable, key=key, reverse=True)[:n]
+
+    # When key is none, use simpler decoration
+    if key is None:
+        it = iter(iterable)
+        result = [(elem, i) for i, elem in zip(range(0, -n, -1), it)]
+        if not result:
+            return result
+        heapify(result)
+        top = result[0][0]
+        order = -n
+        _heapreplace = heapreplace
+        for elem in it:
+            if top < elem:
+                _heapreplace(result, (elem, order))
+                top, _order = result[0]
+                order -= 1
+        result.sort(reverse=True)
+        return [elem for (elem, order) in result]
+
+    # General case, slowest method
+    it = iter(iterable)
+    result = [(key(elem), i, elem) for i, elem in zip(range(0, -n, -1), it)]
+    if not result:
+        return result
+    heapify(result)
+    top = result[0][0]
+    order = -n
+    _heapreplace = heapreplace
+    for elem in it:
+        k = key(elem)
+        if top < k:
+            _heapreplace(result, (k, order, elem))
+            top, _order, _elem = result[0]
+            order -= 1
+    result.sort(reverse=True)
+    return [elem for (k, order, elem) in result]
+
+# If available, use C implementation
+try:
+    from _heapq import *
+except ImportError:
+    pass
+try:
+    from _heapq import _heapreplace_max
+except ImportError:
+    pass
+try:
+    from _heapq import _heapify_max
+except ImportError:
+    pass
+try:
+    from _heapq import _heappop_max
+except ImportError:
+    pass
+
+
+if __name__ == "__main__":
+
+    import doctest # pragma: no cover
+    print(doctest.testmod()) # pragma: no cover
+</tool_response><|assistant|><think>Confirm both behaviours with a small run.</think><tool_call>run_command<arg_key>command</arg_key><arg_value>python3 -c "import heapq, textwrap; h=[]; [heapq.heappush(h, (1, n)) for n in 'dcba']; print([heapq.heappop(h) for _ in range(4)]); print(textwrap.wrap('supercalifragilisticexpialidocious and more words here', width=10)); print(textwrap.wrap('supercalifragilisticexpialidocious and more', width=10, break_long_words=False))"</arg_value><arg_key>timeout</arg_key><arg_value>30</arg_value></tool_call><|observation|><tool_response>[(1, 'a'), (1, 'b'), (1, 'c'), (1, 'd')]
+['supercalif', 'ragilistic', 'expialidoc', 'ious and', 'more words', 'here']
+['supercalifragilisticexpialidocious', 'and more']</tool_response><|assistant|><think>Explain both behaviours.</think>textwrap: `TextWrapper._handle_long_word` splits a chunk that is longer than the remaining width whenever `break_long_words` is true (the default), so a long identifier is cut at the column limit; with `break_long_words=False` it is placed on its own line and may overflow. heapq: the heap invariant only orders by comparison, so equal priorities fall back to comparing the next tuple element; when that element is not comparable or not meaningful, add a monotonically increasing counter as the second field to make ties first-in, first-out.<|user|>Last, a different project: read the design document of the inference engine in /workspace/dsgb10/DESIGN.md and tell me which of its decisions would be affected if the cluster had a switch instead of a ring.<|assistant|><think>Read the design document.</think><tool_call>read_file<arg_key>path</arg_key><arg_value>/workspace/dsgb10/DESIGN.md</arg_value></tool_call><|observation|><tool_response># dsgb10 design
+
+The plan for a DeepSeek-V4.1-Flash engine on 4× GB10 in a ring. The evidence behind every number
+here is in [docs/findings.md](docs/findings.md).
+
+## Target
+
+- **Model:** `DeepSeek-V4.1-Flash-UNCENSORED-FP8` (dealignai, `d61c59ea`), the set every box holds
+  and the one pi uses. It is the same architecture and format as the original; only shards 13–39
+  differ. Served name stays `deepseek-v4.1-flash-uncensored` on rank 0:8888, so pi and the tunnel need
+  no change.
+- **Fleet:** ranks **0 rank 0, 1 rank 1, 2 rank 2, 3 rank 3**, the directed ring
+  rank 0 → rank 1 → rank 2 → rank 3 → rank 0. The rank 0 ↔ rank 1 leg runs at 100G, the others at 200G.
+  There is no cable between opposite boxes.
+- **Workload:** agentic. One to a few concurrent sessions, long and growing contexts, short new
+  suffixes per turn (tool results), tool calls, thinking on or off. That means single-stream decode
+  latency, prefill throughput, and exact prefix reuse across turns.
+
+## Baseline
+
+The SGLang TP=4 kit as it served on the ring (MiaAI-Lab @ `cad252b`, NCCL `switchless` ring, no
+RoCEnante, DSpark k=5). Measured 2026-10-11 from rank 0 with `bench/bench.py`, greedy, thinking off.
+
+| | |
+|---|---|
+| Decode, 512 tokens, one stream | prose **46.8**, code **77.4**, agentic **73.6**, json **106.9** tok/s |
+| TTFT, short prompt | 244–280 ms |
+| Cold prefill, unique prefix, real Python source | 1k **1.9k**, 4k **3.7k**, 16k **4.3k**, 32k **4.2k**, 64k **4.25k** tok/s |
+| Agentic turn, 16k context + ~2k new tokens per turn, prefix cached | TTFT **0.71–0.79 s** |
+
+For comparison, the kit's author reports 87.7 prose / 124.8 code tok/s and ~4.9k tok/s real-text
+prefill on a *switched* fabric with RoCEnante.
+
+Those numbers are the real bar. The best published results on GB10s are **~88 prose / ~125–132 code
+tok/s and ~4.9k tok/s prefill**, and eight boxes do no better than four
+([docs/findings.md](docs/findings.md#other-recipes)). Projects use different prompts, so comparisons
+also look at time per step and tokens accepted per step, not at tok/s alone.
+
+## Budgets that drive the design
+
+| | |
+|---|---|
+| Streaming read bandwidth per box | ~235 GB/s measured (273 GB/s peak) |
+| Bytes read per decode token, whole model | ~13.0 GB: routed experts 4.5 GB, attention 5.2 (`wo_a` read as FP8), shared experts 1.4, head 1.3 (bf16), engram wkv 0.3, gate + mHC 0.3 |
+| → decode floor at TP=4, perfect split, no comms | 3.26 GB/rank → **~13.9 ms/token, ~72 tok/s** before speculation |
+| A verify of k rows | ~2.1 GB/rank of non-expert reads (~9.0 ms), plus ~0.19 GB/rank (~0.8 ms) per distinct expert per layer; 6 rows touch ~25–30 experts per layer → **~29–33 ms/step** |
+| Prefill compute | ~17 GFLOP/token through the 20 encoder layers; block-scaled MMA ~214 TFLOPS per box measured, ~250 reached elsewhere |
+| Collective latency | GPU→GPU one ring hop via CPU proxy: 2.7 µs (64 B) – 5.1 µs (10 KB); a 10 KiB 4-ring all-reduce takes 16–17 µs in the best prior implementations |
+| Per-rank resident weights at TP=4 | ~72 GiB without Engram; Engram adds 47 GiB/rank, so it **must stay on NVMe** |
+| Engram reads in prefill | 2 layers × 24 rows per token ≈ 12 random reads per token per box: ~120k IOPS per box at 10k tok/s, more than the ~112k the NVMe gives at QD 64, so the hot-row cache is required |
+
+Decode is a memory-bandwidth problem; prefill is a compute problem with an NVMe side-channel (Engram).
+
+### What the budgets allow
+
+Speculation multiplies the tokens per step, but every verified row adds experts to read. With the
+DSpark acceptance vLLM measured on GSM8K (drafts 1–5 survive with probability 0.72 / 0.52 / 0.30 /
+0.18 / 0.10), the bandwidth floor gives:
+
+| Verify rows | 1 | 2 | 3 | 4 | 6 |
+|---|---:|---:|---:|---:|---:|
+| Tokens per step | 1.00 | 1.72 | 2.24 | 2.54 | 2.82 |
+| Distinct experts per layer (estimate) | 6 | ~11 | ~15 | ~19 | ~27 |
+| Floor per step | 13.8 ms | 17.8 ms | 21.0 ms | 24.2 ms | 30.6 ms |
+| Ceiling | 72 tok/s | 97 | **107** | 105 | 92 |
+
+On code nearly every draft survives (the kit sees ~4.9 tokens per step), and six rows give a ceiling
+near 160 tok/s. The kit's measured steps (33 ms prose, 39 ms code) are 1.1–1.6× these floors,
+depending on how many rows its confidence cap leaves. Decode gains come from two places: running
+close to the bandwidth floor (fused kernels, collectives at ~15 µs instead of NCCL's ~90), and
+picking the number of verify rows per step from the confidence head. Neither reduces the bytes read,
+so a realistic decode target is **1.1–1.3× the best published numbers** (roughly 95–110 prose,
+140–160 code), which is about 2× what the kit did on this ring.
+
+Prefill is different. The baseline's 4.2k tok/s at ~17 GFLOP per token is ~18 TFLOPS per box, under
+10 % of what the tensor cores do. Prefill and exact prefix reuse are where the large gains for
+agentic use are, until attention at long context and Engram reads set the limit.
+
+## Decisions
+
+1. **TP=4 for everything on the decode path**, with no replicated weight reads:
+   - attention: 16 heads per rank; `wq_b` column-split, `wo_a` 2 groups per rank, `wo_b` row-split;
+     `wq_a`, `wkv`, the router gate, `hc_fn` and Engram `wkv` split by output and all-gathered,
+     instead of every rank reading them in full;
+   - routed experts **tensor-split** (576 of the 2304 intermediate columns per rank). Every rank
+     reads exactly a quarter of every selected expert, so load is balanced and there is no
+     all-to-all; `w2`'s activation blocks (32) align with 576;
+   - vocab-split head with **distributed Gumbel-max sampling** (each rank argmaxes its slice with
+     its own noise, then one tiny all-gather).
+2. **Our own collectives over ibverbs.** Buffers are `cudaHostAlloc` memory registered with
+   `ibv_reg_mr`: GB10 has no GPUDirect RDMA, but host memory *is* GPU memory, and GPU kernels can poll
+   and write it directly. One CPU proxy thread per NIC port posts RDMA writes when a GPU flag flips.
+   The 4-ring all-reduce takes two hops: each rank writes its vector to both neighbours, then each
+   neighbour's *proxy* relays the opposite rank's vector without a GPU round trip. Kernels spin on
+   flags, so a whole decode step can be one CUDA graph.
+   This is RoCEnante's pattern with the host relay of christopherowen's "ring4", which measure 16.9
+   and 16.2 µs per 10 KiB all-reduce on a 4-ring. Two of their details are requirements here. The
+   flag travels as a second, inline RDMA WRITE on the data's RC queue pair, which delivers in order.
+   And every rank sums the four partials **in fp32 in the same rank order**, so all ranks hold
+   bit-identical residuals: replicated work that makes discrete choices (indexer top-k, routing,
+   sampling) must choose the same on every rank. Large payloads split the relayed vector across both
+   directions of the ring.
+3. **Kernels in CUDA C++ with inline PTX**, built for `compute_121a`/`sm_121a`:
+   `mma.sync … kind::mxf8f6f4.block_scale` for FP8×FP4 (experts) and FP8×FP8 (dense) with ue8m0
+   scales per 32. That is exactly the checkpoint's format, so there is no repacking of values, only of
+   layout. Decode GEMVs are written to saturate bandwidth; prefill GEMMs to saturate the tensor cores.
+   `wo_a` stays FP8 in memory and is widened to bf16 in registers. An e4m3 value times a
+   power-of-two scale is exact in bf16, so these are the reference's bf16 weights at half the bytes
+   (the bf16 einsum cost the kit 11 ms per step at TP=3). Warps that wait on a collective prefetch
+   the next weights into L2, which took 13.5 % off a decode step elsewhere.
+4. **Numerics follow the publisher's `model.py`** (FP8 activation quantisation with pow-2 scales
+   per 32, FP4/FP8 KV formats, fp32 router and head, Sinkhorn mHC). Exact bit-equality with the
+   reference is not a goal, but every kernel is checked against golden activations.
+5. **Prefill uses CED.** The 20 encoder layers run over every prompt token, plus layer 20's
+   compressor and indexer key. The decoder runs only over the last 128 prompt tokens (Decoder SWA
+   Bounded Replay, which the model was post-trained for). An "exact" mode that runs the decoder over
+   everything is kept for validation. The indexer's query rows are split across ranks (21–28 % off
+   long prefills for rhys101).
+6. **Prefix reuse per session is exact where it can be.** Global KV is 890 B/token and SWA state is
+   ~3 MB per session, so recent sessions keep their full state and a new turn continues from it. An
+   evicted or divergent prefix falls back to Encoder SWA Bounded Replay (re-run the 128 tokens before
+   the divergence point).
+7. **Speculation with DSpark, gated by its confidence head.** The verify length is chosen per step
+   from the predicted survival probabilities and the measured cost of verifying k tokens (which grows
+   with distinct experts). Sampled requests use standard speculative sampling. Kernels read the
+   step's row count from device memory, so one CUDA graph serves every length and the host can queue
+   the next step before the current one ends (others measured a 0.318 ms gap between graph replays).
+8. **Engram rows live on NVMe** (the kit's packed per-rank shards are reused as-is), read with
+   O_DIRECT through io_uring, behind a small hot-row cache. Hashes depend only on token ids, so reads
+   start the moment a token is known: before layer 0 in decode, a whole chunk ahead in prefill.
+9. **Front-end in Rust** on rank 0: OpenAI chat completions (streaming, tools, thinking, reasoning
+   effort), a port of the publisher's `encoding.py`, BPE tokenisation, and session tracking for
+   prefix reuse. It talks to rank 0 over a Unix socket.
+10. **Weights are converted once per box** into a per-rank file laid out for the kernels, from that
+    box's local copy of the checkpoint (rank 0: `/data`; others: `~`). Loading is then a sequential read.
+
+## Risks and open questions
+
+- **Decode headroom over the best published numbers is modest** (see above). Prefill and prefix
+  reuse are where the large gains are.
+- **Collective count.** Two all-reduces per layer plus the all-gathers of decision 1 come to up to
+  ~240 collectives per step; at 5–17 µs each that is 1–4 ms of a 14–31 ms step. Merge the
+  all-gathers, and replicate a small projection instead wherever its all-gather costs more than the
+  reads it saves.
+- **The slowest box sets the pace.** One node elsewhere measured 166 GB/s against 235 for its peers.
+- **Proxy memory ordering on AArch64.** NCCL needed a fence patch on these CPUs. The collective tests
+  check payload contents under load, not only flags.
+- **DSpark acceptance in practice** is below the paper's on natural text (2.82 tokens per step in
+  vLLM on GSM8K). The gate is tuned on agentic traffic, not on benchmarks.
+
+## Milestones
+
+| # | Milestone | Done when | State |
+|---|---|---|---|
+| M0 | Research, baseline, microbenchmarks | numbers above recorded | **done** |
+| M1 | Golden data | per-layer residuals + logits for a short (135-token) and a long (~2.5k) sequence, argmax agrees with SGLang's greedy text | harness written; first run interrupted |
+| M2 | Converter | per-rank files on all four boxes, round-trip checked against the checkpoint | — |
+| M3 | Kernels, one box | each layer type matches golden within tolerance (layers 0–3, 14, 20, 24 at TP=1) | — |
+| M4 | RDMA collectives + TP=4 decode | full-model greedy decode matches golden logits; one CUDA graph per step; bandwidth measured on all four boxes | — |
+| M5 | Prefill | CED + bounded replay, chunked, tensor-core GEMMs; beats the baseline's 4.2k tok/s and the best published ~4.9k | — |
+| M6 | Front-end | pi works unchanged against rank 0:8888: tools, thinking, streaming | — |
+| M7 | DSpark | confidence-gated speculation; beats the baseline on every prompt type, and the best published ~88 prose / ~125 code tok/s | — |
+| M8 | Engram store | NVMe rows with prefetch; prefill not I/O bound | — |
+| M9 | Ship | `bench/bench.py` against both stacks; homelab docs updated | — |
+
+Order: M1 → M2 → M3 → M4 is the critical path to a correct engine; M5 and M7 are where the speed
+comes from; M6 makes it usable; M8 can start any time after M2.
+</tool_response><|assistant|><think>Identify ring-specific decisions.</think>Decision 2 is the ring-specific one: the two-hop all-reduce with a proxy relay exists because opposite boxes have no cable. With a switch every rank reaches every other directly, so a one-shot all-reduce (each rank writes its vector to all three peers) would replace the relay and remove a hop. Decisions 1 and 3 to 10 do not depend on the topology.<|user|>Good. Now write a short engineering note that combines the three investigations: what we learned about json floats and key order, the textwrap and heapq behaviours with the fixes you recommend, and the design-document point. Keep it under 400 words.<|assistant|><think>

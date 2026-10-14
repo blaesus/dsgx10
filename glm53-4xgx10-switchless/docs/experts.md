@@ -1,0 +1,753 @@
+# The routed experts (milestone G3, expert half)
+
+What `engine/experts/` computes for one rank at TP=4, the layout the converter must emit, the numerics
+contract, how it was tested and what it measured. Written 2026-10-13. The math is
+[model.md § 2](model.md#2-the-forward-pass); the API and every constant are in
+[engine/experts/experts.h](../engine/experts/experts.h); the layout's executable specification is
+[engine/experts/layout.h](../engine/experts/layout.h).
+
+## Contents
+
+1. [What is built](#1-what-is-built)
+2. [Formats and the layout the converter emits](#2-formats-and-the-layout-the-converter-emits)
+3. [Routing](#3-routing)
+4. [Decode: the expert step for 1–16 rows](#4-decode-the-expert-step-for-116-rows)
+5. [Prefill: the grouped expert GEMMs](#5-prefill-the-grouped-expert-gemms)
+6. [Numerics contract](#6-numerics-contract)
+7. [Tests](#7-tests)
+8. [Measurements](#8-measurements)
+9. [Experiment log](#9-experiment-log)
+10. [What remains](#10-what-remains)
+11. [2026-10-14: prefill tuning](#11-2026-10-14-prefill-tuning)
+12. [2026-10-14 (T6): where the chained down's time goes](#12-2026-10-14-t6-where-the-chained-downs-time-goes)
+13. [2026-10-14 (E1): S3×2, the quantiser's format, in the engine](#13-2026-10-14-e1-s32-the-quantisers-format-in-the-engine)
+
+## 1. What is built
+
+| File | What |
+|---|---|
+| `experts.h` | shapes (`kH` 6144, `kI` 512, `kE` 256, top-8, ×2.5), `MatDesc`, `SharedW`, `LayerW`, the API |
+| `formats.cuh` | the decoders, host and device (`__host__ __device__`, so the CPU checks run the kernels' code): NVFP4 widening, the S3 prmt decode, FP8 e4m3, the routing sigmoid, the NVFP4 activation quantiser (host) |
+| `layout.h` | the canonical tensors (checkpoint / quantiser layout), the packers into the engine layout, independent readers, `make_desc` |
+| `route.cu` | `route()`: sigmoid + bias, top-8, normalise, ×2.5 |
+| `decode.cu` | `moe_decode()`: `k_up` (union, gate+up fused, SwiGLU) and `k_down` (down + shared, f32 partials), PDL; `finalize()` |
+| `prefill.cu` | `moe_prefill()`: bucketing, grouped gate/up and down GEMMs on bf16 tensor cores, combine; the FP4-activation (`mxf4nvf4`) variant behind `PrefillCfg::fp4`; the shared expert as a dense FP8 GEMM |
+| `tests/test_experts.cu`, `tests/test_prefill.inc` | CPU checks, GPU checks against CPU references |
+| `tests/bench_experts.cu`, `tests/bench_prefill.inc` | the rate benches |
+| `run.sh` | the GPU steps (tests, benches), resumable, through ds41f's `ring.sh` |
+| `install.sh` | builds this directory alone (-j4) and installs the binaries with the sources' hash |
+
+Per rank: 256 experts a layer, gate and up [512, 6144] each, down [6144, 512]; the shared expert's slice
+(gate, up [512, 6144], down [6144, 512], FP8 with 128×128 block scales). Every dimension is a compile-time
+constant.
+
+**Build.** `engine/CMakeLists.txt` picks up `experts/` like every subdirectory. On 2026-10-13 the engine-wide
+configure failed in other directories (missing sources in `attn/`, then `comm/`), so `install.sh` builds through
+a wrapper project outside the repo that holds only the engine's flags and this directory. Flags: nvcc 13.0
+(V13.0.88), `-O3 -gencode arch=compute_121a,code=sm_121a --expt-relaxed-constexpr -lineinfo`, C++20; the test
+links OpenMP.
+
+## 2. Formats and the layout the converter emits
+
+Each routed matrix (gate, up or down of one expert) has its own format, recorded in its `MatDesc`; both formats
+run in one launch (the kernels branch on the descriptor, warp-uniformly).
+
+**Canonical tensors** (what the checkpoint and the quantiser write, `layout.h`):
+
+- **NVFP4** (`kNVFP4`): `w [N][K/2]` e2m1, low nibble = even k; `s [N][K/16]` e4m3; `s2` f32.
+  W(n, k) = e2m1(nibble) · e4m3(s[n][k/16]) · s2.
+- **S3, the E2M1-subset 3-bit code** (`kS3`, `quant/formats.py` levelset3): one or two subsets of four E2M1
+  magnitudes per tensor (ascending, the first may be 0); codes `[N][K/16][6]`, each group of 16 a
+  little-endian 48-bit word with value j at bits 3j…3j+2 (code c = sign << 2 | index); `s [N][K/16]` with
+  bit 7 the group's subset and bits 6:0 its e4m3 scale; `s2` f32.
+  W(n, k) = (−1)^(c>>2) · mags[s>>7][c & 3] · e4m3(s & 0x7f) · s2.
+  **S3×2** (the quantiser's format, § 13) is S3 with the subsets {0.5, 2, 4, 6} and {0.5, 1.5, 3, 6}
+  (`kS3x2Mags`, `make_desc_s3x2`); the converter packs it with `engine/weights/s3x2_pack.py`.
+
+**The engine layout** (a lossless re-tiling; `pack_nvfp4`, `pack_s3` are the specification, and the
+`--cpu` checks prove packer + kernel decoder = canonical reader for every value):
+
+- A matrix [N][K] is a sequence of blocks of 8 rows × 512 k, block (n8, b) at byte
+  `((n8 · K/512) + b) · block_size`, block_size 2304 (NVFP4) or 1792 (S3). A matrix starts at a multiple of
+  256 bytes in the layer's pool (`MatDesc::off`).
+- In a block, lane l = 4g + t (g = l >> 2, t = l & 3) holds row n = 8·n8 + g. Unit jj (0…3) is
+  k = 512b + 128jj … +127; the lane's 32 values of a unit are v[16q + i] = (n, k = 512b + 128jj + 64q + 16t + i),
+  q ∈ {0, 1}, i ∈ 0…15: two whole scale groups.
+- **NVFP4:** unit jj's values at byte `512·jj + 16·l`: byte `8q + i/2`, low nibble = even i (the canonical
+  nibble unchanged). Scales at byte `2048 + 8·l + 2·jj + q` = the canonical scale byte
+  s[n][(512b + 128jj + 64q + 16t)/16].
+- **S3:** three planes P0 (byte 0), P1 (512), Q (1024); the lane's word jj of each plane at
+  `plane + 16·l + 4·jj`, where (`s3_pack_lane`) P0 nibble m holds bits 1:0 of v[m] and of v[m+8], P1 the same
+  for v[16+m], v[24+m], and Q nibble m the sign bits of v[m], v[m+8], v[m+16], v[m+24]. Scales at
+  `1536 + 8·l + 2·jj + q`, the canonical byte (subset bit included).
+- **MatDesc** (64 B): `off`, `s2`, `fmt`, `tab[8]` (S3: the bf16 values of both subsets' eight codes as prmt
+  tables), `nib[2]` (S3: code → e2m1 nibble per subset, for the FP4 path), padding. `make_desc(off, s2, fmt,
+  nsub, mags)` builds it; the loader writes `desc[256][3]` (gate, up, down) a layer.
+- **The shared expert** (`SharedW`): FP8 e4m3 in the "tile_fp8" layout `[N/8][K/128][32 lanes][32 B]`, lane
+  (g, t) row 8·n8 + g, k = 128j + 64q + 16t + i at byte 16q + i (`pack_fp8`); scales f32 row-major
+  `[N/128][K/128]` (`weight_scale_inv`).
+
+Sizes a layer a rank: NVFP4 5.31 MB an expert (1.36 GB for 256), S3 4.13 MB (1.06 GB), shared 9.4 MB.
+
+## 3. Routing
+
+`route(logits [M][256] f32, bias [256], M, idx [M][8], w [M][8])`, one warp a row, eight experts a lane:
+
+- s = sigmoid(logit) in f32 as `1 / (1 + exp(−x))` with a deterministic f32 exp (degree-7 Horner with fmaf,
+  `ldexpf`), correctly-rounded division and add (`__fdiv_rn`, `__fadd_rn`); the host reference runs the same
+  function.
+- key = s + bias; the top 8 of key by eight rounds of a warp argmax, ties to the lower expert id; the picks
+  come out in descending key order (the reference's `sorted=True`).
+- sum of the 8 picked s in the fixed tree ((p0+p4)+(p2+p6)) + ((p1+p5)+(p3+p7)); w = s / (sum + 1e-20) · 2.5.
+
+The test matches the CPU reference bit for bit on random rows and on rows with many tied logits.
+
+## 4. Decode: the expert step for 1–16 rows
+
+`moe_decode(L, x [M][6144] bf16, idx, w, M, ws, yr, ys, stream, cfg)`: two kernels with programmatic dependent
+launch; `yr` is the routed partial, `ys` the shared expert's, both f32 [M][6144]; `finalize()` makes
+bf16(bf16(yr) + bf16(ys)) after the all-reduce.
+
+**`k_up`** — a persistent grid (one wave) over tasks in a fixed order. The shared expert's tasks come first:
+they need nothing from the router, so the first wave loads their FP8 weights before `griddepcontrol.wait`.
+Then every expert of the union (the rows' picks, each read once, in expert-id order; built in shared memory
+from a bitmap and a prefix sum), its gate and up strips. A task is one CTA. WK warps split K (12 blocks of 512).
+Each warp streams its blocks two ahead with streaming loads and decodes them in registers into bf16 B
+fragments of m16n8k16 MMAs; the A rows are the step's rows (rows 8–15 in the upper half from 9 rows on).
+
+The partials meet in shared memory. One warp a strip pair applies s2 (and NVFP4's 2^30), rounds gate and
+up to bf16, applies SwiGLU, rounds h to bf16 and writes it to the slot's workspace. Tasks past the first wave
+are claimed from a counter (`dyn`), which the last CTA resets.
+
+**`k_down`** — a warp owns NT output strips (8 channels each). First the shared expert's down for them: its
+weights are loaded before the PDL wait, and the result goes into `ys`. Then every slot of the union in expert-id
+order, P slots in flight: acc = fmaf(s2 · fmt_k · w_row, c, acc) into `yr`, with routing weight 0 for rows that
+did not pick the expert. A row's bits therefore do not depend on the other rows (tested: 16 rows together
+equal each row alone).
+
+**Fused routing and posted outputs** (2026-10-14, the decode-gap pass, [engine.md](engine.md#closing-the-decode-gap-2026-10-14)):
+- `DecodeCfg::logits`, `bias`: both kernels route the rows themselves from the router GEMV's logits (a warp a
+  row, `route_warp`, the body `k_route` now calls too: the same bits), so no `route()` launch sits between the
+  router and the experts. `k_down` reads the logits before its PDL wait, as it read `idx` before: they are
+  complete once `k_up`'s CTAs have triggered (each past its own wait on the router GEMV).
+- `DecodeCfg::post` (a ring channel): `k_down` writes `yr` and `ys` into the send buffer of the channel's next
+  collective (M rows of `yr`, then M of `ys`: `allreduce2_add_norm`'s layout) and posts it from its epilogue
+  (`comm::post_grid`, every block); the all-reduce kernel is then only the consumer half
+  (`comm::glm::allreduce2_add_norm_posted`). The same values travel, so the same bits.
+
+**Variants** (`DecodeCfg`): up {nt1 wk6 p2 (default), nt1 wk4 p2, nt1 wk4 p1, nt2 wk4 p1, nt1 wk2 p2,
+nt2 wk2 p1}; down {nt2 p1 (default), nt1 p2, nt1 p3, nt2 p2, nt1 p4}.
+
+- All down variants, and the up variants with the same K split, give identical bits (tested).
+- A different WK changes the order of the K sums. The default was chosen by the sweep in § 8; it is best or
+  within noise of the best at every row count.
+
+## 5. Prefill: the grouped expert GEMMs
+
+`moe_prefill(L, x [T][6144], idx, w, T ≤ 8192, ws, yr, ys, stream, cfg)`, outputs as decode.
+
+1. **Bucketing** (`k_count`, `k_scan`, `k_scatter`): counts per expert; offsets and a tile list in
+   expert order, 128 picks a tile; each pick gets a position through an atomic per expert (`perm[pos] = row`).
+   Each row's eight picks are kept sorted by expert id (`rpos`, `re`, `rw`) for the combine. The atomics change
+   only where a pick sits in its bucket, which no row's result depends on: tested bit-identical across runs and
+   across chunk composition.
+2. **Gate/up** (`k_pup`; since 2026-10-14 the default is its warp-specialised form `k_pup_ws`, § 11): a CTA is a tile (128 picks of one expert) × 64 channels of gate and of up. Eight
+   warps are arranged 2 (rows) × 4 (channels); a warp tile is 64 rows × 2 gate + 2 up strips, so SwiGLU runs in
+   registers. Each k-step of 64:
+   - A (the gathered x rows) by 16-byte `cp.async.ca` into a 3-stage ring, chunks XOR-swizzled by row, read with LDS.128 (conflict-free).
+   - B: each warp decodes two of the 16 strips with the decode kernels' functions (so the same exact bf16
+     values) from raw blocks loaded a block (512 k) ahead into registers, into a 2-stage shared buffer.
+   - bf16 `mma.sync` m16n8k16, f32 accumulation.
+   - A warp whose 64 rows all lie past the tile's end skips its MMAs.
+
+   The epilogue is decode's: ×s2·fmt_k, bf16 gate and up, SwiGLU, bf16 h [position][512].
+3. **Down** (`k_pdown_r`; since 2026-10-14 the default is the chained down `k_pdown_c`, which replaces this
+   step and the combine, § 11): a CTA is a tile × 4 column blocks of 128 outputs, as one pipeline of 32 k-steps
+   (K = 512). The next blocks' weights load during the current one. Each pick's raw sums c go to `yp`
+   [position][columns of the pass] in f32. At T = 2048+ the columns run in 2 or 4 passes, so that `yp` stays
+   ≤ 420 MB.
+4. **Combine** (`k_combine`): per row and column, its picks in expert-id order, acc = fmaf(s2 · fmt_k · w, c,
+   acc). This is the decode step's arithmetic, so a row's routed output equals decode's up to the order of the K
+   sums inside each pick (tested).
+5. **Shared expert** (`k_pup<true>`, since 2026-10-14 `k_pup_ws<true>`; `k_pdown<true>`, since T6 at 128-row
+   tiles, `PrefillCfg::sh_rows`, § 12): dense over the chunk's rows, FP8 → bf16 tiles, each 128-k
+   unit summed apart and added × its block scale (as decode).
+
+**The FP4-activation path** (`PrefillCfg::fp4`, with `in_scale_gu` and `in_scale_dn` the layer's static
+input scales). This path changes outputs, which is experiment 4's question.
+
+- `k_quant` makes x and then h NVFP4 per 16, in IEEE f32 steps that the host function
+  `nvfp4_quant16_host` repeats bit for bit:
+  - sb = e4m3_rn_sat(amax / (6·S));
+  - d = e4m3(sb)·S;
+  - q = e2m1_rn_sat(x / d).
+- `k_pup_f4` and `k_pdown_f4` run `mma.sync … kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64` (e2m1 × e2m1,
+  ue4m3 scales), with k-steps of 128.
+- The weights go to shared memory as natural-order nibbles plus scale bytes:
+  - NVFP4: the bytes as stored.
+  - S3: the code → nibble table, by prmt; the subset bit is dropped from the scale.
+- The epilogues use alpha = S·s2.
+- The shared expert stays on the bf16 path (its FP8 block scales cannot ride this MMA).
+
+## 6. Numerics contract
+
+The reference is `ref/glmref.py` (moe): g = bf16(s2·Σ x·W′), u likewise; h = bf16(bf16(silu(g))·u);
+y_e = bf16(down(h)); out = bf16(Σ_e w_e · y_e in f32, in expert-id order) + shared, a bf16 add.
+
+| Point | Engine |
+|---|---|
+| weights | decoded exactly: e2m1 × e4m3 (and the subset's magnitude) is exact in bf16. NVFP4 values carry 2^−30 (the ×2^96 scale trick of the widening), which the epilogues multiply back exactly (`fmt_k` = 2^30) |
+| gate, up | f32 sums of exact bf16 products, ×s2·fmt_k, rounded to bf16, as the reference |
+| h | bf16(bf16(silu(g)) · u), `silu = g / (1 + expf(−g))` |
+| down | f32 sums; each expert's contribution added as fmaf(s2 · fmt_k · w, c, acc) in expert-id order |
+| shared | per 128-k unit an f32 sum, then acc = fmaf(scale, unit, acc) |
+| output | yr and ys are f32 partials of this rank; after the all-reduce, `finalize` makes bf16(bf16(yr) + bf16(ys)) |
+
+**Deviation from the reference.** At TP=4 a rank holds the partial of each expert's down over its 512 of the
+2048 intermediate channels, so it cannot round each expert's full y to bf16 before the weighted sum, as the
+reference does. The engine sums the experts' partials in f32 and rounds once after the all-reduce. Rounding the
+partials to bf16 instead would add an error the reference does not have, without reproducing its rounding.
+
+- **Summation order.** A K split (WK) fixes the order of the K sums. Decode is batch-invariant (a row's bits do
+  not depend on the other rows) and deterministic. Prefill equals decode up to the order of the K sums inside
+  each pick. It is deterministic and independent of the chunk's other rows.
+- **FP4 path.** It is not output-preserving. The activations are quantised. The MMA sums each k64 exactly and
+  rounds toward zero to f32; the k-steps are then summed in f32 in order. Measured in § 7: 17 % relative RMS
+  difference from the bf16 path on random data.
+
+## 7. Tests
+
+`test_experts` (GPU, through `run.sh test`); `test_experts --cpu` runs only the host checks. All pass as of the
+last run (2026-10-14 r8: 90 checks, the 78 above plus 12 new; § 11). Since the defaults changed, the older
+prefill checks (ranges, determinism, chunk invariance) now run on the new kernels.
+
+| Check | Result |
+|---|---|
+| CPU: NVFP4 widen, S3 pack + prmt decode (both subsets), FP8 widen (254 values), S3 code → nibble table, packers vs canonical readers (NVFP4, S3, FP8), routing reference (order, ties, sum) | 0 mismatches |
+| GPU dequantisation, NVFP4 / S3 / S3 two subsets, both shapes | 0 of 3,145,728 values differ from bf16(value × scale) |
+| route, random and many-tied rows | ids and weight bits identical to the reference |
+| decode h, M = 1, 3, 5, 8, 9, 16 (the shared expert included) | ≥ 99.9 % bit-exact against bf16 of the double sums; every value inside the range that f32 sums of the same terms can give (bound 2e−5 · Σ\|terms\| on gate and up, each end rounded as the kernel rounds) |
+| decode routed / shared out vs double from the GPU's h | ≤ 3.3e−7 / 8.4e−8 of Σ\|terms\| (tolerance 1e−4) |
+| decode batch invariance (16 rows vs each alone), determinism | 0 differ |
+| decode variants | same K split: bit-identical; other K splits: h inside the f32-sum range |
+| prefill T = 1, 37, 300, 2500 (2 down passes): h of sampled rows (8 picks + shared) | ≥ 99.7 % bit-exact, all inside the range |
+| prefill routed / shared out vs double from the GPU's h | ≤ 3.0e−7 / 8.1e−8 of Σ\|terms\| |
+| prefill vs decode, every row (T ≤ 300) | about half the outputs bit-identical; the rest differ by h's rounding flips (≤ 1.7e−3 of the row's largest output) |
+| prefill deterministic (T = 2500 twice); chunk invariance (300 rows alone vs inside 2500) | 0 differ |
+| FP4: x and h quantised (115,200 and 76,800 groups) vs the host quantiser | 0 differ |
+| FP4: h from the dequantised x | all inside the f32-sum range (24,576 of 24,576 bit-exact) |
+| FP4: routed out vs double from the GPU's quantised h | 4.5e−8 of Σ\|terms\| |
+| FP4: shared unchanged, deterministic | 0 differ |
+| (2026-10-14) prefill T = 1, 37, 300, 2500: h of every pick, warp-specialised gate/up with 64 × 64 warps (`up = 2`) vs `k_pup` | 0 differ |
+| (2026-10-14) prefill T = 1, 37, 300, 2500: every yr and ys value, the defaults (`k_pup_ws`, chained down) vs the kernels of 2026-10-13 (`k_pup`, `k_pdown_r` + `k_combine`) | 0 differ |
+| (2026-10-14) the same with `up = 2`, `down = 2` (warp-specialised chained down), 256-column passes claimed 3 round-robin, the shared expert on a side stream | 0 differ |
+
+Test data: 10 stored experts in five format patterns (all NVFP4; S3 with one subset; S3 with two; S3 gate/up +
+NVFP4 down; NVFP4 gate/up + S3 down) mapped over the 256 ids. The subsets are {0.5, 2, 4, 6} and {0, 1, 3, 6}
+(until E1; since 2026-10-14 the S3×2 pair {0.5, 2, 4, 6} + {0.5, 1.5, 3, 6}, the odd pairs keeping {0, 1, 3, 6}; § 13).
+Random scales; x random bf16; picks with six hot experts (prefill).
+
+## 8. Measurements
+
+**Conditions.** One GB10 (rank 0's), through `ring.sh` with production paused (the job's MEM line: 8–9 GiB
+used). Clocks unpinned: 2.18 GHz under load, 3003 MHz memory. The streaming-read probe measured
+234–237 GB/s in every run. Builds and source hashes are listed in § 9.
+
+**Decode** (the default variant nt1 wk6 p2 dyn / nt2 p1; the same decode code in three runs: r3 on bin-3,
+sources `91b677a77cde4477`; r9 and r10 on bin-8, `20f0734bb91e2377`).
+
+- The step is route + `k_up` + `k_down`, the shared expert included.
+- Each figure is the median of 7 replays of a graph of 64 steps.
+- A pool of ≥ 2.2 GB is cycled, so L2 holds no step's weights.
+- Bytes = the union's weights and scales + the shared expert.
+- "6c" = 6 rows over 28 experts (experiment 1's case).
+
+Cells give the range over the three runs as % of 235 GB/s (run-to-run spread is 2–6 points; the streaming
+probe gave 230–237 GB/s in the same windows).
+
+| Rows | union | NVFP4 | S3 | mix (S3 gate/up + NVFP4 down) | ms a token, 75 layers (r3): NVFP4 / S3 / mix |
+|---:|---:|---|---|---|---|
+| 1 | 8 | 93.3–99.3 % | 92.2–95.9 % | 91.3–96.1 % | 16.70 / 14.13 / 15.15 |
+| 2 | 15.8 | 97.1–99.8 % | 96.0–98.7 % | 90.7–99.5 % | 29.84 / 24.15 / 25.94 |
+| 4 | 30.5 | 95.2–100.3 % | 96.7–98.9 % | 97.0–99.8 % | 54.60 / 43.73 / 47.17 |
+| 6 | 44.4 | 97.7–100.3 % | 96.9–99.3 % | 96.5–99.8 % | 78.04 / 61.98 / 67.25 |
+| 6c | 28 | 97.1–99.4 % | 96.4–98.3 % | 95.3–99.1 % | 50.74 / 40.61 / 43.82 |
+| 8 | 57.9 | 96.9–100.4 % | 89.8–99.4 % | 97.1–99.9 % | 100.8 / 79.81 / 86.69 |
+| 16 | 102.4 | 95.1–100.8 % | 95.2–98.5 % | 96.7–98.7 % | 175.1 / 140.0 / 152.7 |
+
+Against the targets:
+
+- **≥ 90 % at 16 rows:** met in every run.
+- **≥ 95 % (NVFP4) and ≥ 94 % (S3) at 6 rows:** met in every run.
+- **1 row:** NVFP4 met it in 2 of 3 runs (93.3 % in r9); S3 in 1 of 3 (95.9, 93.9, 92.2 %).
+- **Per token** (one row), the 75 MoE layers' experts take 16.7–17.8 ms in NVFP4, 14.1–14.7 ms in S3 and
+  15.2–16.0 ms mixed.
+- **The spread** is larger than the gap to the target, so the 1-row figures need pinned clocks and repeats.
+  At 1 row the step is ~200 µs, and fixed costs weigh most: the route kernel (~6 µs in the step), the PDL
+  handover, and the tail of the up wave.
+
+| Parts at 1 row (µs) | NVFP4 | S3 | mix |
+|---|---:|---:|---:|
+| step (route + up + down) | 222.6 | 188.4 | 201.9 |
+| without the router | 216.9 | 182.2 | 193.6 |
+| up alone / down alone | 149.2 / 74.7 | 124.1 / 59.6 | 123.7 / 72.9 |
+
+The router costs 4.7 µs alone and ~6 µs in the step. Under PDL, up and down overlap: their sum exceeds the
+step by ~7 µs.
+
+**Prefill** (r9: bin-8, sources `20f0734bb91e2377`). One layer of 256 distinct experts in the format.
+
+- The chunk's rows pick 8 distinct experts uniformly at random (balanced buckets, ~T/32 picks an expert).
+- Each figure is the median of 5 replays of a 3-call graph.
+- TFLOPS count the useful MACs × 2: routed T × 8 × 3 × 512 × 6144, shared T × 3 × 512 × 6144.
+- "% of 107" is against the measured bf16 `mma.sync` peak.
+
+| Path, format | 1k rows: ms, TFLOPS (% of 107) | 4k | 8k | ms for 1k rows through 75 layers (8k chunks) |
+|---|---|---|---|---|
+| bf16, NVFP4 | 10.2, 17.0 (15.9 %) | 23.0, 30.2 (28.2 %) | 44.0, 31.6 (29.6 %) | 412 |
+| bf16, S3 | 9.6, 18.2 (17.0 %) | 22.5, 30.9 (28.9 %) | 42.8, 32.6 (30.4 %) | 401 |
+| bf16, mix | 10.2, 17.0 (15.9 %) | 23.4, 29.7 (27.7 %) | 43.4, 32.1 (30.0 %) | 407 |
+| FP4 activations, NVFP4 | 10.0, 17.4 | 20.8, 33.5 | 37.7, 36.9 | 353 |
+| FP4 activations, S3 | 8.8, 19.7 | 19.8, 35.2 | 36.8, 37.8 | 345 |
+
+Phases at 8k rows, NVFP4 (ms; TFLOPS of the phase's own MACs):
+
+| Phase | bf16 path | FP4 path |
+|---|---|---|
+| bucketing | 0.03 | 0.03 |
+| gate/up GEMM (FP4: with both quantisations) | 16.8 (49.0) | 10.9 (75.4) |
+| down GEMM (writes the f32 per-pick sums, 1.6 GB) | 12.6 (32.8) | 12.7 (32.5) |
+| combine (reads them back, writes yr) | 8.1 | 8.2 |
+| shared expert (FP8, both paths bf16) | 5.0 (30.9) | 5.1 |
+
+The gate/up kernel's time with parts switched off (bench diagnostics, r8, 8k rows, NVFP4, ms):
+
+| Configuration | ms |
+|---|---:|
+| all | 16.6 |
+| no weights | 13.2 |
+| no MMAs | 15.2 |
+| no A loads | 14.3 |
+| only A loads | 9.9 |
+| only MMAs | 10.6 |
+| only weights | 6.0 |
+
+The kernel is not bound by any one part. Its MMA loop alone reaches 77 TFLOPS. The gathered A (x rows, each
+tile's 1.5 MB read by all 8 channel-block CTAs, ~7.4 GB at 8k from L2) alone takes 10 ms.
+
+**The ≥ 60 % target (64 TFLOPS) is not met: 29–30 % at 8k rows.** Two separate reasons:
+
+1. **The per-pick f32 sums are a memory floor.** Keeping decode's numerics (each pick's down sum in f32, added
+   in expert-id order; no bf16 rounding of the rank's partial) means 8k rows write and read back
+   65,536 × 6144 × 4 B = 1.6 GB twice, plus 0.2 GB of yr: 3.4 GB, 14.5 ms at 235 GB/s.
+   - The GEMMs alone at the bf16 peak take 13.0 ms (1.39 PFLOP).
+   - Even if the down GEMM fully hid its writes, the combine's 7.7 ms cannot hide behind anything in this
+     layer. The ceiling is therefore ~67 TFLOPS (63 %), and only with GEMMs at 100 % of peak.
+   - Storing the per-pick sums in bf16 halves the floor but changes outputs (not done: exact-output rule).
+2. **The GEMM kernels themselves reach 30–47 % of peak.**
+   - Gate/up runs at 49–52 TFLOPS and down at 33.
+   - Shared expert: 31 TFLOPS (64-row tiles, per-unit scale accumulators).
+   - At 1k rows, gate/up is bound by the weights (each tile decodes the whole expert slice; 0.9 GB of gate/up
+     weights a layer is 3.9 ms at 235 GB/s), and partial tiles waste MMAs.
+
+FP4 activations (`mxf4nvf4`, peak 429 TFLOPS): the gate/up GEMM reaches 76–83 TFLOPS of useful work, 1.6–1.7×
+the bf16 kernel. The down GEMM (bound by its f32 writes) and the combine do not change, so the whole layer
+speeds up 1.2× (36.9–37.8 TFLOPS of useful work at 8k).
+
+
+## 9. Experiment log
+
+All runs: one GPU (rank 0), `run.sh` steps through `ring.sh`, results in `~/dsgb10-data/glm53-experts/rN.tsv`
+(not in the repo), binaries in `bin-N` with their `SOURCES` hash.
+
+| Run | Sources | What | Outcome |
+|---|---|---|---|
+| r1 | bin-1 | test, decode sweeps (first kernels: a separate down wave, a double-precision exp in the router) | the test step ran nothing: `test_experts` rejected `--out` (fixed). Decode 86.7–97.8 %, NVFP4 94.6 % at 1 row, S3 86.7 % at 1 row; large spread between variants |
+| r2 | `ceb7a54fbf426074` | test, decode: the f32 sigmoid, shared down fused into `k_down` with weights before the PDL wait, dynamic task claiming, per-part timings | decode 96–101 % with wk6; the tests flagged two things in the checks, not the kernels: an h check by "2 bf16 ulp" fails on cancelling sums (10 of ~400k values), and other-K-split variants were compared at a relative tolerance. Both replaced by the f32-sum range check |
+| r3 | `91b677a77cde4477` | test (all pass), first prefill (2-stage, MMAs branching per m16 tile), decode with the new defaults | the decode table above; prefill 27–29 TFLOPS at 8k (up 45, down 25, combine 8.1 ms) |
+| r4 | `e1c9c7da146078b2` | 3-stage A ring; tighter prefill checks from the workspace (`prefill_view`); the FP4 path and its tests | all pass; the 3rd stage changed nothing measurable (up 45 → 45 TFLOPS); FP4 up 76–84 TFLOPS |
+| r5 | `9a3ff38b77831097` | branch-free MMA steps (warp-level skip, fragments loaded ahead), the down kernel over 4 column blocks with weights prefetched | all pass; down 25.8 → 32.3 TFLOPS, up 45 → 47, 8k layer 49.3 → 45.4 ms |
+| r6 | bin-6 | the gate/up diagnostics (parts switched off) | only-A-loads 10.4 ms, only-MMAs 10.3 ms, only-weights 5.9 ms of 17.4 |
+| r7 | `aeece0beb106d950` | A tile as 16-byte `cp.async.cg` chunks, read with LDS.128 (half the instructions, conflict-free) | **slower**: up 17.4 → 21.8 ms; A loads alone 10.4 → 20.5 ms. The cause was `.cg` (L2 only) instead of `.ca` |
+| r8 | `20f0734bb91e2377` | the same with `cp.async.ca` | up 16.6 ms (49.7 TFLOPS); A loads alone 9.9 ms |
+| r9 | `20f0734bb91e2377` | final: tests (all pass), prefill and FP4 tables, decode sweeps | the prefill table; decode 2–6 points under r3 with unchanged decode code |
+| r10 | `20f0734bb91e2377` | decode sweeps again (spread check) | within the r3–r9 range; S3 at 1 row 92.2 % |
+
+## 10. What remains
+
+- **Prefill rate.** At 8k rows the bf16 prefill is at 36–37 % of the bf16 peak after the 2026-10-14 tuning
+  (§ 11), against a 60 % target. The bounds are measured in § 11.
+  - The chained down (16 ms at 8k, 25 TFLOPS) is now the largest phase: its ordered read-add-write of yr
+    and the waits between a row's picks. Next: fewer, larger column passes with yr held in shared memory
+    per row block (needs tiles grouped by row, not by expert), or the down's MMAs at 128-row × 256-column
+    CTAs to halve the yr traffic per MAC.
+  - The gate/up kernel is 3.3 ms over its MMA-only time; the shared expert (4.6 ms, 33 TFLOPS) runs its
+    gate/up at 64-row tiles (its down at 128 since T6).
+  - T6 (§ 12) located the down's cost: the ordered adds' stores, drained by the fence before each release
+    while the SM's only CTA waits. Going further needs the adds off the MMA warps' path (an asynchronous
+    epilogue or two CTAs an SM), which the 80 KB of shared memory and 248 registers a thread leave no room for.
+  - A split K or bf16 per-pick sums would go further but change outputs (not done: exact-output rule).
+- **Decode at 1 row** varies by run (S3 92–96 %). It needs pinned-clock repeats and a look at the fixed costs
+  (route, the PDL handover, the up wave's tail).
+- **FP4 path.** It is not output-preserving: on random data its outputs differ from the bf16 path by 17 %
+  relative RMS, which is for experiment 4 to judge on real activations with calibrated input scales. Its down
+  GEMM is unchanged in speed (f32-write bound) and uses 2 A stages.
+- **Integration.** The loader that fills the pool and `desc` from the converter's output (`layout.h`'s packers
+  are its specification). Wiring into the layer loop (the router's logits from the gate GEMV, yr/ys into the
+  all-reduce, `finalize`). The engine-wide CMake configure, once `attn/` and `comm/` configure again.
+- **Real weights.** All tests use synthetic tensors; a check against `ref/glmref.py` on a real layer's experts
+  is still to do.
+
+## 11. 2026-10-14: prefill tuning
+
+**Goal:** the bf16 routed-expert prefill from 30 % towards 60 % of the 107 TFLOPS bf16 peak at chunks of
+≥ 4096 rows. The rule was exact output: every output bit-identical to the 2026-10-13 kernels. bf16
+intermediates, a split K and FP4 activations were not allowed. Decode is untouched.
+
+**Result:** 1.23× at 8k rows, 35.5–37.4 % of peak. Every yr and ys value is bit-identical to the old path
+(tested at T = 1, 37, 300, 2500). The 60 % target is not met; the reasons are below.
+
+### What changed
+
+`PrefillCfg` gains `up`, `down`, `yr_kb`, `chain_q` and `side` (experts.h). The kernels of 2026-10-13 stay
+selectable as `up = 0`, `down = 0`.
+
+1. **The chained down** (`k_pdown_c`, `down = 1`, the default). It replaces the down GEMM plus combine.
+   - The old down wrote each pick's f32 down sums to a 1.6 GB buffer; the combine read them back.
+   - Now each tile's sums are added into yr as soon as a 128-column block is done:
+     `yr = fmaf(s2 · fmt_k · w, c, yr)`, with the row's rank-0 pick starting from 0.
+   - Each pick knows its rank among its row's eight picks in expert-id order (`prank`, `pw`, filled by
+     `k_scatter`). Its add waits until the rank before it has written. The waits use tickets per
+     (row, 32 columns) in the workspace:
+     - a warp polls them with relaxed loads and nanosleep;
+     - it releases with a fence, then stores rank + 1 (0 after rank 7, so the tickets reset themselves);
+     - a spin bound traps rather than hangs.
+   - The adds and their order are the combine's, so the output bits are the same. No summation order
+     changes.
+   - The CTAs are persistent and claim (pass, tile) tasks from a counter.
+     - Passes are column slices whose yr fits an L2 budget: `yr_kb`, default 16 MB, divided by `chain_q`.
+       The pass width is the widest of 256 × {24, 12, 8, 6, 4, 3, 2} columns that fits, at least 256.
+     - `chain_q` passes are claimed round-robin, tiles in expert order within each pass.
+     - A task is claimed only after every task it may wait on, so the waits cannot deadlock.
+   - yr is read with `ld.global.cg` and an L2 evict_last hint, a whole m16 tile's loads in flight together.
+2. **Warp-specialised gate/up** (`k_pup_ws`, `up = 1`, the default; also the shared expert's gate/up).
+   - 512 threads: 8 consumer warps run the same MMAs in the same k order as `k_pup`. 8 producer warps load
+     A and decode B into a 3-stage ring, handed over with named barriers (full / empty per stage).
+   - The producer order: decode B(i), wait for A(i), arrive full, then wait empty and load A(i + 2).
+3. **Coalesced A loads** (`load_a_co`). Eight threads cover one row's 128 bytes, so a warp instruction
+   covers 4 whole lines instead of 16 part-lines. Used by both new kernels. Alone, the A loads go from
+   9.9 to 5.7 ms at 8k.
+
+**Variants kept, not defaults** (tested bit-identical):
+- `up = 2`: 4 consumer warps of 64 × 64.
+- `down = 2`: the chained down, warp-specialised (`k_pdown_cw`).
+- `side`: the shared expert forked to a second stream.
+
+### Before / after
+
+r8 (bin-10, sources `84aeb0c6fe455ba2`; the commit adds comments only). One GB10 (rank 0's), conditions as
+in § 8. The old and new paths were measured in the same job, A then B and then again in reverse order
+(B, A); the cells give both, in run order.
+
+| Format, rows | old (up 0, down 0): ms, TFLOPS | new (up 1, down 1): ms, TFLOPS | % of 107: old → new |
+|---|---|---|---|
+| NVFP4, 1k | 10.07 / 10.13, 17.3 / 17.2 | 8.56 / 8.44, 20.3 / 20.6 | 16.1 → 19.0–19.3 |
+| NVFP4, 4k | 23.27 / 23.58, 29.9 / 29.5 | 19.01 / 19.09, 36.6 / 36.5 | 27.6–27.9 → 34.1–34.2 |
+| NVFP4, 8k | 44.90 / 44.10, 31.0 / 31.6 | 36.62 / 36.48, 38.0 / 38.1 | 29.0–29.5 → 35.5–35.6 |
+| S3, 1k | 9.61 / 9.68, 18.1 / 18.0 | 7.80 / 7.91, 22.3 / 22.0 | 16.8–16.9 → 20.5–20.8 |
+| S3, 4k | 22.51 / 22.58, 30.9 / 30.8 | 18.37 / 18.11, 37.9 / 38.4 | 28.8–28.9 → 35.4–35.9 |
+| S3, 8k | 43.10 / 42.96, 32.3 / 32.4 | 35.10 / 34.76, 39.6 / 40.0 | 30.2–30.3 → 37.1–37.4 |
+| mix, 1k | 10.12 / 9.97, 17.2 / 17.4 | 7.91 / 7.76, 22.0 / 22.4 | 16.1–16.3 → 20.6–21.0 |
+| mix, 4k | 23.09 / 23.06, 30.1 / 30.2 | 18.53 / 18.25, 37.5 / 38.1 | 28.2 → 35.1–35.6 |
+| mix, 8k | 43.25 / 43.10, 32.2 / 32.3 | 35.35 / 35.25, 39.4 / 39.5 | 30.1–30.2 → 36.8–36.9 |
+
+Through 75 layers at 8k-row chunks, NVFP4, the routed and shared experts take 417 → 343 ms per 1k rows (means of
+the two orders), before the attention side.
+
+The phases at 8k, NVFP4 (r8, first order), in ms with the phase's TFLOPS:
+
+| Phase | old | new |
+|---|---|---|
+| bucketing | 0.05 | 0.05 |
+| gate/up | 17.0 (48.6) | 14.2 (58.0) |
+| down | 12.9 (31.9) | 16.2 (25.4), adds into yr included |
+| combine | 8.3 | — |
+| shared expert | 5.0 (30.7) | 4.7 (32.6) |
+
+The two changes add up: the A/B grid also measured the mixed pairs. At 8k in NVFP4, the chained down alone
+gives 44.9 → 39.8 ms and the WS gate/up alone 44.9 → 41.5 ms.
+
+### Why not 60 %
+
+60 % is 64 TFLOPS, 21.7 ms a layer at 8k. The new path takes 36.5 ms:
+
+- **Gate/up**, 14.2 ms. With parts switched off (r6): MMAs only 10.9 ms, A loads only 5.7, weights
+  only 5.9. It already runs within 3.3 ms of its own MMA loop, which reaches 75 TFLOPS on `mma.sync`.
+- **Chained down**, 16.2 ms, against 3.9 ms of MACs at peak. It is bound by the ordered add into yr: each
+  pick's 6144 columns are read, added and written in the row's expert order, 3.2 GB of L2 traffic at 8k.
+  Its tiles also wait on other tiles. Narrower passes (more L2 hits) mean more waits and more re-reads of
+  h; wider ones spill yr out of L2 (see `yr_kb` and `chain_q` below).
+- **Shared expert**, 4.6 ms at 33 TFLOPS.
+
+Even with gate/up at its MMA floor and the down at the old down's 12.9 ms without the combine, a layer
+would take ~29 ms (48 TFLOPS, 45 %). Going further needs a down that avoids the ordered f32 read-add-write
+per pick, or numerics that change outputs (§ 10).
+
+### Runs
+
+Results are in `~/dsgb10-data/glm53-experts-pf/rN.tsv` and binaries in `bin-N` (not in the repo). Each run
+is one `ring.sh` job on rank 0's GPU. All runs are NVFP4 unless noted.
+
+| Run | Sources | What | Outcome |
+|---|---|---|---|
+| r1 | `b9aaf884` | chained down, first form: one ticket per (row, pass) | 1k: down 84 ms (a pick waits for its row's previous pick over the whole pass). Chunk invariance failed: the workspace offsets moved with T (fixed: tickets at fixed offsets) |
+| r2 | `1fb6a81d` | a ticket per (row, 128-column block); the side stream | all checks pass; 8k down 66 ms. Side stream: no gain |
+| r3 | `1336999b` | WS gate/up (first form); `chain_q` | WS up 17.5 vs 17.0 ms: no gain. `chain_q` 4: 8k down 76 → 29 ms |
+| r4 | `8b32c32f` | a ticket per (row, 32 columns), so each warp waits only for its own rows | 8k down 50 ms at cq 1, 25 at cq 4; the yr loads were found serialized behind their adds |
+| r5 | `3f6137db` | producers reordered (decode B before waiting on A); an L2 prefetch of the next A rows | up 16.5 ms. Chained down 18.3 ms vs 21.5 for the old down plus combine. The prefetch hurt: A loads alone 9.9 → 14.6 ms (removed) |
+| r6 | `eda26751` | coalesced A loads; yr loads batched per m16 tile | all checks pass; the best: 8k 36.4 ms, 38.3 TFLOPS. yrkb 65536: worse. up 2 (64 × 64 warps): 15.2 ms, worse. Diagnostics above |
+| r7 | `a53d3d84` | sweep: down 1 / 2, cq 2 / 4 / 8, yrkb 16 / 32 MB, 1k–8k | all checks pass, including down 2. Best down 1, yrkb 16 MB, cq 2–4 (8k 36.3–36.6 ms). cq 8: 39.6 ms. yrkb 32 MB: 0.3–1 ms worse. Down 2: 0.4–1.5 ms worse |
+| r8 | `84aeb0c6` (bin-10); `440bb14d` (bin-11) | final A/B in both orders, three formats (bin-10). bin-11: setmaxnreg 120 / 136 for producer / consumer warps | the table above; 90 checks pass on both. setmaxnreg: up 14.5 ms (no gain); down 2 16.1 vs down 1 16.3 ms (within noise). Kept off (`kWsRegP = kWsRegC = 0`): the consumers already fit in 120 registers, so they gain nothing; without the split, `k_pdown_cw` spills 64 bytes |
+
+**Not done.** A split K for the down's or the gate/up's K sums: it changes the summation order, so it is
+outside the rule.
+
+## 12. 2026-10-14 (T6): where the chained down's time goes
+
+**Goal:** the routed-expert prefill faster with every yr and ys value bit-identical (prefill task T6, lever 2).
+**Result:** one exact change, the shared expert's down at 128-row tiles (`PrefillCfg::sh_rows`, default 128):
+the shared phase 0.1–0.2 ms faster at 1k–8k rows (A B B A below), within the whole call's spread. The chained
+down, the largest phase, was taken apart (below), and five exact variants of its epilogue were tested and
+dropped: none was faster.
+
+All runs: one `ring.sh` job each on rank 0's GPU, NVFP4 at 8k rows unless noted. Results are in
+`~/dsgb10-data/glm53-pfk-moe/*.tsv` (not in the repo); the source hashes are the install's `SOURCES`.
+
+### The chained down, parts switched off
+
+`PrefillCfg::ddiag` (bench only, wrong results) switches parts of `k_pdown_c` off, as `diag` does for the
+gate/up (`bench_experts --prefill q4 --diag`). Sources `cb1a8b40` (d2.tsv), `yr_kb` default:
+
+| `k_pdown_c` at 8k | cq 1 | cq 2 | cq 4 |
+|---|---|---|---|
+| everything | 17.8 ms | 16.8 | 17.5 |
+| no adds into yr (no waits, loads, stores, tickets) | 6.0 | 6.3 | 4.6 |
+| no waits (adds unordered, no tickets) | 13.9 | 13.3 | 15.8 |
+| no waits, no yr loads (stores only) | 11.0 | 10.9 | 11.5 |
+| no waits, no yr stores (loads only) | 6.0 | 5.9 | 4.4 |
+| no weights | 15.6 | 15.4 | 14.6 |
+| no MMAs | 16.8 | 16.5 | 17.1 |
+| no A (h) loads | 12.6 | 12.8 | 14.7 |
+
+- The MMAs, weights and h loads without the adds take 4.6–6.3 ms; the adds cost 10.5–12.9 ms on top.
+- Of the adds, the stores cost most: 4.6–6.9 ms over no adds. After its stores each warp fences (`__threadfence`) before
+  releasing its rows' tickets, so it waits for every store to land. One CTA a SM (80 KB of shared memory,
+  248 registers a thread) then waits at the next `__syncthreads`, and nothing else can run on the SM.
+- Loads without stores cost nothing: nothing waits for their values.
+- The waits for the lower-rank picks cost 1.7–3.9 ms.
+
+### What the L2 holds
+
+`l2w` (a microbenchmark, scratch, not in the repo; 192 CTAs × 512 threads over a buffer of S MB, repeated):
+
+| S, MB | 2 | 4 | 8 | 12 | 16 | 24 | 64 | 512 |
+|---|---|---|---|---|---|---|---|---|
+| store GB/s | 851 | 917 | 898 | 913 | 564 | 348 | 178 | 187 |
+| load GB/s | 900 | 866 | 882 | 854 | 876 | 784 | 266 | 213 |
+| read-modify-write GB/s | 1478 | 1402 | 1347 | 729 | 534 | 441 | 228 | 204 |
+
+The L2 (24 MB) holds about 12 MB of written data. The chained down's yr in flight is `chain_q` passes ×
+T × 256 columns × 4 B, 16–32 MB at 8k. A smaller hot set does not help, though: with 256-column passes
+and cq 2 (hs.tsv, d3.tsv) the adds cost about the same per row at T = 2048 (4 MB of yr in flight;
+1.1 µs a row), 4096 (8 MB; 1.7 µs) and 8192 (16 MB; 1.5 µs). The bound is the drain of each warp's
+stores before its release, not where they land.
+
+### Variants tried (all bit-identical, all dropped)
+
+`k_pdown_p` (`down = 3`; removed from the code afterwards), a copy of `k_pdown_c` with one change each, tested against the 2026-10-13 kernels
+at T = 1, 37, 300, 2500 (0 outputs differ). 8k NVFP4, both orders in one job, ms of the down phase:
+
+| Variant | Down, ms | k_pdown_c in the same job | Sources, results |
+|---|---|---|---|
+| a column block's rows waited for and their yr loaded at k-step 0 of the block (registers), added after it | 29.9–30.1 (cq 4) | 16.7–17.3 (cq 4) | `0b0c83ec`, p1.tsv |
+| the same at k-step 4 | 22.2–22.4 (cq 4) | | |
+| L2 hints: weights evict-first, a row's last add (rank 7) stored evict-first | 16.7–17.5 (cq 4) | | |
+| fences `fence.acq_rel.gpu` instead of `__threadfence` | 16.8–17.6 (cq 2, 4) | 17.2–17.8 (cq 2, 4) | `18f4058e`, p2.tsv |
+| a block's rows released after the next block's MMAs (the fence finds the stores landed) | 48.9–50.7 (cq 2), 28.2–28.8 (cq 4) | | |
+| an epilogue's 32 yr loads a lane all issued before its first add | 17.0–17.8 (cq 2, 4) | 16.4–17.3 (cq 2, 4) | `f978e0ea`, p3.tsv |
+
+- Early loads must wait for the tickets earlier, so the waits grow (the CTA stalls at each wait), and the
+  k-step-0 form spills 88 bytes.
+- The deferred release delays every dependent pick by a column block; the waits grow far more than the fences
+  shrink.
+- The 2026-10-14 runs had already tried the yr budget (`yr_kb`) and passes in flight (`chain_q`); hs.tsv repeats the
+  sweep at 2k–8k: the defaults (16 MB, cq 4; cq 2 is equal within the spread) stay.
+- Not tried, too large for this task: an asynchronous epilogue (the MMA warps hand a column block's sums to
+  epilogue warps through shared memory: 64 KB a 128 × 128 block, against 101 KB in all with the 80 KB of A and
+  B stages), and two CTAs a SM (each ≤ 50 KB and ≤ 128 registers a thread; the accumulators and the raw
+  weight blocks alone take about 136).
+
+### The shared expert's down at 128-row tiles
+
+`k_pdown<true, 4>` (`sh_rows = 128`, the default) decodes each FP8 weight strip once for 128 rows of the chunk
+instead of 64; the same MMAs, unit sums and scaling a row, so the same bits (tested against the 64-row
+kernel: the 2026-10-13 reference of § 7 now runs with `sh_rows = 64`; all checks pass, `bc6bb3df`).
+Its gate/up at 128-row tiles (`k_pup<true, 4>`, 256 threads) was no faster than `k_pup_ws<true>` at 64
+(`417d9553`, p4.tsv) and was dropped.
+
+A B B A in one job (`bc6bb3df`, f1.tsv), A = 64-row tiles, B = 128; the shared phase, then the whole call:
+
+| Format, rows | shared, ms: A / B / B / A | whole call, ms: A / B / B / A |
+|---|---|---|
+| NVFP4, 1k | 0.68 / 0.58 / 0.59 / 0.69 | 9.23 / 8.92 / 9.06 / 8.77 |
+| NVFP4, 4k | 2.34 / 2.22 / 2.25 / 2.48 | 19.97 / 19.92 / 19.98 / 19.84 |
+| NVFP4, 8k | 4.79 / 4.69 / 4.65 / 4.67 | 38.52 / 38.70 / 38.57 / 38.90 |
+| S3, 1k | 0.69 / 0.62 / 0.60 / 0.66 | 8.14 / 8.01 / 8.35 / 8.02 |
+| S3, 4k | 2.44 / 2.24 / 2.24 / 2.38 | 18.94 / 18.99 / 19.12 / 19.28 |
+| S3, 8k | 4.87 / 4.68 / 4.66 / 4.88 | 37.15 / 36.96 / 37.15 / 37.11 |
+| mix, 1k | 0.66 / 0.60 / 0.58 / 0.68 | 8.09 / 8.12 / 8.16 / 8.21 |
+| mix, 4k | 2.32 / 2.25 / 2.36 / 2.50 | 19.22 / 18.76 / 19.08 / 19.19 |
+| mix, 8k | 4.75 / 4.57 / 4.61 / 4.82 | 37.42 / 37.21 / 37.24 / 37.14 |
+
+The shared phase gains 0.06–0.2 ms (2–14 %); the whole call moves within its spread (±0.3 ms). The phases at
+8k NVFP4 in this job: bucketing 0.05 ms, gate/up 15.6–16.4, chained down 17.3–17.7, shared 4.65–4.79; the whole
+call 38.5–38.9 ms, 36.0–36.1 TFLOPS, 33.4–33.8 % of the bf16 peak (§ 11's r8 job measured 36.5–36.6 ms with
+the same kernels; the 2 ms between the jobs is not explained here).
+
+### Checks
+
+`test_experts` (`run.sh test`) on every build of this section: all pass, 0 failed (f1.log: the final sources;
+p1–p4.log: the dropped variants' checks as well).
+
+## 13. 2026-10-14 (E1): S3×2, the quantiser's format, in the engine
+
+**Goal:** the quantiser's chosen expert format ([quantiser.md](quantiser.md) Q1: S3×2 gate/up + NVFP4 down, the
+main track; S3×2 on every projection, the bracket) in the engine, every value exact to the format's definition
+in `quant/formats.py`. **Result:** the kernels needed no new decode path (S3 always carried two subsets in
+`MatDesc`); E1 fixes the pair, gives the converter a packer that is byte-for-byte `layout.h`, checks the
+quantiser's own bytes on real experts through every reader and kernel, adds a decode variant equal to prefill
+bit for bit, and makes the loader check S3 descriptors and scale bytes. Experiment row E1.
+
+### The format, exactly
+
+S3×2 is `kS3` with the subsets `kS3x2Mags` (experts.h): **A = {0.5, 2, 4, 6}** where a group's scale byte has
+bit 7 clear, **B = {0.5, 1.5, 3, 6}** where it is set (quantiser.md § 2, `levelset3` with two subsets):
+
+- a group is 16 consecutive k of one row (K is the GEMM's input dimension, torch `W[out][in]`'s `in`);
+- per group the quantiser tries both subsets × the multipliers {1, .95, .9, .85, .8, .75, .7}, scale
+  `e4m3_rne(amax₁₆ / 6 · m / s2)`, values to the nearest level (ties to the lower), and keeps the least squared
+  error (first in (subset, multiplier) order on ties); the winner's subset is bit 7 and its e4m3 scale bits 6:0;
+- `s2 = f32(amax) / f32(2688)` over the whole tensor (a division, unlike NVFP4's multiply by f32(1/2688); per
+  tensor, gate and up not shared, unlike NVFP4);
+- code `c = sign << 2 | j` means (−1)^sign · m_j of the group's subset; 16 codes a little-endian 48-bit word,
+  value i at bits 3i…3i+2; W = (−1)^(c>>2) · mags[s>>7][c&3] · e4m3(s & 0x7F) · s2.
+- 3.5 bpw a matrix (3 bits + an 8-bit scale per 16); the main track averages 3.83 (NVFP4 down at 4.5).
+
+In the engine nothing about the format is new: the block is S3's (1,792 B for 8 rows × 512 k, § 2), the
+subset bit travels in the scale byte, and the two subsets are the descriptor's prmt tables (`tab[0..3]` A,
+`tab[4..7]` B) and FP4 nibble words (`nib[0]`, `nib[1]`). Every product mag · e4m3 is exact in bf16 (at most 6
+significant bits; 1.5 adds one bit to 0.5's), so the decoded weights are the format's values exactly. A
+matrix's descriptor is `make_desc_s3x2(off, s2)`; a layer mixes formats per projection as before (each of an
+expert's three `MatDesc`s has its own `fmt`; the kernels branch warp-uniformly on it).
+
+The tests used {0, 1, 3, 6} as the second subset until E1; they now use the measured pair, and the odd-pairs
+pattern keeps {0, 1, 3, 6} so a pair with a 0 stays covered.
+
+**The FP4 tensor-core path and the two subsets.** Both subsets are E2M1 magnitudes, so each code is an E2M1 value
+times the group's e4m3 scale. `k_pup_f4` / `k_pdown_f4` turn each code into its E2M1 nibble through the subset's
+nibble word (`nib[s >> 7]`, by prmt), clear bit 7 of the scale byte and hand it to `mma … kind::mxf4nvf4
+.block_scale.scale_vec::4X` as the ue4m3 scale of the same 16 values: the weight side of the MMA is the format's
+value, bit for bit. The path is still not output-preserving: it quantises the activations to NVFP4 (§ 5), which
+the contract (bf16 activations, f32 accumulation) does not allow, and on these weights it moves the routed output
+by 15.8–17.2 % relative RMS (below). Under the contract prefill runs the bf16 `mma.sync` path, the weights decoded
+to bf16 by the decode kernels' own functions.
+
+### What the converter calls
+
+`engine/weights/s3x2_pack.py` (needs only `quant/formats.py`, numpy, torch; CPU):
+
+```
+q  = quantise_expert(W_gate, W_up, W_down, recipe="mix")       # [(fmt, canonical)] x 3, full f32 tensors
+sl = [rank_slice(f, c, m, r) for m, (f, c) in enumerate(q)]    # gate/up rows [512r, +512), down cols [512r, +512)
+entry, tag, moff = expert_entry(sl)                            # the TOC entry's bytes, fmt tag, matrix offsets
+descs = expert_descs(sl, entry_off_in_pool)                    # 3 x 64 B MatDesc (make_desc_s3x2 / make_desc)
+```
+
+Recipes: `mix` (S3×2, S3×2, NVFP4; an expert 4,521,984 B a rank), `s3x2` (4,128,768 B), `nvfp4` (NVIDIA's recipe,
+gate/up sharing amax; 5,308,416 B). `pack_s3` is a vectorised port of `layout.h pack_s3`; `pack_nvfp4` repeats
+experts_fill.py's port so the module stands alone. The reserved entries are sized for NVFP4, so an S3 fill must
+re-declare each expert entry's `fmt`, `shape` and `reserve_bytes` (as `tests/s3x2_layer_test.py` does on a copy).
+Time: ~2.2–2.8 s an expert at 4 threads (quantise all three, cut, pack), ~12 min a layer a rank at 4 threads if
+each rank quantised alone; quantising once and cutting four ranks is ~4× cheaper.
+
+### Checks (all 2026-10-14, all pass)
+
+| Check | Where | Result |
+|---|---|---|
+| `s3x2_pack.py selftest`: vectorised packers vs a per-element port of `read_s3`/`read_q4` on random bits; Gaussian 2048 × 6144 / 6144 × 2048 tensors through levelset3 / nvfp4_rtn, 4 rank slices = slices of the full tensor's values, 8,000 packed values each read back; descriptor tables decode to the subsets | CPU | 0 bad |
+| The quantiser's bytes (dumps of layer 3 experts 0, 51, 102, 153, 204, 255 cut to rank 1, layer 40's to rank 2, mix and s3x2; 4 random experts × 2 recipes): Python packer = `layout.h` packer; Python MatDesc = `make_desc_s3x2` / `make_desc`; the torch model (levelset3_dequant / nvfp4_dequant without s2) = `canon_s3`/`canon_q4` and = `read_s3`/`read_q4` of the Python-packed blocks; scale bytes | `test_experts --real` (host) | 0 of 113,246,208 values a layer differ (75,497,472 random), 0 bytes, 0 descriptors; subset B in 40.3 % (layer 3), 38.0 % (layer 40), 50.0 % (random) of the groups |
+| The GPU decode (`dec_group`, the kernels' fragment mapping) of every value vs the torch model | GPU | 0 of 113,246,208 differ, each layer (NVFP4 as bf16(v · 2⁻³⁰)) |
+| Decode at M = 1, 3, 5, 6, 8, 9, 16 on a layer of these 12 real experts (both recipes) mapped over 256 ids: h against double (the f32-sum range), outputs against double from the GPU's h, batch invariance, determinism, all 9 up and 5 down variants | GPU | all pass; h 99.98 % bit-exact (e.g. M = 16: 425,890 of 425,984), outputs ≤ 2.1e−7 of Σ\|terms\| |
+| Prefill at T = 1, 37, 300 on the same layers: h, outputs against double; default kernels vs those of 2026-10-13 and the variants (bit-identical); the FP4 path (activation bits, h range, outputs) | GPU | all pass |
+| **Decode = prefill**: the wk1 decode variants (`DecodeCfg::up = kUpPrefillOrder` = 6, and 7, 8) against moe_prefill, every h (8 picks + shared) and every yr and ys value, 16-row steps | GPU, real (both layers), random and synthetic layers | **0 differ**: h 0 of 1,382,400, outputs 0 of 3,686,400 at T = 300, each layer |
+| Synthetic `test_experts` with the measured pair (109 checks; adds M = 6, the descriptor check, subsets A, B, C) | GPU | all pass |
+| `glw_kcheck --partial --layers 3 --blocks` on the NVFP4 layer-3 test file | CPU | 3,123 ok, 0 bad (768 new block checks) |
+| A copy of that file with layer 3 re-filled in S3×2 mix from the master by `s3x2_pack.py` (`tests/s3x2_layer_test.py`, 706 s, 1,211,736,064 B): `glw_check`; `glw_kcheck --blocks`; `glw_expert_fill_test` experts 0, 17, 255 (read_s3 / read_q4 through each descriptor vs the canonical slices) | CPU | CRCs, padding, geometry OK; 3,635 ok, 0 bad: 512 S3 descriptors all the S3×2 pair, 150,994,944 scale bytes, 40,203,464 groups of subset B; 0 of 28,311,552 values differ |
+
+A damaged copy of the S3×2 file (one scale byte made the e4m3 NaN, one table byte flipped) was refused by the
+loader's CRC check before kcheck's own checks ran; those are covered by the host unit check ("cpu s3 descriptor
+check": a flipped table byte, a flipped nibble word, an off-grid and a descending subset, an NVFP4 descriptor all
+refused; another pair accepted and reported).
+
+### Decode against the floor
+
+One GB10 (rank 0's), `ring.sh` job j2 (bin-2, sources `e440cbbea4af725c`), streaming probe 227.5–229.4 GB/s in
+the window. Each figure is the median of 7 replays of a 64-step graph (route + up + down, the shared expert
+included), % of 235 GB/s; the runs were in the order A B C D D C B A (A = the default wk6, B–D = wk1 p2, p4, nt2),
+the cells give A's two runs and B's two.
+
+| Rows | mix (S3×2 gate/up + NVFP4 down): default | mix: wk1 p2 (= prefill) | S3×2 all: default | S3×2 all: wk1 p2 |
+|---:|---|---|---|---|
+| 1 | 88.9 / 90.0 % (218.2 / 215.8 µs) | 83.1 / 83.5 % (233.5 / 232.5 µs) | 91.6 / 91.8 % (197.3 / 196.9 µs) | 82.8 / 82.2 % |
+| 6 | 94.6 / 93.7 % (945 / 955 µs) | 89.1 / 87.3 % | 92.1 / 97.1 % (890 / 845 µs) | 86.5 / 88.0 % |
+| 16 | 94.8 / 94.4 % (2,121 / 2,129 µs) | 90.4 / 90.3 % | 92.6 / 93.4 % (1,987 / 1,968 µs) | 89.7 / 89.5 % |
+
+- The default keeps experiment 1's 91–93 % (S3) and K2's range: S3×2 91.6–97.1 %, mix 88.9–94.8 % of 235
+  (91.9–99.9 % of the measured window). Per token, 75 layers at 1 row: mix 16.2–16.4 ms, S3×2 14.8 ms.
+- **The prefill-order decode costs 5–10 %.** One warp a strip pair sums all 6,144 k (prefill's order) instead of
+  six warps 1,024 each; its tasks are six times longer and the up wave's tail grows (up alone at 1 row: 147 vs
+  134 µs). p4 and nt2 are no better than p2. Kept as a variant, not the default: the default stays the
+  engine's decode; choosing decode = prefill for the runner (its `DecodeCfg::up`) is the orchestrator's call
+  (engine/model is outside E1).
+
+### Prefill
+
+j3 (bin-2), 256 distinct experts in the format, balanced picks, median of 5 replays (§ 8's method), the defaults
+(warp-specialised gate/up, chained down):
+
+| Format | 1k rows: ms, TFLOPS (% of 107) | 4k | 8k |
+|---|---|---|---|
+| mix, bf16 | 8.07, 21.6 (20.1 %) | 18.83, 37.0 (34.5 %) | 36.38, 38.2 (35.7 %) |
+| S3×2, bf16 | 7.96, 21.9 (20.4 %) | 18.41, 37.8 (35.3 %) | 36.33, 38.3 (35.8 %) |
+| mix, FP4 activations (not exact) | 9.47, 18.4 | 21.04, 33.1 | 38.07, 36.6 |
+| S3×2, FP4 activations (not exact) | 9.05, 19.2 | 20.39, 34.1 | 37.32, 37.3 |
+
+As T1/T6 measured for the same kernels; the gate/up runs at 58–60 TFLOPS at 8k (mix 13.8 ms) and the chained
+down's ordered adds (16.7 ms) bound the layer. The FP4 path (its 2026-10-13 kernels, `up 0 down 0`) is now
+slower than the exact path at every size: its gate/up is faster (78.7–79.7 TFLOPS) but its down and combine are
+the old ones.
+
+### Failures and what is left
+
+- **Decode = prefill is a variant, not the default**: 5–10 % slower at decode (above). The other way round,
+  prefill in the default decode's order (six 1,024-k chains summed in order), needs a second accumulator set in
+  the gate/up kernel (64 more registers a thread in `k_pup_ws`, which is capped at 128 a thread at 512
+  threads) or 64 KB more shared memory a CTA; not tried.
+- No S3×2 fill of the rank files: experts_fill.py (another agent's) must call `s3x2_pack` and re-declare the
+  entries' format and size (reserved for NVFP4 today); `tests/s3x2_layer_test.py` shows the calls on a copy.
+- The real-expert decode/prefill tests use synthetic x (unit-RMS bf16) and a synthetic shared expert; no real
+  activations, no KL (experiment 3).
+- kcheck's new checks were not seen to fire on a damaged file (the CRC refused it first); the unit check covers
+  their verdicts.
+- Runs: `~/dsgb10-data/glm53-e1/` (j1–j3.tsv, ring1–3.txt; job1–3.sh), dumps in `/data/scratch/glm53-e1/` (not in
+  the repo).

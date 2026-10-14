@@ -1,0 +1,935 @@
+# The layer runner and the TP=4 step (engine/model)
+
+G4: GLM-5.3 end to end on the four ranks (two ASUS Ascent GX10, two DGX Spark): the embedding, 78 layers, the
+final norm, the vocabulary-split head, the sampler and the MTP layer, over the kernels of `engine/attn`,
+`engine/experts` and `engine/comm`. Everything here was run on the ring on 2026-10-13/14, borrowed from the
+DeepSeek service through its `ring.sh` (jobs of 15 s to 2 min).
+
+**Status.** End to end on the filled rank files since 2026-10-14 (G8, partial: within 2× the reference's order variance
+on all four golden sets, refhashes pinned, 22–23 tok/s plain through glmfront; [below](#end-to-end-on-real-weights-g8-2026-10-14)).
+Before that: runs on four ranks on synthetic weights and on the real non-expert rank files (G2) with synthetic
+routed experts, layer 3 also with its real NVFP4 experts. Decode step at 1 row **46.4 ms** (21.6 tok/s) against
+a 34.2 ms bandwidth floor (1.35×); after the 2026-10-14 decode-gap pass 43.6 ms (1.27×) in the interleaved A/B, ~44 ms
+on undisturbed ranks, the MoE at its floor and the rest the collectives' latency and attention ([Closing the
+decode gap](#closing-the-decode-gap-2026-10-14)); prefill **1,106 / 1,145 / 908 tok/s** for chunks of 2,600 and
+8,192 from 0 and the last 8,192 of 32,768 tokens, **1,027 tok/s** for a whole 32,768-token prompt, after the
+pipelined prefill attention and 4 comm blocks ([Prefill kernels](#prefill-kernels-t6-2026-10-14); 1,084 / 1,086 /
+860 and 968 with the collectives overlapped, [Prefill overlap](#prefill-overlap-2026-10-14); 854 / 794 / 698 and
+753 after the tensor-core GEMMs of [Prefill GEMMs](#prefill-gemms-2026-10-14); 381 / 374 / 350 on the 16-row
+GEMVs), 83 % of the published 1,374 tok/s at 8k. Against the
+reference's golden data the residual stream after layers 0–3 agrees to cosine 0.9998 (mean), relative error
+1.2–2.1 %, the size the FP8 requantisation predicts (each FP8 tensor 2.6 % relative error). Every
+self-consistency check passes (below).
+
+## Code
+
+| File | What |
+|---|---|
+| `model.h` | the API: `Model` (bind a rank file or synthetic weights, `launch` a step of 1–16 rows, `wait`, `prefill`, `profile`), `Batch` (rows with token, position, slot, session; per-session `Sampling`), `SampleOut` |
+| `config.h` | the model's constants beyond attn.h/experts.h: the MTP layer 78, 79 caches, dense layers 0–2, vocabulary 154,856 used of 154,880, stop ids 154820/154827/154829 (protocol.md v2) |
+| `model.cu` | the decode step: one layer, the forward, one CUDA graph per row count, launch and wait, profiling, cache hashes |
+| `mtp.cu` | the MTP layer's draft passes (decode: pass 1 over every row, the chains from each session's last accepted row), its eh_proj, the teacher-forced `mtp_forced` |
+| `spec.h` | the drafts' gate (how many drafts a session's next verify step feeds) and its cost model |
+| `prefill.cu` | prefill chunks of up to 8,192 rows (the projections through attn's `gemm()` / `gemm_bf16()`, `pf_proj`; the layers in two pieces of rows, each piece's collectives on a second stream beside the other's compute, `kTunePfOverlap`), the MTP cache fill |
+| `ops.cu`, `sample.cu` | the step-input ring, the vocabulary-split embedding, the top-1 for drafts, publishing; the DeepSeek sampler ported (38,720 ids a rank, ids ≥ 154,856 masked) |
+| `oproj.cu` | o_proj as the producer half of its all-reduce (`kTuneOproj`, off by default; [Closing the decode gap](#closing-the-decode-gap-2026-10-14)) |
+| `tools/step_profile.py` | the per-kernel critical-path profile of `glm_run trace`'s nsys reports, every rank; `--prefill`: one prefill chunk's (`glm_run pftrace`), per kernel kind and per class, and per stream (busy, idle, the side stream under the main one) |
+| `l2pf.cu` | the paced L2 prefetch (DeepSeek's l2pf): the next weights during collectives and attention |
+| `bind.cu` | binding a `.glw` rank file (names, sizes and layouts checked), synthetic weights, synthetic routed experts for a file whose pools are not filled |
+| `tools/glm_run.cu` | the driver: `bench`, `l2pf`, `ab` (two lever sets, interleaved, timing and output bits), `trace` (under nsys), `prefill`, `pfab` (prefill, two lever sets A B B A, timing and output bits; chunks or whole prompts), `pftrace` (one chunk under nsys), `check`, `tf`, `refhash` |
+| `tools/compare_golden.py` | the `tf` dumps against the golden files (reference.md § 7) |
+| `install.sh`, `run4.sh`, `run.sh` | out-of-tree build (-j4) with the sources' hash; the ring launcher (comm's pattern, binaries under `~/dsgb10-data/glm53-model/`); the resumable ring steps |
+
+## The decode step
+
+A layer, R ≤ 16 rows (each rank holds 16 of 64 heads, a quarter of every expert, a quarter of the vocabulary):
+
+1. x-projection GEMV (q_a, kv_a, k_pe and on full-indexer layers the indexer's k: 688 rows a rank, 656 on
+   shared layers) and the indexer head weights → **all-gather** (`allgather_xproj`);
+2. `attn_prep`: q_a norm, kv norm, RoPE, the latent cache write (and the index key on full layers);
+3. q_b (+ the indexer's wq_b on full layers) → **all-gather** of the indexer queries → `index_select`
+   (full layers; shared layers reuse the top-2048 of the last full layer);
+4. absorbed W_UK → `sparse_attn` (split-K 16 for 1–2 rows, 8 above) → absorbed W_UV → o_proj (f32 partials);
+5. **all-reduce + residual + ffn_norm** (`allreduce_add_norm`, the partials rounded once to bf16 after the sum);
+6. dense layers: gate_up with the SwiGLU epilogue, down (f32) → **all-reduce + residual + next norm**; MoE
+   layers: the router GEMV (BF16, f32 out), `route`, `moe_decode` (routed and shared experts in one kernel
+   family, f32 partials for each) → **`allreduce2_add_norm`** (new, below): both partials in one collective,
+   y = bf16(bf16(Σ routed) + bf16(Σ shared)), the reference's order of roundings.
+
+So a step has 3 collectives a layer plus one on full layers: 255 for 78 layers, plus the embedding's row
+all-gather. The head is a BF16 GEMV to f32 logits (the golden form); the sampler exchanges each rank's top
+candidates (`topk_exchange`), never the logits. A step's inputs go through a ring of host slots read by the
+first kernel (`k_step_in`), so the graph never changes; a token −1−r means "row r of the previous step's
+sample", so the next step can be queued before the previous sample is known. Each step publishes its
+`SampleOut` to mapped host memory with a sequence number; `wait` spins on it.
+
+**MTP.** With `drafts` ≥ 1 each step ends with the draft passes: pass 1 at each row's position p with the token
+after it (the next row's input if the same session continues, else the sampled token; its embedding zeroed at
+position 0), x = eh_proj([enorm(e) | hnorm(h_p)]) (h_p after `model.norm`), layer 78 with its own cache and
+indexer, the shared head norm, the head, the masked greedy top-1. Pass k > 1 chains on the MTP's own output
+and the top-2048 of pass 1. A verify step (`Batch::spec`) feeds a session's token and its drafts as rows and
+chains from its last accepted row ([Drafts](#drafts-g7-2026-10-14)).
+
+## Prefill
+
+Chunks of ≤ 8,192 rows (`Options::prefill_rows`): the embedding all-gathered in 1,024-row pieces; every FP8
+projection (x-projection, q_b + wq_b, W_UK, W_UV, o_proj, the dense gate/up and down, the MTP fill's eh_proj and
+x-projection) one launch of attn's tensor-core `gemm()` over the chunk, the BF16 router one launch of
+`gemm_bf16()` (both the 16-row GEMV's bits; since 2026-10-14, [Prefill GEMMs](#prefill-gemms-2026-10-14)); the
+indexer for rows at position ≥ 2,048 through `index_select`'s prefill path (staged queries, `k_score_pf`, the
+merged `k_sel_thresh` + `k_sel_compact` selection) in batches sized to a 512 MiB score scratch (rows below attend
+densely); `sparse_attn` without split; each sublayer ends with an f32
+reduce-scatter by rows, the residual add and the next norm on the rank's quarter of the rows and one
+all-gather of h and the normed rows; the MoE through `moe_prefill`. The layers run on two pieces of the chunk's
+rows, each piece's sublayer ends on a second stream while the other piece computes (chunks of 1,024 rows and more;
+the same bits; since 2026-10-14, [Prefill overlap](#prefill-overlap-2026-10-14)). The MTP cache fill runs after each chunk
+(eh_proj, layer 78's norm, x-projection, all-gather and `attn_prep` only — no MoE), the chunk's last row kept
+pending until the next chunk or the first decode step brings the token after it. With a `Sampling`, the last
+row is sampled as a one-row step (head, sampler, draft passes).
+
+## Checks
+
+All on the ring, four ranks (`run.sh check`, synthetic weights, 2,600-token prompt crossing 2,048; split-K 1 so
+decode and prefill sum the attention alike):
+
+| Check | Result |
+|---|---|
+| one prefill chunk = two chunks (1,300 + 1,300) | all 79 caches bit-identical |
+| decode steps of 16 rows = prefill | caches of layers 0–3 bit-identical; from layer 4 on the routed sums differ in order (`moe_decode` vs `moe_prefill`), as designed |
+| 16 rows in one step = 16 one-row steps | token and logit bits of all 16 rows, all 78 caches |
+| graph replay = eager | all rows and caches |
+| the four ranks | identical samples and cache hashes |
+| temperature 0.8, top-p 0.9, 20 logprobs | ids in the used vocabulary, probabilities ≤ 1, identical on every rank |
+| comm `coll_tests` with `allreduce2_add_norm` | exact against the host for 1–16 rows, with and without PDL, identical on all ranks |
+
+Batch invariance holds only at a fixed split-K: the default (16 up to 2 rows, 8 above) makes a row's attention
+sum depend on the step's row count. Decided by the serving layer, not here; the check pins it.
+
+**Against the golden data** (`run.sh tf-prefill tf-decode`; the 291-token `short` sequence; the real rank files
+with routed experts synthetic, then with layer 3's real NVFP4 experts filled into copies of all four files):
+
+| After layer | cosine min / mean | relative error |
+|---|---|---|
+| 0 | 0.99953 / 0.99993 | 1.19 % |
+| 1 | 0.99947 / 0.99980 | 2.00 % |
+| 2 | 0.99947 / 0.99978 | 2.09 % |
+| 3 (real experts) | 0.99895 / 0.99977 | 2.14 % |
+| 3 (synthetic experts) | 0.95159 / 0.99606 | 8.56 % |
+
+Prefill and decode give the same numbers to five digits. The reference attends with BF16 weights, this engine
+with FP8 (2.6 % relative error a tensor in the converter's manifest), so this is an envelope, not equality;
+logits and top-1 cannot be compared until the expert pools are filled. `refhash` (synthetic, 300-token prompt,
+64 greedy tokens fed back one step ahead): the same hash on all four ranks.
+
+The weight files' first GPU run (`run.sh weights`): every rank loads its file with the device copies matching
+their CRCs (0.8–2.9 s); `glw_kcheck --gpu` on rank 0's layers 0, 3, 10, 78 and the head: 105,136 checks ok,
+**1 bad**: one of 12,288 SwiGLU outputs of `layers.0.mlp.gate_up` outside kcheck's 2-ulp bound (the kernels'
+own tests are bit-exact against torch; likely the bound near a cancelling gate, not yet looked into).
+
+## Measurements
+
+Decode, synthetic weights (16 routed-expert pools of all 256 NVFP4 experts, layer l on pool l mod 16), context
+4,096, CUDA graphs with PDL and the L2 prefetch, the median of the last 4 of 32 steps (GPU time between events).
+The floor is the step's bytes at 235 GB/s: every weight read once, the routed experts at the expected number of
+distinct experts for R rows routed independently (8 at 1 row, 46 at 6).
+
+| Rows | GPU ms | floor ms | × floor | tok/s | host launch |
+|---|---|---|---|---|---|
+| 1 | 46.4 | 34.2 | 1.35 | 21.6 | 6.8 µs |
+| 2 | 60.8 | 47.4 | 1.28 | 33.2 | 6.6 µs |
+| 4 | 81.4 | 72.4 | 1.13 | 49.1 | 6.5 µs |
+| 6 | 97.2 | 95.9 | 1.01 | 61.7 | 6.8 µs |
+| 8 | 110.8 | 118.0 | 0.94 | 72.4 | 6.6 µs |
+| 16 | 146.8 | 193.4 | 0.76 | 111.0 | 6.7 µs |
+
+Above 6 rows the synthetic router's picks overlap more than independent routing would, so the "floor" there
+overstates the bytes. With one MTP draft pass: 50.4 / 64.6 / 85.5 ms at 1 / 2 / 4 rows (+3.6–4.0 ms).
+
+Where the time goes (one eager step without PDL, events between kernel classes; the collectives include
+waiting for the slowest rank):
+
+| Class | 1 row | 6 rows | 16 rows |
+|---|---|---|---|
+| MLP / MoE (router, routed + shared experts) | 21.1 | 61.8 | 93.7 |
+| o_proj | 9.0 | 9.1 | 9.2 |
+| q_b + wq_b | 3.6 | 3.7 | 3.8 |
+| x-projection | 2.2 | 2.4 | 2.6 |
+| W_UK + W_UV | 2.4 | 2.5 | 2.6 |
+| attn_prep + index_select + sparse_attn | 4.1 | 5.5 | 9.2 |
+| head + sample | 2.6 | 2.2 | 2.5 |
+| collectives (4 kinds) | 9.7 | 19.4 | 28.5 |
+| total (eager) | 54.7 | 106.6 | 152.1 |
+
+Per layer class at 1 row: dense 0.74 ms, MoE with full indexer 0.71, MoE with shared indexer 0.65. The graph
+with PDL is 8 ms faster than eager at 1 row. The collectives' own cost at 1 row is 4.4 ms (ring.md); the rest
+of the 12 ms gap to the floor is the MoE at ~83 % of its bytes' floor at one row and the launch tails.
+
+**L2 prefetch, A/B and B/A** (`run.sh l2pf`): 1 row +0.1 %, 6 rows +4.1 %, 16 rows +2.8 %. Kept on.
+
+**Prefill** (synthetic, from position 0): 414 / 434 / 419 / 403 / 400 tok/s for chunks of 512 / 1,024 / 2,048
+/ 4,096 / 8,192 rows (1.24 s to 20.5 s a chunk), after the expert prefill tuning (6cb6fce); 397–416 before. With
+the prefill GEMMs (2026-10-14): 854 / 802 / 704 tok/s at 2,600 / 8,192 / 32,768 tokens; with the collectives overlapped (T5, 2026-10-14) 1,084 / 1,086 / 860, a whole 32,768-token prompt 968; with T6's kernels 1,106 / 1,145 / 908 and 1,027; below.
+
+## Closing the decode gap (2026-10-14)
+
+A pass on the decode step's gap to its bandwidth floor with every output unchanged bit for bit. Five ring jobs of
+4–9 minutes on the four ranks, synthetic weights at context 4,096 as above; the merged tree of 2ec6f1c (the
+attention-side tuning and the server) for the final numbers.
+
+**Method.** `glm_run trace` replays the step's graph under nsys on every rank (`run.sh trace`: CUDA trace with
+graph nodes, `--capture-range=cudaProfilerApi`); `tools/step_profile.py` reads the four reports and gives, per
+kernel kind, its *critical-path increment*: the end of the kernel minus the end of the one before it on the
+stream, i.e. what it adds to the step with PDL overlapping the launches (the eager profile above, without PDL,
+overstates every boundary). The levers are switches (`Options::tune`, `Model::set_tune`, `glm_run --tune`); `glm_run
+ab` (`run.sh ab`) times two lever sets in one process, ten rounds of 12 graph steps in the order A B, then B A
+(each lever set keeps its own graphs), and checks that both give the same bits: the final normed rows, the
+sampled tokens and logit values, and every layer's cache, on every rank.
+
+**Where the 1-row step goes** (ms a step, the sum of the increments over the layers; ranks 1 and 2: rank 1 is
+undisturbed, rank 2 the slowest, below):
+
+| Kernel | before, rank 1 | before, rank 2 | after, rank 1 | after, rank 2 |
+|---|---:|---:|---:|---:|
+| `k_up` (shared + routed gate/up) | 11.49 | 13.29 | 11.92 | 13.32 |
+| o_proj | 7.30 | 8.46 | 8.48¹ | 9.37¹ |
+| `k_down` | 4.77 | 5.59 | 4.98 | 5.55 |
+| all-reduce after the MoE / MLP | 5.35 | 2.15 | 7.70² | 3.82² |
+| all-reduce after o_proj | 4.83 | 1.90 | (above) | (above) |
+| `k_attn` (attn/) | 3.00 | 3.43 | 2.28 | 2.58 |
+| head | 2.09 | 2.50 | 2.11 | 2.42 |
+| x-projection all-gather (+ indexer queries') | 2.10 | 1.81 | 2.14 | 1.73 |
+| q_b (+ wq_b) | 2.05 | 2.50 | 2.04 | 2.30 |
+| router GEMV | 0.67 | 1.30 | 0.69 | 1.06 |
+| `k_route` | 0.48 | 0.49 | — | — |
+| step | 48.0 | | 45.9 | |
+
+"Before": the tree before this pass (the attention-side tuning not yet merged), "after": all levers on (¹ this trace
+ran o_proj's posting variant, off by default: see below; ² both all-reduces as one kind). The two traces ran with
+the same disturbance on rank 2 (below); one trace of the merged tree with the levers off, with rank 2 undisturbed for its
+length, gave **44.4 ms** at 1 row and **91.5 ms** at 6.
+
+What the profile says:
+- **The MoE is at its floor inside the graph.** `k_up` + `k_down` on an undisturbed rank: 16.3 ms for 75 layers,
+  217 µs a layer against 221 µs for its bytes at 235 GB/s (the shared expert's 9.4 MB and eight routed experts'
+  42.5 MB; the kernels preload the shared expert before their PDL wait, so a little lands inside the all-reduce
+  before). The eager profile's 21.1 ms was launch gaps without PDL, plus `route` (7 µs a layer in the graph:
+  0.5 ms a step) and the router GEMV (13–17 µs a layer, at its floor).
+- **o_proj, the head, q_b are at their floors** (o_proj 7.3 ms against 8.4 for 78 × 25.2 MB: its first chunks
+  load before the PDL wait, during the all-reduce; the head 2.1 against 2.0).
+- **The waiting is one slow rank, and the slowness is not ours.** Rank 2's memory-bound kernels ran 8–16 %
+  slower than ranks 1 and 3 (`k_up` 13.3 against 11.5 ms; at 6 rows 43.2 against 37.3), so the other ranks wait
+  for it in every all-reduce (5.3 + 4.8 ms on rank 1, 2.2 + 1.9 on rank 2). The cause: the reference's CPU run
+  (experiment 2, `glmref.py`) on rank 2's box at ~600 % CPU, on cores 5–9 among others, i.e. on the cores pinned
+  for the ring's proxies, and drawing on the same LPDDR5X as the GPU. While it paused between runs the step was
+  44.4 ms at 1 row and 91.5 at 6 (the trace above) against 46–48 and 97–99 with it. Every A/B below ran with it
+  (A/B rounds interleaved so that both sides see the same mix); the absolute step times move with it by ±2 ms.
+- **What is left on the slowest rank** at 1 row is the collectives' own time (the two all-reduces ~24 µs each
+  inside the step, 156 of them: 3.8 ms; the all-gathers 1.7 ms), the attention kernels (`k_attn`, the indexer,
+  prep, combine: ~4 ms, attn/), the sampler and the launch boundaries.
+
+**The levers** (all exact; leave-one-out: all on against all but one, at 1 / 6 rows, gain in %):
+
+| Lever (`Tune` bit) | What | Leave-one-out 1 / 6 rows |
+|---|---|---|
+| `kTuneRoute` (1) | the routing inside `k_up` and `k_down` (`DecodeCfg::logits`; experts.md § 4): no `route()` launch | +0.1 / −0.0 |
+| `kTunePost` (2) | `k_down` writes both partials into the ring's send buffer and posts them from its epilogue; the all-reduce is its consumer half (`allreduce2_add_norm_posted`) | +0.7 / +1.4 |
+| `kTuneIw` (4) | full layers: the indexer's head weights in the x-projection's launch (attn's `GemvIw`) | +0.0 / +0.0 |
+| `kTuneOproj` (8) | o_proj as the producer half of its all-reduce (`model/oproj.cu`: attn's FP8 GEMV arithmetic, the partials into the send buffer, posted) | −0.2 / +0.5 |
+| `kTuneArRow` (16) | the fused all-reduces with one block of 768 threads a row: no barrier between blocks (`slices = 1`; ring.md) | +1.0 / +0.9 |
+
+Leave-one-out spreads (min .. max of the ten rounds' ratios) are ±3–9 %, so single levers below ~1 % are not
+resolved. The default is `kTuneDefault` = 1 | 2 | 4 | 16: the o_proj variant is off, since its kernel is slower than
+attn's (its tail writes 24 KB a row to host-mapped memory and fences at system scope: 8.5 against 8.1 ms a
+step) and buys back about that in the all-reduce.
+
+**Step time, before and after** (GPU ms, medians of ten interleaved rounds, the same job; outputs the same bits
+at every row count):
+
+| Rows | none | default (17) | gain | all (1f) | gain |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 44.28 | 43.60 | 1.2 % | 45.59 (A 46.99) | 3.0 % |
+| 2 | 58.96 | 57.96 | 0.6 % | 60.87 (A 61.85) | 2.0 % |
+| 4 | 79.48 | 78.01 | 0.6 % | 80.65 (A 80.45) | 1.3 % |
+| 6 | 96.48 | 94.08 | 0.2 % | 94.30 (A 94.54) | 0.4 % |
+| 16 | 151.64 | 152.53 | −0.6 % | 146.37 (A 145.94) | −0.3 % |
+| 1, one draft pass | 48.57 | 48.09 | 1.0 % | | |
+| 2, one draft pass | 64.59 | 64.50 | 0.4 % | | |
+
+(The gain column is the median of the rounds' B/A ratios, not the ratio of the medians; the "all" columns are a
+second job, its own A in brackets.) Against the 34.2 ms floor: 1.27× at 1 row in the best interleaved
+measurement, 1.30× with the gap measured from the earlier `bench` (47.7 ms before this pass on the same
+disturbed ring). The levers are worth ~1–3 % at 1–4 rows and nothing at 16 (where the collectives are 98 µs
+apiece and bound by their bytes, not their latency).
+
+**The L2 prefetch with the levers on** (`run.sh l2pf`, A/B and B/A): +3.0 % at 1 row, +0.6 % at 6, +1.7 % at 16
+(G4: +0.1 / +4.1 / +2.8 %). Kept as it is: on the slowest rank its windows are only the collectives' own ~20 µs,
+and the next GEMVs already load their first chunks before their PDL wait inside the same window, so a schedule
+change has at most that window to gain.
+
+**Exactness.** `ab`: every row count, the default and the full set, with and without a draft pass: the same
+bits as no levers on all four ranks. `tf` via decode with `--tune 0` and `--tune 1f`: all 20 dump files
+(argmax, top-20, log-probabilities, lse, the logits of the sampled rows, the hidden rows after layers 0–4 and
+77) byte-identical, on the real rank files (layers 0–3 real, routed experts synthetic) and on synthetic weights.
+`run.sh check` passes with the defaults (chunking, decode = prefill, 16 rows = 16 one-row steps, graph = eager,
+ranks agree). `coll_tests test` passes with the new `slices = 1` cases (1–16 rows, with and without PDL, both
+add-norm variants, against the host reference and attn's rmsnorm). `test_experts` passes (route through
+`route_warp`). The server's ring tests (`server/tests/ring_job.sh`: serve, batch, front, kept) pass on the merged
+binary. No summation order changed: the all-reduce sums ranks 0–3 in order as before; the one-block norm does
+rmsnorm's 256 runs of 24, its eight xor-trees and its warp-order sum; the posted partials are the same values.
+
+**What failed or did not pay.** o_proj posting (above: neutral, off). Fusing the index weights into the
+x-projection (attn's new `GemvIw`): nothing measurable, kept since it is one launch fewer on 21 layers. The
+first A/B runs (one block of 32 steps a side, A B B A) could not resolve 1 % against rank 2's disturbance (the
+same configuration measured 43.0–47.3 ms in one job): replaced by the interleaved rounds.
+
+**What remains for the gap.** On undisturbed ranks the step is ~44 ms at 1 row (1.29×). The rest is the
+collectives' own latency on the critical path (~5.5 ms at 1 row: 156 f32 all-reduces at ~24 µs and 99
+all-gathers at ~17 µs) and the attention side (~4 ms, attn/). Exact ways to take more: fewer collectives (the
+x-projection all-gather merged into the all-reduce before it needs the x-projection replicated or a
+reduce-scatter design, ring.md), and the ring's per-collective latency itself (the host proxies' relay; not broken down
+here). Operationally: keep CPU jobs off the ring's boxes (or off cores 5–8) while
+measuring or serving; a busy box costs 2–4 ms at 1 row and ~6 ms at 6.
+
+## Prefill GEMMs (2026-10-14)
+
+The prefill path's projections moved from 16-row GEMV launches to the attention side's tuned tensor-core GEMM
+(T2, [attention.md § 5](attention.md)), outputs unchanged bit for bit. Seven ring jobs of 1–6 minutes on the four
+ranks and one on rank 0 (attn's tests), 01:11–01:49 (+0100); synthetic weights except `tf`.
+
+**What changed.** `prefill.cu`'s `pf_proj` runs an FP8 projection over the whole chunk as one `gemm()` launch at
+the GEMV's split-K: the x-projection (split-K 4; also the MTP fill's), q_b with the indexer's wq_b (two segments),
+W_UK and W_UV (grouped), o_proj, the dense gate/up (SwiGLU) and down, and the MTP layer's eh_proj (`mtp.cu`;
+1–16 rows at decode stay one GEMV). attn's test P shows each of these shapes equal to the 16-row GEMVs in all six
+tile configurations (eh_proj, 1536 × 12288, is not in P; the runner's checks below cover it). The router is BF16,
+which `gemm()` does not take: attn's `gemm()` gained a BF16-weight form, `gemm_bf16()` (gemm.cu: the BF16 GEMV's
+arithmetic, the four MMAs of each 64-k chunk accumulating straight into the sum, the weights staged as each lane's
+32 bytes; one 128 × 64 tile shape, 3 stages, 72 KiB), tested equal to the 16-row BF16 GEMV in three new P checks
+at 4,600 rows (the router's shape at split-K 4, the whole head, a 1000-row bf16-out case). Two `Tune` bits switch
+them, both in `kTuneDefault` (now 0x77): `kTunePfGemm` (32) the FP8 projections, `kTunePfRouter` (64) the router.
+Kept as GEMVs: the head (BF16, only for `kFlagLogits`, i.e. `tf`; its logits buffer holds 16 rows, so it stays
+16 rows a launch), `index_weights` (BF16, 8 rows, its own kernel: 10 ms a chunk) and any chunk of ≤ 16 rows. The
+shared expert is not attn's: `moe_prefill` already runs it as a dense FP8 GEMM in the experts' own layout. **The
+indexer** already took attn's prefill path: `index_select` with more than 16 rows stages the queries and runs
+`k_score_pf` and the merged `k_sel_thresh` + `k_sel_compact` (4 launches a call, T2), the trace below shows it, so
+nothing changed there; a batch tail of ≤ 16 rows takes the decode kernels, the same bits (attn test E). The
+batches are 512 MiB of scores: 3,971 rows at `max_ctx` 33,792, 512 at 256k (attn measured calls of 512 rows
+~10 % slower than of 2,048 at 32k).
+
+**Method.** `glm_run pfab` (`run.sh pfab`): one process, two lever sets, for each chunk A B B A (A = 0x17, the
+16-row GEMVs; B = 0x77), the slot's caches before the chunk filled with hashed values (`fill_cache`), a greedy
+`Sampling` on the last row and one MTP draft (so that the MTP layer's cache holds every row's final normed hidden),
+`prefill_ms` (events around the whole call: the chunk, the MTP fill, the last row's sample and draft pass); both
+lever sets warmed with a 512-row prefill first. After each run: the hash of every layer's cache (KV, index keys,
+the MTP layer's) over positions 0 to the chunk's end and the sampled token and value; A and B must agree in all four
+runs and on every rank. "2,600 / 8,192 / 32,768 tokens" are one chunk each: 2,600 rows from 0, 8,192 from 0, and
+the last 8,192-row chunk of a 32,768-token prompt (at position 24,576). `--max-ctx 33792`. The breakdown: `glm_run
+pftrace` (`run.sh pftrace`: one 8,192-row chunk at 24,576 after a warm one, inside the profiler range, no drafts)
+under nsys on every rank, read by `tools/step_profile.py --prefill` (per kernel kind and class, the critical-path
+increments of the main stream as in [Closing the decode gap](#closing-the-decode-gap-2026-10-14)).
+
+**Prefill throughput** (sources sha256 225b0ca7cb2def35, 01:28–01:31; ms of the two runs of each side):
+
+| Tokens (chunk at) | 16-row GEMVs (A) | tok/s | gemm + gemm_bf16 (B) | tok/s | B/A speed |
+|---|---:|---:|---:|---:|---:|
+| 2,600 (0) | 6,836.7 / 6,801.0 | 381 | 3,043.6 / 3,043.3 | **854** | 2.24× |
+| 8,192 (0) | 21,742.2 / 22,007.7 | 374 | 10,217.3 / 10,222.0 | **802** | 2.14× |
+| 32,768 (8,192 at 24,576) | 23,236.4 / 23,560.6 | 350 | 11,622.5 / 11,659.9 | **704** | 2.01× |
+
+The two levers apart: the FP8 projections alone (B = 0x37, an earlier build of the same code, 01:11–01:15)
+768 / 725 / 641 tok/s (2.02 / 1.94 / 1.84×); the router's `gemm_bf16` on top (0x37 against 0x77, 8,192 from 0,
+01:31) 723 → 799 tok/s, 1.105×. Repeats agree within 1.5 %. **Against the published bar** (1,374 tok/s cold at 8k,
+DESIGN.md): 802 tok/s is 58 % of it; the 8,192-row chunk takes 10.2 s where the bar needs 6.0.
+
+**Where a chunk goes** (8,192 rows at 24,576; ms, rank 0, the range over the four ranks in brackets; "before":
+0x17, 23.47–23.49 s; "after": 0x77, 11.67–11.71 s):
+
+| Class (kernels) | before | after | share after |
+|---|---:|---:|---:|
+| collectives, waiting included: all-gather of h + normed rows 1,380, reduce-scatter after o_proj / dense down 1,018, of the routed partials 937, of the shared partials 809, x-projection all-gather 175, the rest 110 | 4,927 | **4,429** (4,155–4,754) | 37.8 % |
+| attention: `k_attn` (33 ms a layer, no split) 2,592, `k_prep` 32 | 2,620 | **2,624** (2,512–2,721) | 22.4 % |
+| MoE prefill: `k_pdown_c` 1,220, `k_pup_ws` 996 + 180 (two launch shapes a layer), `k_pdown` 175 (four a layer), the rest 9 | 2,545 | **2,580** (2,454–2,686) | 22.0 % |
+| projections: o_proj + dense down 645, q_b (+ wq_b) 182, x-projection 109, W_UV 72, W_UK 64, router 48, dense gate/up 35 | 12,484 | **1,154** (1,117–1,192) | 9.9 % |
+| indexer: `k_score_pf` 497, `k_sel_compact` 179, `k_sel_thresh` 64, `k_q_stage` 15, index weights 10, the rest 10 | 770 | **775** (712–775) | 6.6 % |
+| norms, residual adds, embedding | 149 | **149** | 1.3 % |
+
+Before, the projections were 53 % of the chunk (the router's 16-row BF16 GEMVs alone 1,132 ms); after, they are
+10 % (o_proj 8.0 ms at 8,192 rows: 52 TFLOPS, as attn measured it). **What is left is the ring and two kernels.**
+A MoE layer's collectives move three 201 MB f32 reduce-scatters (o_proj's, the routed and the shared partials) and
+two 201 MB bf16 all-gathers (h and the normed rows, after each sublayer). The shared partials' reduce-scatter
+follows the routed one, so the ranks arrive together: 10.8 ms on every rank, ~14 GB/s a rank of the 151 MB it
+sends. So ~4 s of a chunk is the ring's bandwidth, not its latency, and it runs on the compute stream: nothing
+overlaps it. Then sparse attention without split (33 ms a layer at 8,192 rows: ~18 TFLOPS of its MMAs) and the
+expert GEMMs at T1's level. For 1,374 tok/s the 8k chunk must lose 4.3 s of its 10.2. Overlapping the collectives
+with the compute (a second stream and sub-chunks; rows are independent, so outputs stay exact) bounds the traced
+chunk by its compute, ~7.3 s (~1,120 tok/s; the chunk from position 0, not traced, is 1.4 s shorter); the rest has
+to come from attention and the experts.
+
+**Exactness.** `pfab`: A and B the same bits at all three chunks, in all four runs and on every rank (hashes
+f561aaa161f5703e, b5d2be0e85c00e60, 01f4fa4803ca445f; the same in the earlier build), and 0x37 against 0x77 too.
+`tf` via prefill on the real rank files (`run.sh tf-prefill`, the 291-token `short` sequence, layers 0–3 real,
+routed experts synthetic): all 20 dump files (argmax, top-20, log-probabilities, lse, logits, the sampled rows,
+the hidden rows after layers 0–4 and 77) byte-identical between the base build (067ba12, its own default 0x17),
+this build's default and this build with `--tune 17`, and identical to the `short-prefill` dump of 2026-10-13.
+`run.sh check` passes (chunking, decode = prefill, 16 rows = 16 one-row steps, graph = eager, ranks agree,
+sampling), run on both builds. attn's tests: 44 pass at S = 300, 96 at S = 4,600 (93 before, plus the three BF16
+checks), memcheck on A C B F P at S = 300 clean (41 pass; the BF16 checks need the head data of S = 4,600 and were
+not run under memcheck). The server's ring tests (`server/tests/ring_job.sh`: serve, batch, front, kept) pass on a
+`glm53_rank` built from this tree (sources b8ba34daeb3d6f71). On the final sources (merged with glm53 at 05cf496,
+comments changed since; `glm_run` d32601a9e8517dd6, `glm53_rank` 2930a17b4553e7e6, 01:45–01:49): `check` passes,
+`pfab` at 2,600 rows the same bits and hash (384 → 855 tok/s), the server's ring tests pass. Decode is unchanged: the step's code is untouched
+except eh_proj's call, which at 1–16 rows is the same single GEMV launch.
+
+**What failed or was not done.** Nothing failed. The first A/B job overlapped a CPU build on rank 0 (nice 19);
+the table's job ran alone. Not measured: a whole 32,768-token prompt (four chunks), `pfab` without the MTP draft;
+not run: memcheck over `gemm_bf16`.
+
+## Prefill overlap (2026-10-14)
+
+After T4 a chunk spent 38 % of its time in the ring's collectives, bandwidth-bound and on the compute stream, so
+nothing overlapped them. T5 runs them on a stream of their own beside the compute, outputs unchanged bit for bit.
+Ten ring jobs of 1–7 minutes (one of them, attn's tests, on rank 0 only), 02:00–03:07 (+0100); synthetic weights
+except `tf` and the server's tests.
+
+**What changed** (`prefill.cu`, one `Tune` bit `kTunePfOverlap` = 0x80, now in `kTuneDefault` = 0xf7). The chunk's
+rows are split into pieces (`Options::prefill_pieces`, default 2; a multiple of 64 rows each, at least
+`prefill_min_piece` = 512, so chunks under 1,024 rows stay one piece). Each sublayer computes the pieces in order on
+the compute stream; a piece's sublayer end (the f32 reduce-scatter by rows, the residual add and norm on the rank's
+quarter of the piece, the all-gather of h and the normed rows) runs on a second stream, created at the highest
+priority so that a collective's blocks get the next free SMs, while the next piece computes. Events carry the
+dependencies: a piece's sublayer end waits for its compute, the piece's next sublayer waits for its end. There is
+one ring channel, so every collective goes to the second stream in the same order on every rank. The x-projection
+and indexer-query all-gathers are short and the compute waits for them, so a long sublayer end is queued only
+behind the next piece's short ones (deferred); the last piece's MoE end waits behind the next layer's first piece's.
+With two pieces a layer runs: piece 0's attention while the layer before's piece-1 end runs; piece 1's attention
+while piece 0's attention end runs; piece 0's MoE while piece 1's attention end runs; piece 1's MoE while piece 0's
+MoE end runs. The overlapped collectives use `prefill_comm_blocks` (8) blocks, not 16. Bits: a row's arithmetic is
+the whole chunk's. The projections, the router, the indexer and the attention compute a row alike whatever rows
+share the launch (attn's tests P and E), and so do the experts (experts.h: a call's results do not depend on the
+other rows). A piece's attention reads the cache entries its own and the earlier pieces' `attn_prep` wrote. The
+reduce-scatter adds the four ranks' partials in rank order wherever the piece boundaries fall, and the add and the
+norm go row by row. With the bit off (or one piece) the launches are the unpipelined chunk's, in the same order.
+The embedding's all-gathers stay on the compute stream before the layers; the chunk ends by joining the second
+stream, so the MTP fill, the sample and the decode steps after it see a quiet ring. `glm_run` gained
+`--pf-pieces`, `--pf-blocks`, `--pf-min-piece`, and `pfab` takes a whole prompt longer than a chunk;
+`step_profile.py --prefill` prints a per-stream summary (busy time, the main stream's idle time, the side stream's
+time under the main stream's kernels).
+
+**Choosing pieces and blocks** (sources 0d9ee41d6b627474, jobs 1–4, 02:00–02:29; `pfab` 0x77 against 0xf7, 8,192
+rows at 24,576, tok/s of the overlapped side; the unpipelined side 699–713 in every job):
+
+| Pieces | comm blocks 2 | 4 | 8 | 12 | 16 |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 869 | 882 | **892** | 849 | |
+| 3 | | | 887 | | |
+| 4 | | 852 | | | 827 |
+| 8 | | 811 | | | |
+
+At 8,192 from 0: 2 pieces 1,106, 3 pieces 1,060, 2 pieces with 12 blocks 1,058. More pieces mean more short
+all-gathers to wait for and smaller GEMMs; more blocks take more SMs from the compute. Repeats of one setting
+differ by a few per cent (2 × 8 at 24,576: 892 in job 3, 860 in job 5's `pfab` on the final sources, 866 in its
+`pftrace`).
+
+**Prefill throughput** (final sources: `glm_run` 139d188c604ea91a, merged with glm53 at 3b2ae08; job 5,
+02:34–02:42, and job 6, 02:44–02:49; ms of the two runs of each side, A = 0x77, B = 0xf7):
+
+| Tokens (chunk at) | unpipelined (A) | tok/s | overlapped (B) | tok/s | B/A speed |
+|---|---:|---:|---:|---:|---:|
+| 2,600 (0) | 3,046.1 / 3,041.6 | 854 | 2,394.8 / 2,403.2 | **1,084** | 1.27× |
+| 8,192 (0) | 10,301.5 / 10,343.7 | 794 | 7,544.4 / 7,545.6 | **1,086** | 1.37× |
+| 8,192 at 24,576 (the last chunk of 32,768) | 11,717.8 / 11,749.2 | 698 | 9,525.8 / 9,518.7 | **860** | 1.23× |
+| a whole 32,768-token prompt (four chunks) | 43,791.8 / 43,274.3 | 753 | 33,959.1 / 33,738.5 | **968** | 1.29× |
+
+**Against the published bar** (1,374 tok/s cold at 8k): 1,086 tok/s is 79 % of it (T4: 58 %); the 8,192-row chunk
+takes 7.5 s where the bar needs 6.0.
+
+**Where a chunk goes now** (`pftrace`, 8,192 rows at 24,576, the same binary with 0x77 and with the default, job 5;
+ms; rank 0, the four ranks' range in brackets):
+
+| | before (0x77): 11,469–11,507 ms | after (0xf7): 9,446–9,485 ms |
+|---|---:|---:|
+| compute stream busy | 11,476 (all of it, collectives included) | **8,745** (8,371–9,225) |
+| … attention (`k_attn`, `k_prep`) | 2,651 (2,510–2,651) | 3,239 (3,146–3,383) |
+| … MoE prefill | 2,565 (2,462–2,580) | 3,264 (3,059–3,415) |
+| … projections | 1,152 (1,122–1,174) | 1,288 (1,253–1,409) |
+| … indexer | 774 (714–774) | 934 (877–966) |
+| … collectives on the compute stream | 4,185 (4,185–4,505) | 19 (the embedding's; 19–59) |
+| compute stream idle (waiting for the other stream) | 8 | **700** (253–1,088) |
+| collectives' stream busy | – | 5,322 (4,665–5,589), of it under compute 4,610 (4,403–4,610) |
+
+So 87 % of the ring's time now runs under compute, and it takes longer there (5.3 s against 4.2 s: 8 blocks, and
+the compute beside it). **The cost is the compute itself:** beside the ring's copies the compute kernels run 20 %
+slower on rank 0 (7,290 → 8,745 ms busy) and 27 % on rank 2 (7,265 → 9,225), every class alike (attention +22 %,
+MoE +27 %, indexer +21 % on rank 0), more than the 8 SMs the collectives take (17 %). The ring's traffic goes
+through the same memory: a reduce-scatter of 201 MB copies its input into the send buffers, the NICs read those and
+write the neighbours' quarters, and the reduction reads four quarters; by that count (an estimate, not measured) on
+the order of a gigabyte of DRAM traffic in ~10 ms. Rank 2, the slowest under it, sets the chunk: its compute stream
+is idle only 253 ms. The idle time of the other ranks is mostly the x-projection all-gather's wait (the `k_prep`
+after it: 545–715 ms of increments on ranks 0, 1, 3 against 36 ms of kernel) and the next layer's first GEMM
+waiting for the MoE's end (`k_gemm g11x32 <k_pdown_c`: 66–336 against 48–57).
+
+**Exactness.** `pfab`: A and B the same bits in all four runs, at every size, on every rank and at every piece
+count and block count tried (hashes f561aaa161f5703e, b5d2be0e85c00e60, 01f4fa4803ca445f: T4's, and 8ee634566afdf576
+for the whole 32,768-token prompt). `run.sh check` passes with the overlap on (its 2,048- and 1,300-row chunks run
+as two pieces): chunking, decode = prefill, 16 rows = 16 one-row steps, graph = eager, ranks agree, sampling. `tf`
+via prefill on the real rank files (`run.sh tf-prefill`, the 291-token `short` sequence): all 20 dump files
+byte-identical to the `short-prefill` dump of 2026-10-13, with the default (291 rows: one piece) and with
+`--pf-min-piece 64` (pieces of 192 and 99 rows, the overlap on). attn's tests from this tree: 44 pass at S = 300, 96
+at S = 4,600 (attn is unchanged). The server's ring tests (`server/tests/ring_job.sh`: serve, batch, front, kept) pass
+on a `glm53_rank` built from this tree (sources 98817b82c9ab36db). **Decode is unchanged**: the step's code is
+untouched; `ab` 0x77 against 0xf7 43.612 / 43.549 ms at 1 row, 95.482 / 95.432 at 6, the same bits; `bench` of the
+T4 build (d32601a9e8517dd6) against this one, A B B A, wall ms a step over 32 steps: 45.21 / 45.43 against 45.38 /
+45.48 at 1 row, 96.83 / 97.24 against 97.46 / 96.97 at 6 (the GPU medians of 4 steps, 44.4–49.5 ms, are too noisy
+to compare).
+
+**What failed or was not done.** Evict-first cache hints (`__ldcs` / `__stcs`) on the bulk reduce-scatter's and the
+multi all-gather's copies, meant to keep the ring's streams out of the compute's L2 (sources 39643ccbf8d251aa, job
+3): 892 → 866 tok/s at 24,576, 1,106 → 1,088 at 8,192 from 0, no gain; reverted. The server's front phase failed
+once (job 9, 03:02) because the worktree had no `glmfront` build; run again with the main checkout's (the frontend
+is unchanged), it passes. Not tried: the MoE's shared expert first so that its reduce-scatter starts during the
+routed experts (with two pieces the MoE end already runs during the other piece's MoE), a fused residual + norm +
+all-gather after the reduce-scatter, the ring's copies with fewer bytes (the producer writing its partials straight
+into the send buffers, as decode's posted partials do; a chunk's partials are far beyond the 4 MiB buffers).
+
+## Prefill kernels (T6, 2026-10-14)
+
+T6 asked for faster prefill compute with every output bit unchanged, in three levers: the sparse attention, the
+MoE prefill, and the compute's slowdown beside the ring's copies. Ring jobs of 1–9 minutes, 2026-10-14
+03:18–06:22 (+0100), synthetic weights except `tf` and the server's tests; final sources: `glm_run`
+302106db81ca4448, attn's tests 1178708d35bca344, experts bc6bb3dfa0c29884, `glm53_rank` 3eb552ac51afccb9.
+
+**What changed.**
+
+1. **Attention** (attn's `k_attn_pf`, [attention.md § 5 "T6"](attention.md)): the unsplit sparse attention with the
+   next key block's gathers (bulk copies, mbarriers per 16-key slot) in flight under the current block's compute,
+   `k_attn`'s arithmetic bit for bit; dense rows (positions under 2,048) included. It runs wherever
+   `sparse_attn` has one split; a `Tune` bit `kTunePfAttn` (0x100, now in `kTuneDefault` = 0x1f7) selects it for
+   prefill (off: `k_attn`). Alone, on rank 0: 1.09× (random selections over 32k) to 1.37× (dense rows).
+2. **The ring's collectives with 4 blocks** (`Options::prefill_comm_blocks`, 8 → 4): fewer SMs and less memory
+   traffic beside the compute.
+3. **MoE** ([experts.md § 12](experts.md)): the shared expert's down at 128-row tiles (`PrefillCfg::sh_rows`); the
+   chained down, the largest phase, located but not made faster.
+
+**Lever 1, A B B A in one job** (`pfab` 0xf7, `k_attn`, against 0x1f7, `k_attn_pf`; 8 comm blocks, sources
+c906f863893c4064 with the arrival fix, 04:52–04:56):
+
+| Tokens (chunk at) | `k_attn` ms | tok/s | `k_attn_pf` ms | tok/s | B/A |
+|---|---:|---:|---:|---:|---:|
+| 2,600 (0) | 2,448.7 / 2,456.1 | 1,060 | 2,391.2 / 2,390.1 | 1,088 | 1.026 |
+| 8,192 (0) | 7,624.1 / 7,608.7 | 1,076 | 7,314.7 / 7,318.8 | 1,120 | 1.041 |
+| 8,192 at 24,576 | 9,457.2 / 9,390.4 | 869 | 9,060.8 / 9,071.3 | 904 | 1.039 |
+| a whole 32,768-token prompt | 33,874.2 / 34,007.2 | 965 | 32,787.6 / 32,797.1 | 999 | 1.035 |
+
+**Lever 3: comm blocks** (0x1f7 against itself, each a `pfab` A B B A; the cells give its four runs' tok/s range;
+jobs in the order shown):
+
+| Blocks | 8,192 at 24,576 (order 8 4 6 6 4 8) | 8,192 at 0 (order 8 4 2 2 4 8) | 2,600 at 0 |
+|---:|---:|---:|---:|
+| 8 | 889–898 (mean 9,166 ms) | 1,111–1,117 | 1,079–1,080 |
+| 6 | 901–912 (9,042 ms) | | |
+| 4 | **901–918 (8,979 ms)** | **1,151–1,153** | 1,077–1,095 |
+| 2 | | 1,126–1,130 | 1,080–1,086 |
+
+T5 had found 8 best with `k_attn` (892 against 882 at 24,576); beside `k_attn_pf` 4 is 2 % faster at 24,576 and
+3 % at 8,192 from 0. Three pieces instead of two (4 blocks, order 2 3 3 2): 1,115–1,133 against 1,140–1,145 at
+8,192 from 0, 912–915 against 911–919 at 24,576; two kept. Bits the same at every setting.
+
+**The final tree, A B B A in one job** (`pfab` 0xf7 against 0x1f7, both with the new defaults otherwise: 4 comm
+blocks and the MoE change; 05:59–06:06):
+
+| Tokens (chunk at) | 0xf7 ms | tok/s | 0x1f7 ms | tok/s | B/A | T5 (0xf7, 8 blocks) |
+|---|---:|---:|---:|---:|---:|---:|
+| 2,600 (0) | 2,425.6 / 2,434.2 | 1,070 | 2,359.9 / 2,342.9 | **1,106** | 1.033 | 1,084 |
+| 8,192 (0) | 7,444.3 / 7,457.6 | 1,099 | 7,167.2 / 7,144.0 | **1,145** | 1.041 | 1,086 |
+| 8,192 at 24,576 | 9,345.3 / 9,420.5 | 873 | 8,958.3 / 9,077.9 | **908** | 1.040 | 860 |
+| a whole 32,768-token prompt | 33,560.3 / 33,099.0 | 983 | 31,903.9 / 31,907.1 | **1,027** | 1.045 | 968 |
+
+Against T5's published figures (other jobs): +2.0 % / +5.4 % / +5.6 % / +6.1 %. **Against the published bar**
+(1,374 tok/s cold at 8k): 1,145 tok/s is 83 % of it; the 8,192-row chunk takes 7.16 s where the bar needs 5.96.
+
+**Where a chunk goes now** (`pftrace`, 8,192 rows at 24,576, 0xf7 and 0x1f7, 8 comm blocks, sources
+c906f863893c4064, 05:00; ms; rank 0, the four ranks' range in brackets; `step_profile.py --prefill`):
+
+| | 0xf7 (`k_attn`): 9,406–9,433 ms | 0x1f7 (`k_attn_pf`): 9,036–9,061 ms |
+|---|---:|---:|
+| compute stream busy | 9,106 (8,337–9,106) | **8,749** (8,069–8,749) |
+| … attention (the kernel; with `k_prep`) | 3,355 (3,096–3,355); 3,394 | **2,990** (2,788–2,990); 3,028 |
+| … MoE prefill | 3,361 (3,040–3,361) | 3,368 (3,069–3,368) |
+| … projections | 1,379 (1,237–1,379) | 1,370 (1,248–1,370) |
+| … indexer | 951 (873–951) | 960 (878–960) |
+| compute stream idle | 300 (300–1,095) | 293 (293–992) |
+| collectives' stream busy | 4,787 (4,787–5,568) | 4,724 (4,724–5,443) |
+
+The attention kernel is 11 % faster in the chunk, against 9–37 % alone: beside the ring's copies each 4,096-row
+piece takes 19.2 ms (`k_attn` 21.5; alone about 11–15 and 14–16.5). The MoE (a third of the chunk) and the ring's
+interference are now the largest items.
+
+**MoE** (experts.md § 12, a subagent's A B B A on rank 0): the shared down at 128-row tiles saves 0.06–0.2 ms of
+the shared phase at 1k–8k rows, within the whole call's spread (38.5–38.9 ms at 8k NVFP4). The chained down
+(17.3–17.7 ms at 8k) is bound by its ordered adds into yr: the MMAs, weight and h loads alone take 4.6–6.3 ms;
+the stores' drain behind the fence before each ticket release costs 4.6–6.9 ms with one CTA an SM, the waits for
+lower-ranked picks 1.7–3.9. Five exact variants (yr loads earlier, cache hints, lighter fences, later ticket
+release, batched loads) gave nothing or lost; going further needs the adds off the MMA warps' path (an
+asynchronous epilogue or two CTAs an SM), a redesign.
+
+**A race found and fixed.** The first `k_attn_pf` matched `k_attn` in every bench but not in the overlapped
+prefill: `pfab` 0x1f7 against itself differed from run to run (first differing cache layer 1–2), while one piece
+(`--pf-pieces 1`) or the overlap off (0x177) passed. A debug build compared the kernel's output with `k_attn`'s on
+the same inputs after each launch (layers 0–2): one row in a few thousand differed, a band of 32–128 output dims of
+all 16 heads, always a dense row. The warp's `mbarrier.arrive` releasing a slot issued before its `ldmatrix` loads
+of the slot had returned, so the next bulk copy could overwrite them. With the arrival made dependent on the
+loaded registers (and a proxy fence before the regather) every `pfab` passes. Copy kernels beside the attention in
+a bench (`bench_attn --only pstress`) did not reproduce the race.
+
+**Exactness** (the final tree): `pfab` A and B the same bits at every size, on every rank (the T4/T5 hashes
+f561aaa161f5703e, b5d2be0e85c00e60, 01f4fa4803ca445f, 8ee634566afdf576), and 0x1f7 against itself before at
+8,192 and 2,600 twice; `run.sh check` passes (chunking, decode = prefill, 16 rows = 16 one-row steps, graph =
+eager, ranks agree, sampling); `tf` via prefill on the real rank files (the 291-token `short` sequence) gives all
+20 dump files byte-identical to the 2026-10-13 `short-prefill` dump, with one piece and with `--pf-min-piece 64`
+(two pieces); attn's tests 48 pass at S = 300 (with the new checks: `k_attn_pf` = `k_attn` at one split for every
+row; decode calls of 1, 6, 16 rows at one split = the prefill rows), 100 at S = 4,600, memcheck 45 + 33 checks 0
+errors; `test_experts` all pass; the server's ring tests (serve, batch, front, kept, spec record / forced / gate)
+pass on a `glm53_rank` from this tree. **Decode is unchanged**: at its default split-K the step runs `k_attn` as
+before; `ab` 0xf7 against 0x1f7 46.51 / 46.21 ms at 1 row, 98.18 / 97.91 at 6, the same bits.
+
+**What failed or was not done.** The first `k_attn_pf` (the race above); attention variants slower than the kept
+one (attention.md); five chained-down variants (experts.md § 12); 6 and 2 comm blocks, 3 pieces. Memcheck once
+failed with an out-of-memory error from `cudaMalloc` while another tenant held memory; it passed on rerun. Not
+tried: the ring's copies through the copy engine (`cudaMemcpyAsync`) or paced copies (the copy kernels pipeline
+pieces against the NIC proxy's flags, so a copy-engine path is a protocol change); two attention CTAs an SM (needs
+under 50 KB of shared memory a CTA).
+
+## Drafts (G7, 2026-10-14)
+
+Speculative decoding with the model's own MTP layer, in the decode step and the server, the tokens unchanged.
+Code: `model.h` (`Batch::spec`, `Batch::passes`, `SampleOut::draft`/`accepted`), `mtp.cu`, `ops.cu`
+(`mtp_tokens`, `mtp_select`, `publish`), `spec.h` (the gate), `tools/glm_run.cu` (`spec`, `mtpgold`),
+`engine/server/cmd.cpp` (`spec_loop`; [serving.md](serving.md) § 3.1).
+
+**The verify step.** A session's rows are its last token and the k drafts the step before made for it, at
+consecutive positions. Every row is sampled as in any step: with a fixed split-K (`Options::attn_splits`; a
+verify step without one is refused) a row's bits do not depend on the other rows (the `check` above: 16 rows in
+one step = 16 one-row steps), and the sampler's Gumbel noise is keyed by (seed, position), so row j's sample is
+what a plain step at that position samples, greedy or seeded. On the device (`mtp_tokens`, one thread) the
+session's drafts are accepted while each equals the sample of the row before it; `SampleOut::accepted[s]` = a,
+and the session emits the samples of rows 0 .. a (the accepted drafts' successors and the bonus). Rows past a
+leave main-cache and MTP-cache entries past the session's history: the next step's rows write those positions
+again before any row reads them (attention reads positions up to the row's own), so nothing is rolled back by
+copying. DESIGN decision 9's batch invariance holds at the pinned split-K: every verify step's rows reproduce
+the plain one-row steps bit for bit (tokens, logit values, logprobs), at 1-4 sessions, checked below.
+
+**The MTP passes.** Pass 1 runs over every row of the step, each at its position p with the token after it: the
+next row's input while the drafts hold (`mtp_tokens`: rows before the chain row take the next row's token,
+the rest their own sample), so the MTP cache entries of the accepted rows and of the chain row are the ones a
+plain decode would write. Then each session's chain starts at its chain row c = first + a (`mtp_select`: its
+hidden, normed hidden, top-2048 and position into a row a session): the head on row c gives draft 1, and passes
+2 .. K run on one row a session at pos[c] + k - 1 on the previous pass's draft and the MTP's own output hidden,
+pass 1's top-2048 shared. Each chained pass writes its own provisional MTP entry at its own position (one row a
+session, its own position: no two drafts share an entry, the multi-row overwrite G4 refused is gone). `publish`
+writes draft[s][0 .. K) and accepted[s] for every session.
+
+**The gate** (`spec.h`, host code, the same float operations on every rank): per session p[j], an exponential
+average (1/8) of draft j + 1's acceptance given the ones before it; the next step verifies the k (0 .. kmax) that
+maximises (1 + p0 + p0 p1 + ...) / (c1 + k drow), with c1 = 44.5 ms and drow = 15.5 ms measured below. At k = 0
+the step still runs pass 1, so draft 1 is judged against the sample and the gate reopens when the text turns
+predictable. The step's passes are the most any of its sessions' gates may want next.
+
+**Graphs.** One CUDA graph per (rows, sessions, passes), captured on first use (`gkey`; a step's passes are a
+graph property, the drafts' count per session is data). The plain loop uses passes 0 (no MTP work) and rows =
+sessions; verify steps use passes 1 .. kmax and rows from sessions to 16. With kmax 3 and 4 slots that is at
+most 4 + 7 + 10 + 13 = 34 row/session shapes times 3 pass counts, of which a run meets the few its gates choose;
+one graph per k and batch size is not needed because the drafts a session feeds only change the rows (and the
+same rows cover every split of them between sessions).
+
+**Exactness** (bit for bit: token, logit value and logprob bits of every emitted token against the plain
+pipelined run, in the order plain, ks, ks reversed, plain; the real rank files, `--splits 16`; `run.sh spec`):
+
+| Job | Sessions | Prompts | Drafts | Result |
+|---|---|---|---|---|
+| 2026-10-14 01:55 | 1 | short, python; greedy and T 0.8 top-p 0.95 | k 1, 2, 3, 4, 5, gate, oracle | 4 of 4 PASS |
+| 02:52 | 2, 3, 4 | short, python, prose mixed | k 1, 2, gate, oracle | 6 of 6 PASS |
+| 03:03 | 1 | prose (4,762), agentic (26,834) | k 1, 2, 3, gate, oracle | 4 of 4 PASS |
+| 03:09 | 1, 2, 4 | short, python | oracle (accepted 0/1/2/3: 10/8/8/20 steps at one session) | 6 of 6 PASS |
+| 03:19 (merged code) | 1, 4 | short, python | k 1, gate, oracle | 6 of 6 PASS |
+
+With synthetic routed experts in layers 3-77 the MTP's own drafts are never accepted (the main model's text is
+noise), so the oracle (k = -3) feeds kmax drafts taken from the plain run's tokens with about one in four changed
+by a hash of the position: verify steps accept every length 0 .. 3, stops and limits included. Every rank's
+token hash is the same.
+
+**The MTP against the golden data** (`run.sh mtpgold`: the reference's final hidden of the four golden sequences,
+37,985 rows, teacher-forced through `Model::mtp_forced` in blocks of rows, every block's last row chained 5
+passes; rank 0 also compares layer 78's output with the reference's):
+
+| Sequence | draft = reference MTP argmax | draft = main argmax at t+1 (reference) | layer 78 cosine mean (min) |
+|---|---|---|---|
+| short (291) | 0.986 | 0.782 (0.786) | 0.9955 (0.971) |
+| prose (4,762) | 0.966 | 0.582 (0.581) | 0.9955 (0.980) |
+| python (6,106) | 0.973 | 0.680 (0.679) | 0.9946 (0.968) |
+| agentic (26,834) | 0.953 | 0.450 (0.449) | 0.9947 (0.964) |
+
+The engine's draft 1 is accepted by the main model's greedy token as often as the reference's own MTP is (the
+reference column: its MTP argmax against its main argmax). Layer 78's relative error, 9 %, is the NVFP4 the
+converter quantised the MTP's BF16 experts to (each matrix 9.5 %, [layout.md](layout.md) § 6).
+
+**A failure on the way: the workers' rank files.** The first runs (01:22-01:41) gave draft = main argmax 0.53
+on short against the reference's 0.79 and layer 78 cosine 0.58. The layer's input matched the reference (cosine
+0.9999), row 0's residual after attention too (0.99988), its router logits to 0.01; its MoE output did not. The
+cause: the copies of the rank files on ranks 1-3 (`~/glm53/weights/rank{1,2,3}.glw`, 5,560,139,776 bytes, 23:34
+on 2026-10-13) predate the MTP experts' fill; rank 0's file has them (6,919,143,424 bytes, 00:08), so rank 0 ran
+layer 78's real experts and ranks 1-3 synthetic ones, each rank's quarter of every expert summed together. With
+copies of the four filled files (SHA-256s as [layout.md](layout.md) § 8) every number above is the reference's.
+The fleet's copies on ranks 1-3 are still the old ones (not touched here); `glm53_rank` now warns when the
+ranks' files differ in the layers with experts from the file. `glm_run` does not check it.
+
+**Accepted lengths** (teacher-forced chains from every 4th row, greedy, against the main model's argmax; the
+tokens a verify step of k drafts emits are 1 + E[min(L, k)]):
+
+| Sequence | chains | P(L = 0 / 1 / 2 / 3 / 4 / 5) | tokens a step at k = 1 / 2 / 3 / 5 |
+|---|---|---|---|
+| short | 71 | 0.21 / 0.39 / 0.30 / 0.06 / 0 / 0.04 | 1.79 / 2.18 / 2.28 / 2.37 |
+| prose | 1,189 | 0.45 / 0.43 / 0.10 / 0.02 / 0.003 / 0.001 | 1.56 / 1.69 / 1.71 / 1.72 |
+| python | 1,525 | 0.31 / 0.45 / 0.14 / 0.06 / 0.02 / 0.03 | 1.69 / 1.93 / 2.04 / 2.11 |
+| agentic | 6,707 | 0.56 / 0.35 / 0.07 / 0.02 / 0.005 / 0.007 | 1.44 / 1.53 / 1.56 / 1.58 |
+
+Sampled decoding accepts less (a draft is accepted with the probability the main model's tempered distribution
+gives it); not measured here, the golden data holds only the greedy argmax.
+
+**The cost of a verify step** (one session, GPU ms a step, real non-expert files and synthetic routed experts in
+NVFP4 pools of the real size, `--splits 16`, both orders):
+
+| Rows | plain (no MTP) | 1 (k 0 + pass 1) | 2 (k 1) | 3 (k 2) | 4 (k 3) | 5 (k 4) | 6 (k 5) |
+|---|---|---|---|---|---|---|---|
+| ms | 41.4-45.6 | ~44.5 | 59.5-64.9 | 75.6-80.7 | 90.3-97.5 | 107.1-114.0 | 122.9-129.9 |
+
+Every row more costs ~16 ms: a row is another token's eight routed experts in each of 75 MoE layers, read from
+memory (the step is bound by the expert bytes, [Closing the decode gap](#closing-the-decode-gap-2026-10-14)), so
+a draft pays only if it is accepted more than ~35 % of the time. With more sessions a row costs less (n = 4: 74
+ms plain at 4 rows, 119 at 8, 159 at 12, 197 at 16; ~10 ms a row), but every row is still new experts.
+
+**Tokens a second.** Measured with the oracle (accepted 0.62-0.65 of 3 drafts, 2.78-2.82 tokens a step): 1
+session 29.1-30.8 tok/s against 21.7-24.1 plain (×1.22-1.34); 2 sessions ×1.15; 4 sessions ×1.05 (68.2 against
+64.6). With the MTP's own acceptance (the table above) and the measured costs, the best fixed k at one session is
+k = 1 on every sequence, decode only:
+
+| Sequence | plain | k 1 | k 2 | ×, best |
+|---|---|---|---|---|
+| short | 23.0 | 29.0 | 27.8 | 1.26 |
+| python | 23.0 | 27.4 | 24.6 | 1.19 |
+| prose | 23.0 | 25.2 | 21.5 | 1.10 |
+| agentic | 23.0 | 23.4 | 19.6 | 1.02 |
+
+(tok/s = tokens a step / (61.6 ms at k 1, 78.4 at k 2); plain 43.5 ms.) Against the published 49.3 (code) and
+30.0 (prose) tok/s, end to end, this is short of both: the plain step itself is at 23 tok/s, and the drafts add
+~10-26 % at one session. These are projections from teacher-forced acceptance and measured step costs, not an
+end-to-end run: with synthetic routed experts there is no real text to draft, and glmfront end to end would
+measure the gate's overhead only. With acceptance 0 the gate costs 9-13 % against plain (k 0 steps still run
+pass 1 and the verify loop is synchronous, one step at a time, where the plain loop queues a step ahead; and the
+gate's prior verifies a draft in ~9 % of the steps); `--no-spec` avoids it.
+
+**Not done.** Measured acceptance with sampling; end-to-end tok/s through glmfront on real text (needs the
+routed experts of layers 3-77); the verify loop queued a step ahead (the next step's rows depend on the
+accepted count: a step could be queued for the all-accepted case and redone otherwise); a batch-aware gate (its
+cost model is one session's; with 4 sessions a row costs ~10 ms, not 15.5).
+
+## End to end on real weights (G8, 2026-10-14)
+
+**Partial: paused on 2026-10-14 at 09:22 (+0100), on the user's word.** These are the engine's first runs with
+every routed expert from the rank files: C1's fill, NVIDIA's NVFP4 bytes ([layout.md § 8](layout.md): 108,844,417,024 B
+a rank; SHA-256 `f1010873…` / `e4c1b689…` / `f8b0c628…` / `a0c8e8cd…` for ranks 0–3). Six ring jobs ran on
+2026-10-14, 08:42–09:22: three passed (a, b, c+d), one failed on memory, one was killed by earlyoom, and one
+server job passed. The other four server configurations (drafts k = 1, 2, 3 and the gate) were not run.
+Binaries: `glm_run` sources 0c27f04de9416c62 (job a) and 58d7487b630103f6 (jobs b–d, the memory guard
+changed); `glm53_rank` d3fdc9de82caf384; glmfront from the main checkout's build of 01:07.
+
+**What was added.** `glm_run tf` and `refhash` take the golden set's raw copies (`--gold PREFIX --seqs`, the first
+`--tf-max` tokens). `tf` writes one dump a sequence with the golden run's sample rows and records a
+**tf hash** (FNV-1a over every dumped bit). `refhash` records its tokens (`--dir`). The modes `eager` / `graphs`
+switch `Model::set_graphs` between steps. `--index-scratch-mib` sets the prefill indexer's scratch (also in
+`glm53_rank`). `--min-free-mib` (4,608) is a guard: after the weights and the prefill buffers every rank reports
+its free device memory and MemAvailable, and all ranks stop if one is short.
+`tools/compare_golden.py g8` runs the comparison against both golden orders, plus the two orders against each
+other over the same positions. `run.sh g8` and `g8_job.sh` drive the `glm_run` jobs, `g8_chain.sh` runs jobs
+back to back, and `server/tests/g8_job.sh` + `g8_front.py` handle the server through glmfront.
+
+**Memory, measured** (MemTotal 121.63 GiB a box; the weights bind 108.83 GB = 101.36 GiB in 58–70 s a load; the
+loader's staging is 8 pinned buffers of 64 MiB, freed after). Free device / MemAvailable after the weights,
+2,048-row prefill buffers, 128 MiB of index scratch and the caches of one 6,400-position slot, in GiB:
+
+| Job | rank 0 | rank 1 | rank 2 | rank 3 |
+|---|---|---|---|---|
+| a (08:46) | 2.05 / 6.73 | 9.16 / 11.50 | 7.91 / 10.99 | 8.49 / 11.37 |
+| b (09:06, one draft pass) | 5.03 / 8.34 | 9.15 / 11.49 | 7.92 / 10.79 | 8.46 / 11.36 |
+| server plain (09:17, before its 1.94 GiB pool) | 4.20 / 9.40 | 9.56 / 11.92 | 3.04 / 10.04 | 8.89 / 11.82 |
+
+Rank 0 and rank 2 vary by several GiB from job to job with what else runs there: agents' processes on rank 0,
+the reference's passes on rank 2. **Failures on the way.**
+1. The first job (08:29) used the default 8,192-row prefill chunk, about 3 GB of buffers beside the weights.
+   Rank 0 fell to ~1 GiB, and the NVRM driver logged out-of-memory errors on ranks 0 and 2 at 08:30:47–48. On
+   rank 2, earlyoom (`-m 3 --prefer python`) terminated the reference's tracks pass at 08:30:48. Rank 0 thrashed
+   until the 600 s timeout, and its systemd watchdogs killed snapd and journald at 08:36:41.
+2. A second job (08:52) stopped at the guard: rank 0 had 0.99 GiB free on the device at the time.
+3. A third (08:56) was killed by earlyoom on rank 2 (now our process, with `oom_score_adj` 1000, not the python
+   pass), while the reference ran three passes there (8.6 GB).
+4. The first server job (09:12) found no glmfront in the worktree.
+
+Since then every launcher sets `oom_score_adj` 1000 on its ranks ([serving.md § 5.1](serving.md)), prefill
+runs in 2,048-row chunks with 128 MiB of index scratch, and the jobs ran with the reference's passes on rank 2
+stopped (the coordinator's window).
+
+### Against the golden data
+
+`tf` runs teacher-forced over the golden sequences (short and python whole, prose whole, agentic's first 8,000
+of 26,834 tokens). The comparison is with `compare_golden.py g8` on rank 2 (nice 19, 4 cores) against `all`
+(transformers' order) and `all-f32` (the contract's order). The "orders" row compares those two runs with each
+other over the same positions: the reference's own order variance, reference.md § 10.2. KL(golden ‖ engine) and
+max |Δ logit| are over the full logits at the golden sample rows (every row of short; 84–89 rows of the others,
+65 of agentic's prefix); top-1 and top-20 are over every row. Via prefill:
+
+| Sequence | against | argmax equal | top-20 overlap | KL mean (p99, max) | max \|Δ logit\| | top-1 vs the text |
+|---|---|---:|---:|---|---:|---:|
+| short (291) | `all` | 0.928 | 0.841 | 0.074 (0.97, 1.89) | 10.7 | engine 0.793, ref 0.793 |
+| | `all-f32` | **0.931** | 0.842 | **0.093** (1.63, 4.44) | 12.7 | ref 0.807 |
+| | orders | 0.935 | 0.884 | 0.052 (0.64, 2.02) | 8.0 | |
+| python (6,106) | `all` | 0.885 | 0.825 | 0.402 (5.43, 7.48) | 12.5 | engine 0.691, ref 0.689 |
+| | `all-f32` | **0.892** | 0.825 | **0.266** (2.97, 5.81) | 11.8 | ref 0.695 |
+| | orders | 0.898 | 0.843 | 0.410 (8.21, 8.30) | 13.1 | |
+| prose (4,762) | `all` | 0.827 | 0.825 | 0.083 (0.71, 0.82) | 6.7 | engine 0.502, ref 0.501 |
+| | `all-f32` | **0.825** | 0.821 | **0.080** (0.69, 1.46) | 4.9 | ref 0.511 |
+| | orders | 0.844 | 0.838 | 0.070 (0.72, 0.74) | 5.7 | |
+| agentic (first 8,000) | `all` | 0.692 | 0.705 | 0.327 (6.27, 6.40) | 12.7 | engine 0.479, ref 0.477 |
+| | `all-f32` | **0.699** | 0.708 | **0.297** (3.87, 7.68) | 12.9 | ref 0.481 |
+| | orders | 0.715 | 0.731 | 0.289 (4.92, 5.22) | 13.1 | |
+
+**DESIGN decision 3's 2× criterion: met on all four.** Against the contract's order (`all-f32`), the ratio of the
+engine's disagreement to the reference's own is:
+
+| | short | python | prose | agentic (8k) |
+|---|---:|---:|---:|---:|
+| argmax (1 − equal) | 1.05× | 1.06× | 1.12× | 1.06× |
+| KL mean | 1.79× | 0.65× | 1.14× | 1.03× |
+| max \|Δ logit\| | 1.58× | 0.90× | 0.86× | 0.99× |
+
+Short's KL is the closest to the bound, at 1.79×. It has the fewest positions (291), and its p99 and max are the
+largest entries of the table. The engine is not closer to the contract's order than to transformers', because
+its FP8 attention projections dominate the difference (layers 0–3 below), not the order of the expert sums.
+
+**Via decode** (16-row steps, each repeating the row before it; one draft pass, so the MTP's logits come too):
+short argmax 0.949 against `all-f32` (KL 0.088, max |Δ logit| 13.0) and 0.955 against `all` (KL 0.046). Python
+0.880 against `all-f32` (KL 0.288) and 0.880 against `all` (KL 0.372). These are within the same envelope as
+prefill; decode's routed sums are in their own order (decision 11).
+
+**Hidden states, short, via prefill** (cosine mean / min, median relative error; `all-f32`; the orders' own
+median relative error in brackets):
+
+| After layer | 0 | 1 | 3 | 10 | 20 | 30 | 40 | 50 | 60 | 70 | 77 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| cosine mean | 0.99993 | 0.99980 | 0.99977 | 0.99923 | 0.99768 | 0.99561 | 0.98619 | 0.97988 | 0.96852 | 0.95695 | 0.95978 |
+| cosine min | 0.99953 | 0.99947 | 0.99948 | 0.99621 | 0.98982 | 0.94452 | 0.70800 | 0.53550 | 0.27277 | 0.20928 | 0.45035 |
+| rel. error | 1.15 % (0.19) | 1.98 % (0.33) | 2.11 % (0.46) | 3.5 % (1.1) | 6.1 % (4.6) | 7.8 % (5.7) | 10.9 % (8.4) | 10.9 % (8.5) | 13.2 % (10.2) | 18.4 % (13.9) | 23.2 % (17.4) |
+
+Layers 0–3 give the same numbers as G4's (FP8 attention against the reference's BF16: 1.2–2.1 %, 4–6× the order
+variance there). From layer 4 the difference grows as routing flips amplify it, as the two orders' own does; by
+layer 77 it is 1.33× theirs (23 % against 17 %). The worst rows (cosine min) are single positions whose routes
+flipped. The full per-layer table, every layer 0–77, is in `g8-prefill.json`.
+
+**The MTP's drafts** (via decode, one draft pass, the engine's own hidden states): the draft argmax equals the
+reference's on 0.934 (short; 0.931 against `mtp-nvfp4`, the reference's MTP with NVFP4 experts) and 0.868 (python;
+0.869 against `mtp-nvfp4`). The reference's two orders agree on 0.952 and 0.899 of the drafts. Experiment 5's
+0.98–0.99 was the MTP fed identical hidden states; here the hidden states differ by ~20 %, so the order variance
+is the scale. Draft = the engine's own main argmax at t+1, the one-draft greedy acceptance: **0.797** (short) and
+**0.669** (python), against the reference's 0.796 and 0.688 (`all-f32`).
+
+### The refhash pins
+
+The pins are measured on the real rank files above, at `--max-ctx 6400 --chunk 2048`, greedy, 64 tokens after the
+prompt, each step queued one ahead (the server's way). The hash is over every token's id, its logit value and its
+drafts (none here).
+
+| Prompt | refhash | runs |
+|---|---|---|
+| short (291 tokens) | **`5243e999f39aa989`** | graphs, graphs, eager (job a, 08:47–08:50); graphs in a second process (job d, 09:11–09:12); all four ranks agree in each |
+| python (6,106 tokens) | **`842072b728abcad9`** | the same four |
+
+The teacher-forced dumps' tf hashes (argmax, top-20, log-probabilities, lse, next-token log-probability, the kept
+logits and hidden rows; rank 0) are:
+
+| Run | short | python | prose | agentic (8k) |
+|---|---|---|---|---|
+| prefill, layers 0–77 dumped (short, python) or layer 77 only | `8245b29c332bf2d6` | `eb99060159898dc3` | `24fd7437619d3d5b` | `f366c57b319843d7` |
+| decode, one draft pass, layer 77 | `c9235b96050f2739` | `be0bd5451ff99a18` | | |
+
+They were each run once, so they are recorded, not yet pinned by a repeat. The server's greedy output through
+glmfront (below) begins with the same 64 tokens as the refhash runs on both prompts.
+
+### Real text through glmfront (drafts off)
+
+The server job: `server/tests/g8_job.sh plain`, 09:17–09:21. The four ranks ran with `--no-spec --max-ctx 8192
+--chunk 2048 --kv-gib 2 --margin-gib 0.25 --disk-gib 0 --slots 4 --index-scratch-mib 128` (a pool of 21 pages,
+1.94 GiB a rank), and the engine was serving 61 s after the start. glmfront ran on 127.0.0.1:18894 with
+`--dump-dir`. `g8_front.py` sent the four conversations of `ref/tokens`. Agentic was cut to its first six
+messages, so it ends on a tool result (4,265 tokens). Each prompt went greedy, then seeded (T 1.0, top-p 0.95,
+seed 1234, on the cached prompt), with at most 512 new tokens; then two sessions at once.
+
+| Prompt | prompt tokens | TTFT cold (greedy) | prefill | decode greedy / seeded tok/s | output |
+|---|---:|---:|---:|---|---|
+| short | 291 | 1.45 s | 1,444 ms (202 tok/s; the graph warm-up) | 23.3 / 23.2 | 512 tokens, reasoning |
+| prose | 4,762 | 6.19 s | 6,181 ms (770 tok/s) | 22.6 / 22.0 | 512, reasoning |
+| python | 6,106 | 7.46 s | 7,459 ms (819 tok/s) | 22.8 / 22.7 | 512, reasoning |
+| agentic (6 messages) | 4,265 | 5.56 s | 5,556 ms (768 tok/s) | 22.5 / 22.4 | 57 / 63: a tool call |
+
+A decode step takes 42.0–43.9 ms (median per run). A cached prompt's TTFT is 0.11–0.13 s. **Two sessions**
+(python and prose, greedy): 59.5 ms a step, 16.7 tok/s each, **33.2 tok/s together**. Short with agentic: 22.5
+tok/s for short; agentic ended after 57 tokens. **Each session's tokens with two at once equal its tokens alone,
+on all four prompts**: batch invariance at the fixed split-K, on real text.
+
+**Against the bars.** Decode at one session is 22–23 tok/s. That is the plain step's rate (G7 projected 23.0)
+and below the published 49.3 (code) and 30.0 (prose). Prefill in this job ran 770–819 tok/s in 2,048-row chunks,
+the chunk the memory allows beside the 101.4 GiB weights. That is below T6's 1,145 at 8,192-row chunks and the
+1,374 bar; prefill with larger chunks waits for weights under ~90 GiB (the S3 fill, C2).
+
+**Not run (paused):** the drafts through the front-end (`--spec-force 1/2/3` and the gate). So there is no
+acceptance on real generated text, no draft tok/s, and no bit check of drafts against plain on real text yet.
+`g8_job.sh k1|k2|k3|gate` and `g8_front.py compare` are ready for them. G7's projections at k = 1 (29.0 / 27.4
+/ 25.2 / 23.4 tok/s on short / python / prose / agentic) are still projections.
+
+**The text** (greedy, the start of the reasoning, through glmfront):
+- short: "The user is asking about a passage from Jerome K. Jerome's *Three Men in a Boat* (1889). They want to
+  know: 1. What is the narrator's complaint? 2. How does the passage make it funny? Let me analyze the passage
+  carefully. …"
+- prose: "The user wants me to summarize the route of the voyage so far and list the natural-history
+  observations Darwin makes, in order … 1. Departure from Devonport, 27 December 1831 (after two failed
+  attempts due to heavy southwestern gales) 2. 6 January 1832: reached Teneriffe, but prevented from landing
+  due to cholera fears. …"
+- python: "Let me carefully review these three scripts. They're analysis tools for a GLM-5.3 NVFP4 checkpoint.
+  … ### tools/nvfp4_entropy.py Purpose: compute empirical entropy of NVFP4 expert tensors by reading sampled
+  tensors via safetensors header offsets. …"
+- agentic: "Now read the decoder and scanner, which handle float parsing and the C accelerator import." followed
+  by a well-formed `read_file` tool call on `/usr/lib/python3.12/json/decoder.py` (seeded: the same call).
+
+This reads as GLM-5.3. The golden set holds no free-running greedy continuation (the reference is teacher-forced
+only), so there is nothing to compare these tokens with. The first generated token is the teacher-forced argmax
+at the prompt's last row, which the `tf` tables cover.
+
+**Data**: `~/dsgb10-data/glm53-g8/` on rank 0 (`results-*.tsv`, `g8/{prefill,decode}/`, `front/plain.091700.*`,
+`chain/`, `g8-*.json`); the comparison's copies on rank 2 in the same tree.
+
+## What remains
+
+- **Prefill** (1,145 tok/s at 8k after T6, 83 % of the published 1,374): the compute runs 20–27 % slower beside
+  the ring's copies (their memory traffic; [Prefill overlap](#prefill-overlap-2026-10-14)): fewer bytes through
+  memory per collective (a fused residual + norm + all-gather, the producers writing into the send buffers) would
+  give that back; the compute stream still waits 0.3–1.0 s a chunk, mostly for the short x-projection all-gathers;
+  then the expert GEMMs (the chained down bound by its ordered yr adds, experts.md § 12) and `sparse_attn`
+  (`k_attn_pf`, gather-bound on random selections: [Prefill kernels](#prefill-kernels-t6-2026-10-14)), a third of
+  the chunk each. The slowest rank (2) sets the chunk. The
+  indexer's batches shrink to 512 rows at a 256k `max_ctx` (512 MiB scratch).
+- **The decode gap** (1.27–1.30× at 1 row after the 2026-10-14 pass, ~1.29× on undisturbed ranks; G4's target
+  1.25×): fewer collectives (merge the x-projection all-gather into the previous all-reduce's epilogue, the
+  indexer queries' all-gather into it on full layers), the embedding all-gather onto the sampler's exchange, the
+  ring's per-collective latency; the MoE is at its floor ([Closing the decode gap](#closing-the-decode-gap-2026-10-14)).
+- **Real routed experts** (G8, partial, [above](#end-to-end-on-real-weights-g8-2026-10-14)): `tf` against both
+  golden orders, the refhash pins and the plain server through glmfront are done. Not done: the drafts through
+  the front-end on real text (`server/tests/g8_job.sh k1 k2 k3 gate`: acceptance, tok/s, tokens against plain),
+  a repeat of the tf hashes, prefill in chunks larger than 2,048 rows beside the 101.4 GiB weights.
+- `glw_kcheck --gpu`'s one SwiGLU output outside its bound.
+- Batch invariance under the default split-K (above).
