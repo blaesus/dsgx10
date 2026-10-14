@@ -6,7 +6,7 @@
 set -eu
 cd "$(dirname "$0")"
 ENGINE=$(cd .. && pwd)
-TOP=$HOME/dsgb10-data/glm53-model
+TOP=$HOME/dsgb10-data/${DATA_NAME:-glm53-model}  # DATA_NAME: another tree (a tuning branch beside the main one)
 BIN=${1:-$TOP/bin}
 mkdir -p "$TOP/wrap" "$BIN"
 sed -n '/^set(CMAKE_CUDA_FLAGS/p' "$ENGINE/CMakeLists.txt" > "$TOP/wrap/flags.cmake"

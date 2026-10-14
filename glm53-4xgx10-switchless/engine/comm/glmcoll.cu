@@ -90,7 +90,9 @@ __device__ __forceinline__ float rms_out(float x, float rstd, float w) {
 
 // kTwo (allreduce2_add_norm): two partials, part then part2, sent as one contribution of 2 R rows; the value added
 // to the residual is bf16(bf16(sum) + bf16(sum2)), the experts' finalize (the routed and the shared expert's sums).
-template <bool kNorm, bool kTwo = false>
+// kPosted (allreduce2_add_norm_posted): the producer kernel wrote this rank's contribution into the send buffer and
+// posted it (the producer half in its epilogue); this kernel is the consumer half only.
+template <bool kNorm, bool kTwo = false, bool kPosted = false>
 __global__ void __launch_bounds__(512) k_allreduce_hidden(DevChannel ch, const float* part, int R, int S, int RG,
                                                           float* out_f32, uint16_t* out_bf16, const uint16_t* res,
                                                           uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn,
@@ -105,7 +107,7 @@ __global__ void __launch_bounds__(512) k_allreduce_hidden(DevChannel ch, const f
   pdl_wait();
   const uint64_t s = next_seq(ch);
   uint8_t* sb = send_buf(ch, s);
-  if (item) {
+  if (!kPosted && item) {
     const uint4* p = reinterpret_cast<const uint4*>(part + (size_t)row * kDim + c0);
     const uint4 a = p[0], b = p[1];
     *reinterpret_cast<uint4*>(sb + off) = a;
@@ -117,7 +119,7 @@ __global__ void __launch_bounds__(512) k_allreduce_hidden(DevChannel ch, const f
       *reinterpret_cast<uint4*>(sb + (size_t)R * kHiddenF32Row + off + 16) = b2;
     }
   }
-  post_grid(ch, s, (uint32_t)((size_t)R * kDim * 4 * (kTwo ? 2 : 1)));
+  if (!kPosted) post_grid(ch, s, (uint32_t)((size_t)R * kDim * 4 * (kTwo ? 2 : 1)));
   pdl_launch();
   uint4 rv{}, wv{};
   if (kNorm && item) {  // while the contributions travel
@@ -219,11 +221,119 @@ __global__ void __launch_bounds__(512) k_allreduce_hidden(DevChannel ch, const f
   }
 }
 
-template <bool kNorm, bool kTwo = false>
+// The fused all-reduce with one block a row (slices = 1): 768 threads of 8 columns, the whole row in one block, so
+// rmsnorm's statistic needs no barrier across blocks (its 256 run sums go through shared memory, then the same
+// eight xor-trees and warp-order sum); a single-block grid's wait_all also has no release hop. The same bits as
+// the sliced kernel (the same sums in the same order).
+template <bool kTwo, bool kPosted>
+__global__ void __launch_bounds__(768) k_ar_norm_row(DevChannel ch, const float* part, int R, const uint16_t* res,
+                                                     uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn,
+                                                     const float* part2) {
+  __shared__ float hs[kDim];
+  __shared__ float ss[256];
+  __shared__ float rstd_sh;
+  const int row = blockIdx.x, c0 = threadIdx.x * 8;
+  const size_t off = ((size_t)row * kDim + c0) * 4;
+  pdl_wait();
+  const uint64_t s = next_seq(ch);
+  if (!kPosted) {
+    uint8_t* sb = send_buf(ch, s);
+    const uint4* p = reinterpret_cast<const uint4*>(part + (size_t)row * kDim + c0);
+    const uint4 a = p[0], b = p[1];
+    *reinterpret_cast<uint4*>(sb + off) = a;
+    *reinterpret_cast<uint4*>(sb + off + 16) = b;
+    if constexpr (kTwo) {
+      const uint4* p2 = reinterpret_cast<const uint4*>(part2 + (size_t)row * kDim + c0);
+      const uint4 a2 = p2[0], b2 = p2[1];
+      *reinterpret_cast<uint4*>(sb + (size_t)R * kHiddenF32Row + off) = a2;
+      *reinterpret_cast<uint4*>(sb + (size_t)R * kHiddenF32Row + off + 16) = b2;
+    }
+    post_grid(ch, s, (uint32_t)((size_t)R * kDim * 4 * (kTwo ? 2 : 1)));
+  }
+  pdl_launch();
+  const uint4 rv = *reinterpret_cast<const uint4*>(res + (size_t)row * kDim + c0);
+  const uint4 wv = *reinterpret_cast<const uint4*>(w + c0);
+  wait_all(ch, s);
+  float v[8];
+  {
+    const float4 a = sum4_f32(ch, s, off), b = sum4_f32(ch, s, off + 16);
+    v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
+    if constexpr (kTwo) {
+      const size_t o2 = (size_t)R * kHiddenF32Row + off;
+      const float4 a2 = sum4_f32(ch, s, o2), b2 = sum4_f32(ch, s, o2 + 16);
+      const float u[8] = {a2.x, a2.y, a2.z, a2.w, b2.x, b2.y, b2.z, b2.w};
+#pragma unroll
+      for (int j = 0; j < 8; ++j) v[j] = bfround(__fadd_rn(bfround(v[j]), bfround(u[j])));
+    }
+  }
+  finish_grid(ch, s);
+  float h[8];
+  {
+    const uint32_t rw[4] = {rv.x, rv.y, rv.z, rv.w};
+    uint32_t q[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      h[2 * j] = bfround(__fadd_rn(bf2f(rw[j]), bfround(v[2 * j])));
+      h[2 * j + 1] = bfround(__fadd_rn(bf2f(rw[j] >> 16), bfround(v[2 * j + 1])));
+      q[j] = (uint32_t)f2bf(h[2 * j]) | (uint32_t)f2bf(h[2 * j + 1]) << 16;
+    }
+    *reinterpret_cast<uint4*>(res_out + (size_t)row * kDim + c0) = make_uint4(q[0], q[1], q[2], q[3]);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) hs[c0 + j] = h[j];
+  }
+  __syncthreads();
+  if (threadIdx.x < 256) {  // rmsnorm's thread u: columns [24u, 24u + 24) in order
+    const float* x = hs + threadIdx.x * 24;
+    float a = 0.f;
+#pragma unroll
+    for (int j = 0; j < 24; ++j) a = __fadd_rn(a, __fmul_rn(x[j], x[j]));
+    ss[threadIdx.x] = a;
+  }
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    float tot = 0.f;
+#pragma unroll
+    for (int wp = 0; wp < 8; ++wp) {
+      float x = ss[wp * 32 + threadIdx.x];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) x = __fadd_rn(x, __shfl_xor_sync(0xffffffffu, x, o));
+      tot = __fadd_rn(tot, x);
+    }
+    if (threadIdx.x == 0) rstd_sh = rms_rstd(tot, kDim, eps);
+  }
+  __syncthreads();
+  const float rstd = rstd_sh;
+  const uint32_t ww[4] = {wv.x, wv.y, wv.z, wv.w};
+  uint32_t q[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+    q[j] = (uint32_t)f2bf(rms_out(h[2 * j], rstd, bf2f(ww[j]))) |
+           (uint32_t)f2bf(rms_out(h[2 * j + 1], rstd, bf2f(ww[j] >> 16))) << 16;
+  *reinterpret_cast<uint4*>(xn + (size_t)row * kDim + c0) = make_uint4(q[0], q[1], q[2], q[3]);
+}
+
+template <bool kNorm, bool kTwo = false, bool kPosted = false>
 void launch_ar(const DevChannel& ch, const float* part, int R, float* out_f32, uint16_t* out_bf16, const uint16_t* res,
                uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st, bool pdl, int S,
                const float* part2 = nullptr) {
   if (S == 0) S = 8;  // measured best or equal at 1-16 rows (docs/ring.md)
+  if constexpr (kNorm) {
+    if (S == 1) {  // one block a row
+      if (R < 1 || R > kMaxRows || (size_t)R * kHiddenF32Row * (kTwo ? 2 : 1) > ch.cap)
+        die("comm::glm: all-reduce of %d rows (1 to %d; cap %u)", R, kMaxRows, ch.cap);
+      cudaLaunchConfig_t cfg{};
+      cfg.gridDim = dim3(R);
+      cfg.blockDim = dim3(768);
+      cfg.stream = st;
+      cudaLaunchAttribute attr[1];
+      attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr[0].val.programmaticStreamSerializationAllowed = 1;
+      cfg.attrs = attr;
+      cfg.numAttrs = pdl ? 1 : 0;
+      CUDA_CHECK(cudaLaunchKernelEx(&cfg, k_ar_norm_row<kTwo, kPosted>, ch, part, R, res, res_out, w, eps, xn, part2));
+      return;
+    }
+  }
   if (S != 8 && S != 16 && S != 32) die("comm::glm: all-reduce over %d slices (8, 16 or 32)", S);
   if (R < 1 || R > kMaxRows || (size_t)R * kHiddenF32Row * (kTwo ? 2 : 1) > ch.cap)
     die("comm::glm: all-reduce of %d rows of %zu B (1 to %d rows; cap %u)", R, kHiddenF32Row, kMaxRows, ch.cap);
@@ -240,7 +350,7 @@ void launch_ar(const DevChannel& ch, const float* part, int R, float* out_f32, u
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = pdl ? 1 : 0;
-  CUDA_CHECK(cudaLaunchKernelEx(&cfg, k_allreduce_hidden<kNorm, kTwo>, ch, part, R, a.S, a.RG, out_f32, out_bf16, res,
+  CUDA_CHECK(cudaLaunchKernelEx(&cfg, k_allreduce_hidden<kNorm, kTwo, kPosted>, ch, part, R, a.S, a.RG, out_f32, out_bf16, res,
                                 res_out, w, eps, xn, part2));
 }
 
@@ -353,6 +463,16 @@ void allreduce2_add_norm(const DevChannel& ch, const float* part, const float* p
                          uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st, bool pdl,
                          int slices) {
   launch_ar<true, true>(ch, part, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices, part2);
+}
+
+void allreduce_add_norm_posted(const DevChannel& ch, int R, const uint16_t* res, uint16_t* res_out, const uint16_t* w,
+                               float eps, uint16_t* xn, cudaStream_t st, bool pdl, int slices) {
+  launch_ar<true, false, true>(ch, nullptr, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices);
+}
+
+void allreduce2_add_norm_posted(const DevChannel& ch, int R, const uint16_t* res, uint16_t* res_out, const uint16_t* w,
+                                float eps, uint16_t* xn, cudaStream_t st, bool pdl, int slices) {
+  launch_ar<true, true, true>(ch, nullptr, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices, nullptr);
 }
 
 void allgather_rows(const DevChannel& ch, const RowSeg* segs, int nseg, int rows, cudaStream_t st, int blocks,

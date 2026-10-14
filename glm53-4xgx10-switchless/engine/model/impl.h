@@ -72,6 +72,10 @@ struct PfState {  // device: how far a layer's windows got
 void l2pf_window(const PfTarget (&t)[kPfTargets], int layer, int window, float budget_us,
                  const unsigned long long* arrived, const unsigned long long* finished, PfState* state, cudaStream_t s);
 
+// o_proj [6144][4096] FP8 for rows <= 16 as the producer half of its all-reduce: the f32 partials straight into the
+// send buffer of the ring's next collective, posted (oproj.cu); then comm::glm::allreduce_add_norm_posted.
+void oproj_post(const uint16_t* x, int rows, const Fp8W& w, const comm::DevChannel& ch, cudaStream_t st, bool pdl);
+
 // Synthetic weights (bind.cu): allocations kept here so the model can free them.
 struct Synth;
 struct SynthFree {
@@ -134,8 +138,9 @@ struct Model::Impl {
   uint64_t n_steps = 0, n_done = 0;
   double host_us = 0;  // the last launch's host time, without waiting for a free input slot
   cudaEvent_t ev_beg[ops::kOutSlots], ev_end[ops::kOutSlots], ev_pf[2];
-  std::map<int, cudaGraphExec_t> graphs;
-  bool warm[kMaxRows + 1] = {};
+  std::map<uint64_t, cudaGraphExec_t> graphs;  // by (tune, rows): a lever set's graphs are kept across set_tune
+  std::map<uint64_t, bool> warm;
+  uint64_t gkey(int R) const { return (uint64_t)opt.tune << 8 | (uint64_t)R; }
 
   // side streams: l2pf (sc); events for fork/join
   cudaStream_t sc = nullptr;
@@ -161,6 +166,7 @@ struct Model::Impl {
 
   // the launch flags of the step being built: PDL unless profiling
   bool pdl() const { return opt.pdl && !prof; }
+  bool tune(uint32_t bit) const { return (opt.tune & bit) != 0; }
 
   // MTP pending rows: per slot, the last prefilled row's final hidden waits for the token after it
   uint16_t* m_pend = nullptr;  // [slots][6144]

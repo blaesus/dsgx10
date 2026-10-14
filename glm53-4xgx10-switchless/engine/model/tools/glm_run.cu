@@ -6,6 +6,11 @@
 //   bench     decode steps as graphs at --rows (default 1,2,4,6,8,16) at context --ctx: GPU ms a step, wall ms, host
 //             ms a launch; the floor; then one profiled eager step a row count (ms per kernel class, per layer class)
 //   l2pf      the paced L2 prefetch off and on, A/B and B/A, at --rows
+//   ab        the speed levers --ab-base MASK (default none) against --ab MASK (default all; Tune bits, hex), A/B/B/A
+//             at --rows, --ab-rounds (10) rounds of 12 steps each, A B then B A: GPU ms a step (the medians, the ratio
+//             of each round's pair) and whether the outputs are the same bits
+//             (the final normed rows, the sampled tokens and values, every layer's cache)
+//   trace     graph steps at --rows inside cudaProfilerStart/Stop (run under nsys; tools/step_profile.py)
 //   prefill   prefill chunks of --chunks (default 512,1024,2048,4096,8192) rows at position --ctx: tok/s
 //   check     the state checks on synthetic weights (chunking, prefill vs decode, batch invariance, determinism)
 //   tf        teacher-forced over --tokens FILE (--via prefill|decode): argmax, top-20, lse, next logprob, sampled
@@ -25,6 +30,8 @@
 #include <set>
 #include <string>
 #include <vector>
+
+#include <cuda_profiler_api.h>
 
 #include "comm/ring.h"
 #include "comm/ring_config.h"
@@ -91,6 +98,8 @@ struct Args {
   float temp = 0.f, top_p = 1.f;
   std::vector<int> rows = {1, 2, 4, 6, 8, 16}, chunks = {512, 1024, 2048, 4096, 8192};
   std::vector<int> dump_layers;
+  uint32_t ab_base = 0, ab = 0xffffffffu;
+  int ab_rounds = 10;
   Options mo;
   std::vector<std::string> modes;
 };
@@ -182,6 +191,95 @@ void bench(Model& m, comm::Ring& ring) {
            p.total_ms, coll, p.ms[kKPrep] + p.ms[kKIndex] + p.ms[kKAttn]);
     ring.barrier();
   }
+}
+
+// ab: two lever sets, A/B/B/A in one process, timing and output bits
+uint64_t step_hash(Model& m, const SampleOut& o, int R, int n_cache) {
+  const std::vector<uint16_t> h = m.last_hidden(R);
+  uint64_t x = fnv(h.data(), h.size() * 2);
+  for (int r = 0; r < R; ++r) x = fnv(&o.row[r].token, 4, x), x = fnv(&o.row[r].value, 4, x);
+  const std::vector<uint64_t> c = m.cache_hashes(0, n_cache);
+  return fnv(c.data(), c.size() * 8, x);
+}
+
+void ab(Model& m, comm::Ring& ring) {
+  const int rk = ring.rank();
+  Sampling sp;
+  const uint32_t cfg[2] = {A.ab_base, A.ab};
+  const int rounds = A.ab_rounds, per = 12, keep = 8;
+  for (int R : A.rows) {
+    std::vector<int32_t> tok(R);
+    for (int r = 0; r < R; ++r) tok[r] = synth_token(A.seed, r);
+    const Batch b = one_session(R, A.ctx, tok.data(), 0, sp);
+    m.fill_cache(0, A.ctx + 64, 7);
+    uint64_t hs[2] = {};
+    for (int k = 0; k < 2; ++k) {  // warm both (eager, capture, replay), and each one's output bits
+      m.set_tune(cfg[k]);
+      SampleOut o{};
+      for (int i = 0; i < 3; ++i) o = m.wait(m.launch(b));
+      hs[k] = step_hash(m, o, R, A.ctx + R);
+    }
+    ring.barrier();
+    std::vector<double> ms[2], ratio;
+    for (int round = 0; round < rounds; ++round) {
+      double blk[2] = {};
+      for (int q = 0; q < 2; ++q) {
+        const int k = (q ^ round) & 1;  // A B, then B A
+        m.set_tune(cfg[k]);
+        std::vector<uint64_t> ns(per);
+        for (int i = 0; i < per; ++i) ns[i] = m.launch(b);
+        m.wait(ns.back());
+        std::vector<double> g;
+        for (int i = per - keep; i < per; ++i) g.push_back(m.gpu_ms(ns[i]));
+        std::sort(g.begin(), g.end());
+        blk[k] = (g[keep / 2 - 1] + g[keep / 2]) / 2;
+        ms[k].push_back(blk[k]);
+      }
+      ratio.push_back(blk[1] / blk[0]);
+    }
+    const SampleOut o = m.wait(m.launch(b));  // B's bits again after the rounds
+    const uint64_t hb = step_hash(m, o, R, A.ctx + R);
+    auto med = [](std::vector<double> v) {
+      std::sort(v.begin(), v.end());
+      return v.size() % 2 ? v[v.size() / 2] : (v[v.size() / 2 - 1] + v[v.size() / 2]) / 2;
+    };
+    const double ma = med(ms[0]), mb = med(ms[1]), mr = med(ratio);
+    double lo = 1e9, hi = 0;
+    for (double r : ratio) lo = std::min(lo, r), hi = std::max(hi, r);
+    uint64_t mine = hs[1], all[4];
+    ring.allgather_host(&mine, all, 8);
+    bool ranks = true;
+    for (int r = 1; r < 4; ++r) ranks &= all[r] == all[0];
+    record(rk, "ab\trows %d\tA %08x %.3f ms\tB %08x %.3f ms\t(medians of %d rounds, A B / B A)\tB/A median %.4f "
+           "(%.4f .. %.4f)\tgain %.2f %%", R, cfg[0], ma, cfg[1], mb, rounds, mr, lo, hi, 100.0 * (1.0 - mr));
+    check(rk, hs[0] == hs[1] && hb == hs[1] && ranks, "ab rows %d: the outputs of A and B the same bits (hash %016llx), every "
+          "rank the same", R, (unsigned long long)hs[1]);
+    ring.barrier();
+  }
+  m.set_tune(A.mo.tune);
+}
+
+// trace: inside one cudaProfilerStart/Stop (nsys --capture-range=cudaProfilerApi), for each of --rows: an eager step,
+// the graph's capture, then 9 graph steps (tools/step_profile.py takes the last 4 of each row count's 10 steps)
+void trace(Model& m, comm::Ring& ring) {
+  m.fill_cache(0, A.ctx + 64, 7);
+  Sampling sp;
+  CUDA_CHECK(cudaProfilerStart());
+  for (int R : A.rows) {
+    std::vector<int32_t> tok(R);
+    for (int r = 0; r < R; ++r) tok[r] = synth_token(A.seed, r);
+    const Batch b = one_session(R, A.ctx, tok.data(), 0, sp);
+    for (int i = 0; i < 2; ++i) m.wait(m.launch(b));
+    m.drain();
+    ring.barrier();
+    std::vector<uint64_t> ns(9);
+    for (int i = 0; i < 9; ++i) ns[i] = m.launch(b);
+    m.wait(ns.back());
+    m.drain();
+    record(ring.rank(), "trace\trows %d\tgpu %.3f ms (last step)", R, m.gpu_ms(ns.back()));
+    ring.barrier();
+  }
+  CUDA_CHECK(cudaProfilerStop());
 }
 
 void l2pf_ab(Model& m, comm::Ring& ring) {
@@ -537,6 +635,10 @@ int main(int argc, char** argv) {
     else if (a == "--chunk") A.mo.prefill_rows = std::stoi(nx());
     else if (a == "--splits") A.mo.attn_splits = std::stoi(nx());
     else if (a == "--rows") A.rows = parse_list(nx());
+    else if (a == "--tune") A.mo.tune = (uint32_t)std::stoul(nx(), nullptr, 16);
+    else if (a == "--ab") A.ab = (uint32_t)std::stoul(nx(), nullptr, 16);
+    else if (a == "--ab-rounds") A.ab_rounds = std::stoi(nx());
+    else if (a == "--ab-base") A.ab_base = (uint32_t)std::stoul(nx(), nullptr, 16);
     else if (a == "--chunks") A.chunks = parse_list(nx());
     else if (a == "--steps") A.steps = std::stoi(nx());
     else if (a == "--prompt") A.prompt = std::stoi(nx());
@@ -586,6 +688,7 @@ int main(int argc, char** argv) {
   }
   size_t fr = 0, tot = 0;
   CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
+  record(rk, "tune\t%08x", m.options().tune);
   record(rk, "start\t%s weights (%d MoE layers' routed experts from the file) %.2f GB\tmax_ctx %d slots %d drafts %d l2pf %d\tbound in %.1f s\tfree %.1f GB",
          A.synthetic ? "synthetic" : "file", m.file_expert_layers(), m.weight_bytes() / 1e9, m.options().max_ctx, m.options().slots,
          m.options().drafts, (int)m.options().l2pf, now_s() - t0, fr / 1e9);
@@ -593,6 +696,8 @@ int main(int argc, char** argv) {
     ring.barrier();
     if (mode == "bench") bench(m, ring);
     else if (mode == "l2pf") l2pf_ab(m, ring);
+    else if (mode == "trace") trace(m, ring);
+    else if (mode == "ab") ab(m, ring);
     else if (mode == "prefill") bench_prefill(m, ring);
     else if (mode == "check") check_state(m, ring);
     else if (mode == "tf") tf(m, ring);

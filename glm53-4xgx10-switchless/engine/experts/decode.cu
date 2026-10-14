@@ -14,6 +14,7 @@
 // wait) into its own output. Both outputs f32 partial sums.
 #include <cstdio>
 
+#include "comm/ring_dev.cuh"
 #include "common/check.h"
 #include "experts/formats.cuh"
 
@@ -34,10 +35,14 @@ struct Params {
   int M;
   const int* idx;
   const float* w;
+  const float* logits;  // fused routing (DecodeCfg::logits): idx, w unused
+  const float* bias;
   LayerW L;
   __nv_bfloat16* h;  // [slot][M][kI]
   float *yr, *ys;
   int* ctr;          // k_up's task queue (null: static order); zero between launches
+  bool post;         // k_down: yr, ys into ch's send buffer, posted (DecodeCfg::post)
+  comm::DevChannel ch;
 };
 
 // The union of the rows' picks, sorted by expert id. All threads of the CTA (>= 128). W: also each slot's
@@ -47,6 +52,8 @@ struct Union {
   int n;
   uint32_t mask[8];
   int pre[8];
+  int ri[kMaxRows * kTopK];    // fused routing: the rows' picks and weights
+  float rw[kMaxRows * kTopK];
   int id[kMaxUnion];
   float w[W ? kMaxUnion : 1][kMaxRows];
   MatDesc d[W ? kMaxUnion : 1];
@@ -57,9 +64,13 @@ __device__ void build_union(Union<W>& U, const Params& a) {
   if (tid < 8) U.mask[tid] = 0;
   if (W)
     for (int i = tid; i < kMaxUnion * kMaxRows; i += blockDim.x) (&U.w[0][0])[i] = 0.f;
+  const bool fused = a.logits != nullptr;
+  if (fused)  // a warp a row, route()'s code
+    for (int row = tid >> 5; row < a.M; row += blockDim.x >> 5)
+      route_warp(a.logits + (size_t)row * kE, a.bias, tid & 31, U.ri + row * kTopK, U.rw + row * kTopK);
   __syncthreads();
   for (int i = tid; i < ne; i += blockDim.x) {
-    const int e = __ldcg(a.idx + i);
+    const int e = fused ? U.ri[i] : __ldcg(a.idx + i);
     atomicOr(&U.mask[e >> 5], 1u << (e & 31));
   }
   __syncthreads();
@@ -76,11 +87,11 @@ __device__ void build_union(Union<W>& U, const Params& a) {
   }
   __syncthreads();
   for (int i = tid; i < ne; i += blockDim.x) {
-    const int e = __ldcg(a.idx + i);
+    const int e = fused ? U.ri[i] : __ldcg(a.idx + i);
     const int r = U.pre[e >> 5] + __popc(U.mask[e >> 5] & ((1u << (e & 31)) - 1));
     U.id[r] = e;
     if (W) {
-      U.w[r][i / kTopK] = __ldcg(a.w + i);
+      U.w[r][i / kTopK] = fused ? U.rw[i] : __ldcg(a.w + i);
       U.d[r] = a.L.desc[e * 3 + 2];
     }
   }
@@ -305,6 +316,15 @@ __global__ void __launch_bounds__(128) k_down(Params a) {
     if (s < n) load(s, s);
   pdl_wait();
   pdl_launch_dependents();
+  // posted: the outputs go into the send buffer of the collective about to run (every earlier collective has
+  // finished: this grid is past its wait, so the send buffer's last reader, three collectives back, is done)
+  uint64_t seq = 0;
+  float *yr = a.yr, *ys = a.ys;
+  if (a.post) {
+    seq = comm::next_seq(a.ch);
+    yr = reinterpret_cast<float*>(comm::send_buf(a.ch, seq));
+    ys = yr + (size_t)M * kH;
+  }
   {
     const __nv_bfloat16* h0 = a.h + ((size_t)kShSlot * M + r0) * kI + 16 * t;
     const __nv_bfloat16* h1 = a.h + ((size_t)kShSlot * M + r1) * kI + 16 * t;
@@ -336,8 +356,8 @@ __global__ void __launch_bounds__(128) k_down(Params a) {
 #pragma unroll
     for (int i = 0; i < NT; ++i) {
       const int ch = 8 * (s0 + i) + 2 * t;
-      if (g < M) *reinterpret_cast<float2*>(a.ys + (size_t)g * kH + ch) = make_float2(acc[i][0], acc[i][1]);
-      if (R16 && g + 8 < M) *reinterpret_cast<float2*>(a.ys + (size_t)(g + 8) * kH + ch) = make_float2(acc[i][2], acc[i][3]);
+      if (g < M) *reinterpret_cast<float2*>(ys + (size_t)g * kH + ch) = make_float2(acc[i][0], acc[i][1]);
+      if (R16 && g + 8 < M) *reinterpret_cast<float2*>(ys + (size_t)(g + 8) * kH + ch) = make_float2(acc[i][2], acc[i][3]);
     }
   }
   float acc[NT][4];
@@ -387,9 +407,10 @@ __global__ void __launch_bounds__(128) k_down(Params a) {
 #pragma unroll
   for (int i = 0; i < NT; ++i) {
     const int ch = 8 * (s0 + i) + 2 * t;
-    if (g < M) *reinterpret_cast<float2*>(a.yr + (size_t)g * kH + ch) = make_float2(acc[i][0], acc[i][1]);
-    if (R16 && g + 8 < M) *reinterpret_cast<float2*>(a.yr + (size_t)(g + 8) * kH + ch) = make_float2(acc[i][2], acc[i][3]);
+    if (g < M) *reinterpret_cast<float2*>(yr + (size_t)g * kH + ch) = make_float2(acc[i][0], acc[i][1]);
+    if (R16 && g + 8 < M) *reinterpret_cast<float2*>(yr + (size_t)(g + 8) * kH + ch) = make_float2(acc[i][2], acc[i][3]);
   }
+  if (a.post) comm::post_grid(a.ch, seq, (uint32_t)((size_t)2 * M * kH * 4));
 }
 
 __global__ void k_finalize(const float* __restrict__ R, const float* __restrict__ S, int n, __nv_bfloat16* __restrict__ out) {
@@ -464,8 +485,14 @@ const char* decode_down_name(int v) { return kDown[v].name; }
 void moe_decode(const LayerW& L, const __nv_bfloat16* x, const int* idx, const float* w, int M, void* ws, float* yr,
                 float* ys, cudaStream_t st, const DecodeCfg& cfg) {
   if (M < 1 || M > kMaxRows) die("moe_decode: M=%d", M);
-  Params p{x, M, idx, w, L, reinterpret_cast<__nv_bfloat16*>(ws), yr, ys,
-           cfg.dyn ? reinterpret_cast<int*>(static_cast<uint8_t*>(ws) + kWsH) : nullptr};
+  if (!cfg.logits != !cfg.bias || (!cfg.logits && (!idx || !w))) die("moe_decode: idx and w, or logits and bias");
+  Params p{x, M, idx, w, cfg.logits, cfg.bias, L, reinterpret_cast<__nv_bfloat16*>(ws), yr, ys,
+           cfg.dyn ? reinterpret_cast<int*>(static_cast<uint8_t*>(ws) + kWsH) : nullptr, cfg.post != nullptr, {}};
+  if (cfg.post) {
+    p.ch = *cfg.post;
+    if ((size_t)2 * M * kH * 4 > p.ch.cap) die("moe_decode: %d rows' two partials exceed the channel (%u B)", M, p.ch.cap);
+    if (!(cfg.parts & 2)) die("moe_decode: posted outputs need the down kernel");
+  }
   const int cps = cfg.up_ctas_per_sm;
   if (cfg.parts & 1) switch (cfg.up) {
     case 0: up_launch<1, 6, 2>(p, cps, st, cfg.pdl); break;
