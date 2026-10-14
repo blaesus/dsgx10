@@ -104,6 +104,19 @@ configuration has to get right instead:
     normalised, scaled by 2.5, one group; the card's "routing is untouched" means the kept experts' router rows and
     biases are the parent's, which the reference checks against the prune plan and the parent's tensors on two layers.
 
+12. **The contract's attention is the engine's absorbed form** (decided 2026-10-14 from A9, [engine.md](docs/engine.md)
+   § 11): per head q_lat = bf16(q_nope · W_UK) with f32 accumulation; the scores (q_lat · c_j + q_rope · k_rope_j) · 1/16
+   are f32 and never rounded; the row's keys (positions 0..p when p < 2,048, else its 2,048 selected positions in
+   ascending order) are taken in blocks of 64 with an online softmax: the running maximum m updated per block, p_j =
+   exp(s_j − m′) in f32, P_j = bf16(p_j), l and O accumulated in f32 with the rescale exp(m − m′); u = bf16(O / l);
+   o_h = bf16(W_UV · u) with f32 accumulation. The order of the f32 sums inside a dot product is not part of the
+   contract. Decode with a split-K of S > 1 is a second order (each split's own running max, the splits merged in f32
+   in split order before one division and rounding), as decision 11 is for the experts. The reference's expanded form
+   (transformers': bf16 scores, P normalised then rounded) was an artefact of its eager path, not a choice of the
+   model; its golden sets `a1a-f32` and `all-f32` are to be re-made with `glmref.py --attn absorbed` and A8's
+   comparisons repeated (layer 0 expected at ~0.11 %, the dot-product order's floor, from 0.18 %). The engine does not
+   change.
+
 ## Risks and open questions
 
 - The asymmetric INT4 GEMV needs one more operand stream (zero points) and a subtract per weight on 48 SMs; NVFP4's
@@ -155,6 +168,6 @@ Status on 2026-10-14, evening: A0–A8 done on the four installed rank files, ea
 bit-stable (refhash pins in [engine.md](docs/engine.md) § 10), 45.70 ms a step at one row (1.23× the floor), drafts
 exact at 27.9–29.9 tok/s, the service handing the ring over with the DeepSeek service. Two contract deviations
 inherited from glm53's engine were found and fixed the same day (the MoE combine and the residual rounding, engine.md
-§ 9.1). Open: the layer-0 hidden state is not bit-equal to the reference (A9, in progress); prefill 973 tok/s at
+§ 9.1). A9 found the layer-0 gap in the reference's attention form, now decision 12; the golden sets are being re-made in it. Open: prefill 973 tok/s at
 2,600 is under the A5 target; the 256k session needs rank 2's memory back from the CPU reference; `glw_kcheck --gpu`
 for the new layouts; the NVFP4 drafter. The reference ran on rank 2, not rank 3 as the A1 row says.
