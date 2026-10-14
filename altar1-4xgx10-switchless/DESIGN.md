@@ -168,6 +168,6 @@ Status on 2026-10-14, evening: A0–A8 done on the four installed rank files, ea
 bit-stable (refhash pins in [engine.md](docs/engine.md) § 10), 45.70 ms a step at one row (1.23× the floor), drafts
 exact at 27.9–29.9 tok/s, the service handing the ring over with the DeepSeek service. Two contract deviations
 inherited from glm53's engine were found and fixed the same day (the MoE combine and the residual rounding, engine.md
-§ 9.1). A9 found the layer-0 gap in the reference's attention form, now decision 12; the golden sets are being re-made in it. Open: prefill 973 tok/s at
+§ 9.1). A9 found the layer-0 gap in the reference's attention form, now decision 12; the golden sets are being re-made in it (A1f: `a1a-f32-abs` done, the engine's layer 0 now 0.112 % from it; `all-f32-abs` running from 18:13, reference.md § 10). Open: prefill 973 tok/s at
 2,600 is under the A5 target; the 256k session needs rank 2's memory back from the CPU reference; `glw_kcheck --gpu`
 for the new layouts; the NVFP4 drafter. The reference ran on rank 2, not rank 3 as the A1 row says.
