@@ -115,6 +115,8 @@ struct Args {
   std::vector<int> dump_layers;
   uint32_t ab_base = 0, ab = 0xffffffffu;
   int ab_rounds = 10;
+  int min_free_mib = 4608;  // real weights: stop at the start below this much MemAvailable on any rank
+  int tf_max = 0;  // tf, refhash with --gold: a sequence's first tf_max tokens (0: all)
   std::string gold, seqs;  // spec, mtpgold: the golden set's raw copies (PREFIX.tokens.i32 ...), the sequences
   int passes = kMaxDrafts, kmax = 3, spec_samp = 3, block = 16;
   std::vector<int> sess = {1}, ks = {1, 2, 3, -1};
@@ -614,105 +616,6 @@ struct TfSink : Sink {
   }
 };
 
-void tf(Model& m, comm::Ring& ring) {
-  const int rk = ring.rank();
-  if (A.tokens.empty()) die("tf: --tokens FILE");
-  const std::vector<int32_t> tok = ring_tokens(ring, A.tokens);
-  const int N = (int)tok.size();
-  if (N + kMaxDrafts + 1 > m.options().max_ctx) die("tf: %d tokens, max_ctx %d", N, m.options().max_ctx);
-  TfSink sink(tok);
-  if (rk == 0 && !A.sample_rows.empty())
-    for (int64_t r : glmrun::npy_read_ints(A.sample_rows)) sink.sample_rows.insert((int)r), sink.logit_rows.insert((int)r);
-  else
-    for (int r = 0; r < N; r += 256) sink.sample_rows.insert(r), sink.logit_rows.insert(r);
-  for (int l : A.dump_layers) sink.dump_layers.insert(l);
-  uint32_t flags = kFlagLogits | (A.dump_layers.empty() ? 0u : kFlagDump);
-  const double t0 = now_s();
-  if (A.via == "prefill") {
-    m.prefill(0, 0, N, tok.data(), nullptr, flags, &sink);
-    m.drain();
-  } else {  // decode steps of 16 rows, each repeating the row before it (its MTP entry gets the next token)
-    sink.mtp_mode = m.options().drafts > 0;
-    if (sink.mtp_mode) flags |= kFlagMtpLogits;
-    Sampling sp;
-    int pos = 0;
-    while (pos < N) {
-      const int start = std::max(0, pos - 1), R = std::min(kMaxRows, N - start);
-      Batch b = one_session(R, start, tok.data() + start, 0, sp);
-      b.flags = flags;
-      m.launch(b, &sink);
-      pos = start + R;
-    }
-    m.drain();
-  }
-  const double sec = now_s() - t0;
-  if (rk == 0) {
-    if (A.dir.empty()) die("tf: --dir DIR");
-    sink.write(A.dir);
-    int agree = 0, cnt = 0;
-    for (int p = 0; p + 1 < N; ++p) cnt += sink.seen[p], agree += sink.seen[p] && sink.argmax[p] == tok[p + 1];
-    double lp = 0;
-    for (int p = 0; p + 1 < N; ++p) lp += std::isfinite(sink.next_lp[p]) ? sink.next_lp[p] : 0;
-    record(0, "tf\t%s\tvia %s\t%d tokens\t%.1f s\ttop-1 vs the next token %.4f\tmean logprob %.4f", A.tokens.c_str(),
-           A.via.c_str(), N, sec, cnt ? (double)agree / cnt : 0.0, lp / std::max(1, N - 1));
-  }
-}
-
-// ---- refhash: the engine's own outputs ---------------------------------------------------------------------------
-
-void refhash(Model& m, comm::Ring& ring) {
-  const int rk = ring.rank();
-  std::vector<int32_t> prompt;
-  if (!A.tokens.empty()) prompt = ring_tokens(ring, A.tokens);
-  else
-    for (int i = 0; i < (A.prompt ? A.prompt : 300); ++i) prompt.push_back(synth_token(A.seed + 21, i));
-  Sampling sp;
-  sp.temperature = A.temp, sp.top_p = A.top_p, sp.seed = A.seed;
-  const int P = (int)prompt.size();
-  m.reset_slot(0);
-  const double t0 = now_s();
-  uint64_t n = m.prefill(0, 0, P, prompt.data(), &sp);
-  SampleOut o = m.wait(n);
-  const double tp = now_s() - t0;
-  std::vector<int32_t> out;
-  uint64_t h = 0xcbf29ce484222325ull;
-  auto take = [&](const SampleOut& s) {
-    out.push_back(s.row[0].token);
-    h = fnv(&s.row[0].token, 4, h);
-    h = fnv(&s.row[0].value, 4, h);
-    for (int k = 0; k < s.drafts; ++k) h = fnv(&s.draft[0][k], 4, h);
-  };
-  take(o);
-  const double t1 = now_s();
-  int32_t fbk = -1;  // the previous step's row 0, filled in by the device
-  uint64_t prev = 0;
-  bool pending = false;
-  int pos = P;
-  for (int i = 1; i < A.steps && !is_stop(out.back()); ++i) {
-    // queue the next step before the previous one's sample is known (one ahead), as the server does
-    if (pending) {
-      take(m.wait(prev));
-      if (is_stop(out.back())) break;
-    }
-    prev = m.launch(1, pos++, &fbk, sp, 0);
-    pending = true;
-  }
-  if (pending) take(m.wait(prev));
-  const double td = now_s() - t1;
-  uint64_t all[4];
-  ring.allgather_host(&h, all, 8);
-  bool agree = true;
-  for (int r = 1; r < 4; ++r) agree &= all[r] == all[0];
-  if (rk == 0) {
-    std::string s;
-    for (size_t i = 0; i < std::min<size_t>(out.size(), 24); ++i) s += std::to_string(out[i]) + " ";
-    record(0, "refhash\tprompt %d\tT %.2f top-p %.2f\tdrafts %d\t%zu tokens\thash %016llx\tranks %s\tprefill %.1f ms\t"
-           "decode %.2f ms a token\tfirst: %s", P, A.temp, A.top_p, m.options().drafts, out.size(), (unsigned long long)h,
-           agree ? "agree" : "DIFFER", tp * 1e3, td * 1e3 / std::max<size_t>(1, out.size() - 1), s.c_str());
-  }
-  if (!agree) ++g_fail;
-}
-
 // ---- the golden prompts (docs/reference.md § 7: raw copies made by tools/gold_prep.py) ----------------------------
 
 struct GoldSeq {
@@ -753,6 +656,206 @@ std::vector<std::string> split_names(const std::string& s) {
     p = e + 1;
   }
   return v;
+}
+
+// ---- tf: teacher-forced dumps -------------------------------------------------------------------------------------
+// One sequence: rows [0, N) of slot 0 teacher-forced, via one prefill or via decode steps of 16 rows; rank 0 writes
+// the golden format's files into dir (compare with tools/compare_golden.py) and returns the dump's hash (G8's tf
+// refhash: argmax, top-20 ids and log-probabilities, lse, next-token log-probabilities, the kept logit rows, the
+// hidden rows, the MTP's argmax and top-20 when drafts run, all bits). nfull: the whole sequence's length when tok
+// is its prefix (the golden run's sample rows are the whole sequence's).
+
+// the golden run's sample rows of an n-token sequence (docs/reference.md § 7): every row under 1,024 tokens, else
+// every 256th, the first and last 32 and 2047-2049
+std::set<int> golden_rows(int n) {
+  std::set<int> s;
+  if (n < 1024) {
+    for (int i = 0; i < n; ++i) s.insert(i);
+    return s;
+  }
+  for (int i = 0; i < n; i += 256) s.insert(i);
+  for (int i = 0; i < 32; ++i) s.insert(i), s.insert(n - 1 - i);
+  for (int i = 2047; i <= 2049; ++i) s.insert(i);
+  return s;
+}
+
+uint64_t tf_hash(const TfSink& s) {
+  uint64_t h = fnv(s.argmax.data(), s.argmax.size() * 4);
+  h = fnv(s.top_id.data(), s.top_id.size() * 4, h);
+  h = fnv(s.top_lp.data(), s.top_lp.size() * 4, h);
+  h = fnv(s.lse.data(), s.lse.size() * 4, h);
+  h = fnv(s.next_lp.data(), s.next_lp.size() * 4, h);
+  for (auto& kv : s.logit_keep) h = fnv(&kv.first, 4, h), h = fnv(kv.second.data(), kv.second.size() * 4, h);
+  for (auto& L : s.hidden)
+    for (auto& kv : L.second) h = fnv(&kv.first, 4, h), h = fnv(kv.second.data(), kv.second.size() * 4, h);
+  if (s.mtp_mode) {
+    h = fnv(s.m_argmax.data(), s.m_argmax.size() * 4, h);
+    h = fnv(s.m_top_id.data(), s.m_top_id.size() * 4, h);
+    h = fnv(s.m_top_lp.data(), s.m_top_lp.size() * 4, h);
+  }
+  return h;
+}
+
+void tf_one(Model& m, comm::Ring& ring, const std::vector<int32_t>& tok, int nfull, const std::string& name,
+            const std::string& dir) {
+  const int rk = ring.rank();
+  const int N = (int)tok.size();
+  if (N + kMaxDrafts + 1 > m.options().max_ctx) die("tf: %d tokens, max_ctx %d", N, m.options().max_ctx);
+  TfSink sink(tok);
+  std::set<int> rows;
+  if (!A.sample_rows.empty()) {
+    if (rk == 0)
+      for (int64_t r : glmrun::npy_read_ints(A.sample_rows)) rows.insert((int)r);
+  } else {
+    rows = golden_rows(nfull);
+  }
+  for (int r : rows)
+    if (r < N) sink.sample_rows.insert(r), sink.logit_rows.insert(r);
+  for (int l : A.dump_layers) sink.dump_layers.insert(l);
+  uint32_t flags = kFlagLogits | (A.dump_layers.empty() ? 0u : kFlagDump);
+  m.reset_slot(0);
+  const double t0 = now_s();
+  if (A.via == "prefill") {
+    m.prefill(0, 0, N, tok.data(), nullptr, flags, &sink);
+    m.drain();
+  } else {  // decode steps of 16 rows, each repeating the row before it (its MTP entry gets the next token)
+    sink.mtp_mode = m.options().drafts > 0;
+    if (sink.mtp_mode) flags |= kFlagMtpLogits;
+    Sampling sp;
+    int pos = 0;
+    while (pos < N) {
+      const int start = std::max(0, pos - 1), R = std::min(kMaxRows, N - start);
+      Batch b = one_session(R, start, tok.data() + start, 0, sp);
+      b.flags = flags;
+      m.launch(b, &sink);
+      pos = start + R;
+    }
+    m.drain();
+  }
+  const double sec = now_s() - t0;
+  if (rk == 0) {
+    if (dir.empty()) die("tf: --dir DIR");
+    sink.write(dir);
+    int agree = 0, cnt = 0;
+    for (int p = 0; p + 1 < N; ++p) cnt += sink.seen[p], agree += sink.seen[p] && sink.argmax[p] == tok[p + 1];
+    double lp = 0;
+    for (int p = 0; p + 1 < N; ++p) lp += std::isfinite(sink.next_lp[p]) ? sink.next_lp[p] : 0;
+    record(0, "tf\t%s\tvia %s\t%d tokens (of %d)\t%.1f s\ttop-1 vs the next token %.4f\tmean logprob %.4f\ttf hash %016llx\t%s",
+           name.c_str(), A.via.c_str(), N, nfull, sec, cnt ? (double)agree / cnt : 0.0, lp / std::max(1, N - 1),
+           (unsigned long long)tf_hash(sink), dir.c_str());
+  }
+}
+
+// --tokens FILE: that sequence into --dir; --gold PREFIX --seqs a,b,...: each golden sequence (its first --tf-max
+// tokens when longer) into --dir/<name>
+void tf(Model& m, comm::Ring& ring) {
+  if (!A.gold.empty()) {
+    const std::vector<GoldSeq> all = gold_seqs(A.gold);
+    for (const std::string& want : split_names(A.seqs)) {
+      const GoldSeq* g = nullptr;
+      for (const GoldSeq& s : all)
+        if (s.name == want) g = &s;
+      if (!g) die("tf: no sequence %s in %s", want.c_str(), A.gold.c_str());
+      const int n = A.tf_max > 0 ? std::min(g->n, A.tf_max) : g->n;
+      const std::vector<int32_t> tok = read_raw<int32_t>(A.gold + ".tokens.i32", g->off, n);
+      tf_one(m, ring, tok, g->n, g->name, A.dir + "/" + g->name);
+    }
+    return;
+  }
+  if (A.tokens.empty()) die("tf: --tokens FILE or --gold PREFIX --seqs NAMES");
+  const std::vector<int32_t> tok = ring_tokens(ring, A.tokens);
+  tf_one(m, ring, tok, (int)tok.size(), A.tokens, A.dir);
+}
+
+// ---- refhash: the engine's own outputs ---------------------------------------------------------------------------
+// A prompt prefilled from position 0 of slot 0, then --steps greedy (or --temp/--top-p seeded) tokens, each step
+// queued one ahead as the server does; the hash of every token, its logit value and drafts, the same on every rank.
+// The prompt: --tokens FILE, or each golden sequence of --gold PREFIX --seqs (its first --tf-max tokens), or a
+// synthetic one of --prompt tokens. With --dir, rank 0 writes the tokens to DIR/refhash.<name>.<tag>.txt.
+
+void refhash_one(Model& m, comm::Ring& ring, const std::vector<int32_t>& prompt, const std::string& name) {
+  const int rk = ring.rank();
+  Sampling sp;
+  sp.temperature = A.temp, sp.top_p = A.top_p, sp.seed = A.seed;
+  const int P = (int)prompt.size();
+  if (P + A.steps + kMaxDrafts + 2 > m.options().max_ctx) die("refhash: %d + %d tokens, max_ctx %d", P, A.steps, m.options().max_ctx);
+  m.reset_slot(0);
+  const double t0 = now_s();
+  uint64_t n = m.prefill(0, 0, P, prompt.data(), &sp);
+  SampleOut o = m.wait(n);
+  const double tp = now_s() - t0;
+  std::vector<int32_t> out;
+  uint64_t h = 0xcbf29ce484222325ull;
+  auto take = [&](const SampleOut& s) {
+    out.push_back(s.row[0].token);
+    h = fnv(&s.row[0].token, 4, h);
+    h = fnv(&s.row[0].value, 4, h);
+    for (int k = 0; k < s.drafts; ++k) h = fnv(&s.draft[0][k], 4, h);
+  };
+  take(o);
+  const double t1 = now_s();
+  int32_t fbk = -1;  // the previous step's row 0, filled in by the device
+  uint64_t prev = 0;
+  bool pending = false;
+  int pos = P;
+  for (int i = 1; i < A.steps && !is_stop(out.back()); ++i) {
+    // queue the next step before the previous one's sample is known (one ahead), as the server does
+    if (pending) {
+      take(m.wait(prev));
+      if (is_stop(out.back())) break;
+    }
+    prev = m.launch(1, pos++, &fbk, sp, 0);
+    pending = true;
+  }
+  if (pending) take(m.wait(prev));
+  m.drain();
+  const double td = now_s() - t1;
+  uint64_t all[4];
+  ring.allgather_host(&h, all, 8);
+  bool agree = true;
+  for (int r = 1; r < 4; ++r) agree &= all[r] == all[0];
+  if (rk == 0) {
+    std::string s;
+    for (size_t i = 0; i < std::min<size_t>(out.size(), 24); ++i) s += std::to_string(out[i]) + " ";
+    record(0, "refhash\t%s\tprompt %d\tT %.2f top-p %.2f\tdrafts %d\tgraphs %d\t%zu tokens\thash %016llx\tranks %s"
+           "\tprefill %.1f ms\tdecode %.2f ms a token\tfirst: %s", name.c_str(), P, A.temp, A.top_p, m.options().drafts,
+           (int)m.options().graphs, out.size(), (unsigned long long)h, agree ? "agree" : "DIFFER", tp * 1e3,
+           td * 1e3 / std::max<size_t>(1, out.size() - 1), s.c_str());
+    if (!A.dir.empty()) {
+      std::filesystem::create_directories(A.dir);
+      std::string base = name;
+      for (char& c : base)
+        if (c == '/') c = '_';
+      const std::string f = A.dir + "/refhash." + base + "." + A.tag + (m.options().graphs ? ".graphs" : ".eager") + ".txt";
+      if (FILE* fo = std::fopen(f.c_str(), "a")) {
+        std::fprintf(fo, "%016llx", (unsigned long long)h);
+        for (int32_t t : out) std::fprintf(fo, " %d", t);
+        std::fprintf(fo, "\n");
+        std::fclose(fo);
+      }
+    }
+  }
+  if (!agree) ++g_fail;
+}
+
+void refhash(Model& m, comm::Ring& ring) {
+  if (!A.gold.empty()) {
+    const std::vector<GoldSeq> all = gold_seqs(A.gold);
+    for (const std::string& want : split_names(A.seqs)) {
+      const GoldSeq* g = nullptr;
+      for (const GoldSeq& s : all)
+        if (s.name == want) g = &s;
+      if (!g) die("refhash: no sequence %s in %s", want.c_str(), A.gold.c_str());
+      const int n = A.tf_max > 0 ? std::min(g->n, A.tf_max) : g->n;
+      refhash_one(m, ring, read_raw<int32_t>(A.gold + ".tokens.i32", g->off, n), g->name);
+    }
+    return;
+  }
+  std::vector<int32_t> prompt;
+  if (!A.tokens.empty()) prompt = ring_tokens(ring, A.tokens);
+  else
+    for (int i = 0; i < (A.prompt ? A.prompt : 300); ++i) prompt.push_back(synth_token(A.seed + 21, i));
+  refhash_one(m, ring, prompt, A.tokens.empty() ? "synthetic" : A.tokens);
 }
 
 // ---- mtpgold: the MTP layer teacher-forced on the golden final hidden ---------------------------------------------
@@ -1273,6 +1376,9 @@ int main(int argc, char** argv) {
     else if (a == "--ks") A.ks = parse_list(nx());
     else if (a == "--kmax") A.kmax = std::stoi(nx());
     else if (a == "--block") A.block = std::stoi(nx());
+    else if (a == "--tf-max") A.tf_max = std::stoi(nx());
+    else if (a == "--index-scratch-mib") A.mo.index_scratch = (size_t)std::stoi(nx()) << 20;
+    else if (a == "--min-free-mib") A.min_free_mib = std::stoi(nx());
     else if (a == "--spec-samp") A.spec_samp = std::stoi(nx());
     else if (a == "--spec-cost") {
       for (const int v : parse_list(nx())) A.spec_cost.push_back((float)v);
@@ -1319,6 +1425,36 @@ int main(int argc, char** argv) {
   record(rk, "start\t%s weights (%d MoE layers' routed experts from the file) %.2f GB\tmax_ctx %d slots %d drafts %d l2pf %d\tbound in %.1f s\tfree %.1f GB",
          A.synthetic ? "synthetic" : "file", m.file_expert_layers(), m.weight_bytes() / 1e9, m.options().max_ctx, m.options().slots,
          m.options().drafts, (int)m.options().l2pf, now_s() - t0, fr / 1e9);
+  if (!A.synthetic && A.min_free_mib > 0) {
+    // the real rank files leave little memory (101.4 GiB of weights a rank, G8): the prefill buffers now, then every
+    // rank's free device memory and MemAvailable; below --min-free-mib on any rank every rank stops here, rather
+    // than the box thrashing later (unified memory: the host's pages and the device's are the same)
+    m.prefill_init();
+    CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
+    int64_t mine[2] = {(int64_t)fr, 0}, all[8];
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+      char k[64], line[256];
+      long long v;
+      while (std::fgets(line, sizeof line, f))
+        if (std::sscanf(line, "%63s %lld", k, &v) == 2 && !std::strcmp(k, "MemAvailable:")) mine[1] = (int64_t)v << 10;
+      std::fclose(f);
+    }
+    ring.allgather_host(mine, all, 16);
+    bool ok = true;
+    std::string s;
+    for (int r = 0; r < 4; ++r) {
+      char b[96];
+      std::snprintf(b, sizeof b, "%srank %d %.2f / %.2f GiB", r ? ", " : "", r, all[2 * r] / 1073741824.0,
+                    all[2 * r + 1] / 1073741824.0);
+      s += b;
+      ok &= all[2 * r + 1] >= (int64_t)A.min_free_mib << 20;  // MemAvailable: what earlyoom (-m 3: ~3.7 GiB) watches
+    }
+    std::printf("rank %d: free device / MemAvailable after the weights and the prefill buffers (chunk %d, index scratch "
+                "%zu MiB): %s\n", rk, A.mo.prefill_rows, A.mo.index_scratch >> 20, s.c_str());
+    std::fflush(stdout);
+    record(rk, "memory\tchunk %d index scratch %zu MiB\t%s", A.mo.prefill_rows, A.mo.index_scratch >> 20, s.c_str());
+    if (!ok) die("glm_run: a rank has less than %d MiB available after the weights and the prefill buffers (%s)", A.min_free_mib, s.c_str());
+  }
   for (const std::string& mode : A.modes) {
     ring.barrier();
     if (mode == "bench") bench(m, ring);
@@ -1333,6 +1469,8 @@ int main(int argc, char** argv) {
     else if (mode == "refhash") refhash(m, ring);
     else if (mode == "spec") spec(m, ring);
     else if (mode == "mtpgold") mtpgold(m, ring);
+    else if (mode == "eager") m.set_graphs(false);  // the modes after it run eager steps
+    else if (mode == "graphs") m.set_graphs(true);
     else die("unknown mode %s", mode.c_str());
   }
   m.drain();

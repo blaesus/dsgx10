@@ -6,6 +6,9 @@ HERE=${HERE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 FLEET=${FLEET:-$HERE/../../fleet/homelab.conf}
 . "$HERE/../../../ds41f-4xgx10-switchless/engine/server/fleet.sh"
 fleet_load "$FLEET" || exit 2
+# a ring job is preemptible: under memory pressure (earlyoom on every box) it goes first, not the long CPU passes
+# beside it (the reference, the converter); the workers' ranks get the same below
+echo 1000 > /proc/self/oom_score_adj
 NAME=glm53_rank
 RD='~/dsgb10-data/glm53-server/run'  # as written, for the workers' shells
 LRD=$(fleet_local "$RD")
@@ -25,7 +28,7 @@ ranks_ship() {  # BIN: the binary to every box (under a temporary name, then ren
 ranks_workers() {  # args...: ranks 1-3, detached (a timeout of TIMEOUT s, default 900)
   local w r=1
   for w in "${FLEET_WORKERS[@]}"; do
-    ssh "${SSHO[@]}" "$w" "setsid nohup timeout ${TIMEOUT:-900} $RD/$NAME --rank $r $* > $RD/logs/$NAME.$r.log 2>&1 < /dev/null &"
+    ssh "${SSHO[@]}" "$w" "echo 1000 > /proc/self/oom_score_adj; setsid nohup timeout ${TIMEOUT:-900} $RD/$NAME --rank $r $* > $RD/logs/$NAME.$r.log 2>&1 < /dev/null &"
     r=$((r + 1))
   done
 }

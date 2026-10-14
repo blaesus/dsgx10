@@ -5,7 +5,9 @@ final norm, the vocabulary-split head, the sampler and the MTP layer, over the k
 `engine/experts` and `engine/comm`. Everything here was run on the ring on 2026-10-13/14, borrowed from the
 DeepSeek service through its `ring.sh` (jobs of 15 s to 2 min).
 
-**Status.** Runs on four ranks on synthetic weights and on the real non-expert rank files (G2) with synthetic
+**Status.** End to end on the filled rank files since 2026-10-14 (G8, partial: within 2× the reference's order variance
+on all four golden sets, refhashes pinned, 22–23 tok/s plain through glmfront; [below](#end-to-end-on-real-weights-g8-2026-10-14)).
+Before that: runs on four ranks on synthetic weights and on the real non-expert rank files (G2) with synthetic
 routed experts, layer 3 also with its real NVFP4 experts. Decode step at 1 row **46.4 ms** (21.6 tok/s) against
 a 34.2 ms bandwidth floor (1.35×); after the 2026-10-14 decode-gap pass 43.6 ms (1.27×) in the interleaved A/B, ~44 ms
 on undisturbed ranks, the MoE at its floor and the rest the collectives' latency and attention ([Closing the
@@ -729,6 +731,188 @@ routed experts of layers 3-77); the verify loop queued a step ahead (the next st
 accepted count: a step could be queued for the all-accepted case and redone otherwise); a batch-aware gate (its
 cost model is one session's; with 4 sessions a row costs ~10 ms, not 15.5).
 
+## End to end on real weights (G8, 2026-10-14)
+
+**Partial: paused on 2026-10-14 at 09:22 (+0100), on the user's word.** These are the engine's first runs with
+every routed expert from the rank files: C1's fill, NVIDIA's NVFP4 bytes ([layout.md § 8](layout.md): 108,844,417,024 B
+a rank; SHA-256 `f1010873…` / `e4c1b689…` / `f8b0c628…` / `a0c8e8cd…` for ranks 0–3). Six ring jobs ran on
+2026-10-14, 08:42–09:22: three passed (a, b, c+d), one failed on memory, one was killed by earlyoom, and one
+server job passed. The other four server configurations (drafts k = 1, 2, 3 and the gate) were not run.
+Binaries: `glm_run` sources 0c27f04de9416c62 (job a) and 58d7487b630103f6 (jobs b–d, the memory guard
+changed); `glm53_rank` d3fdc9de82caf384; glmfront from the main checkout's build of 01:07.
+
+**What was added.** `glm_run tf` and `refhash` take the golden set's raw copies (`--gold PREFIX --seqs`, the first
+`--tf-max` tokens). `tf` writes one dump a sequence with the golden run's sample rows and records a
+**tf hash** (FNV-1a over every dumped bit). `refhash` records its tokens (`--dir`). The modes `eager` / `graphs`
+switch `Model::set_graphs` between steps. `--index-scratch-mib` sets the prefill indexer's scratch (also in
+`glm53_rank`). `--min-free-mib` (4,608) is a guard: after the weights and the prefill buffers every rank reports
+its free device memory and MemAvailable, and all ranks stop if one is short.
+`tools/compare_golden.py g8` runs the comparison against both golden orders, plus the two orders against each
+other over the same positions. `run.sh g8` and `g8_job.sh` drive the `glm_run` jobs, `g8_chain.sh` runs jobs
+back to back, and `server/tests/g8_job.sh` + `g8_front.py` handle the server through glmfront.
+
+**Memory, measured** (MemTotal 121.63 GiB a box; the weights bind 108.83 GB = 101.36 GiB in 58–70 s a load; the
+loader's staging is 8 pinned buffers of 64 MiB, freed after). Free device / MemAvailable after the weights,
+2,048-row prefill buffers, 128 MiB of index scratch and the caches of one 6,400-position slot, in GiB:
+
+| Job | rank 0 | rank 1 | rank 2 | rank 3 |
+|---|---|---|---|---|
+| a (08:46) | 2.05 / 6.73 | 9.16 / 11.50 | 7.91 / 10.99 | 8.49 / 11.37 |
+| b (09:06, one draft pass) | 5.03 / 8.34 | 9.15 / 11.49 | 7.92 / 10.79 | 8.46 / 11.36 |
+| server plain (09:17, before its 1.94 GiB pool) | 4.20 / 9.40 | 9.56 / 11.92 | 3.04 / 10.04 | 8.89 / 11.82 |
+
+Rank 0 and rank 2 vary by several GiB from job to job with what else runs there: agents' processes on rank 0,
+the reference's passes on rank 2. **Failures on the way.**
+1. The first job (08:29) used the default 8,192-row prefill chunk, about 3 GB of buffers beside the weights.
+   Rank 0 fell to ~1 GiB, and the NVRM driver logged out-of-memory errors on ranks 0 and 2 at 08:30:47–48. On
+   rank 2, earlyoom (`-m 3 --prefer python`) terminated the reference's tracks pass at 08:30:48. Rank 0 thrashed
+   until the 600 s timeout, and its systemd watchdogs killed snapd and journald at 08:36:41.
+2. A second job (08:52) stopped at the guard: rank 0 had 0.99 GiB free on the device at the time.
+3. A third (08:56) was killed by earlyoom on rank 2 (now our process, with `oom_score_adj` 1000, not the python
+   pass), while the reference ran three passes there (8.6 GB).
+4. The first server job (09:12) found no glmfront in the worktree.
+
+Since then every launcher sets `oom_score_adj` 1000 on its ranks ([serving.md § 5.1](serving.md)), prefill
+runs in 2,048-row chunks with 128 MiB of index scratch, and the jobs ran with the reference's passes on rank 2
+stopped (the coordinator's window).
+
+### Against the golden data
+
+`tf` runs teacher-forced over the golden sequences (short and python whole, prose whole, agentic's first 8,000
+of 26,834 tokens). The comparison is with `compare_golden.py g8` on rank 2 (nice 19, 4 cores) against `all`
+(transformers' order) and `all-f32` (the contract's order). The "orders" row compares those two runs with each
+other over the same positions: the reference's own order variance, reference.md § 10.2. KL(golden ‖ engine) and
+max |Δ logit| are over the full logits at the golden sample rows (every row of short; 84–89 rows of the others,
+65 of agentic's prefix); top-1 and top-20 are over every row. Via prefill:
+
+| Sequence | against | argmax equal | top-20 overlap | KL mean (p99, max) | max \|Δ logit\| | top-1 vs the text |
+|---|---|---:|---:|---|---:|---:|
+| short (291) | `all` | 0.928 | 0.841 | 0.074 (0.97, 1.89) | 10.7 | engine 0.793, ref 0.793 |
+| | `all-f32` | **0.931** | 0.842 | **0.093** (1.63, 4.44) | 12.7 | ref 0.807 |
+| | orders | 0.935 | 0.884 | 0.052 (0.64, 2.02) | 8.0 | |
+| python (6,106) | `all` | 0.885 | 0.825 | 0.402 (5.43, 7.48) | 12.5 | engine 0.691, ref 0.689 |
+| | `all-f32` | **0.892** | 0.825 | **0.266** (2.97, 5.81) | 11.8 | ref 0.695 |
+| | orders | 0.898 | 0.843 | 0.410 (8.21, 8.30) | 13.1 | |
+| prose (4,762) | `all` | 0.827 | 0.825 | 0.083 (0.71, 0.82) | 6.7 | engine 0.502, ref 0.501 |
+| | `all-f32` | **0.825** | 0.821 | **0.080** (0.69, 1.46) | 4.9 | ref 0.511 |
+| | orders | 0.844 | 0.838 | 0.070 (0.72, 0.74) | 5.7 | |
+| agentic (first 8,000) | `all` | 0.692 | 0.705 | 0.327 (6.27, 6.40) | 12.7 | engine 0.479, ref 0.477 |
+| | `all-f32` | **0.699** | 0.708 | **0.297** (3.87, 7.68) | 12.9 | ref 0.481 |
+| | orders | 0.715 | 0.731 | 0.289 (4.92, 5.22) | 13.1 | |
+
+**DESIGN decision 3's 2× criterion: met on all four.** Against the contract's order (`all-f32`), the ratio of the
+engine's disagreement to the reference's own is:
+
+| | short | python | prose | agentic (8k) |
+|---|---:|---:|---:|---:|
+| argmax (1 − equal) | 1.05× | 1.06× | 1.12× | 1.06× |
+| KL mean | 1.79× | 0.65× | 1.14× | 1.03× |
+| max \|Δ logit\| | 1.58× | 0.90× | 0.86× | 0.99× |
+
+Short's KL is the closest to the bound, at 1.79×. It has the fewest positions (291), and its p99 and max are the
+largest entries of the table. The engine is not closer to the contract's order than to transformers', because
+its FP8 attention projections dominate the difference (layers 0–3 below), not the order of the expert sums.
+
+**Via decode** (16-row steps, each repeating the row before it; one draft pass, so the MTP's logits come too):
+short argmax 0.949 against `all-f32` (KL 0.088, max |Δ logit| 13.0) and 0.955 against `all` (KL 0.046). Python
+0.880 against `all-f32` (KL 0.288) and 0.880 against `all` (KL 0.372). These are within the same envelope as
+prefill; decode's routed sums are in their own order (decision 11).
+
+**Hidden states, short, via prefill** (cosine mean / min, median relative error; `all-f32`; the orders' own
+median relative error in brackets):
+
+| After layer | 0 | 1 | 3 | 10 | 20 | 30 | 40 | 50 | 60 | 70 | 77 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| cosine mean | 0.99993 | 0.99980 | 0.99977 | 0.99923 | 0.99768 | 0.99561 | 0.98619 | 0.97988 | 0.96852 | 0.95695 | 0.95978 |
+| cosine min | 0.99953 | 0.99947 | 0.99948 | 0.99621 | 0.98982 | 0.94452 | 0.70800 | 0.53550 | 0.27277 | 0.20928 | 0.45035 |
+| rel. error | 1.15 % (0.19) | 1.98 % (0.33) | 2.11 % (0.46) | 3.5 % (1.1) | 6.1 % (4.6) | 7.8 % (5.7) | 10.9 % (8.4) | 10.9 % (8.5) | 13.2 % (10.2) | 18.4 % (13.9) | 23.2 % (17.4) |
+
+Layers 0–3 give the same numbers as G4's (FP8 attention against the reference's BF16: 1.2–2.1 %, 4–6× the order
+variance there). From layer 4 the difference grows as routing flips amplify it, as the two orders' own does; by
+layer 77 it is 1.33× theirs (23 % against 17 %). The worst rows (cosine min) are single positions whose routes
+flipped. The full per-layer table, every layer 0–77, is in `g8-prefill.json`.
+
+**The MTP's drafts** (via decode, one draft pass, the engine's own hidden states): the draft argmax equals the
+reference's on 0.934 (short; 0.931 against `mtp-nvfp4`, the reference's MTP with NVFP4 experts) and 0.868 (python;
+0.869 against `mtp-nvfp4`). The reference's two orders agree on 0.952 and 0.899 of the drafts. Experiment 5's
+0.98–0.99 was the MTP fed identical hidden states; here the hidden states differ by ~20 %, so the order variance
+is the scale. Draft = the engine's own main argmax at t+1, the one-draft greedy acceptance: **0.797** (short) and
+**0.669** (python), against the reference's 0.796 and 0.688 (`all-f32`).
+
+### The refhash pins
+
+The pins are measured on the real rank files above, at `--max-ctx 6400 --chunk 2048`, greedy, 64 tokens after the
+prompt, each step queued one ahead (the server's way). The hash is over every token's id, its logit value and its
+drafts (none here).
+
+| Prompt | refhash | runs |
+|---|---|---|
+| short (291 tokens) | **`5243e999f39aa989`** | graphs, graphs, eager (job a, 08:47–08:50); graphs in a second process (job d, 09:11–09:12); all four ranks agree in each |
+| python (6,106 tokens) | **`842072b728abcad9`** | the same four |
+
+The teacher-forced dumps' tf hashes (argmax, top-20, log-probabilities, lse, next-token log-probability, the kept
+logits and hidden rows; rank 0) are:
+
+| Run | short | python | prose | agentic (8k) |
+|---|---|---|---|---|
+| prefill, layers 0–77 dumped (short, python) or layer 77 only | `8245b29c332bf2d6` | `eb99060159898dc3` | `24fd7437619d3d5b` | `f366c57b319843d7` |
+| decode, one draft pass, layer 77 | `c9235b96050f2739` | `be0bd5451ff99a18` | | |
+
+They were each run once, so they are recorded, not yet pinned by a repeat. The server's greedy output through
+glmfront (below) begins with the same 64 tokens as the refhash runs on both prompts.
+
+### Real text through glmfront (drafts off)
+
+The server job: `server/tests/g8_job.sh plain`, 09:17–09:21. The four ranks ran with `--no-spec --max-ctx 8192
+--chunk 2048 --kv-gib 2 --margin-gib 0.25 --disk-gib 0 --slots 4 --index-scratch-mib 128` (a pool of 21 pages,
+1.94 GiB a rank), and the engine was serving 61 s after the start. glmfront ran on 127.0.0.1:18894 with
+`--dump-dir`. `g8_front.py` sent the four conversations of `ref/tokens`. Agentic was cut to its first six
+messages, so it ends on a tool result (4,265 tokens). Each prompt went greedy, then seeded (T 1.0, top-p 0.95,
+seed 1234, on the cached prompt), with at most 512 new tokens; then two sessions at once.
+
+| Prompt | prompt tokens | TTFT cold (greedy) | prefill | decode greedy / seeded tok/s | output |
+|---|---:|---:|---:|---|---|
+| short | 291 | 1.45 s | 1,444 ms (202 tok/s; the graph warm-up) | 23.3 / 23.2 | 512 tokens, reasoning |
+| prose | 4,762 | 6.19 s | 6,181 ms (770 tok/s) | 22.6 / 22.0 | 512, reasoning |
+| python | 6,106 | 7.46 s | 7,459 ms (819 tok/s) | 22.8 / 22.7 | 512, reasoning |
+| agentic (6 messages) | 4,265 | 5.56 s | 5,556 ms (768 tok/s) | 22.5 / 22.4 | 57 / 63: a tool call |
+
+A decode step takes 42.0–43.9 ms (median per run). A cached prompt's TTFT is 0.11–0.13 s. **Two sessions**
+(python and prose, greedy): 59.5 ms a step, 16.7 tok/s each, **33.2 tok/s together**. Short with agentic: 22.5
+tok/s for short; agentic ended after 57 tokens. **Each session's tokens with two at once equal its tokens alone,
+on all four prompts**: batch invariance at the fixed split-K, on real text.
+
+**Against the bars.** Decode at one session is 22–23 tok/s. That is the plain step's rate (G7 projected 23.0)
+and below the published 49.3 (code) and 30.0 (prose). Prefill in this job ran 770–819 tok/s in 2,048-row chunks,
+the chunk the memory allows beside the 101.4 GiB weights. That is below T6's 1,145 at 8,192-row chunks and the
+1,374 bar; prefill with larger chunks waits for weights under ~90 GiB (the S3 fill, C2).
+
+**Not run (paused):** the drafts through the front-end (`--spec-force 1/2/3` and the gate). So there is no
+acceptance on real generated text, no draft tok/s, and no bit check of drafts against plain on real text yet.
+`g8_job.sh k1|k2|k3|gate` and `g8_front.py compare` are ready for them. G7's projections at k = 1 (29.0 / 27.4
+/ 25.2 / 23.4 tok/s on short / python / prose / agentic) are still projections.
+
+**The text** (greedy, the start of the reasoning, through glmfront):
+- short: "The user is asking about a passage from Jerome K. Jerome's *Three Men in a Boat* (1889). They want to
+  know: 1. What is the narrator's complaint? 2. How does the passage make it funny? Let me analyze the passage
+  carefully. …"
+- prose: "The user wants me to summarize the route of the voyage so far and list the natural-history
+  observations Darwin makes, in order … 1. Departure from Devonport, 27 December 1831 (after two failed
+  attempts due to heavy southwestern gales) 2. 6 January 1832: reached Teneriffe, but prevented from landing
+  due to cholera fears. …"
+- python: "Let me carefully review these three scripts. They're analysis tools for a GLM-5.3 NVFP4 checkpoint.
+  … ### tools/nvfp4_entropy.py Purpose: compute empirical entropy of NVFP4 expert tensors by reading sampled
+  tensors via safetensors header offsets. …"
+- agentic: "Now read the decoder and scanner, which handle float parsing and the C accelerator import." followed
+  by a well-formed `read_file` tool call on `/usr/lib/python3.12/json/decoder.py` (seeded: the same call).
+
+This reads as GLM-5.3. The golden set holds no free-running greedy continuation (the reference is teacher-forced
+only), so there is nothing to compare these tokens with. The first generated token is the teacher-forced argmax
+at the prompt's last row, which the `tf` tables cover.
+
+**Data**: `~/dsgb10-data/glm53-g8/` on rank 0 (`results-*.tsv`, `g8/{prefill,decode}/`, `front/plain.091700.*`,
+`chain/`, `g8-*.json`); the comparison's copies on rank 2 in the same tree.
+
 ## What remains
 
 - **Prefill** (1,145 tok/s at 8k after T6, 83 % of the published 1,374): the compute runs 20–27 % slower beside
@@ -743,9 +927,9 @@ cost model is one session's; with 4 sessions a row costs ~10 ms, not 15.5).
   1.25×): fewer collectives (merge the x-projection all-gather into the previous all-reduce's epilogue, the
   indexer queries' all-gather into it on full layers), the embedding all-gather onto the sampler's exchange, the
   ring's per-collective latency; the MoE is at its floor ([Closing the decode gap](#closing-the-decode-gap-2026-10-14)).
-- **Real routed experts**: the rank files' pools of layers 3-77 are reserved (the fill needs the user's disk
-  decision); then `tf` against the golden logits (top-1, top-20, KL) and the drafts' acceptance and tok/s on real
-  text, end to end. The MTP layer's drafts against `mtp/` are done ([Drafts](#drafts-g7-2026-10-14)); the
-  workers' copies of the rank files lack its experts (rank 0's has them).
+- **Real routed experts** (G8, partial, [above](#end-to-end-on-real-weights-g8-2026-10-14)): `tf` against both
+  golden orders, the refhash pins and the plain server through glmfront are done. Not done: the drafts through
+  the front-end on real text (`server/tests/g8_job.sh k1 k2 k3 gate`: acceptance, tok/s, tokens against plain),
+  a repeat of the tf hashes, prefill in chunks larger than 2,048 rows beside the 101.4 GiB weights.
 - `glw_kcheck --gpu`'s one SwiGLU output outside its bound.
 - Batch invariance under the default split-K (above).

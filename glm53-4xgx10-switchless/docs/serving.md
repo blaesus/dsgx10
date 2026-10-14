@@ -171,6 +171,18 @@ engine/server/run4.sh stop
 `run4.sh` ships the binary to every box and starts ranks 1–3, then rank 0. Run it only through the ring lock:
 `ring.sh` (the DeepSeek engine's) for a job of a few minutes.
 
+**Memory pressure (2026-10-14, G8).** With the filled rank files (101.4 GiB a rank) a rank leaves ~2–9 GiB, and
+every box runs earlyoom (`earlyoom -m 3 -M 2097152 --prefer python`: SIGTERM to the highest-scoring process when
+available memory falls under its threshold). G8's first job (prefill chunks of 8,192 rows: ~3 GB of prefill buffers
+beside the weights) took rank 2 under it at 08:30:48 and earlyoom terminated the reference's tracks pass (python, 3.3
+GiB) there; rank 0 stalled for minutes. So every ring launcher (`ranks.sh` for `run4.sh`, `tests/ring_job.sh` and
+G8's `tests/g8_job.sh`; `engine/model/run4.sh`; `engine/comm/run4.sh`) sets **`oom_score_adj` 1000** on rank 0's
+launch shell and on the workers' (inherited by the ranks): under pressure the preemptible ring job dies first, not
+the hours-long CPU passes beside it. And with the real files keep everything beyond the weights small: prefill
+chunks of 2,048 rows, `--index-scratch-mib 128` (the prefill indexer's scratch, 512 MiB by default), a capped pool
+(`--kv-gib`), no disk tier for tests; `glm_run` stops at the start, on every rank, when a rank's MemAvailable after
+the weights and the prefill buffers is under `--min-free-mib` (4,608: earlyoom's 3 % is ~3.7 GiB).
+
 Options (`glm53_rank --mode serve`):
 
 | Option | Default | |
