@@ -34,4 +34,3 @@ their jobs in [experiments.md](docs/experiments.md).
 - **Not yet.** The two numbers under their targets: prefill 973 tok/s at 2,600 (target ≥ 1,106) and the multi-row
   step above one row on the bench's random routing; `glw_kcheck --gpu` for the INT4 and tiled layouts; the disk tier
   and kept sessions on rank 0 (its data disk is nearly full); the NVFP4 MTP drafter; nothing is pushed.
-
