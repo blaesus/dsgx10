@@ -1,6 +1,6 @@
 // The router's selection (model.md 2.7): s = sigmoid(logits) in f32, sel = s + e_score_correction_bias,
-// the top 8 of sel (descending, ties to the lower expert id; n_group = topk_group = 1 keeps all 256),
-// w = s[idx] / (sum + 1e-20) * 2.5. One warp a row, eight experts a lane (e = lane + 32 j).
+// the top 8 of sel (descending, ties to the lower expert id; n_group = topk_group = 1 keeps all 168),
+// w = s[idx] / (sum + 1e-20) * 2.5. One warp a row, six experts a lane (e = lane + 32 j < 168).
 #include "common/check.h"
 #include "experts/formats.cuh"
 

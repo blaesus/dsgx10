@@ -1,11 +1,14 @@
-// glw_expert_fill_test: a filled routed-expert pool against the canonical NVFP4 or S3 (S3x2) tensors it came from, with the
-// expert kernels' own host readers (engine/experts/layout.h: read_q4 / read_s3 on the packed blocks, canon_q4 / canon_s3 on the
-// canonical tensors). Host only, no device.
+// glw_expert_fill_test: a filled routed-expert pool against the canonical INT4 or BF16 tensors it came from, with the
+// expert kernels' own host readers (engine/experts/layout.h: read_i4 / read_b16 on the packed blocks, canon_i4 or
+// the BF16 bits on the canonical slices). Host only, no device.
 //
 //   glw_expert_fill_test FILE RANK DUMP_DIR LAYER E [E ...]
 // Each expert's matrices are read through its MatDesc (offsets relative to expert 0's entry, the pool base).
-// DUMP_DIR holds experts_fill.py --dump-canon's raw slices L<layer>.r<rank>.e<E>.{gate,up,down}.{w,s}.
+// DUMP_DIR holds engine/weights/int4_pack.py dump's canonical rank slices l<layer>e<E>r<rank>m<m>.{wp,s,zp} (INT4)
+// or .w (BF16), m = 0 gate, 1 up, 2 down.
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -46,28 +49,36 @@ int main(int argc, char** argv) {
     const char* proj[3] = {"gate", "up", "down"};
     for (int m = 0; m < 3; m++) {
       const int N = m < 2 ? gx::kI : gx::kH, K = m < 2 ? gx::kH : gx::kI;
-      const std::string base = dir + "/L" + std::to_string(L) + ".r" + std::to_string(rank) + ".e" + std::to_string(e) + "." + proj[m];
-      const std::vector<uint8_t> w = slurp(base + ".w"), s = slurp(base + ".s");
+      const std::string cb = dir + "/l" + std::to_string(L) + "e" + std::to_string(e) + "r" + std::to_string(rank) + "m" + std::to_string(m);
       const gx::MatDesc& d = desc[3 * e + m];
-      // NVFP4: w [N][K/2] nibbles; S3 (S3x2, s3x2_pack.py): w the codes [N][K/16][6], the subsets from the descriptor
-      const bool s3 = d.fmt == gx::kS3;
-      float mags[2][4];
-      if (w.size() != (s3 ? size_t(N) * K / 16 * 6 : size_t(N) * K / 2) || s.size() != size_t(N) * K / 16)
-        die("%s: canonical sizes", base.c_str());
-      if ((d.fmt != gx::kNVFP4 && !s3) || expert_matrix_fmt(et->fmt, m) != d.fmt || d.off % 256 || d.off < eoff ||
-          d.off - eoff + gx::mat_bytes(d.fmt, N, K) > ent.size() || !(d.s2 > 0) || !std::isfinite(d.s2) ||
-          (s3 && !gx::s3_desc_check(d, mags)))
+      if ((d.fmt != gx::kINT4 && d.fmt != gx::kBF16) || expert_matrix_fmt(et->fmt, m) != d.fmt || !gx::desc_ok(d, d.fmt) ||
+          d.off < eoff || d.off - eoff + gx::mat_bytes(d.fmt, N, K) > ent.size())
         die("expert %d %s: bad descriptor (off %llu, fmt %u, s2 %g)", e, proj[m], (unsigned long long)d.off, d.fmt, d.s2);
+      std::vector<uint8_t> w, s, z;
+      if (d.fmt == gx::kINT4) {
+        w = slurp(cb + ".wp"), s = slurp(cb + ".s"), z = slurp(cb + ".zp");
+        if (w.size() != size_t(N) * K / 2 || s.size() != size_t(N) * K / 32 * 2 || z.size() != size_t(N) / 8 * K / 32 * 4)
+          die("%s: canonical INT4 sizes", cb.c_str());
+      } else {
+        w = slurp(cb + ".w");
+        if (w.size() != size_t(N) * K * 2) die("%s: canonical BF16 size", cb.c_str());
+      }
       long b = 0;
       const uint8_t* pm = ent.data() + (d.off - eoff);
       for (int n = 0; n < N; n++)
         for (int k = 0; k < K; k++) {
-          const float got = s3 ? gx::read_s3(pm, mags, K, n, k) : gx::read_q4(pm, K, n, k);
-          const float want = s3 ? gx::canon_s3(w.data(), s.data(), mags, K, n, k) : gx::canon_q4(w.data(), s.data(), K, n, k);
-          b += std::memcmp(&got, &want, 4) != 0;
+          uint16_t got, want;
+          if (d.fmt == gx::kINT4) {
+            got = gx::read_i4(pm, K, n, k);
+            want = gx::canon_i4(w.data(), reinterpret_cast<const uint16_t*>(s.data()), reinterpret_cast<const uint32_t*>(z.data()), K, n, k);
+          } else {
+            got = gx::read_b16(pm, K, n, k);
+            std::memcpy(&want, w.data() + 2 * (size_t(n) * K + k), 2);
+          }
+          b += got != want;
         }
-      std::printf("layer %d expert %3d %-4s [%d][%d] off %10llu s2 %.6g: %ld of %d values differ\n", L, e, proj[m], N,
-                  K, (unsigned long long)d.off, d.s2, b, N * K);
+      std::printf("layer %d expert %3d %-4s %s [%d][%d] off %10llu: %ld of %d values differ\n", L, e, proj[m],
+                  gx::fmt_name(d.fmt), N, K, (unsigned long long)d.off, b, N * K);
       bad += b;
       checked += long(N) * K;
     }

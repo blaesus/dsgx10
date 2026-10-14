@@ -1,6 +1,13 @@
 // Tests of the routed-expert kernels against CPU references on random data in the real formats.
-//   test_experts --cpu            host only: decoders, packers and readers, the routing reference
-//   test_experts [what...]        GPU (only through ring.sh): deq route decode prefill (default: all)
+//   test_experts --cpu                 host only: decoders, packers and readers, descriptors, the routing reference
+//   test_experts [--fmt i4,b16,q4] [what...]
+//                                      GPU (only through ring.sh): deq route decode prefill equiv (default: all);
+//                                      decode and prefill on a synthetic layer of each format in --fmt (default
+//                                      i4,b16: altar-1's, no fused shared expert; q4 runs with GLM-5.3's fused FP8
+//                                      shared expert, the arrangement the kernels keep); equiv: an INT4 layer against
+//                                      the BF16 layer of its dequantised values, every output bit for bit
+//   test_experts --real DIR [--cpu]    int4_pack.py dump / dump-random: host checks, GPU decode of every value, and the
+//                                      decode, prefill and equiv tests on the dump's experts
 // Exit status 0 when every check passes. Every check prints one "CHECK name ok|FAIL detail" line.
 #include <cmath>
 #include <cstdarg>
@@ -19,7 +26,7 @@ using namespace gx;
 
 static int g_fail = 0;
 static FILE* g_out = nullptr;
-static std::string g_tag;  // prefixed to every check's name (the real-expert runs: "real l3r1: ")
+static std::string g_tag;  // prefixed to every check's name ("[i4] ", "[l4r0] ")
 static void check(const char* name0, bool ok, const char* fmt, ...) {
   char buf[512];
   va_list ap;
@@ -50,6 +57,16 @@ static float bf(__nv_bfloat16 v) { return __bfloat162float(v); }
 static uint16_t bits(__nv_bfloat16 v) { uint16_t b; memcpy(&b, &v, 2); return b; }
 static uint32_t fbits(float f) { uint32_t b; memcpy(&b, &f, 4); return b; }
 
+// INT4 scales for the decode checks: random normal ones, the extremes of the normal range, subnormals (the
+// checkpoint has none: its scales are 2^-15 .. 2^-5, docs/findings.md A0), and overflow (15 x the largest)
+static std::vector<uint16_t> i4_test_scales() {
+  std::vector<uint16_t> v = {0x0001, 0x0002, 0x0017, 0x0040, 0x007F, 0x0080, 0x0081, 0x00FF, 0x0100, 0x3F80, 0x3F81,
+                             0x3FFF, 0x7F00, 0x7F7F, 0x3B80, 0x3C00, 0x3D00};
+  for (int i = 0; i < 64; ++i) v.push_back(rnd_i4_scale(mix64(i + 5)));
+  for (int i = 0; i < 64; ++i) v.push_back((uint16_t)(mix64(i + 99) % 0x7F7F + 1));  // any positive finite bf16
+  return v;
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // host-only checks
 static void cpu_checks() {
@@ -69,29 +86,40 @@ static void cpu_checks() {
       }
     check("cpu nvfp4 widen", !bad, "%d mismatches", bad);
   }
-  {  // S3: pack a lane, decode through selectors + prmt, both subsets
-    int bad = 0;
-    for (int sub = 0; sub < 3; ++sub) {
-      const float* mg = sub == 2 ? kSubC : sub ? kSubB : kSubA;
-      const S3Tab T = s3_table(mg);
-      for (int r = 0; r < 2048; ++r) {
-        uint8_t v[32];
-        for (int i = 0; i < 32; ++i) v[i] = (uint8_t)(mix64(r * 33 + i + sub) & 7);
-        uint32_t P0, P1, Q;
-        s3_pack_lane(v, P0, P1, Q);
-        const uint8_t sc = (uint8_t)(0x30 + r % 0x18);
-        for (int q = 0; q < 2; ++q) {
-          uint32_t o[8];
-          s3_group(P0, P1, Q, q, T, s3_scale_f2_host(sc), o);
+  {  // INT4: i4_dec16's arithmetic (host emulation of the bf16 sub and mul) against the contract, every (u, u_z)
+     // with each test scale, and the nibble order of 16 values
+    size_t bad = 0, n = 0, inexact = 0;
+    for (uint16_t s : i4_test_scales())
+      for (int uz = 0; uz < 16; ++uz)
+        for (int r = 0; r < 2; ++r) {
+          // 16 values: u = (i + r * 7 + uz) % 16 covers every u for each u_z over i
+          uint32_t lo = 0, hi = 0;
+          int u[16];
           for (int i = 0; i < 16; ++i) {
-            const int c = v[16 * q + i];
-            const uint16_t want = f_to_bf16_bits((c & 4 ? -1.f : 1.f) * mg[c & 3] * e4m3_to_f(sc));
-            bad += want != ((o[i / 2] >> 16 * (i & 1)) & 0xFFFF);
+            u[i] = (i + r * 7 + uz) & 15;
+            (i < 8 ? lo : hi) |= (uint32_t)u[i] << (4 * (i % 8));
+          }
+          uint32_t o[8];
+          i4_dec16(lo, hi, i4_zz(uz), bf16x2_bcast(s), o);
+          for (int i = 0; i < 16; ++i) {
+            const uint16_t got = (o[i / 2] >> 16 * (i & 1)) & 0xFFFF, want = i4_value_bits(u[i], uz, s);
+            bad += got != want, ++n;
+            inexact += (double)(u[i] - uz) * bf16_bits_to_f(s) != (double)bf16_bits_to_f(want);
           }
         }
-      }
-    }
-    check("cpu s3 pack + prmt decode (subsets A, B, C)", !bad, "%d mismatches", bad);
+    check("cpu int4 dec16 (host bf16 ops) vs contract", !bad, "%zu of %zu mismatches (%zu products inexact in bf16)", bad, n, inexact);
+  }
+  {  // INT4: the contract's rounding is one rounding of the exact product (not f32 kept, not a rounded difference)
+    size_t one = 0, n = 0;
+    for (uint16_t s : i4_test_scales())
+      for (int u = 0; u < 16; ++u)
+        for (int uz = 0; uz < 16; ++uz) {
+          const double exact = (double)(u - uz) * bf16_bits_to_f(s);
+          const float f = (float)exact;  // exact in f32 (<= 12 significant bits)
+          one += ((double)f == exact || std::isinf(f)) && i4_value_bits(u, uz, s) == f_to_bf16_bits(f);  // inf: past f32 (and bf16) range
+          ++n;
+        }
+    check("cpu int4 contract = bf16_rne(exact (u - u_z) s)", one == n, "%zu of %zu", one, n);
   }
   {  // FP8 widen, every non-NaN byte
     int bad = 0;
@@ -104,132 +132,173 @@ static void cpu_checks() {
     }
     check("cpu fp8 widen (254 values)", !bad, "%d mismatches", bad);
   }
-  {  // the S3 nibble table (FP4 path): the nibble's e2m1 value equals the code's value
-    int bad = 0;
-    for (int sub = 0; sub < 3; ++sub) {
-      const float* mg = sub == 2 ? kSubC : sub ? kSubB : kSubA;
-      const uint32_t t = s3_nibble_table(mg);
-      for (int c = 0; c < 8; ++c) {
-        const float want = (c & 4 ? -1.f : 1.f) * mg[c & 3];
-        bad += e2m1_to_f((t >> 4 * c) & 15) != want;
-      }
+  {  // the loader's descriptor check (glw_kcheck): each format accepted at its own tag, refused at another; the
+     // retired S3 tag and unknown tags refused; misaligned offsets, s2 != 1 on INT4 / BF16, reserved words
+    int bad = 0, n = 0;
+    for (uint32_t f : {kNVFP4, kINT4, kBF16}) {
+      const MatDesc d = make_desc(4096, f == kNVFP4 ? 0.01f : 1.f, f);
+      bad += !desc_ok(d, f), ++n;
+      for (uint32_t g : {(uint32_t)kNVFP4, (uint32_t)kINT4, (uint32_t)kBF16, 1u, 4u})
+        if (g != f) bad += desc_ok(d, g), ++n;
+      MatDesc e = d;
+      e.off += 128;
+      bad += desc_ok(e, f), ++n;
+      e = d;
+      e.rsv[7] = 1;
+      bad += desc_ok(e, f), ++n;
+      e = d;
+      e.s2 = f == kNVFP4 ? -1.f : 2.f;
+      bad += desc_ok(e, f), ++n;
+      e = d;
+      e.s2 = NAN;
+      bad += desc_ok(e, f), ++n;
     }
-    check("cpu s3 code -> e2m1 nibble table", !bad, "%d mismatches", bad);
+    bad += mat_bytes(1, kI, kH) != 0 || mat_bytes(7, kI, kH) != 0, ++n;
+    check("cpu descriptor check (loader)", !bad, "%d wrong verdicts of %d", bad, n);
   }
-  {  // the loader's descriptor check (glw_kcheck): S3x2 accepted as the pair, another pair accepted as not the pair,
-     // a damaged table or nibble word, a non-E2M1 or descending subset refused
-    int bad = 0;
-    float mg[2][4];
-    bool pair = false;
-    const MatDesc a = make_desc_s3x2(4096, 0.01f);
-    bad += !s3_desc_check(a, mg, &pair) || !pair || memcmp(mg, kS3x2Mags, sizeof mg);
-    const float ac[2][4] = {{kSubA[0], kSubA[1], kSubA[2], kSubA[3]}, {kSubC[0], kSubC[1], kSubC[2], kSubC[3]}};
-    bad += !s3_desc_check(make_desc(0, 1.f, kS3, 2, ac), mg, &pair) || pair;
-    MatDesc d = a;
-    d.tab[5] ^= 0x100;  // a low byte of subset B
-    bad += s3_desc_check(d, mg);
-    d = a;
-    d.nib[1] ^= 1;
-    bad += s3_desc_check(d, mg);
-    const float desc_[2][4] = {{0.5f, 4.f, 2.f, 6.f}, {0.5f, 1.5f, 3.f, 6.f}}, offg[2][4] = {{0.5f, 2.f, 4.f, 5.f}, {0.5f, 1.5f, 3.f, 6.f}};
-    bad += s3_desc_check(make_desc(0, 1.f, kS3, 2, desc_), mg) + s3_desc_check(make_desc(0, 1.f, kS3, 2, offg), mg);
-    bad += s3_desc_check(make_desc(0, 1.f, kNVFP4), mg);
-    check("cpu s3 descriptor check (loader)", !bad, "%d wrong verdicts of 7", bad);
-  }
-  {  // packers against the canonical decode, through the layout readers
-    int bad = 0;
+  {  // packers against the canonical decode, through the layout readers (every element)
+    size_t bad = 0;
     const int N = 24, K = 1024;
-    HostMat q = make_q4(N, K, 5, 1.f), s = make_s3(N, K, 6, 1.f, 2, kSubA, kSubB);
+    HostMat q = make_q4(N, K, 5, 1.f), a = make_i4(N, K, 6), b = make_b16(N, K, 7), ab = b16_of(a);
     HostFp8 f = make_fp8(128, 256, 7, 1.f);
     for (int n = 0; n < N; ++n)
       for (int k = 0; k < K; ++k) {
         bad += read_q4(q.packed.data(), K, n, k) != q.value(n, k);
-        bad += read_s3(s.packed.data(), s.mags, K, n, k) != s.value(n, k);
+        bad += read_i4(a.packed.data(), K, n, k) != a.value_bits(n, k);
+        bad += read_b16(b.packed.data(), K, n, k) != b.value_bits(n, k);
+        bad += read_b16(ab.packed.data(), K, n, k) != a.value_bits(n, k);
+        const I4Parts p = read_i4_parts(a.packed.data(), K, n, k);
+        uint16_t sc;
+        memcpy(&sc, &a.s[((size_t)n * (K / 32) + k / 32) * 2], 2);
+        bad += p.u != q4_nibble(a.w.data(), K, n, k) || p.uz != i4_zp(a.zp.data(), K, n, k / 32) || p.s != sc;
+        for (uint32_t fm : {kNVFP4, kINT4, kBF16}) {
+          const HostMat& m = fm == kNVFP4 ? q : fm == kINT4 ? a : b;
+          bad += fbits(read_value(m.packed.data(), fm, K, n, k)) != fbits(m.value(n, k));
+        }
       }
     for (int n = 0; n < 128; ++n)
       for (int k = 0; k < 256; ++k) bad += read_fp8(f.packed.data(), 256, n, k) != e4m3_to_f(f.w[(size_t)n * 256 + k]);
-    check("cpu packers vs canonical (nvfp4, s3, fp8)", !bad, "%d mismatches", bad);
+    size_t sbad = scale_bytes_check(q.packed.data(), kNVFP4, N, K) + scale_bytes_check(a.packed.data(), kINT4, N, K);
+    HostMat z = make_i4(N, K, 8, 0x8001);  // a negative scale: refused
+    sbad += scale_bytes_check(z.packed.data(), kINT4, N, K) != (size_t)N * K / 32;
+    check("cpu packers vs canonical (nvfp4, int4, bf16, fp8, int4 -> bf16)", !bad, "%zu mismatches", bad);
+    check("cpu scale check (nvfp4, int4; a negative int4 scale refused)", !sbad, "%zu wrong", sbad);
   }
-  {  // routing reference: ties go to the lower id, weights sum to 2.5
+  {  // routing reference at 168: ties go to the lower id, weights sum to 2.5
     std::vector<float> l, bias(kE);
     rnd_logits(l, 64, 3, true);
-    for (int e = 0; e < kE; ++e) bias[e] = 34.2f + 0.001f * (float)(e % 7);
+    for (int e = 0; e < kE; ++e) bias[e] = 28.25f;
+    for (int m = 0; m < 64; ++m)  // three experts tied above the rest (|l| < 3), so the tie lies inside the top 8
+      for (int j = 0; j < 3; ++j) l[m * kE + (m * 29 + 53 * j) % kE] = 3.5f;
     std::vector<int> idx(64 * kTopK);
     std::vector<float> w(64 * kTopK);
     route_ref(l.data(), bias.data(), 64, idx.data(), w.data());
-    int bad = 0;
+    int bad = 0, ties = 0;
     for (int m = 0; m < 64; ++m) {
       double s = 0;
       for (int k = 0; k < kTopK; ++k) {
         s += w[m * kTopK + k];
+        bad += idx[m * kTopK + k] < 0 || idx[m * kTopK + k] >= kE;
         if (k) {
           const int a = idx[m * kTopK + k - 1], b = idx[m * kTopK + k];
           const float ka = route_sigmoid(l[m * kE + a]) + bias[a], kb = route_sigmoid(l[m * kE + b]) + bias[b];
           bad += !(ka > kb || (ka == kb && a < b));
+          ties += ka == kb;
         }
       }
       bad += fabs(s - 2.5) > 1e-5;
     }
-    check("cpu routing reference (order, ties, sum)", !bad, "%d bad rows", bad);
+    check("cpu routing reference (order, ties, sum)", !bad && ties > 0, "%d bad rows, %d tied neighbours", bad, ties);
   }
 }
 
 // ------------------------------------------------------------------------------------------------------------------
 // GPU: the decode through the kernels' own fragment mapping, bit for bit
-__global__ void k_deq(const uint8_t* m, MatDesc d, int N, int K, uint16_t* out) {
+template <class F>
+__global__ void k_deq(const uint8_t* m, int N, int K, uint16_t* out) {
   const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-  const int gw = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), B = K / kBlkK;
+  const int gw = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), B = K / F::kBK;
   if (gw >= N / 8 * B) return;
   const int n8 = gw / B, b = gw % B;
-  Raw r;
-  load_blk(r, m + (size_t)gw * (d.fmt == kNVFP4 ? kQ4Blk : kS3Blk), d.fmt, lane);
-  uint32_t tab[8];
-  for (int j = 0; j < 8; ++j) tab[j] = d.tab[j];
-  for (int jj = 0; jj < 4; ++jj)
+  typename F::Raw r;
+  F::load(r, m + (size_t)gw * F::kBlk, lane);
+  for (int jj = 0; jj < F::kU; ++jj)
     for (int q = 0; q < 2; ++q) {
       uint32_t o[8];
-      dec_group(r, jj, q, d.fmt, tab, o);
+      F::dec(r, jj, q, o);
       for (int mm = 0; mm < 8; ++mm) {
-        const size_t base = (size_t)(8 * n8 + g) * K + 512 * b + 128 * jj + 64 * q + 16 * t + 2 * mm;
+        const size_t base = (size_t)(8 * n8 + g) * K + F::kBK * b + 128 * jj + 64 * q + 16 * t + 2 * mm;
         out[base] = o[mm] & 0xFFFF;
         out[base + 1] = o[mm] >> 16;
       }
     }
 }
+// the GPU's decoded bf16 bits of a packed matrix [N][K]
+static std::vector<uint16_t> gpu_deq(const HostMat& m) {
+  uint8_t* dm = h2d(m.packed);
+  uint16_t* dout;
+  CUDA_CHECK(cudaMalloc(&dout, (size_t)m.N * m.K * 2));
+  const int warps = m.N / 8 * (m.K / blk_k(m.fmt));
+  switch (m.fmt) {
+    case kNVFP4: k_deq<FmtNVFP4><<<(warps + 7) / 8, 256>>>(dm, m.N, m.K, dout); break;
+    case kINT4: k_deq<FmtINT4><<<(warps + 7) / 8, 256>>>(dm, m.N, m.K, dout); break;
+    case kBF16: k_deq<FmtBF16><<<(warps + 7) / 8, 256>>>(dm, m.N, m.K, dout); break;
+    default: die("gpu_deq: format %u", m.fmt);
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+  auto got = d2h(dout, (size_t)m.N * m.K);
+  CUDA_CHECK(cudaFree(dm));
+  CUDA_CHECK(cudaFree(dout));
+  return got;
+}
+// mismatches of the GPU's decode against the format's exact bf16 value (NVFP4: x 2^-30, its kernels' carry)
+static size_t deq_mismatches(const HostMat& m, const std::vector<uint16_t>& got) {
+  size_t bad = 0;
+  for (int n = 0; n < m.N; ++n)
+    for (int k = 0; k < m.K; ++k) {
+      const uint16_t gb = got[(size_t)n * m.K + k];
+      if (m.fmt == kNVFP4) {
+        const float want = m.value(n, k) * 0x1p-30f;
+        bad += f_to_bf16_bits(want) != gb && !(want == 0 && (gb & 0x7FFF) == 0);
+      } else {
+        bad += m.value_bits(n, k) != gb;
+      }
+    }
+  return bad;
+}
 static void test_deq() {
-  for (int pat = 0; pat < 3; ++pat)
+  for (uint32_t f : {kINT4, kBF16, kNVFP4})
     for (int j = 0; j < 3; j += 2) {  // gate shape and down shape
       const int N = j < 2 ? kI : kH, K = j < 2 ? kH : kI;
-      HostMat m = pat == 0 ? make_q4(N, K, 40 + j, 1.f) : make_s3(N, K, 50 + j + pat, 1.f, pat, kSubA, kSubB);
-      const MatDesc d = make_desc(0, 1.f, m.fmt, m.nsub, m.mags);
-      uint8_t* dm = h2d(m.packed);
-      uint16_t* dout;
-      CUDA_CHECK(cudaMalloc(&dout, (size_t)N * K * 2));
-      const int warps = N / 8 * (K / kBlkK);
-      k_deq<<<(warps + 7) / 8, 256>>>(dm, d, N, K, dout);
-      CUDA_CHECK(cudaDeviceSynchronize());
-      auto got = d2h(dout, (size_t)N * K);
-      size_t bad = 0;
-      for (int n = 0; n < N; ++n)
-        for (int k = 0; k < K; ++k) {
-          const float want = m.value(n, k) * (m.fmt == kNVFP4 ? 0x1p-30f : 1.f);
-          const uint16_t wb = f_to_bf16_bits(want), gb = got[(size_t)n * K + k];
-          bad += wb != gb && !(want == 0 && (gb & 0x7FFF) == 0);
-        }
+      HostMat m = make_mat(f, N, K, 40 + j + 10 * f, 1.f);
+      const size_t bad = deq_mismatches(m, gpu_deq(m));
       char name[64];
-      snprintf(name, sizeof name, "deq %s%s [%d x %d]", m.fmt == kNVFP4 ? "nvfp4" : "s3", pat == 2 ? " 2 subsets" : "", N, K);
-      check(name, !bad, "%zu of %zu mismatches (bf16 of value x scale%s)", bad, (size_t)N * K, m.fmt == kNVFP4 ? " x 2^-30" : "");
-      CUDA_CHECK(cudaFree(dm));
-      CUDA_CHECK(cudaFree(dout));
+      snprintf(name, sizeof name, "deq %s [%d x %d]", fmt_name(f), N, K);
+      check(name, !bad, "%zu of %zu mismatches (bf16 bits%s)", bad, (size_t)N * K, f == kNVFP4 ? " of value x 2^-30" : " of the contract's value");
     }
+  {  // INT4 with every test scale (subnormal, extreme, overflowing): the device's bf16 sub and mul = the contract
+    size_t bad = 0, n = 0;
+    for (uint16_t s : i4_test_scales()) {
+      HostMat m = make_i4(64, 1024, s, s);
+      bad += deq_mismatches(m, gpu_deq(m)), n += (size_t)64 * 1024;
+    }
+    check("deq INT4, 145 scales (subnormal, extreme, overflow)", !bad, "%zu of %zu mismatches", bad, n);
+  }
 }
 
 static void test_route() {
-  for (int ties = 0; ties < 2; ++ties) {
-    const int M = 16 + 3 * ties;  // more rows than one step: the kernel takes any M
+  for (int ties = 0; ties < 3; ++ties) {
+    const int M = 16 + 3 * (ties > 0);  // more rows than one step: the kernel takes any M
     std::vector<float> l, bias(kE);
-    rnd_logits(l, M, 11 + ties, ties);
-    for (int e = 0; e < kE; ++e) bias[e] = ties ? 34.25f : 34.2f + 0.37f * (float)((mix64(e) % 1000) / 1000.0);
+    rnd_logits(l, M, 11 + ties, ties == 1);
+    for (int e = 0; e < kE; ++e) bias[e] = ties ? 28.25f : 28.2f + 0.37f * (float)((mix64(e) % 1000) / 1000.0);
+    if (ties == 2)  // ties at the 8th place: three experts share the 8th key, the rest distinct
+      for (int m = 0; m < M; ++m) {
+        for (int e = 0; e < kE; ++e) l[m * kE + e] = -4.f + 0.01f * (float)((e * 37 + m * 11) % kE);
+        const int a = (m * 13) % kE, b = (m * 13 + 50) % kE, c = (m * 13 + 101) % kE, top = (m * 13 + 7) % kE;
+        for (int r = 0; r < 7; ++r) l[m * kE + (top + 3 * r) % kE] = 5.f + r;
+        l[m * kE + a] = l[m * kE + b] = l[m * kE + c] = 4.5f;
+      }
     std::vector<int> ri(M * kTopK);
     std::vector<float> rw(M * kTopK);
     route_ref(l.data(), bias.data(), M, ri.data(), rw.data());
@@ -243,8 +312,8 @@ static void test_route() {
     auto gw = d2h(dw, M * kTopK);
     int bad = 0;
     for (int i = 0; i < M * kTopK; ++i) bad += gi[i] != ri[i] || fbits(gw[i]) != fbits(rw[i]);
-    check(ties ? "route (many tied logits, equal bias)" : "route (random)", !bad, "%d of %d picks differ (ids and weight bits)", bad,
-          M * kTopK);
+    const char* nm = ties == 0 ? "route 168 (random)" : ties == 1 ? "route 168 (many tied logits, equal bias)" : "route 168 (3-way tie at the 8th place)";
+    check(nm, !bad, "%d of %d picks differ (ids and weight bits)", bad, M * kTopK);
     cudaFree(dl), cudaFree(db), cudaFree(di), cudaFree(dw);
   }
 }
@@ -254,8 +323,9 @@ static void test_route() {
 struct Ref {
   const TestLayer& L;
   std::map<int, std::vector<float>> deq;  // stored matrix index -> values without s2 [N][K]
-  std::vector<float> sg, su, sd;          // shared, with block scales
+  std::vector<float> sg, su, sd;          // fused shared, with block scales
   explicit Ref(const TestLayer& l) : L(l) {
+    if (!L.fused) return;
     auto fp = [](const HostFp8& h, std::vector<float>& v) {
       v.resize((size_t)h.N * h.K);
 #pragma omp parallel for
@@ -299,12 +369,12 @@ struct HRef {
   bool ok(size_t i, float v) const { return v >= lo[i] && v <= hi[i]; }
 };
 static void ref_h(Ref& R, const std::vector<__nv_bfloat16>& x, int M, const std::vector<int>& uni, HRef& out) {
-  const int U = (int)uni.size();
+  const int U = (int)uni.size(), US = U + (R.L.fused ? 1 : 0);
   std::vector<float>& h = out.h;
-  h.assign((size_t)(U + 1) * M * kI, 0.f);
+  h.assign((size_t)US * M * kI, 0.f);
   out.lo.assign(h.size(), 0.f);
   out.hi.assign(h.size(), 0.f);
-  for (int u = 0; u <= U; ++u) {
+  for (int u = 0; u < US; ++u) {
     const bool sh = u == U;
     const std::vector<float>& G = sh ? R.sg : R.mat(uni[u], 0);
     const std::vector<float>& Uw = sh ? R.su : R.mat(uni[u], 1);
@@ -338,7 +408,7 @@ static void ref_h(Ref& R, const std::vector<__nv_bfloat16>& x, int M, const std:
 
 struct DecodeRun {
   std::vector<int> uni;
-  std::vector<__nv_bfloat16> h;  // [U + 1][M][kI], the shared expert last
+  std::vector<__nv_bfloat16> h;  // [U (+ 1)][M][kI], the fused shared expert last
   std::vector<float> yr, ys;
 };
 static DecodeRun run_decode(const TestLayer& L, const __nv_bfloat16* dx, const int* didx, const float* dw, int M,
@@ -350,10 +420,10 @@ static DecodeRun run_decode(const TestLayer& L, const __nv_bfloat16* dx, const i
   DecodeRun r;
   std::set<int> s(idx.begin(), idx.begin() + M * kTopK);
   r.uni.assign(s.begin(), s.end());
-  const int U = (int)r.uni.size();
+  const int U = (int)r.uni.size(), US = U + (L.fused ? 1 : 0);
   auto hb = d2h(reinterpret_cast<const __nv_bfloat16*>(ws), (size_t)(kMaxUnion + 1) * kMaxRows * kI);
-  r.h.resize((size_t)(U + 1) * M * kI);
-  for (int u = 0; u <= U; ++u) {
+  r.h.resize((size_t)US * M * kI);
+  for (int u = 0; u < US; ++u) {
     const int slot = u == U ? kShSlot : u;
     memcpy(&r.h[(size_t)u * M * kI], &hb[(size_t)slot * M * kI], (size_t)M * kI * 2);
   }
@@ -361,46 +431,61 @@ static DecodeRun run_decode(const TestLayer& L, const __nv_bfloat16* dx, const i
   r.ys = d2h(dys, (size_t)M * kH);
   return r;
 }
+static size_t ys_touched(const std::vector<float>& ys) {  // without a fused shared expert ys is left as it was (0xFF)
+  size_t n = 0;
+  for (float v : ys) n += fbits(v) != 0xFFFFFFFFu;
+  return n;
+}
 
-static void test_decode(TestLayer* ext = nullptr) {  // ext: an uploaded layer (the real experts), else synthetic
-  TestLayer syn;
-  if (!ext) syn.build(10, 1), syn.upload();
-  TestLayer& L = ext ? *ext : syn;
+// the routing of the decode tests: 16 rows of x, idx and w from route() on random logits
+struct Rows {
+  std::vector<__nv_bfloat16> x;
+  std::vector<int> idx;
+  std::vector<float> wts;
+  __nv_bfloat16* dx = nullptr;
+  int* di = nullptr;
+  float* dw = nullptr;
+  void make(int n, uint64_t seed) {
+    std::vector<float> bias(kE), lg;
+    for (int e = 0; e < kE; ++e) bias[e] = 28.2f + 0.37f * (float)((mix64(e + 5) % 1000) / 1000.0);
+    rnd_x(x, (size_t)n * kH, seed);
+    rnd_logits(lg, n, seed + 1, false);
+    float *dl = h2d(lg), *db = h2d(bias);
+    dx = h2d(x);
+    CUDA_CHECK(cudaMalloc(&di, (size_t)n * kTopK * 4));
+    CUDA_CHECK(cudaMalloc(&dw, (size_t)n * kTopK * 4));
+    for (int r0 = 0; r0 < n; r0 += 1024) route(dl + (size_t)r0 * kE, db, std::min(1024, n - r0), di + r0 * kTopK, dw + r0 * kTopK, 0, false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    idx = d2h(di, (size_t)n * kTopK);
+    wts = d2h(dw, (size_t)n * kTopK);
+    cudaFree(dl), cudaFree(db);
+  }
+  void free_dev() { cudaFree(dx), cudaFree(di), cudaFree(dw); }
+};
+
+static void test_decode(TestLayer& L) {
   Ref R(L);
   void* ws;
   CUDA_CHECK(cudaMalloc(&ws, decode_ws_bytes()));
   CUDA_CHECK(cudaMemset(ws, 0, decode_ws_bytes()));
-  float *dyr, *dys, *dl, *db, *dw;
-  int* di;
-  __nv_bfloat16* dx;
+  float *dyr, *dys;
   CUDA_CHECK(cudaMalloc(&dyr, (size_t)kMaxRows * kH * 4));
   CUDA_CHECK(cudaMalloc(&dys, (size_t)kMaxRows * kH * 4));
-  CUDA_CHECK(cudaMalloc(&dl, (size_t)kMaxRows * kE * 4));
-  CUDA_CHECK(cudaMalloc(&db, kE * 4));
-  CUDA_CHECK(cudaMalloc(&di, kMaxRows * kTopK * 4));
-  CUDA_CHECK(cudaMalloc(&dw, kMaxRows * kTopK * 4));
-  CUDA_CHECK(cudaMalloc(&dx, (size_t)kMaxRows * kH * 2));
-  std::vector<float> bias(kE);
-  for (int e = 0; e < kE; ++e) bias[e] = 34.2f + 0.37f * (float)((mix64(e + 5) % 1000) / 1000.0);
-  CUDA_CHECK(cudaMemcpy(db, bias.data(), kE * 4, cudaMemcpyHostToDevice));
-  // 16 rows of x and their routing
-  std::vector<__nv_bfloat16> x;
-  rnd_x(x, (size_t)kMaxRows * kH, 21);
-  std::vector<float> lg;
-  rnd_logits(lg, kMaxRows, 22, false);
-  CUDA_CHECK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dl, lg.data(), lg.size() * 4, cudaMemcpyHostToDevice));
-  route(dl, db, kMaxRows, di, dw, 0, false);
-  CUDA_CHECK(cudaDeviceSynchronize());
-  const auto idx = d2h(di, kMaxRows * kTopK);
-  const auto wts = d2h(dw, kMaxRows * kTopK);
+  Rows rw;
+  rw.make(kMaxRows, 21);
+  const auto& x = rw.x;
+  const auto& idx = rw.idx;
+  const auto& wts = rw.wts;
+  __nv_bfloat16* dx = rw.dx;
+  int* di = rw.di;
+  float* dw = rw.dw;
 
   // full check against the CPU at several row counts
   std::map<int, DecodeRun> runs;
   std::map<int, HRef> refs;
   for (int M : {1, 3, 5, 6, 8, 9, 16}) {
     DecodeRun r = run_decode(L, dx, di, dw, M, idx, ws, dyr, dys, DecodeCfg());
-    const int U = (int)r.uni.size();
+    const int U = (int)r.uni.size(), US = U + (L.fused ? 1 : 0);
     HRef& hr = refs[M];
     ref_h(R, x, M, r.uni, hr);
     const std::vector<float>& h = hr.h;
@@ -410,14 +495,14 @@ static void test_decode(TestLayer* ext = nullptr) {  // ext: an uploaded layer (
       exact += fbits(gv) == fbits(h[i]) || (gv == 0 && h[i] == 0);
       far += !hr.ok(i, gv);
     }
-    char name[64];
-    snprintf(name, sizeof name, "decode M=%d h (%d experts + shared)", M, U);
+    char name[96];
+    snprintf(name, sizeof name, "decode M=%d h (%d experts%s)", M, U, L.fused ? " + shared" : "");
     check(name, far == 0 && exact >= h.size() * 0.995, "%zu of %zu bit-exact, %zu outside the range of f32 sums", exact, h.size(),
           far);
     // down from the GPU's h, in double
     ErrStat er, es;
     std::vector<double> yr((size_t)M * kH, 0), yrm((size_t)M * kH, 0), ys((size_t)M * kH, 0), ysm((size_t)M * kH, 0);
-    for (int u = 0; u <= U; ++u) {
+    for (int u = 0; u < US; ++u) {
       const bool sh = u == U;
       const std::vector<float>& D = sh ? R.sd : R.mat(r.uni[u], 2);
       std::vector<double> wr(M, 0.0);
@@ -437,11 +522,18 @@ static void test_decode(TestLayer* ext = nullptr) {  // ext: an uploaded layer (
           else yr[(size_t)m * kH + n] += a * wr[m], yrm[(size_t)m * kH + n] += am * fabs(wr[m]);
         }
     }
-    for (size_t i = 0; i < yr.size(); ++i) er.add(r.yr[i], yr[i], yrm[i], 1e-4), es.add(r.ys[i], ys[i], ysm[i], 1e-4);
+    for (size_t i = 0; i < yr.size(); ++i) er.add(r.yr[i], yr[i], yrm[i], 1e-4);
     snprintf(name, sizeof name, "decode M=%d routed out vs double (from GPU h)", M);
     check(name, !er.bad, "max |err|/sum|terms| %.2e over %zu", er.worst, er.n);
-    snprintf(name, sizeof name, "decode M=%d shared out vs double (from GPU h)", M);
-    check(name, !es.bad, "max |err|/sum|terms| %.2e over %zu", es.worst, es.n);
+    if (L.fused) {
+      for (size_t i = 0; i < ys.size(); ++i) es.add(r.ys[i], ys[i], ysm[i], 1e-4);
+      snprintf(name, sizeof name, "decode M=%d shared out vs double (from GPU h)", M);
+      check(name, !es.bad, "max |err|/sum|terms| %.2e over %zu", es.worst, es.n);
+    } else {
+      const size_t t = ys_touched(r.ys);
+      snprintf(name, sizeof name, "decode M=%d ys untouched (no fused shared expert)", M);
+      check(name, !t, "%zu of %zu written", t, r.ys.size());
+    }
     runs[M] = std::move(r);
   }
   // a row's bits do not depend on the other rows: each row alone against the 16-row step
@@ -481,107 +573,102 @@ static void test_decode(TestLayer* ext = nullptr) {  // ext: an uploaded layer (
         else check(name, hfar == 0, "another K split: h %zu of %zu differ from the default, %zu outside the range of f32 sums", hb,
                    b.h.size(), hfar);
       }
-  cudaFree(ws), cudaFree(dyr), cudaFree(dys), cudaFree(dl), cudaFree(db), cudaFree(di), cudaFree(dw), cudaFree(dx);
-  if (!ext) L.free_dev();
+  cudaFree(ws), cudaFree(dyr), cudaFree(dys);
+  rw.free_dev();
 }
 
-void test_prefill(TestLayer* ext = nullptr, bool light = false);  // test_prefill.inc
+void test_prefill(TestLayer& L, bool light);  // test_prefill.inc
+void test_equiv(TestLayer& A, bool light);    // test_prefill.inc: INT4 layer A against its dequantised BF16 layer
 
 // ------------------------------------------------------------------------------------------------------------------
-// S3x2 and the mixed expert on the quantiser's own bytes (engine/weights/s3x2_pack.py dump: real BF16 experts of
-// layers 3 and 40 cut to a rank; dump-random: random canonical bits). Host: the Python packer's blocks and
-// descriptors equal layout.h's byte for byte; every value of the torch model of the format (levelset3_dequant /
-// nvfp4_dequant without s2) equals layout.h's canonical reader and its reader of the Python-packed blocks; the
-// loader's checks pass. GPU: the kernels' decode of every value equals the torch model's; then the decode and
-// prefill tests on a layer of these experts.
-static void real_host(const TestLayer& L, const std::vector<RealMat>& rm) {
-  size_t pb = 0, db = 0, vb = 0, rb = 0, sb = 0, nv = 0, nb = 0, nsc = 0, nds = 0;
-  int s3 = 0, q4 = 0;
-  for (size_t i = 0; i < L.m.size(); ++i) {
-    const HostMat& m = L.m[i];
+// The converter's own bytes (engine/weights/int4_pack.py dump: a rank's slice of real experts; dump-random: random
+// canonical bits). Host: the Python packer's blocks and descriptors equal layout.h's byte for byte; the contract's
+// values the Python wrote (.val, value_bits) equal layout.h's canonical reader and its reader of the Python-packed
+// blocks; the loader's checks pass. GPU: the kernels' decode of every value equals .val; then the decode, prefill and
+// equivalence tests on a layer of each format's experts.
+static void real_host(const std::vector<HostMat>& hm, const std::vector<RealMat>& rm) {
+  size_t pb = 0, db = 0, vb = 0, rb = 0, sb = 0, nv = 0, nds = 0;
+  int ni4 = 0, nb16 = 0;
+  for (size_t i = 0; i < hm.size(); ++i) {
+    const HostMat& m = hm[i];
     const RealMat& r = rm[i];
-    std::vector<uint8_t> pk(m.packed.size());
-    if (m.fmt == kS3) pack_s3(m.w.data(), m.s.data(), m.N, m.K, pk.data()), ++s3;
-    else pack_nvfp4(m.w.data(), m.s.data(), m.N, m.K, pk.data()), ++q4;
-    for (size_t j = 0; j < pk.size(); ++j) pb += pk[j] != m.packed[j];
-    const MatDesc d = m.fmt == kS3 ? make_desc_s3x2(0, m.s2) : make_desc(0, m.s2, kNVFP4);
+    HostMat c = m;
+    repack(c);
+    (m.fmt == kINT4 ? ni4 : nb16)++;
+    for (size_t j = 0; j < c.packed.size(); ++j) pb += c.packed[j] != m.packed[j];
+    const MatDesc d = make_desc(0, 1.f, m.fmt);
     db += memcmp(&d, r.desc.data(), sizeof d) != 0;
     MatDesc rd;
     memcpy(&rd, r.desc.data(), sizeof rd);
-    float mg[2][4];
-    bool pair = false;
-    if (m.fmt == kS3) nds += !s3_desc_check(rd, mg, &pair) || !pair;
-    size_t nbm = 0;
-    sb += scale_bytes_check(m.packed.data(), m.fmt, m.N, m.K, &nbm);
-    nb += nbm, nsc += m.fmt == kS3 ? (size_t)m.N * m.K / 16 : 0;
+    nds += !desc_ok(rd, m.fmt);
+    sb += scale_bytes_check(m.packed.data(), m.fmt, m.N, m.K);
     size_t v1 = 0, v2 = 0;
 #pragma omp parallel for reduction(+ : v1, v2)
     for (int n = 0; n < m.N; ++n)
       for (int k = 0; k < m.K; ++k) {
-        const float want = bf16_bits_to_f(r.val[(size_t)n * m.K + k]);
-        const float c = m.value(n, k);
-        const float g = m.fmt == kS3 ? read_s3(m.packed.data(), m.mags, m.K, n, k) : read_q4(m.packed.data(), m.K, n, k);
-        v1 += fbits(c) != fbits(want);
-        v2 += fbits(g) != fbits(want);
+        const uint16_t want = r.val[(size_t)n * m.K + k];
+        v1 += m.value_bits(n, k) != want;
+        v2 += (m.fmt == kINT4 ? read_i4(m.packed.data(), m.K, n, k) : read_b16(m.packed.data(), m.K, n, k)) != want;
       }
     vb += v1, rb += v2, nv += (size_t)m.N * m.K;
   }
-  check("real: python packer = layout.h packer", !pb, "%zu bytes differ (%d S3x2, %d NVFP4 matrices)", pb, s3, q4);
-  check("real: python MatDesc = make_desc", !db && !nds, "%zu of %zu descriptors differ; %zu S3 not the S3x2 pair", db, L.m.size(), nds);
-  check("real: torch model = canonical reader", !vb, "%zu of %zu values differ (bits, without s2)", vb, nv);
-  check("real: torch model = reader of the packed blocks", !rb, "%zu of %zu values differ", rb, nv);
-  check("real: scale bytes (loader check)", !sb, "%zu bad; subset B in %.1f %% of S3 groups", sb, nsc ? 100.0 * nb / nsc : 0.0);
+  check("real: python packer = layout.h packer", !pb, "%zu bytes differ (%d INT4, %d BF16 matrices)", pb, ni4, nb16);
+  check("real: python MatDesc = make_desc, desc_ok", !db && !nds, "%zu of %zu descriptors differ; %zu refused", db, hm.size(), nds);
+  check("real: python contract values = canonical reader", !vb, "%zu of %zu values differ (bf16 bits)", vb, nv);
+  check("real: python contract values = reader of the packed blocks", !rb, "%zu of %zu values differ", rb, nv);
+  check("real: scales (loader check)", !sb, "%zu bad", sb);
 }
-static void real_deq(const TestLayer& L, const std::vector<RealMat>& rm) {
+static void real_deq(const std::vector<HostMat>& hm, const std::vector<RealMat>& rm) {
   size_t bad = 0, n = 0;
-  for (size_t i = 0; i < L.m.size(); ++i) {
-    const HostMat& m = L.m[i];
-    const MatDesc d = m.fmt == kS3 ? make_desc_s3x2(0, m.s2) : make_desc(0, m.s2, kNVFP4);
-    uint8_t* dm = h2d(m.packed);
-    uint16_t* dout;
-    CUDA_CHECK(cudaMalloc(&dout, (size_t)m.N * m.K * 2));
-    const int warps = m.N / 8 * (m.K / kBlkK);
-    k_deq<<<(warps + 7) / 8, 256>>>(dm, d, m.N, m.K, dout);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    const auto got = d2h(dout, (size_t)m.N * m.K);
-    for (size_t j = 0; j < got.size(); ++j) {
-      const float v = bf16_bits_to_f(rm[i].val[j]);
-      const uint16_t want = m.fmt == kS3 ? rm[i].val[j] : f_to_bf16_bits(v * 0x1p-30f);
-      bad += got[j] != want && !(v == 0 && (got[j] & 0x7FFF) == 0);
-    }
+  for (size_t i = 0; i < hm.size(); ++i) {
+    const auto got = gpu_deq(hm[i]);
+    for (size_t j = 0; j < got.size(); ++j) bad += got[j] != rm[i].val[j];
     n += got.size();
-    CUDA_CHECK(cudaFree(dm));
-    CUDA_CHECK(cudaFree(dout));
   }
-  check("real: GPU decode = torch model", !bad, "%zu of %zu values differ (bf16 bits; NVFP4 x 2^-30)", bad, n);
+  check("real: GPU decode = the contract's values", !bad, "%zu of %zu values differ (bf16 bits)", bad, n);
 }
 static void test_real(const std::string& dir, bool gpu) {
   const std::string tag = dir.substr(dir.find_last_of('/') + 1);
   g_tag = "[" + tag + "] ";
-  TestLayer L;
+  std::vector<HostMat> hm;
   std::vector<RealMat> rm;
-  load_real(L, rm, dir, 5);
-  printf("== %s: %d stored experts (%zu matrices)\n", dir.c_str(), L.NS, L.m.size());
-  real_host(L, rm);
+  load_real(hm, rm, dir);
+  printf("== %s: %zu matrices\n", dir.c_str(), hm.size());
+  real_host(hm, rm);
   if (gpu) {
-    real_deq(L, rm);
-    L.upload();
-    test_decode(&L);
-    test_prefill(&L, true);
-    L.free_dev();
+    real_deq(hm, rm);
+    for (uint32_t f : {kINT4, kBF16}) {
+      TestLayer L;
+      real_layer(L, hm, f, 5);
+      if (!L.NS) continue;
+      g_tag = "[" + tag + " " + fmt_tag(f) + "] ";
+      printf("== %s: %d stored %s experts\n", dir.c_str(), L.NS, fmt_name(f));
+      L.upload();
+      test_decode(L);
+      test_prefill(L, true);
+      if (f == kINT4) test_equiv(L, true);
+      L.free_dev();
+    }
   }
   g_tag.clear();
 }
 
 int main(int argc, char** argv) {
   std::set<std::string> what;
-  std::vector<std::string> real;
+  std::vector<std::string> real, fmts = {"i4", "b16"};
   bool cpu = false;
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--cpu")) cpu = true;
     else if (!strcmp(argv[i], "--out") && i + 1 < argc) g_out = fopen(argv[++i], "a");
     else if (!strcmp(argv[i], "--real") && i + 1 < argc) real.push_back(argv[++i]);
-    else what.insert(argv[i]);
+    else if (!strcmp(argv[i], "--fmt") && i + 1 < argc) {
+      fmts.clear();
+      for (std::string s = argv[++i]; !s.empty();) {
+        const size_t c = s.find(',');
+        fmts.push_back(s.substr(0, c));
+        s = c == std::string::npos ? "" : s.substr(c + 1);
+      }
+    } else what.insert(argv[i]);
   }
   if (!real.empty()) {  // --real DIR ...: those layers only (with --cpu, their host checks only)
     if (cpu) cpu_checks();
@@ -593,8 +680,27 @@ int main(int argc, char** argv) {
     if (want("cpu")) cpu_checks();
     if (want("deq")) test_deq();
     if (want("route")) test_route();
-    if (want("decode")) test_decode();
-    if (want("prefill")) test_prefill();
+    for (const auto& fs : fmts) {
+      if (!want("decode") && !want("prefill")) break;
+      const uint32_t f = fmt_of(fs);
+      TestLayer L;
+      L.build(f, 10, f == kNVFP4 ? 1 : 2 + f, f == kNVFP4);  // NVFP4 with GLM-5.3's fused FP8 shared expert
+      L.upload();
+      g_tag = "[" + fs + "] ";
+      if (want("decode")) test_decode(L);
+      if (want("prefill")) test_prefill(L, false);
+      L.free_dev();
+      g_tag.clear();
+    }
+    if (want("equiv")) {
+      TestLayer A;
+      A.build(kINT4, 10, 7, false);
+      A.upload();
+      g_tag = "[i4 = b16(deq)] ";
+      test_equiv(A, false);
+      A.free_dev();
+      g_tag.clear();
+    }
   }
   printf("%s: %d failed\n", g_fail ? "FAILED" : "all ok", g_fail);
   return g_fail ? 1 : 0;
