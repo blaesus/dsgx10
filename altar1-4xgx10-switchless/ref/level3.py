@@ -78,22 +78,26 @@ def main():
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
     r1, r2 = a.runs.split(",")
-    X = {r: R(a.altar, r) for r in (r1, r2)}
+    # an altar-1 run not finished yet (no final/argmax.npy) is left out, with the pairs that need it
+    X = {r: R(a.altar, r) for r in (r1, r2) if os.path.exists(os.path.join(a.altar, r, "final", "argmax.npy"))}
     Y = {r: R(a.glm, r) for r in (r1, r2)}
     res = {}
     hdr = f"{'seq':8s} {'pair':34s} {'argmax=':>8s} {'diff,in top5':>12s} {'diff,out':>9s} {'KL mean':>8s} {'median':>8s} {'p99':>7s} {'max':>7s}"
     print(hdr)
     for s in a.seqs.split(","):
         rs = {}
-        pairs = [(f"altar {r1} | glm {r1}", Y[r1], X[r1]), (f"altar {r2} | glm {r2}", Y[r2], X[r2]),
-                 (f"glm {r1} | glm {r2} (floor)", Y[r1], Y[r2]), (f"altar {r1} | altar {r2} (floor)", X[r1], X[r2])]
+        pairs = [(f"altar {r1} | glm {r1}", Y[r1], X.get(r1)), (f"altar {r2} | glm {r2}", Y[r2], X.get(r2)),
+                 (f"glm {r1} | glm {r2} (floor)", Y[r1], Y[r2]), (f"altar {r1} | altar {r2} (floor)", X.get(r1), X.get(r2)),
+                 (f"altar {r2} | glm {r1} (cross order)", Y[r1], X.get(r2)), (f"altar {r1} | glm {r2} (cross order)", Y[r2], X.get(r1))]
         for tag, A, B in pairs:   # KL(A ‖ B): the parent first
+            if A is None or B is None:
+                continue
             p = pair(A, B, s)
             rs[tag] = p
             print(f"{s:8s} {tag:34s} {p['argmax_agree']:8.4f} {p['differ_but_second_in_first_top5']:12.4f} "
                   f"{1 - p['argmax_agree'] - p['differ_but_second_in_first_top5']:9.4f} {p['kl_mean']:8.4f} "
                   f"{p['kl_median']:8.4f} {p['kl_p99']:7.3f} {p['kl_max']:7.3f}")
-        rs["own"] = {f"altar {r}": own(X[r], s) for r in (r1, r2)} | {f"glm {r}": own(Y[r], s) for r in (r1, r2)}
+        rs["own"] = {f"altar {r}": own(X[r], s) for r in X} | {f"glm {r}": own(Y[r], s) for r in (r1, r2)}
         print(f"{s:8s} top-1 vs next / mean log p: " + "  ".join(f"{k} {v['top1']:.3f} / {v['mean_logprob']:.3f}"
                                                               for k, v in rs["own"].items()))
         res[s] = rs
