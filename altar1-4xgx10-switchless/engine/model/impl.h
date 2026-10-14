@@ -37,28 +37,51 @@ T* halloc(size_t n) {  // pinned, mapped host memory
   return static_cast<T*>(p);
 }
 
-struct Fp8W {  // an FP8 weight in the attention GEMV's tiles and its f32 scales
-  const uint8_t* w = nullptr;
-  const float* s = nullptr;
+// A projection's weight: its format (attn.h WFmt: BF16 row-major, kBF16T or the INT4 tile; altar-1 has no FP8
+// weight), its bytes and the matrix's natural shape [n][k]. Bound per layer from the file's layouts (bind.cu): the
+// format is a property of the binding, never guessed (attn refuses a kNone segment).
+struct Proj {
+  ::glm::WFmt fmt = ::glm::WFmt::kNone;
+  const void* w = nullptr;
+  int n = 0, k = 0;
+  size_t bytes() const { return w ? ::glm::weight_bytes(fmt, (size_t)n, (size_t)k) : 0; }
+  // a GEMV / GEMM segment of this weight writing y (row stride ldy elements)
+  ::glm::GemvSeg seg(void* y, int ldy) const {
+    ::glm::GemvSeg s;
+    s.fmt = fmt, s.w = w, s.n = n, s.y = y, s.ldy = ldy;
+    return s;
+  }
 };
+// Per layer (docs/engine.md, "What the runner binds"): q_b, W_UV, o_proj INT4 tiles on layers 4-76 and BF16 on
+// 0-3, 77, 78; everything else BF16 (kBF16T as the converter writes it, or row-major); W_UK^T always BF16 (an INT4
+// layer's is the contract's exact dequantisation); the routed experts INT4 on 4-76 and BF16 on 3, 77, 78
+// (gx::LayerW::fmt, checked against every descriptor); the shared expert BF16 through attn's GEMV / GEMM (gate/up
+// interleaved with the SwiGLU epilogue, then down to f32 partials), outside the routed kernels.
 struct LayerW {
   const uint16_t *attn_norm = nullptr, *ffn_norm = nullptr, *q_norm = nullptr, *kv_norm = nullptr;
   const uint16_t *k_norm_w = nullptr, *k_norm_b = nullptr;  // full layers
-  Fp8W xproj, q_b, w_uk, w_uv, o_proj, iq_b;                 // iq_b: the indexer's wq_b (full layers)
-  const uint16_t* wproj = nullptr;                            // the indexer's weights_proj rows [8][6144]
-  Fp8W gate_up, down;                                         // dense layers 0-2
-  const uint16_t* router = nullptr;                           // MoE: BF16 [256][6144]
+  Proj xproj, q_b, w_uk, w_uv, o_proj, iq_b;                 // iq_b: the indexer's wq_b (full layers)
+  const uint16_t* wproj = nullptr;                            // the indexer's weights_proj rows [8][6144], row-major
+  Proj gate_up, down;                                         // dense layers 0-2: gate/up interleaved, down
+  Proj sh_gate_up, sh_down;                                   // MoE: the shared expert [1024][6144], [6144][512]
+  const uint16_t* router = nullptr;                           // MoE: BF16 [168][6144], row-major
   const float* router_bias = nullptr;
-  gx::LayerW moe{};                                           // MoE: the routed pool, descriptors, shared expert
+  gx::LayerW moe{};                                           // MoE: the routed pool, descriptors and format
+  double exp_bytes = 0;                                       // MoE: one routed expert's bytes (gate, up, down)
 };
-// An FP8 projection of M rows, the segments' y at row 0 (prefill.cu): attn's prefill gemm() in one launch when
-// use_gemm and M > 16 (each output the GEMV's bits at the same split-K, attn's test P), else 16-row GEMV launches.
+// A projection of M rows, the segments' y at row 0 (prefill.cu): attn's prefill gemm() in one launch when use_gemm
+// and M > 16 (each output the 16-row GEMV's bits at the same split-K, attn's test P; INT4 segments dequantised into
+// `scratch`, bf16 of at least the largest INT4 segment's n x k elements), else 16-row GEMV launches. Every segment
+// carries its format.
 void pf_proj(bool use_gemm, const uint16_t* x, int ldx, int M, int K, const ::glm::GemvSeg* segs, int nseg,
-             ::glm::GemvOut out, int splitk, cudaStream_t st, bool pdl);
+             ::glm::GemvOut out, int splitk, cudaStream_t st, bool pdl, uint16_t* scratch = nullptr,
+             size_t scratch_elems = 0);
+// The INT4 scratch prefill's GEMMs need: the largest INT4 projection, o_proj [6144][4096] (50.3 MB; attention.md § 8)
+inline constexpr size_t kInt4ScratchElems = (size_t)::glm::kDim * ::glm::kOProjK;
 
 struct MtpW {
   const uint16_t *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
-  Fp8W eh;  // [1536][12288] rows of this rank
+  Proj eh;  // [1536][12288] rows of this rank, BF16
 };
 
 // The next weights the step reads, for the paced L2 prefetch (l2pf.cu): a layer's tensors in read order.
@@ -77,10 +100,6 @@ struct PfState {  // device: how far a layer's windows got
 void l2pf_window(const PfTarget (&t)[kPfTargets], int layer, int window, float budget_us,
                  const unsigned long long* arrived, const unsigned long long* finished, PfState* state, cudaStream_t s);
 
-// o_proj [6144][4096] FP8 for rows <= 16 as the producer half of its all-reduce: the f32 partials straight into the
-// send buffer of the ring's next collective, posted (oproj.cu); then comm::glm::allreduce_add_norm_posted.
-void oproj_post(const uint16_t* x, int rows, const Fp8W& w, const comm::DevChannel& ch, cudaStream_t st, bool pdl);
-
 // Synthetic weights (bind.cu): allocations kept here so the model can free them.
 struct Synth;
 struct SynthFree {
@@ -97,14 +116,14 @@ struct Model::Impl {
   comm::DevChannel ch{};
   bool bound = false;
   size_t wbytes = 0;
-  double exp_bytes = 0;  // one routed expert's bytes a rank (gate, up, down of one MoE layer)
   bool l2pf_on = true;
   std::unique_ptr<detail::Synth, detail::SynthFree> synth;
 
   // weights
   detail::LayerW lw[kCacheLayers];
   detail::MtpW mtp;
-  const uint16_t *embed = nullptr, *head = nullptr, *norm_w = nullptr;
+  const uint16_t *embed = nullptr, *norm_w = nullptr;  // the embedding row-major [38720][6144] (a row lookup)
+  detail::Proj head;                                          // [38720][6144] BF16
   const uint32_t* rope = nullptr;
   int rope_positions = 0;
 
@@ -201,9 +220,16 @@ struct Model::Impl {
   ~Impl();
   void bind_common(comm::Ring& ring);
   void bind_file(glw::WeightFile& wf, const SynthOptions* fill);
-  void synth_pools(const SynthOptions& so, std::vector<const uint8_t*>& pools, std::vector<const gx::MatDesc*>& descs);
+  // synthetic routed-expert pools of format fmt (INT4 or BF16) in the kernels' layouts: SynthOptions::expert_pools
+  // of them (BF16: bf16_pools), a layer using pool i % n of its format's; returns an expert's bytes
+  struct SynthPools {
+    std::vector<const uint8_t*> pool;
+    std::vector<const gx::MatDesc*> desc;
+    double exp_bytes = 0;
+  };
+  SynthPools synth_pools(const SynthOptions& so, uint32_t fmt);
   bool synth_experts = false;
-  int real_expert_layers = 0;  // MoE layers bound to the file's routed experts  // a file's routed experts replaced by synthetic pools
+  int real_expert_layers = 0;  // MoE layers bound to the file's routed experts (the rest synthetic: fill_experts)
   void bind_synth(const SynthOptions& so);
 
   // ---- the decode step (model.cu) ----
