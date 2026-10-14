@@ -31,6 +31,6 @@ cmake --build "$TOP/build" -j4 --target altar1_rank > /dev/null
 cp "$TOP/build/server/altar1_rank" "$BIN/altar1_rank.new" && mv -f "$BIN/altar1_rank.new" "$BIN/altar1_rank"
 h=$(cat ./*.h ./*.cpp ../model/*.h ../model/*.cu ../attn/*.h ../attn/*.cu ../experts/*.h ../experts/*.cu ../comm/*.h \
   ../comm/*.cu ../comm/*.cpp ../weights/*.h ../weights/*.cpp | sha256sum | cut -c1-16)
-c=$(git rev-parse --short HEAD 2> /dev/null)$(git status --porcelain .. 2> /dev/null | grep -q . && echo +dirty)
+c=$(git rev-parse --short HEAD 2> /dev/null)$(git status --porcelain .. 2> /dev/null | grep -q . && echo +dirty || true)
 echo "sources sha256 $h, commit $c, built $(date '+%F %T %z')" > "$BIN/SOURCES"
 cat "$BIN/SOURCES"
