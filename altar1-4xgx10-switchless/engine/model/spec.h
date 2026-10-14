@@ -10,10 +10,11 @@
 namespace glm::model {
 
 // The modelled cost of a verify step of one session, ms: c1 for its first row with draft pass 1, drow for each row
-// more with its chained draft pass. The defaults are the 2026-10-14 measurements at split-K 16 (docs/engine.md).
+// more with its chained draft pass. The defaults are altar-1's fit of 2026-10-14 (the server's one-session step medians
+// at k 1-3 forced, split-K 16, synthetic weights in the real formats: docs/serving.md § 3.1); glm53's were 44.5, 15.5.
 struct SpecCost {
-  float c1 = 44.5f;
-  float drow = 15.5f;
+  float c1 = 52.4f;
+  float drow = 13.0f;
 };
 
 // Per session: p[j], an exponential average (1/8) of the acceptance of draft j + 1 given that the drafts before it were
