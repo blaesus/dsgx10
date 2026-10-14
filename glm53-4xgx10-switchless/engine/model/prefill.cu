@@ -259,8 +259,10 @@ void Model::Impl::prefill_chunk(int sl, int a, int M, const int32_t* tokens, boo
         s.y = qlat, s.ldy = kHeads * kKvLora, s.group_rows = kKvLora, s.x_group = kQkDim;
         pf_proj(G, p.q + (size_t)r0 * kOProjK, kOProjK, m, kNope, &s, 1, GemvOut::kBF16, 1, st, false);
       }
+      if (!tune(kTunePfAttn)) sparse_attn_config(0);
       sparse_attn(qlat, p.q + (size_t)r0 * kOProjK, p.pos + r0, p.slot + r0, rope, kv_of(l), p.topk + (size_t)r0 * kTopK,
                   m, 1, AttnScratch{}, u, st);
+      sparse_attn_config(-1);
       {
         GemvSeg s;
         s.w = w.w_uv.w, s.s = w.w_uv.s, s.n = kOProjK, s.rs = 64, s.ks = 128;

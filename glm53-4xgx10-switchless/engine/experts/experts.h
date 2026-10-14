@@ -114,6 +114,9 @@ struct PrefillCfg {
   float in_scale_gu = 1.f, in_scale_dn = 1.f;  // input_scale of gate/up and of down (fp4 only)
   bool shared = true;                          // run the shared expert
   int diag = 0;  // bench diagnostics of the gate/up kernel (wrong results): 1 no weights, 2 no MMAs, 4 no A loads
+  // the same for the chained down (down 1): 1, 2, 4 as diag, 8 no adds into yr, 16 no waits, 32 no yr loads, 64 no
+  // yr stores (bench_experts --diag, docs/experts.md section 12)
+  int ddiag = 0;
   // The routed down and combine (bf16 path): 1 (default) the chained down, which adds each pick's f32 sums
   // into yr in the row's expert-id order as its tile finishes (no per-pick buffer); 2 the same,
   // warp-specialised; 0 the kernels of 2026-10-13 (per-pick f32 sums to a buffer, then a combine). All give
@@ -122,6 +125,9 @@ struct PrefillCfg {
   // The routed gate/up (bf16 path): 1 (default) warp-specialised (8 MMA warps, 8 warps loading A and decoding
   // B), 2 the same with 4 MMA warps of 64 x 64 (slower), 0 the kernel of 2026-10-13. The same bits (tested).
   int up = 1;
+  // The shared expert's down: 128 (default) rows a CTA (k_pdown<true, 4>), or 64, that of 2026-10-14 (more FP8
+  // decodes a row). The same bits (tested).
+  int sh_rows = 128;
   int yr_kb = 0;               // chained down: the L2 budget of the yr columns in flight, KB (0: the default)
   int chain_q = 4;             // chained down: passes claimed round-robin (fewer waits, h re-read from L2)
   cudaStream_t side = nullptr;  // if set, the shared expert runs on it (forked and joined with events)

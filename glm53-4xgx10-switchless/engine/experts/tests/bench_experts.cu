@@ -1,9 +1,9 @@
 // Benchmarks of the routed-expert kernels on one GB10 (GPU: only through ring.sh).
 //   bench_experts --bw                                   the window's streaming read
 //   bench_experts --decode q4|s3|mix [--rows 1,2,4,6,8,16,6c] [--sweep] [--out f.tsv]
-//   bench_experts --prefill q4|s3|mix [--chunks 1024,4096,8192] [--fp4] [--down 0,1] [--yrkb 0] [--side 0] [--cq 4] [--up 0,1] [--diag]
+//   bench_experts --prefill q4|s3|mix [--chunks 1024,4096,8192] [--fp4] [--down 0,1] [--yrkb 0] [--side 0] [--cq 4] [--up 0,1] [--sh 128] [--diag]
 //                 [--out f.tsv]   (down: PrefillCfg::down variants; yrkb: chained-down L2 budgets, KB; side: the
-//                 shared expert on a second stream; cq: chained-down passes in flight; up: PrefillCfg::up variants; diag: the gate/up kernel with parts switched off)
+//                 shared expert on a second stream; cq: chained-down passes in flight; up: PrefillCfg::up variants; diag: the gate/up kernel and the chained down with parts switched off; sh: the shared down's rows a CTA)
 // Decode: a pool of >= 2.2 GB of experts in the format (random bits, valid scales) is cycled so L2 holds no
 // step's weights; each step routes its rows (logits that pick a chosen set) and runs the expert step; a CUDA
 // graph of whole steps, the median of 7 replays. Bytes = the union's weights and scales + the shared expert's.
@@ -325,6 +325,7 @@ static void bench_decode(const std::string& fname, const std::string& rows_s, bo
 
 struct PfOpts {
   std::string down = "0,1", yrkb = "0", side = "0", cq = "4", up = "0,1";
+  std::string sh = "128";  // the shared down's rows a CTA (PrefillCfg::sh_rows)
   bool diag = false;
 };
 void bench_prefill(const std::string& fname, const std::string& chunks, bool fp4, const PfOpts& o);  // bench_prefill.inc
@@ -343,6 +344,7 @@ int main(int argc, char** argv) {
     else if (a == "--sweep") sweep = true;
     else if (a == "--fp4") fp4 = true;
     else if (a == "--down" && i + 1 < argc) po.down = argv[++i];
+    else if (a == "--sh" && i + 1 < argc) po.sh = argv[++i];
     else if (a == "--yrkb" && i + 1 < argc) po.yrkb = argv[++i];
     else if (a == "--side" && i + 1 < argc) po.side = argv[++i];
     else if (a == "--cq" && i + 1 < argc) po.cq = argv[++i];

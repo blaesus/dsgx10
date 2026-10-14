@@ -1,7 +1,7 @@
 // Timings of engine/attn on one GB10 (this rank's shapes at TP=4). Weights and caches are cycled through pools
 // several times larger than L2 (24 MB), so every timed launch reads from DRAM, as a step's would. Each figure is
 // the median over replays of a CUDA graph of one pass over the pool, divided by the launches in it.
-// usage: bench_attn [--out FILE] [--only bw,gemv,index,attn,prefill,pgemm] [--ctx 32768,131072,262144]
+// usage: bench_attn [--out FILE] [--only bw,gemv,index,attn,prefill,pgemm,pattn] [--ctx 32768,131072,262144]
 #include <algorithm>
 #include <cstdarg>
 #include <random>
@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "attn/attn.h"
+#include "attn/attn_common.cuh"
 #include "testutil.h"
 
 using namespace glm;
@@ -483,10 +484,307 @@ void bench_prefill(const std::vector<int>& ctxs) {
   }
 }
 
+// ---- prefill attention at the runner's shape: a chunk of 8,192 rows at 24,576 over a 32,768-entry cache ------
+// The gather alone (cp.async of whole 64-key blocks into shared memory, CTAs persistent over the rows) and
+// sparse_attn, for three key patterns: "rand" (each row a sorted random 2048 of 0..p, as the indexer picks on random
+// data: the whole 37.7 MB cache in play, over L2's 24 MB), "win" (a random 2048 of the last 4,096 positions: 4.7 MB
+// in play) and "same" (every row the first row's set); and the dense rows (positions 0..2047).
+__global__ void k_gather(const uint16_t* cache, const int* topk, int rows, int kpi, int* sink) {
+  extern __shared__ __align__(16) uint8_t gsm[];
+  for (int r = blockIdx.x; r < rows; r += gridDim.x) {
+    const int* tk = topk + (size_t)r * kTopK;
+    for (int b = 0; b < kTopK; b += kpi) {
+      __syncthreads();
+      for (int i = threadIdx.x; i < kpi * (kLat / 8); i += blockDim.x) {
+        const int key = i / (kLat / 8), part = i % (kLat / 8);
+        glm::cp_async16(gsm + (size_t)i * 16, cache + (size_t)tk[b + key] * kLat + part * 8);
+      }
+      glm::cp_async_wait_all();
+      __syncthreads();
+    }
+  }
+  if (threadIdx.x == 0 && gsm[5] == 123 && gsm[77] == 1) sink[0] = 1;
+}
+
+// The gather alone as a ring of NS slots of 16 keys a CTA (one CTA an SM), each slot regathered the moment it lands:
+// the gather rate at NS x 18.4 KB in flight an SM. TMA: warp 0 alone, one bulk copy a key on the slot's mbarrier;
+// otherwise warp s owns slot s and gathers it with cp.async (36 pieces a lane), then waits for its own pieces.
+__device__ __forceinline__ uint32_t s32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+template <bool TMA>
+__global__ void k_gather_ring(const uint16_t* cache, const int* topk, int rows, int ns, int pfd, int* sink) {
+  extern __shared__ __align__(16) uint8_t gsm[];
+  uint64_t* bar = reinterpret_cast<uint64_t*>(gsm + (size_t)ns * 16 * kLat * 2);
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int per = (rows - blockIdx.x + gridDim.x - 1) / gridDim.x, total = per * (kTopK / 16);
+  auto src = [&](int n, int k) {
+    const int r = blockIdx.x + (n / (kTopK / 16)) * gridDim.x;
+    return cache + (size_t)topk[(size_t)r * kTopK + (n % (kTopK / 16)) * 16 + k] * kLat;
+  };
+  if (TMA) {
+    if (warp) return;
+    if (lane == 0)
+      for (int s = 0; s < ns; ++s) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(s32(bar + s)) : "memory");
+    __syncwarp();
+    auto issue = [&](int n) {
+      const int s = n % ns;
+      if (lane == 0) asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(s32(bar + s)), "r"(16 * kLat * 2) : "memory");
+      __syncwarp();
+      if (lane < 16)
+        asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                         s32(gsm + ((size_t)s * 16 + lane) * kLat * 2)), "l"(src(n, lane)), "r"(kLat * 2), "r"(s32(bar + s))
+                     : "memory");
+    };
+    for (int n = 0; n < ns && n < total; ++n) issue(n);
+    for (int n = 0; n < total; ++n) {
+      const uint32_t par = (n / ns) & 1;
+      asm volatile("{\n .reg .pred p;\n W_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra W_%=;\n}\n" ::"r"(
+                       s32(bar + n % ns)), "r"(par) : "memory");
+      if (n + ns < total) issue(n + ns);
+    }
+  } else {
+    if (warp >= ns) return;
+    for (int n = warp; n < total; n += ns) {
+      if (pfd && n + pfd < total)  // L2 prefetch of the slice pfd ahead: 16 keys x 9 lines of 128 bytes
+        for (int i = lane; i < 16 * 9; i += 32)
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(src(n + pfd, i / 9) + (i % 9) * 64));
+      for (int i = lane; i < 16 * (kLat / 8); i += 32)
+        glm::cp_async16(gsm + ((size_t)warp * 16 * kLat + (i / (kLat / 8)) * kLat + (i % (kLat / 8)) * 8) * 2,
+                        src(n, i / (kLat / 8)) + (i % (kLat / 8)) * 8);
+      glm::cp_async_wait_all();
+    }
+  }
+  if (threadIdx.x == 0 && gsm[5] == 123 && gsm[77] == 1) sink[0] = 1;
+}
+
+// a copy kernel to run beside the attention (as the ring's copies run beside the prefill's compute): blocks of 512
+// threads bouncing 16-byte words through shared memory, `iters` passes
+__global__ void __launch_bounds__(512) k_stress(int4* dst, const int4* src, size_t n, int iters) {
+  __shared__ int4 b[2048];
+  for (int it = 0; it < iters; ++it)
+    for (size_t i = blockIdx.x * (size_t)2048; i < n; i += (size_t)gridDim.x * 2048) {
+      for (int j = threadIdx.x; j < 2048; j += 512) b[j] = src[i + j];
+      __syncthreads();
+      for (int j = threadIdx.x; j < 2048; j += 512) dst[i + j] = b[(j + 512) & 2047];
+      __syncthreads();
+    }
+}
+
+__global__ void k_sleep(long long ns) {
+  const long long t0 = clock64();
+  while (clock64() - t0 < ns * 2) __nanosleep(1000);  // ~2 GHz
+}
+
+void bench_pstress() {
+  // the runner's first chunk shape (rows 0..2599 in two launches, a slot table) with copy kernels of 8 blocks on a
+  // second stream (low or high priority) arriving while the attention runs (after a sleeping kernel of d us): k_attn
+  // once alone, then k_attn and k_attn_pf beside the copies
+  const int M = 2600, P1 = 1344, T = 8192;
+  const size_t per = (size_t)T * kLat;
+  Dev<uint16_t> cache(per);
+  fill(cache.p, per * 2, 43, 1);
+  std::vector<uint32_t> rope_h((size_t)(T + 64) * 32, 0x3F80u);
+  Dev<uint32_t> rope(rope_h);
+  Dev<uint16_t> ql((size_t)M * kHeads * kKvLora), qa((size_t)M * kHeads * kQkDim), u((size_t)M * kHeads * kKvLora);
+  fill(ql.p, ql.n * 2, 53, 1);
+  fill(qa.p, qa.n * 2, 59, 1);
+  const size_t sn = (size_t)1 << 20;  // 16 MB each
+  Dev<int4> sa(sn), sb(sn);
+  std::vector<int> mp(M), ms(M, 1), mt((size_t)M * kTopK, -7);
+  std::mt19937 rng2(11);
+  std::uniform_real_distribution<double> U(0.0, 1.0);
+  for (int i = 0; i < M; ++i) {
+    mp[i] = i;
+    if (i < kTopK) continue;
+    int need = kTopK, left = i + 1, k = 0;
+    for (int v = 0; need > 0; ++v, --left)
+      if (U(rng2) * left < need) mt[(size_t)i * kTopK + k++] = v, --need;
+  }
+  Dev<int> dpos(mp), dslot(ms), dtk(mt);
+  KvCache kv;
+  kv.kv = cache.p;
+  kv.slot_stride = 4096;
+  int lo = 0, hi = 0;
+  CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+  cudaStream_t s1, s2[2];
+  CUDA_CHECK(cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking));
+  CUDA_CHECK(cudaStreamCreateWithPriority(&s2[0], cudaStreamNonBlocking, lo));
+  CUDA_CHECK(cudaStreamCreateWithPriority(&s2[1], cudaStreamNonBlocking, hi));
+  std::vector<uint16_t> ref;
+  auto run = [&](int cfg, int pri, int d) {
+    sparse_attn_config(cfg);
+    u.zero();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (d >= 0) {
+      k_sleep<<<1, 32, 0, s2[pri]>>>((long long)d * 1000);
+      for (int i = 0; i < 40; ++i) k_stress<<<8, 512, 0, s2[pri]>>>(sb.p, sa.p, sn, 1);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    for (int pc = 0; pc < 2; ++pc) {
+      const int a0 = pc ? P1 : 0, n = pc ? M - P1 : P1;
+      sparse_attn(ql.p + (size_t)a0 * kHeads * kKvLora, qa.p + (size_t)a0 * kHeads * kQkDim, dpos.p + a0, dslot.p + a0, rope.p,
+                  kv, dtk.p + (size_t)a0 * kTopK, n, 1, AttnScratch{}, u.p + (size_t)a0 * kHeads * kKvLora, s1);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return u.down((size_t)M * kHeads * kKvLora);
+  };
+  ref = run(0, 0, -1);
+  for (int pri : {0, 1})
+    for (int cfg : {0, -1}) {
+      int same = 0, runs = 0;
+      for (int d : {0, 200, 500, 1000, 2000, 3000})
+        for (int rep = 0; rep < 2; ++rep) {
+          const std::vector<uint16_t> got = run(cfg, pri, d);
+          ++runs;
+          if (got == ref) { ++same; continue; }
+          size_t first = 0, nd = 0, last = 0;
+          for (size_t i = 0; i < got.size(); ++i)
+            if (got[i] != ref[i]) { if (!nd) first = i; last = i; ++nd; }
+          result("pstress\t%s %s priority, copies after %d us: %zu values differ, rows %zu..%zu (head %zu dim %zu first)",
+                 cfg ? "k_attn_pf" : "k_attn", pri ? "high" : "low", d, nd, first / (kHeads * kKvLora), last / (kHeads * kKvLora),
+                 first / kKvLora % kHeads, first % kKvLora);
+        }
+      result("pstress\t%s beside 40 copy kernels of 8 blocks (%s priority): the same bits as k_attn alone in %d of %d runs",
+             cfg ? "k_attn_pf" : "k_attn", pri ? "high" : "low", same, runs);
+    }
+  sparse_attn_config(-1);
+  CUDA_CHECK(cudaStreamDestroy(s1));
+  CUDA_CHECK(cudaStreamDestroy(s2[0]));
+  CUDA_CHECK(cudaStreamDestroy(s2[1]));
+}
+
+void bench_pattn() {
+  const int T = 32768, R = 8192, P0 = T - R;
+  const size_t per = (size_t)T * kLat;
+  Dev<uint16_t> cache(per);
+  fill(cache.p, per * 2, 43, 1);
+  std::vector<uint32_t> rope_h((size_t)(T + 64) * 32, 0x3F80u);
+  Dev<uint32_t> rope(rope_h);
+  Dev<uint16_t> ql((size_t)R * kHeads * kKvLora), qa((size_t)R * kHeads * kQkDim), u((size_t)R * kHeads * kKvLora);
+  fill(ql.p, ql.n * 2, 53, 1);
+  fill(qa.p, qa.n * 2, 59, 1);
+  Dev<int> sink(1);
+  std::mt19937 rng(7);
+  std::vector<int> hp(R), ht((size_t)R * kTopK);
+  for (int i = 0; i < R; ++i) hp[i] = P0 + i;
+  Dev<int> pos(hp);
+  const double flops = 2.0 * R * kTopK * kHeads * (kLat + kKvLora), bytes = (double)R * kTopK * kLat * 2;
+  for (const char* pat : {"rand", "win", "same"}) {
+    for (int i = 0; i < R; ++i) {
+      int* d = ht.data() + (size_t)i * kTopK;
+      const std::string p(pat);
+      if (p == "same" && i > 0) { std::copy(ht.begin(), ht.begin() + kTopK, d); continue; }
+      const int lo = p == "win" ? hp[i] - 4095 : 0;
+      // selection sampling (Knuth's algorithm S): kTopK of [lo, p], ascending
+      int need = kTopK, left = hp[i] + 1 - lo, k = 0;
+      std::uniform_real_distribution<double> U(0.0, 1.0);
+      for (int v = lo; need > 0; ++v, --left)
+        if (U(rng) * left < need) d[k++] = v, --need;
+    }
+    Dev<int> tk(ht);
+    KvCache kv;
+    kv.kv = cache.p;
+    std::vector<uint16_t> ref;
+    for (int cfg : {0, -1, 0, -1}) {  // k_attn at one split, k_attn_pf; A B A B
+      sparse_attn_config(cfg);
+      u.zero();
+      const double aus = time_graph(1, [&](int, cudaStream_t s) {
+        sparse_attn(ql.p, qa.p, pos.p, nullptr, rope.p, kv, tk.p, R, 1, AttnScratch{}, u.p, s);
+      }, 3);
+      const std::vector<uint16_t> got = u.down();
+      if (ref.empty()) ref = got;
+      result("pattn\t%s\tsparse_attn %s %d rows at %d\t%.2f ms\t(%.1f TFLOPS, %.0f GB/s of entries gathered)\t%s", pat,
+             cfg ? "k_attn_pf" : "k_attn", R, P0, aus / 1e3, flops / aus / 1e6, bytes / aus / 1e3,
+             got == ref ? "bits = k_attn" : "BITS DIFFER");
+    }
+    sparse_attn_config(-1);
+    for (int ns : {4}) {
+      const size_t sm = (size_t)ns * 16 * kLat * 2 + 64;
+      CUDA_CHECK(cudaFuncSetAttribute(k_gather_ring<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm));
+      CUDA_CHECK(cudaFuncSetAttribute(k_gather_ring<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm));
+      const double t1 = time_graph(1, [&](int, cudaStream_t s) { k_gather_ring<true><<<48, 32, sm, s>>>(cache.p, tk.p, R, ns, 0, sink.p); }, 3);
+      const double t2 = time_graph(1, [&](int, cudaStream_t s) { k_gather_ring<false><<<48, 32 * ns, sm, s>>>(cache.p, tk.p, R, ns, 0, sink.p); }, 3);
+      result("pattn\t%s\tgather ring of %d slots of 16 keys, 48 CTAs: bulk copies %.2f ms (%.0f GB/s), cp.async %.2f ms (%.0f GB/s)", pat, ns,
+             t1 / 1e3, bytes / t1 / 1e3, t2 / 1e3, bytes / t2 / 1e3);
+    }
+    for (int cfg = 0; cfg < (std::string(pat) == "rand" ? 3 : 0); ++cfg) {
+      const int kpi = 64 >> cfg, ctas = 48 << cfg;
+      const size_t sm = (size_t)kpi * kLat * 2;
+      CUDA_CHECK(cudaFuncSetAttribute(k_gather, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm));
+      const double gus = time_graph(1, [&](int, cudaStream_t s) {
+        k_gather<<<ctas, 128, sm, s>>>(cache.p, tk.p, R, kpi, sink.p);
+      }, 3);
+      result("pattn\t%s\tgather only, %d keys a step, %d CTAs of 128\t%.2f ms\t(%.0f GB/s)", pat, kpi, ctas, gus / 1e3, bytes / gus / 1e3);
+    }
+  }
+  {  // dense rows 0..2047
+    std::vector<int> dp(2048);
+    for (int i = 0; i < 2048; ++i) dp[i] = i;
+    Dev<int> dpos(dp);
+    KvCache kv;
+    kv.kv = cache.p;
+    std::vector<uint16_t> ref;
+    for (int cfg : {0, -1, 0, -1}) {
+      sparse_attn_config(cfg);
+      u.zero();
+      const double aus = time_graph(1, [&](int, cudaStream_t s) {
+        sparse_attn(ql.p, qa.p, dpos.p, nullptr, rope.p, kv, nullptr, 2048, 1, AttnScratch{}, u.p, s);
+      }, 3);
+      const std::vector<uint16_t> got = u.down((size_t)2048 * kHeads * kKvLora);
+      if (ref.empty()) ref = got;
+      const double df = 2.0 * (2048.0 * 2049 / 2) * kHeads * (kLat + kKvLora);
+      result("pattn\tdense\tsparse_attn %s rows 0..2047\t%.2f ms\t(%.1f TFLOPS of the causal work)\t%s",
+             cfg ? "k_attn_pf" : "k_attn", aus / 1e3, df / aus / 1e6, got == ref ? "bits = k_attn" : "BITS DIFFER");
+    }
+    sparse_attn_config(-1);
+  }
+  {  // the runner's first chunk: rows 0..2599 (dense below 2048, then random selections), a slot table, in two
+     // launches as the two pieces (0..1343, 1344..2599); k_attn once, then k_attn_pf 6 times: the same bits each time?
+    const int M = 2600, P1 = 1344;
+    std::vector<int> mp(M), ms(M, 1), mt((size_t)M * kTopK, -7);
+    std::mt19937 rng2(11);
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    for (int i = 0; i < M; ++i) {
+      mp[i] = i;
+      if (i < kTopK) continue;
+      int need = kTopK, left = i + 1, k = 0;
+      for (int v = 0; need > 0; ++v, --left)
+        if (U(rng2) * left < need) mt[(size_t)i * kTopK + k++] = v, --need;
+    }
+    Dev<int> dpos(mp), dslot(ms), dtk(mt);
+    KvCache kv;
+    kv.kv = cache.p;
+    kv.slot_stride = 4096;  // slot 1 at entries 4096..
+    std::vector<uint16_t> ref;
+    int same = 0;
+    for (int it = 0; it < 7; ++it) {
+      sparse_attn_config(it ? -1 : 0);
+      u.zero();
+      for (int pc = 0; pc < 2; ++pc) {
+        const int a0 = pc ? P1 : 0, n = pc ? M - P1 : P1;
+        sparse_attn(ql.p + (size_t)a0 * kHeads * kKvLora, qa.p + (size_t)a0 * kHeads * kQkDim, dpos.p + a0, dslot.p + a0, rope.p,
+                    kv, dtk.p + (size_t)a0 * kTopK, n, 1, AttnScratch{}, u.p + (size_t)a0 * kHeads * kKvLora, 0);
+      }
+      CUDA_CHECK(cudaDeviceSynchronize());
+      const std::vector<uint16_t> got = u.down((size_t)M * kHeads * kKvLora);
+      if (ref.empty()) ref = got;
+      else if (got == ref) ++same;
+      else {
+        size_t first = 0, nd = 0;
+        for (size_t i = 0; i < got.size(); ++i)
+          if (got[i] != ref[i]) { if (!nd) first = i; ++nd; }
+        result("pattn\tchunk0\trun %d: %zu values differ, the first at row %zu head %zu dim %zu", it, nd, first / (kHeads * kKvLora),
+               first / kKvLora % kHeads, first % kKvLora);
+      }
+    }
+    sparse_attn_config(-1);
+    result("pattn\tchunk0\tk_attn_pf = k_attn in %d of 6 runs (rows 0..2599 in two launches, a slot table)", same);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string only = "bw,gemv,index,attn,prefill,pgemm", out;
+  std::string only = "bw,gemv,index,attn,prefill,pgemm", out;  // pattn: only when asked
   std::vector<int> ctxs = {32768, 131072, 262144};
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -497,18 +795,20 @@ int main(int argc, char** argv) {
       std::string s = argv[++i];
       size_t p = 0;
       while (p < s.size()) { ctxs.push_back(std::stoi(s.substr(p))); p = s.find(',', p); if (p == std::string::npos) break; ++p; }
-    } else die("usage: bench_attn [--out FILE] [--only bw,gemv,index,attn,prefill,pgemm] [--ctx a,b,c]");
+    } else die("usage: bench_attn [--out FILE] [--only bw,gemv,index,attn,prefill,pgemm,pattn] [--ctx a,b,c]");
   }
   if (!out.empty()) g_out = fopen(out.c_str(), "a");
   cudaDeviceProp pr;
   CUDA_CHECK(cudaGetDeviceProperties(&pr, 0));
   result("device\t%s\t%d SMs\tsmem/block optin %zu", pr.name, pr.multiProcessorCount, pr.sharedMemPerBlockOptin);
-  auto want = [&](const char* k) { return only.find(k) != std::string::npos; };
+  auto want = [&](const char* k) { return ("," + only + ",").find("," + std::string(k) + ",") != std::string::npos; };
   if (want("bw")) bench_bw();
   if (want("gemv")) bench_gemv();
   if (want("index")) bench_index(ctxs);
   if (want("attn")) bench_attn(ctxs);
   if (want("prefill")) bench_prefill(ctxs);
   if (want("pgemm")) bench_pgemm();
+  if (want("pattn")) bench_pattn();
+  if (want("pstress")) bench_pstress();
   return 0;
 }

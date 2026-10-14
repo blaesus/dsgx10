@@ -165,6 +165,7 @@ void test_prefill() {
       PrefillCfg c0;
       c0.down = 0;
       c0.up = 0;
+      c0.sh_rows = 64;  // and the shared down at 64-row tiles
       const PrefillOut r = run_prefill(L, dx, di, dw, T, ws, dyr, dys, c0);
       // h by row and pick (bucket positions come from atomics and differ between calls)
       const auto h0 = d2h(prefill_view(ws, T).h, (size_t)T * kTopK * kI);

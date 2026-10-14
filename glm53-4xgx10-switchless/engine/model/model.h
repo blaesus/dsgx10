@@ -112,7 +112,10 @@ enum Tune : uint32_t {
   // prefill: a chunk's rows in Options::prefill_pieces pieces, each piece's collectives on a stream of their own
   // while the next piece computes (prefill.cu, docs/engine.md "Prefill overlap")
   kTunePfOverlap = 1u << 7,
-  kTuneDefault = kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter | kTunePfOverlap,
+  // prefill: sparse_attn's pipelined unsplit kernel (attn's k_attn_pf; off: k_attn at one split; the same bits)
+  kTunePfAttn = 1u << 8,
+  kTuneDefault =
+      kTuneRoute | kTunePost | kTuneIw | kTuneArRow | kTunePfGemm | kTunePfRouter | kTunePfOverlap | kTunePfAttn,
   kTuneAll = 0xffffffffu,
 };
 
@@ -134,7 +137,7 @@ struct Options {
   int prefill_rows = 8192;  // rows a prefill chunk, at most (<= kMaxChunk)
   int prefill_pieces = 2;   // kTunePfOverlap: pieces a chunk (1-8), each of a multiple of 64 rows (2: measured best)
   int prefill_min_piece = 512;  // kTunePfOverlap: rows of a piece at least (chunks of fewer than twice that: one piece)
-  int prefill_comm_blocks = 8;  // kTunePfOverlap: blocks of the overlapped reduce-scatters and all-gathers (1-16)
+  int prefill_comm_blocks = 4;  // kTunePfOverlap: blocks of the overlapped reduce-scatters and all-gathers (1-16; T6: 4)
   int attn_splits = 0;   // sparse attention's split-K at decode (0: 16 up to 2 rows, 8 above)
   size_t index_scratch = 512ull << 20;  // the prefill indexer's score scratch, bytes
 };

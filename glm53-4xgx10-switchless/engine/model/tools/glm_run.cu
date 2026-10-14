@@ -372,6 +372,7 @@ void prefill_ab(Model& m, comm::Ring& ring) {
     for (int j = 0; j < C; ++j) tok[j] = synth_token(A.seed + 3, at + j);
     double ms[2][2] = {};
     uint64_t h[2][2] = {};
+    std::vector<uint64_t> lh[4];  // per layer, each run
     for (int q = 0; q < 4; ++q) {  // A B B A
       const int k = (q == 1 || q == 2) ? 1 : 0, o = q / 2;
       m.set_tune(cfg[k]);
@@ -383,6 +384,7 @@ void prefill_ab(Model& m, comm::Ring& ring) {
       const float v = so.row[0].value;
       ms[k][o] = m.prefill_ms();
       const std::vector<uint64_t> c = m.cache_hashes(0, at + C);
+      lh[q] = c;
       uint64_t x = fnv(c.data(), c.size() * 8);
       x = fnv(&t, 4, x), x = fnv(&v, 4, x);
       h[k][o] = x;
@@ -399,6 +401,15 @@ void prefill_ab(Model& m, comm::Ring& ring) {
     check(rk, h[0][0] == h[0][1] && h[1][0] == h[1][1] && h[0][0] == h[1][0] && ranks,
           "pfab chunk %d at %d: A and B the same bits (caches of positions 0-%d, the last row's sample; hash %016llx), "
           "every rank the same", C, at, at + C - 1, (unsigned long long)h[1][0]);
+    if (!(h[0][0] == h[0][1] && h[1][0] == h[1][1] && h[0][0] == h[1][0])) {
+      int fl[4] = {-1, -1, -1, -1};  // each run's first cache layer that differs from run 0's (-1: none)
+      for (int q = 1; q < 4; ++q)
+        for (size_t l = 0; l < lh[q].size(); ++l)
+          if (lh[q][l] != lh[0][l]) { fl[q] = (int)l; break; }
+      record(rk, "pfab\tchunk %d\tat %d\thashes A %016llx %016llx B %016llx %016llx\tfirst layer differing from run 0: %d %d %d", C,
+             at, (unsigned long long)h[0][0], (unsigned long long)h[0][1], (unsigned long long)h[1][0],
+             (unsigned long long)h[1][1], fl[1], fl[2], fl[3]);
+    }
   }
   m.set_tune(A.mo.tune);
 }
