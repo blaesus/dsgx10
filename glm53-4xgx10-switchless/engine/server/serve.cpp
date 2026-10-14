@@ -319,6 +319,7 @@ struct Session {
   std::vector<int32_t> disk;  // its pages in the disk tier when spilled
   uint64_t used = 0;          // LRU clock
   double t_used = 0;          // unix time of its last request (kept sessions age out by it)
+  model::SpecGate gate;       // its drafts' acceptance (spec_loop), in memory only: a kept session starts afresh
 };
 
 // The server's index of a planned stop's kept sessions: a header, then each session: id, LRU clock and time,
@@ -349,6 +350,9 @@ struct Flight {
   int q = 0;  // the reused positions (DONE's cached tokens)
   double t_start = 0, t_first = 0, dec_s = 0;
   int decoded = 0, runs = 0, batched = 0;
+  // the MTP's drafts of the tokens after out.back() (the prefill's last step or the last verify step drafted them)
+  std::vector<int32_t> drafts;
+  long steps = 0, verified = 0, accepted = 0;  // its verify steps, drafts fed, drafts accepted
 };
 
 enum Go { kGoDecode, kGoDone, kGoWait };
@@ -782,6 +786,7 @@ class Server {
     const int32_t tok0 = first.row[0].token;
     tokens(f.rq, first, 0);
     f.out.push_back(tok0);
+    f.drafts.assign(first.draft[0], first.draft[0] + std::clamp(first.drafts, 0, model::kMaxDrafts));
     if (stop_id(f, tok0)) return ended(f, fe::kStop);
     if ((int)f.out.size() >= (int)h.max_new_tokens) return ended(f, fe::kLength);
     return kGoDecode;
@@ -815,7 +820,8 @@ class Server {
         finish(f, fe::kContext);
         continue;
       }
-      if (!place(f.rq.h.session_id, pos + 2 + std::min(left, o_.grow), {})) {
+      // with drafts, room for a verify step's rows and its chained passes past them (spec_loop shortens them anyway)
+      if (!place(f.rq.h.session_id, pos + 2 + 2 * g_spec.kmax + std::min(left, o_.grow), {})) {
         finish(f, fe::kContext, "the KV pool is full (sessions in flight hold it)");
         continue;
       }
@@ -836,9 +842,22 @@ class Server {
       x.n_stop = (int)f.rq.stop.size();
       std::copy(f.rq.stop.begin(), f.rq.stop.end(), x.stop);
       x.sp = f.sp;
+      x.n_draft = (int)std::min<size_t>(f.drafts.size(), model::kMaxDrafts);
+      std::copy(f.drafts.begin(), f.drafts.begin() + x.n_draft, x.draft);
+      x.gate = S.gate;
+      if (g_spec.oracle) {  // tests: the tokens after out.back() as the same request gave them before
+        const auto it = oracle_.find(oracle_key(f));
+        if (it != oracle_.end() && it->second.size() > f.out.size()) {
+          x.n_oracle = (int)std::min<size_t>(it->second.size() - f.out.size(), kMaxOracle);
+          std::copy(it->second.begin() + (std::ptrdiff_t)f.out.size(),
+                    it->second.begin() + (std::ptrdiff_t)f.out.size() + x.n_oracle, x.oracle);
+        }
+      }
     }
+    const bool spec = g_spec.kmax > 0;
     Cmd c{};
     c.op = kCmdBatch;
+    c.flags = spec ? kBatchSpec : 0;
     c.n = n;
     const double t_dec = now_s();
     issue(c);
@@ -863,7 +882,8 @@ class Server {
       if (!(ctl & kCtlPause) && (io_.submit_waiting() || (ends && !wait_.empty()))) m_.set_ctl(ctl |= kCtlPause);
     };
     std::vector<double> st;
-    const std::vector<BatchEnd> end = batch_loop(m_, e, wd_, cb, &st);
+    const std::vector<BatchEnd> end =
+        spec ? spec_loop(m_, e, wd_, cb, g_spec, &st) : batch_loop(m_, e, wd_, cb, &st);
     if (ctl) m_.set_ctl(0);
     const double dt = now_s() - t_dec;
     std::vector<uint32_t> why(n);
@@ -872,6 +892,8 @@ class Server {
       const BatchEnd& x = end[k];
       Session& S = sess_.at(f.rq.h.session_id);
       f.dec_s += dt, f.decoded += x.sampled, ++f.runs;
+      f.steps += x.steps, f.verified += x.verified, f.accepted += x.accepted;
+      if (spec) S.gate = x.gate, f.drafts.assign(x.draft, x.draft + x.n_draft);
       if (n > 1) f.batched += x.sampled;
       if (x.fed > 0) {  // the history: the token it started from, and the samples fed after it
         S.hist.push_back(e[k].token);
@@ -888,8 +910,10 @@ class Server {
     std::vector<double> d;
     for (size_t i = 1; i < st.size(); ++i) d.push_back(1e3 * (st[i] - st[i - 1]));
     std::sort(d.begin(), d.end());
-    std::printf("serve: run of %d: %zu steps in %.1f ms, %.2f ms a step (median)\n", n, st.size(), 1e3 * dt,
-                d.empty() ? 0.0 : d[d.size() / 2]);
+    long tok = 0;
+    for (const BatchEnd& x : end) tok += x.sampled;
+    std::printf("serve: run of %d: %zu steps in %.1f ms, %.2f ms a step (median), %ld tokens (%.2f a step)\n", n,
+                st.size(), 1e3 * dt, d.empty() ? 0.0 : d[d.size() / 2], tok, st.empty() ? 0.0 : (double)tok / st.size());
     std::vector<Flight> paused;
     for (int k = 0; k < n; ++k) {
       if (why[k] == kPaused || why[k] == kGrow) paused.push_back(std::move(fl[k]));
@@ -932,17 +956,29 @@ class Server {
     while (!wait_.empty()) ready_.push_back(std::move(wait_.front())), wait_.pop_front();
   }
 
+  // tests (--spec-oracle): a request's tokens by its prompt and sampling, for the next identical request's drafts
+  std::map<uint64_t, std::vector<int32_t>> oracle_;
+  static uint64_t oracle_key(const Flight& f) {
+    uint64_t h = keepfile::fnv(f.rq.prompt.data(), f.rq.prompt.size() * 4);
+    const model::Sampling& s = f.sp;
+    const uint64_t v[4] = {s.temperature > 0 ? s.seed : 0, (uint64_t)s.top_k, (uint64_t)s.n_top, (uint64_t)f.rq.h.max_new_tokens};
+    const float w[2] = {s.temperature, s.top_p};
+    return keepfile::fnv(w, sizeof w, keepfile::fnv(v, sizeof v, h));
+  }
+
   void finish(Flight& f, uint32_t why, const std::string& err = "") {
     const fe::SubmitHeader& h = f.rq.h;
+    if (g_spec.oracle && err.empty() && (why == fe::kStop || why == fe::kLength)) oracle_[oracle_key(f)] = f.out;
     done(f.rq, err.empty() ? why : fe::kError, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first, err);
     Io::forget(f.rq);
     const auto it = sess_.find(h.session_id);
     const double pf = f.t_first > 0 ? f.t_first - f.t_start : 0;
     std::printf("serve: req %llu session %016llx: prompt %u, reused %d, prefill %.1f ms (%.0f tok/s), %zu tokens, "
-                "decode %.1f tok/s, %d runs (%d tokens in batches), %s; session %zu positions; pool %d of %zu pages free\n",
+                "decode %.1f tok/s, %d runs (%d tokens in batches), drafts %ld of %ld accepted in %ld steps, %s; session %zu "
+                "positions; pool %d of %zu pages free\n",
                 (unsigned long long)h.req_id, (unsigned long long)h.session_id, h.n_prompt, f.q, 1e3 * pf,
                 (h.n_prompt - f.q) / std::max(1e-9, pf), f.out.size(), f.decoded / std::max(1e-9, f.dec_s), f.runs,
-                f.batched,
+                f.batched, f.accepted, f.verified, f.steps,
                 why == fe::kStop ? "stop" : why == fe::kLength ? "length" : why == fe::kCancelled ? "cancelled" : "context",
                 it == sess_.end() ? (size_t)0 : it->second.hist.size(), free_pages(), own_.size());
     std::fflush(stdout);

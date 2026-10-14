@@ -15,6 +15,8 @@
 
 namespace srv {
 
+SpecConf g_spec;
+
 double now_s() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -170,6 +172,123 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const std::vector<BatchEntry>&
   return end;
 }
 
+std::vector<BatchEnd> spec_loop(model::Model& m, const std::vector<BatchEntry>& e, Watchdog& wd, const OnBatch& on,
+                                const SpecConf& sc, std::vector<double>* step_t) {
+  const int kmax = sc.kmax;
+  const model::SpecCost& cost = sc.cost;
+  const int n = (int)e.size();
+  if (kmax < 1 || kmax > m.options().drafts) die("spec_loop: kmax %d, the model drafts %d", kmax, m.options().drafts);
+  std::vector<BatchEnd> end(n);
+  std::vector<int> pos(n), fed(n, 0);
+  std::vector<int32_t> x(n);
+  std::vector<std::vector<int32_t>> D(n);
+  std::vector<char> live(n, 1);
+  std::vector<int> feed, fpos(n, 0);  // entries whose last token a final step feeds, at fpos
+  std::vector<int32_t> last(n, 0);
+  for (int k = 0; k < n; ++k) {
+    pos[k] = e[k].pos0, x[k] = e[k].token;
+    D[k].assign(e[k].draft, e[k].draft + std::clamp(e[k].n_draft, 0, model::kMaxDrafts));
+    end[k].gate = e[k].gate;
+    end[k].gate.kmax = kmax;
+    if (e[k].max_new < 1) live[k] = 0, end[k].why = kEndLength;
+    else if (pos[k] >= e[k].limit) live[k] = 0, end[k].why = kEndContext;
+  }
+  for (;;) {
+    model::Batch b;
+    b.spec = 1;
+    int first[model::kMaxSess], kk[model::kMaxSess], ent[model::kMaxSess];
+    int ns = 0, left = 0;
+    for (int k = 0; k < n; ++k) left += live[k];
+    for (int k = 0; k < n; ++k) {
+      if (!live[k]) continue;
+      --left;
+      if (e[k].n_oracle > 0) {  // tests: the earlier request's next tokens, about one in four changed
+        const int j0 = end[k].sampled;  // tok_{j0 + 1} follows x
+        D[k].clear();
+        for (int r = 1; r <= kmax && j0 + r - 1 < e[k].n_oracle; ++r) {
+          int32_t t = e[k].oracle[j0 + r - 1];
+          if (model::oracle_changed((uint32_t)(j0 + r))) t = (t + 1) % model::kVocabUsed;
+          D[k].push_back(t);
+        }
+      }
+      int kj = sc.force > 0 ? std::min(sc.force, (int)D[k].size()) : end[k].gate.choose(cost, (int)D[k].size());
+      // up to max_new - sampled: the last row then feeds the request's last token when the drafts before it hold
+      kj = std::min({kj, e[k].limit - 1 - pos[k], e[k].max_new - end[k].sampled, model::kMaxRows - b.R - 1 - left});
+      kj = std::max(kj, 0);
+      first[ns] = b.R, kk[ns] = kj, ent[ns] = k;
+      for (int r = 0; r <= kj; ++r) {
+        b.tokens[b.R] = r == 0 ? x[k] : D[k][r - 1];
+        b.pos[b.R] = pos[k] + r, b.slot[b.R] = e[k].slot, b.sess[b.R] = ns;
+        ++b.R;
+      }
+      b.sp[ns++] = e[k].sp;
+    }
+    if (!ns) break;
+    b.nsess = ns;
+    // the next step's drafts: as many as any gate may want, within every entry's pages
+    int passes = 1;
+    for (int s = 0; s < ns; ++s) passes = std::max(passes, sc.force > 0 ? sc.force : end[ent[s]].gate.choose(cost, kmax));
+    for (int s = 0; s < ns; ++s) passes = std::min(passes, e[ent[s]].limit - pos[ent[s]] - kk[s]);
+    b.passes = std::max(passes, 1);
+    wd.started = now_s();
+    const model::SampleOut& o = m.wait(m.launch(b));
+    wd.started = 0;
+    if (step_t) step_t->push_back(now_s());
+    for (int s = 0; s < ns; ++s) {
+      const int k = ent[s], c0 = first[s], a = o.accepted[s];
+      BatchEnd& z = end[k];
+      if (a < 0 || a > kk[s]) die("spec_loop: entry %d accepted %d of %d drafts", k, a, kk[s]);
+      z.gate.update(kk[s], a, kk[s] == 0 && !D[k].empty() ? (int)(D[k][0] == o.row[c0].token) : -1);
+      ++z.steps, z.verified += kk[s], z.accepted += a;
+      const int p0 = pos[k];  // row 0's position; fed == sampled here
+      fed[k] += a + 1, pos[k] += a + 1;
+      bool ended = false;
+      int i = 0;
+      for (; i <= a && !ended; ++i) {
+        const int32_t t = o.row[c0 + i].token;
+        if (on) on(k, o, c0 + i);
+        ++z.sampled;
+        if (std::find(e[k].stop, e[k].stop + e[k].n_stop, t) != e[k].stop + e[k].n_stop) z.why = kEndStop, ended = true;
+        else if (z.sampled >= e[k].max_new) z.why = kEndLength, ended = true;
+      }
+      if (ended) {  // batch_loop's queued row feeds the last token: here row i (when its draft held) or a step below
+        if (i <= a) fed[k] = z.sampled + 1;
+        else if (p0 + a + 1 < e[k].limit) feed.push_back(k), last[k] = o.row[c0 + a].token, fpos[k] = p0 + a + 1;
+      } else {
+        x[k] = o.row[c0 + a].token;
+        D[k].assign(o.draft[s], o.draft[s] + o.drafts);
+        if (k < 31 && (o.ctl & (1u << k))) {
+          z.why = kEndCancel, ended = true;
+          if (pos[k] < e[k].limit) feed.push_back(k), last[k] = x[k], fpos[k] = pos[k];
+        }
+        else if (o.ctl & kCtlPause) z.why = kEndPause, ended = true;
+        else if (pos[k] >= e[k].limit) z.why = kEndContext, ended = true;
+        if (ended) {
+          z.n_draft = (int)D[k].size();
+          std::copy(D[k].begin(), D[k].end(), z.draft);
+        }
+      }
+      if (ended) live[k] = 0, z.fed = std::min(fed[k], z.sampled + 1);
+    }
+  }
+  // the entries that ended (stop, length, cancel) on a token no row fed yet: one more step feeds it, as batch_loop's
+  // queued row does (its sample unused), so that the session's caches and history are batch_loop's
+  if (!feed.empty()) {
+    model::Batch b;
+    b.spec = 1, b.passes = 1;
+    for (const int k : feed) {
+      const int r = b.R++;
+      b.tokens[r] = last[k], b.pos[r] = fpos[k], b.slot[r] = e[k].slot, b.sess[r] = r, b.sp[r] = e[k].sp;
+    }
+    b.nsess = b.R;
+    wd.started = now_s();
+    m.wait(m.launch(b));
+    wd.started = 0;
+    for (const int k : feed) end[k].fed = end[k].sampled + 1;
+  }
+  return end;
+}
+
 void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, Disk* disk, uint64_t run_id) {
   (void)run_id;
   const int rank = ring.rank();
@@ -188,7 +307,8 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, Disk* disk, uint64_
     } else if (c.op == kCmdBatch) {
       std::vector<BatchEntry> e(c.n);
       bcast_payload(ring, e.data(), e.size() * sizeof(BatchEntry), rank);
-      batch_loop(m, e, wd, nullptr);
+      if (c.flags & kBatchSpec) spec_loop(m, e, wd, nullptr, g_spec);
+      else batch_loop(m, e, wd, nullptr);
     } else if (c.op == kCmdSpill || c.op == kCmdUnspill) {
       std::vector<int32_t> p(c.n);
       bcast_payload(ring, p.data(), p.size() * 4, rank);

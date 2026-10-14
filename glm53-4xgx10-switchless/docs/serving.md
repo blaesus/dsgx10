@@ -63,10 +63,43 @@ or pages in the disk tier when spilled, or nothing.
   waits for one of them to end.
 - A session that reaches the end of its pages before `--max-ctx` is given more (`--grow`, 1,024 positions beyond
   its need) and requeued, without losing a token.
-- **B3** (batched MTP drafts) is G7's. G6 runs without drafts.
+- **B3**: drafts, on by default (§ 3.1).
 
 Measured on the test job (one MoE layer's experts from the file, the others synthetic; `--splits 16`): a decode
 step of **45 ms at 1 row, 60 ms at 2, 72 ms at 3, 85 ms at 4** (22, 33, 41, 47 tokens a second in all).
+
+### 3.1 Drafts (G7, 2026-10-14)
+
+With drafts on (the default; `--no-spec` turns them off) a run decodes with `spec_loop` (`cmd.cpp`) instead of
+`batch_loop`: one verify step at a time ([engine.md, Drafts](engine.md#drafts-g7-2026-10-14)), each session
+feeding its next token and the k drafts its gate chooses (0 .. `--spec-drafts`, default 3), all sessions of the
+run in one step of at most 16 rows (a session gets at least its own row). The step's samples up to the first
+draft that differs are the session's tokens, so the tokens, logprobs and top logprobs are `batch_loop`'s, bit for
+bit, greedy or seeded; the ends are the same too:
+
+- a stop id or `max_new` inside a step's accepted rows ends the request there (the rows after it are not sent);
+- as `batch_loop`'s queued row does, the request's last token is fed at its position before the run ends (by the
+  verify row after it when its draft held, else by one more one-row step), so the session's history and its
+  caches are the plain loop's: a later turn on the session reuses the same prefix and prefills the same rows
+  (without this a turn after a request differed at its first token: the plain loop had decoded one position
+  more, which the turn then reused while the drafts' run left it to prefill);
+- cancel and pause are read from the control word after each step, as in `batch_loop`;
+- rows and chained draft passes stay below the session's pages (`limit`): a session near the end of its pages
+  verifies fewer drafts, and is given more pages (`run` places 2·kmax positions more than plain decoding does).
+
+The drafts after a run (the MTP's for the token after the last one sent) go back to the request (`Flight::drafts`)
+for its next run, the gate's state to the session (`Session::gate`, in memory only: a kept session's gate starts
+afresh); a request's first drafts come from its prefill's sampled step. The MTP cache entries are part of every
+page (`cache_copy`, `cache_get`/`cache_put`: the 79 layers' caches include layer 78's and its index cache), so they
+move with a session's pages on a move, a spill and a read back, a fork's copy and a planned stop; the one entry
+not exact after a turn is the position before the turn's first prefilled row (written with the token the last
+step sampled, which the turn's prompt may not continue with; prefill's pending row is not kept across requests):
+it only costs acceptance. Options: `--spec-drafts K` (1-5), `--spec-cost C1,DROW` (the gate's cost model, ms),
+`--no-spec`; for tests `--spec-force N` (N drafts every step) and `--spec-oracle` (a request identical to an
+earlier one drafts that one's tokens, about one in four changed). A verify step needs a fixed split-K
+(`--splits`, default 16; `--splits 0` with drafts is refused).
+
+The run's log line gives the tokens a step; a request's line its drafts accepted of verified.
 
 ## 4. The store
 
@@ -153,6 +186,8 @@ Options (`glm53_rank --mode serve`):
 | `--disk-gib`, `--disk-dir`, `--disk-tag` | 32, `RANK<r>_SPILL`, none | the disk tier |
 | `--keep-gib`, `--keep-days` | 0, 7 | kept sessions |
 | `--step-timeout S` | 120 | the watchdog's limit for one step or chunk |
+| `--no-spec`, `--spec-drafts K`, `--spec-cost C1,DROW` | drafts on, 3, 44.5,15.5 | drafts (§ 3.1) |
+| `--spec-force N`, `--spec-oracle` | off | tests only (§ 3.1) |
 
 ### 5.2 As a service
 
@@ -224,16 +259,23 @@ OWNER=glm53-server ds41f-4xgx10-switchless/engine/server/ring.sh glm53-4xgx10-sw
 | `front_test.py` | `glmfront` on 127.0.0.1:18894 over the engine: the same chat completion twice gives the same text with 632 of 633 prompt tokens cached; streamed, the same text; a second turn reuses the first (657 cached); a client that leaves mid-stream is cancelled and the next request is served with the same text | passed (6 checks) |
 | `serve_test.py --kept` | a planned stop (SIGTERM: 4 sessions kept, 0.55 GiB, in 0.44 s) and a start: the turn resumes at its full prefix (2,691 of 2,692) from disk with the same tokens | passed (3 checks) |
 | `frontend/tools/smoke_test.py` | the front-end against its mock engine, unchanged | passed (29 checks, 0 failures) |
+| `spec_test.py` (phase `spec`, G7) | 26 requests (one session greedy and seeded with logprobs; a stop id inside the text and a turn after it, greedy and seeded; 2, 3, 4 sessions at once; a request arriving mid-decode; a turn after eviction to disk; turns past and below 2,048 positions; a fork; a 160-token request) recorded on a server with `--no-spec`, then compared on one with `--spec-force 3 --spec-oracle` (twice: MTP drafts, all rejected, then oracle drafts: 26 of 39 accepted in 14 steps on a 40-token request, 34 tok/s against 21 plain) and on one with the gate: tokens, logprob bits and ends identical | passed 2026-10-14 03:33 on the merged code (1 + 52 + 26 checks) |
 
 The ring job was run twice: on the engine before and after merging glm53 at dbc9a88 (the attention tuning),
-both all passed; [experiments.md](experiments.md) lists them.
+both all passed; [experiments.md](experiments.md) lists them. With drafts (G7, 2026-10-14, the merged code at
+5141dd8): every phase passed with drafts on (the default), in two ring jobs (main to kept 03:25-03:27, spec
+03:27-03:33), on copies of the four filled rank files (`WEIGHTS='--weights ~/dsgb10-data/glm53-g7/weights/rank%d.glw
+--fill-experts'`, `SERVER_DATA` for the job's own data tree). The phase took three tries: the first two found the
+history difference of § 3.1 (a turn after a request differed at its first token), fixed by feeding the last
+token.
 
 ## 7. What remains
 
 - **The FP8 cache or DCP**, for a 256k session at the planned weights (§ 4.2); the store's budget follows
   `cache_pos_bytes`, so neither changes the server.
-- **MTP (G7)**: drafts in the decode steps (B3). The MTP layer's pending row is not moved with a session's pages,
-  so the server runs with no drafts today.
+- **Drafts on real text** (G7): acceptance and tok/s end to end through glmfront wait for the routed experts of
+  layers 3-77; the verify loop runs a step at a time (no step queued ahead); the gate's cost model is one
+  session's.
 - **The service on the ring**: started, lent, reclaimed and stopped (§ 5.2, 2026-10-14); a planned stop with
   kept sessions waits for rank 0's disk tier.
 - **pi against the test port** with the real experts (G6's acceptance test, once the rank files are filled).

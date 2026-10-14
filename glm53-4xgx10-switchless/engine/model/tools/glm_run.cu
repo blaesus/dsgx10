@@ -24,6 +24,11 @@
 //             rows' logits and hidden into --dir (the reference's golden format, docs/reference.md § 7)
 //   refhash   prefill --tokens (or --prompt N synthetic ids) and decode --steps greedy tokens (and --temp T): the hash
 //             of the tokens and their logit bits, every rank
+//   spec      speculative decoding (G7) against plain decoding on the golden prompts (--gold PREFIX, --seqs), --sess
+//             sessions, --ks drafts a step (-1: the gate), --steps tokens a session: the same tokens bit for bit, and
+//             ms a step, tok/s, acceptance (docs/engine.md, "Drafts")
+//   mtpgold   the MTP layer teacher-forced on the golden final hidden (--gold PREFIX on every rank, --seqs, --passes):
+//             its drafts against the reference's MTP argmax, the main argmax and the text
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -38,11 +43,14 @@
 #include <string>
 #include <vector>
 
+#include <deque>
+
 #include <cuda_profiler_api.h>
 
 #include "comm/ring.h"
 #include "comm/ring_config.h"
 #include "model/model.h"
+#include "model/spec.h"
 #include "model/tools/io.h"
 #include "weights/loader.h"
 
@@ -107,6 +115,10 @@ struct Args {
   std::vector<int> dump_layers;
   uint32_t ab_base = 0, ab = 0xffffffffu;
   int ab_rounds = 10;
+  std::string gold, seqs;  // spec, mtpgold: the golden set's raw copies (PREFIX.tokens.i32 ...), the sequences
+  int passes = kMaxDrafts, kmax = 3, spec_samp = 3, block = 16;
+  std::vector<int> sess = {1}, ks = {1, 2, 3, -1};
+  std::vector<float> spec_cost;
   Options mo;
   std::vector<std::string> modes;
 };
@@ -544,7 +556,9 @@ struct TfSink : Sink {
     }
   }
   void tensor(int L, const char* name, const int32_t* pos, int R, const void* data, size_t row_bytes) override {
-    if (!dump_layers.count(L)) return;
+    // the MTP layer's diagnostics ("x", "attn", "router") are not the golden format's hidden rows
+    if (!dump_layers.count(L) || !std::strcmp(name, "x") || !std::strcmp(name, "attn") || !std::strcmp(name, "router"))
+      return;
     const uint16_t* b = static_cast<const uint16_t*>(data);
     for (int r = 0; r < R; ++r) {
       if (!sample_rows.count(pos[r]) || hidden[L].count(pos[r])) continue;
@@ -555,7 +569,7 @@ struct TfSink : Sink {
       }
       hidden[L][pos[r]] = v;
     }
-    (void)row_bytes, (void)name;
+    (void)row_bytes;
   }
   void write(const std::string& dir) {
     const std::string f = dir + "/final", mt = dir + "/mtp";
@@ -688,6 +702,510 @@ void refhash(Model& m, comm::Ring& ring) {
   if (!agree) ++g_fail;
 }
 
+// ---- the golden prompts (docs/reference.md § 7: raw copies made by tools/gold_prep.py) ----------------------------
+
+struct GoldSeq {
+  std::string name;
+  int off = 0, n = 0;
+};
+std::vector<GoldSeq> gold_seqs(const std::string& prefix) {
+  std::vector<GoldSeq> v;
+  FILE* f = std::fopen((prefix + ".seqs.txt").c_str(), "r");
+  if (!f) die("cannot read %s.seqs.txt", prefix.c_str());
+  char name[64];
+  int off, n;
+  while (std::fscanf(f, "%63s %d %d", name, &off, &n) == 3) v.push_back({name, off, n});
+  std::fclose(f);
+  return v;
+}
+template <class T>
+std::vector<T> read_raw(const std::string& path, size_t off_elems = 0, size_t n_elems = SIZE_MAX) {
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) die("cannot read %s", path.c_str());
+  std::fseek(f, 0, SEEK_END);
+  const size_t all = (size_t)std::ftell(f) / sizeof(T);
+  if (off_elems > all) die("%s: %zu elements, offset %zu", path.c_str(), all, off_elems);
+  n_elems = std::min(n_elems, all - off_elems);
+  std::vector<T> v(n_elems);
+  std::fseek(f, (long)(off_elems * sizeof(T)), SEEK_SET);
+  if (std::fread(v.data(), sizeof(T), n_elems, f) != n_elems) die("%s: short read", path.c_str());
+  std::fclose(f);
+  return v;
+}
+std::vector<std::string> split_names(const std::string& s) {
+  std::vector<std::string> v;
+  size_t p = 0;
+  while (p <= s.size()) {
+    const size_t e = s.find(',', p);
+    v.push_back(s.substr(p, e == std::string::npos ? std::string::npos : e - p));
+    if (e == std::string::npos) break;
+    p = e + 1;
+  }
+  return v;
+}
+
+// ---- mtpgold: the MTP layer teacher-forced on the golden final hidden ---------------------------------------------
+// Every rank reads the same files (--gold PREFIX on every box). Each sequence of --seqs: its MTP rows t = 0 .. n - 2
+// (hidden t after model.norm, token t + 1) in blocks of 16 rows from position 0 of slot 0 (Model::mtp_forced), the
+// pass-1 draft of every row, and --passes - 1 chained drafts from each block's last row. Against the golden data:
+// the draft against the reference's MTP argmax (mtp/argmax.npy), against the main model's argmax at t + 1 (the
+// one-draft greedy acceptance on the model's own text) and the text's token t + 2; the chains' accepted lengths
+// against the main argmax and against the text.
+// rank 0: layer 78's output rows against the golden ones (PREFIX.l78.bf16: by main row, zeros where not saved)
+struct L78Sink : Sink {
+  const uint16_t* gold = nullptr;  // the sequence's rows
+  int n = 0;
+  double cos_sum = 0, cos_min = 1, rel_sum = 0;
+  long rows = 0;
+  std::vector<uint16_t> gx;  // PREFIX.x16.bf16: the layer's input of the first rows (diagnostics), if there
+  std::string first;         // the first rows' cosines
+  std::vector<uint16_t> ga;  // PREFIX.row0.bf16: row 0's residual after attention and output (diagnostics), if there
+  static double bf(uint16_t u) {
+    const uint32_t x = (uint32_t)u << 16;
+    float v;
+    std::memcpy(&v, &x, 4);
+    return (double)v;
+  }
+  void tensor(int L, const char* name, const int32_t* pos, int R, const void* data, size_t) override {
+    if (L != kMtpLayer || !gold) return;
+    if (!std::strcmp(name, "router")) {  // row 0's top-12 logits
+      const float* lg = static_cast<const float*>(data);
+      for (int r = 0; r < R; ++r) {
+        if (pos[r] != 0) continue;
+        const float* l = lg + (size_t)r * 256;
+        std::vector<int> id(256);
+        std::iota(id.begin(), id.end(), 0);
+        std::partial_sort(id.begin(), id.begin() + 12, id.end(), [&](int a, int b) { return l[a] > l[b]; });
+        first += " router0:";
+        for (int i = 0; i < 12; ++i) {
+          char b[32];
+          std::snprintf(b, sizeof b, " %d=%.3f", id[i], l[id[i]]);
+          first += b;
+        }
+      }
+      return;
+    }
+    if (!std::strcmp(name, "attn")) {  // row 0 against PREFIX.row0.bf16's first row (the residual after attention)
+      if (ga.size() < (size_t)kDim) return;
+      for (int r = 0; r < R; ++r) {
+        if (pos[r] != 0) continue;
+        const uint16_t* b = static_cast<const uint16_t*>(data) + (size_t)r * kDim;
+        double gg = 0, mm = 0, gm = 0, dd = 0;
+        for (int c = 0; c < kDim; ++c) {
+          const double x = bf(ga[c]), y = bf(b[c]);
+          gg += x * x, mm += y * y, gm += x * y, dd += (x - y) * (x - y);
+        }
+        char t[96];
+        std::snprintf(t, sizeof t, " attn0 %.5f/%.4f", gm / std::sqrt(gg * mm + 1e-30), std::sqrt(dd / gg));
+        first += t;
+      }
+      return;
+    }
+    const bool is_x = std::strcmp(name, "x") == 0;
+    if (is_x && gx.empty()) return;
+    const uint16_t* b = static_cast<const uint16_t*>(data);
+    auto f = [](uint16_t u) {
+      const uint32_t x = (uint32_t)u << 16;
+      float v;
+      std::memcpy(&v, &x, 4);
+      return (double)v;
+    };
+    for (int r = 0; r < R; ++r) {
+      if (pos[r] < 0 || pos[r] >= n) continue;
+      if (is_x && (size_t)(pos[r] + 1) * kDim > gx.size()) continue;
+      const uint16_t* g = is_x ? gx.data() + (size_t)pos[r] * kDim : gold + (size_t)pos[r] * kDim;
+      double gg = 0, mm = 0, gm = 0, dd = 0;
+      for (int c = 0; c < kDim; ++c) {
+        const double x = f(g[c]), y = f(b[(size_t)r * kDim + c]);
+        gg += x * x, mm += y * y, gm += x * y, dd += (x - y) * (x - y);
+      }
+      if (gg == 0) continue;  // not saved
+      const double cs = gm / std::sqrt(gg * mm + 1e-30);
+      if (pos[r] < 8) {
+        char b[96];
+        std::snprintf(b, sizeof b, " %s%d %.4f/%.3f", is_x ? "x" : "h", pos[r], cs, std::sqrt(dd / gg));
+        first += b;
+      }
+      if (is_x) continue;
+      cos_sum += cs, cos_min = std::min(cos_min, cs), rel_sum += std::sqrt(dd / gg), ++rows;
+    }
+  }
+};
+
+void mtpgold(Model& m, comm::Ring& ring) {
+  const int rk = ring.rank();
+  const bool have_l78 = rk == 0 && std::filesystem::exists(A.gold + ".l78.bf16");
+  if (A.gold.empty()) die("mtpgold: --gold PREFIX");
+  const std::vector<GoldSeq> seqs = gold_seqs(A.gold);
+  const std::vector<int32_t> tok = read_raw<int32_t>(A.gold + ".tokens.i32");
+  const std::vector<int32_t> am = read_raw<int32_t>(A.gold + ".argmax.i32");
+  const std::vector<int32_t> mam = read_raw<int32_t>(A.gold + ".mtp_argmax.i32");
+  const std::vector<std::string> want = split_names(A.seqs.empty() ? "short,prose,python,agentic" : A.seqs);
+  const int passes = std::max(1, std::min(m.options().drafts, A.passes));
+  const int B = std::clamp(A.block, 1, kMaxRows);  // rows a teacher-forced block; a chain from each block's last row
+  struct Tot {
+    long rows = 0, ref = 0, main = 0, text = 0, chains = 0;
+    long chain_main[kMaxDrafts + 1] = {}, chain_text[kMaxDrafts + 1] = {};
+  } all;
+  for (const GoldSeq& s : seqs) {
+    if (std::find(want.begin(), want.end(), s.name) == want.end()) continue;
+    const int n = s.n;
+    if (n + kMaxDrafts + 2 > m.options().max_ctx) die("mtpgold: %s has %d tokens, max_ctx %d", s.name.c_str(), n, m.options().max_ctx);
+    const std::vector<uint16_t> hid = read_raw<uint16_t>(A.gold + ".hfinal.bf16", (size_t)s.off * kDim, (size_t)n * kDim);
+    std::vector<uint16_t> l78;
+    L78Sink sink;
+    if (have_l78) {
+      l78 = read_raw<uint16_t>(A.gold + ".l78.bf16", (size_t)s.off * kDim, (size_t)n * kDim);
+      sink.gold = l78.data(), sink.n = n;
+      if (std::filesystem::exists(A.gold + ".x16.bf16")) sink.gx = read_raw<uint16_t>(A.gold + ".x16.bf16");
+      if (std::filesystem::exists(A.gold + ".row0.bf16")) sink.ga = read_raw<uint16_t>(A.gold + ".row0.bf16");
+    }
+    m.reset_slot(0);
+    Tot t;
+    std::vector<int32_t> d1(B), chain(kMaxDrafts);
+    const double t0 = now_s();
+    for (int r0 = 0; r0 + 1 < n; r0 += B) {  // MTP rows r0 .. r0 + R - 1: hidden r, token r + 1
+      const int R = std::min(B, n - 1 - r0);
+      m.mtp_forced(0, r0, R, tok.data() + s.off + r0 + 1, hid.data() + (size_t)r0 * kDim, passes, d1.data(), chain.data(),
+                   have_l78 ? &sink : nullptr);
+      for (int r = 0; r < R; ++r) {
+        const int g = s.off + r0 + r;  // the main row
+        if (r0 + r + 2 >= n) continue;  // no token t + 2
+        ++t.rows;
+        t.ref += mam[g] >= 0 && d1[r] == mam[g];
+        t.main += d1[r] == am[g + 1];
+        t.text += d1[r] == tok[g + 2];
+      }
+      // the chain from the block's last row t: draft j (1 .. passes) is the token at t + j + 1
+      const int tl = r0 + R - 1;
+      if (tl + passes + 1 < n) {
+        ++t.chains;
+        int lm = 0, lt = 0;
+        bool om = true, ot = true;
+        for (int j = 1; j <= passes; ++j) {
+          const int32_t d = j == 1 ? d1[R - 1] : chain[j - 2];
+          const int g = s.off + tl;
+          om = om && d == am[g + j];
+          ot = ot && d == tok[g + j + 1];
+          lm += om, lt += ot;
+        }
+        ++t.chain_main[lm], ++t.chain_text[lt];
+      }
+    }
+    const double sec = now_s() - t0;
+    auto frac = [](long a, long b) { return b ? (double)a / b : 0.0; };
+    auto lens = [&](const long* h) {
+      std::string o;
+      double mean = 0;
+      for (int j = 0; j <= passes; ++j) {
+        char b[32];
+        std::snprintf(b, sizeof b, "%s%.3f", j ? " " : "", frac(h[j], t.chains));
+        o += b;
+        mean += j * frac(h[j], t.chains);
+      }
+      char b[48];
+      std::snprintf(b, sizeof b, " (mean %.3f)", mean);
+      o += b;
+      // a verify step of k drafts accepts min(L, k): tokens a step 1 + sum_{j <= k} P(L >= j)
+      o += "; tokens a step at k = 1..";
+      o += std::to_string(passes) + ":";
+      double tps = 1;
+      for (int k = 1; k <= passes; ++k) {
+        double ge = 0;
+        for (int j = k; j <= passes; ++j) ge += frac(h[j], t.chains);
+        tps += ge;
+        std::snprintf(b, sizeof b, " %.3f", tps);
+        o += b;
+      }
+      return o;
+    };
+    record(rk, "mtpgold\t%s\t%ld rows\t%.1f s\tdraft = reference MTP argmax %.4f\tdraft = main argmax at t+1 %.4f\t"
+           "draft = token t+2 %.4f\tchains %ld (passes %d): accepted 0..%d vs main argmax %s\tvs text %s",
+           s.name.c_str(), t.rows, sec, frac(t.ref, t.rows), frac(t.main, t.rows), frac(t.text, t.rows), t.chains, passes,
+           passes, lens(t.chain_main).c_str(), lens(t.chain_text).c_str());
+    if (sink.rows)
+      record(rk, "mtpgold\t%s\tlayer 78's output against the golden rows\t%ld rows\tcosine min %.5f mean %.5f\trelative error "
+             "%.4f\tfirst rows (cosine/relative error):%s", s.name.c_str(), sink.rows, sink.cos_min, sink.cos_sum / sink.rows,
+             sink.rel_sum / sink.rows, sink.first.c_str());
+    all.rows += t.rows, all.ref += t.ref, all.main += t.main, all.text += t.text, all.chains += t.chains;
+    for (int j = 0; j <= kMaxDrafts; ++j) all.chain_main[j] += t.chain_main[j], all.chain_text[j] += t.chain_text[j];
+  }
+  record(rk, "mtpgold\tall\t%ld rows\tdraft = reference MTP argmax %.4f\tdraft = main argmax at t+1 %.4f\tdraft = token t+2 "
+         "%.4f", all.rows, all.rows ? (double)all.ref / all.rows : 0.0, all.rows ? (double)all.main / all.rows : 0.0,
+         all.rows ? (double)all.text / all.rows : 0.0);
+  // every rank the same drafts: the counts all-gathered
+  int64_t mine[3] = {all.ref, all.main, all.text}, every[4][3];
+  ring.allgather_host(mine, every, sizeof mine);
+  bool agree = true;
+  for (int r = 1; r < 4; ++r) agree &= std::memcmp(every[r], every[0], sizeof mine) == 0;
+  check(rk, agree, "mtpgold: the four ranks' drafts agree");
+}
+
+// ---- spec: speculative decoding against plain decoding ------------------------------------------------------------
+// The prompts of --seqs from the golden set (--gold PREFIX on rank 0), each prefilled once into a slot of its own
+// with a greedy sample (its first token and drafts). A run copies the prompts' caches into working slots and decodes
+// --gen tokens a session for --sess sessions (session j on prompt (t + j) mod prompts), greedy or seeded sampling
+// (T 0.8, top-p 0.95, seed 1000 + j): plain (one row a session a step, no MTP, queued one step ahead) and speculative
+// at each of --ks (k drafts verified a step, k passes; -1: the gate, SpecGate with --spec-cost), in the order
+// plain, ks, ks reversed, plain (both orders). Every speculative run's tokens, logit values and log-probabilities
+// against the plain run's, bit for bit; GPU ms a step, wall tok/s, acceptance, tokens a step. k = -3, the oracle:
+// --kmax drafts a step taken from the plain run's tokens with about one in four changed (so the verify steps accept
+// 0 .. kmax drafts whatever the MTP's quality: with synthetic routed experts the MTP's own drafts are never accepted).
+struct Stream {
+  std::vector<int32_t> tok;
+  std::vector<uint32_t> bits;  // value and logprob bits of each token
+};
+struct RunStat {
+  int steps = 0;
+  long emitted = 0, verified = 0, accepted = 0, rows = 0;
+  double gpu_ms = 0, wall_s = 0;
+  long hist_acc[kMaxDrafts + 2] = {};  // steps by drafts accepted (single-session runs)
+};
+struct SpecPrompt {
+  int slot = 0, P = 0;
+  int32_t x0 = 0;
+  std::vector<int32_t> d0;
+  std::string name;
+};
+
+void take(Stream& s, const SampleRow& r) {
+  s.tok.push_back(r.token);
+  uint32_t v, l;
+  std::memcpy(&v, &r.value, 4), std::memcpy(&l, &r.logprob, 4);
+  s.bits.push_back(v), s.bits.push_back(l);
+}
+
+void spec(Model& m, comm::Ring& ring) {
+  const int rk = ring.rank();
+  if (A.gold.empty()) die("spec: --gold PREFIX");
+  std::vector<GoldSeq> seqs;
+  std::vector<int32_t> all_tok;
+  if (rk == 0) seqs = gold_seqs(A.gold), all_tok = read_raw<int32_t>(A.gold + ".tokens.i32");
+  const std::vector<std::string> want = split_names(A.seqs.empty() ? "short,python" : A.seqs);
+  const Options& o = m.options();
+  const int np = (int)want.size(), nmax = *std::max_element(A.sess.begin(), A.sess.end());
+  if (np + nmax > o.slots) die("spec: %d prompts and %d sessions need %d slots (--slots)", np, nmax, np + nmax);
+  if (o.drafts < 1) die("spec: --drafts K (the most draft passes)");
+  // the prompts: rank 0's tokens to every rank, prefilled, sampled greedily (their first token and drafts)
+  std::vector<SpecPrompt> pr(np);
+  Sampling greedy;
+  for (int i = 0; i < np; ++i) {
+    std::vector<int32_t> t;
+    if (rk == 0) {
+      for (const GoldSeq& s : seqs)
+        if (s.name == want[i]) t.assign(all_tok.begin() + s.off, all_tok.begin() + s.off + s.n);
+      if (t.empty()) die("spec: no sequence %s in %s", want[i].c_str(), A.gold.c_str());
+    }
+    int64_t n = (int64_t)t.size(), every[4];
+    ring.allgather_host(&n, every, 8);
+    t.resize(every[0]);
+    for (int64_t o = 0; o < every[0]; o += 16384) {  // pieces of 64 KiB (the bootstrap sockets' limit)
+      const int64_t m = std::min<int64_t>(16384, every[0] - o);
+      std::vector<int32_t> buf(4 * m);
+      ring.allgather_host(t.data() + o, buf.data(), (size_t)m * 4);
+      std::copy(buf.begin(), buf.begin() + m, t.begin() + o);
+    }
+    SpecPrompt& p = pr[i];
+    p.slot = i, p.P = (int)t.size(), p.name = want[i];
+    if (p.P + A.steps + 4 * kMaxDrafts + 8 > o.max_ctx) die("spec: %s: %d tokens + %d, max_ctx %d", want[i].c_str(), p.P, A.steps, o.max_ctx);
+    m.reset_slot(p.slot);
+    const double t0 = now_s();
+    const SampleOut so = m.wait(m.prefill(p.slot, 0, p.P, t.data(), &greedy));
+    m.drain();
+    p.x0 = so.row[0].token;
+    for (int k = 0; k < so.drafts; ++k) p.d0.push_back(so.draft[0][k]);
+    record(rk, "spec\tprompt %s\t%d tokens\tprefill %.1f s\tfirst token %d\tdrafts %d", p.name.c_str(), p.P, now_s() - t0,
+           p.x0, (int)p.d0.size());
+  }
+  const int N = A.steps;
+  SpecCost cost;
+  if (A.spec_cost.size() == 2) cost.c1 = A.spec_cost[0], cost.drow = A.spec_cost[1];
+  // one run: n sessions on prompts t0 + j; k: -2 plain, -1 gate, >= 0 k drafts verified a step
+  auto run = [&](int n, int t0, bool sampled, int k, std::vector<Stream>& out, RunStat& st, const std::vector<Stream>* oref) {
+    out.assign(n, Stream{});
+    st = RunStat{};
+    std::vector<int> pos(n);
+    std::vector<int32_t> x(n);
+    std::vector<std::vector<int32_t>> D(n);
+    std::vector<SpecGate> gate(n, SpecGate(A.kmax));
+    std::vector<Sampling> sp(n);
+    for (int j = 0; j < n; ++j) {
+      const SpecPrompt& p = pr[(t0 + j) % np];
+      m.cache_copy(np + j, p.slot, p.P);
+      pos[j] = p.P, x[j] = p.x0, D[j] = p.d0;
+      if (sampled) sp[j].temperature = 0.8f, sp[j].top_p = 0.95f, sp[j].seed = 1000 + j;
+    }
+    m.drain();
+    ring.barrier();
+    const double w0 = now_s();
+    if (k == -2) {  // plain: every session a row a step, the next step queued before the last one's sample is known
+      std::deque<uint64_t> q;
+      for (int i = 0; i < N; ++i) {
+        Batch b;
+        b.R = n, b.nsess = n, b.passes = 0;
+        for (int j = 0; j < n; ++j)
+          b.tokens[j] = i == 0 ? x[j] : -1 - j, b.pos[j] = pos[j] + i, b.slot[j] = np + j, b.sess[j] = j, b.sp[j] = sp[j];
+        q.push_back(m.launch(b));
+        if (q.size() == 2) {
+          const SampleOut& so = m.wait(q.front());
+          st.gpu_ms += m.gpu_ms(q.front());
+          for (int j = 0; j < n; ++j) take(out[j], so.row[j]);
+          q.pop_front();
+          ++st.steps;
+        }
+      }
+      while (!q.empty()) {
+        const SampleOut& so = m.wait(q.front());
+        st.gpu_ms += m.gpu_ms(q.front());
+        for (int j = 0; j < n; ++j) take(out[j], so.row[j]);
+        q.pop_front();
+        ++st.steps;
+      }
+      st.emitted = (long)n * N, st.rows = (long)n * N;
+    } else {  // speculative: a verify step at a time
+      int passes = k > 0 ? k : 1;
+      for (;;) {
+        Batch b;
+        b.spec = 1;
+        std::vector<int> first(n, -1), kk(n, 0), sess_of(n, -1);
+        int ns = 0;
+        for (int j = 0; j < n; ++j) {
+          if ((int)out[j].tok.size() >= N) continue;
+          if (k == -3) {  // the oracle: the plain run's next tokens, one in four changed (by a hash of the position)
+            const int e = (int)out[j].tok.size();
+            D[j].clear();
+            for (int r = 1; r <= A.kmax && e + r - 1 < N; ++r) {
+              int32_t t = (*oref)[j].tok[e + r - 1];
+              if (oracle_changed((uint32_t)(e + r))) t = (t + 1) % kVocabUsed;
+              D[j].push_back(t);
+            }
+          }
+          int kj = k == -1 ? gate[j].choose(cost, (int)D[j].size()) : k == -3 ? (int)D[j].size() : std::min<int>(k, (int)D[j].size());
+          kj = std::min(kj, kMaxRows - b.R - 1);
+          first[j] = b.R, kk[j] = kj, sess_of[j] = ns;
+          for (int r = 0; r <= kj; ++r) {
+            b.tokens[b.R] = r == 0 ? x[j] : D[j][r - 1];
+            b.pos[b.R] = pos[j] + r, b.slot[b.R] = np + j, b.sess[b.R] = ns;
+            ++b.R;
+          }
+          b.sp[ns++] = sp[j];
+        }
+        if (!ns) break;
+        b.nsess = ns;
+        if (k == -3) passes = A.kmax;
+        if (k == -1) {  // the drafts the next step may verify
+          passes = 1;
+          for (int j = 0; j < n; ++j)
+            if (first[j] >= 0) passes = std::max(passes, gate[j].choose(cost, A.kmax));
+        }
+        b.passes = passes;
+        const uint64_t id = m.launch(b);
+        const SampleOut so = m.wait(id);
+        st.gpu_ms += m.gpu_ms(id);
+        ++st.steps;
+        st.rows += b.R;
+        for (int j = 0; j < n; ++j) {
+          if (first[j] < 0) continue;
+          const int s = sess_of[j], a = so.accepted[s];
+          if (a < 0 || a > kk[j]) die("spec: session %d accepted %d of %d", j, a, kk[j]);
+          for (int i = 0; i <= a && (int)out[j].tok.size() < N; ++i) take(out[j], so.row[first[j] + i]), ++st.emitted;
+          st.verified += kk[j], st.accepted += a;
+          if (n == 1) ++st.hist_acc[std::min(a, kMaxDrafts + 1)];
+          gate[j].update(kk[j], a, kk[j] == 0 && !D[j].empty() ? (int)(D[j][0] == so.row[first[j]].token) : -1);
+          x[j] = so.row[first[j] + a].token, pos[j] += a + 1;
+          D[j].assign(so.draft[s], so.draft[s] + so.drafts);
+        }
+      }
+    }
+    st.wall_s = now_s() - w0;
+  };
+  const std::vector<int> ks = A.ks;
+  for (int n : A.sess) {
+    const int types = n == 1 ? np : 1;  // one session: each prompt; more: prompts mixed, from the first
+    for (int t0 = 0; t0 < types; ++t0)
+      for (int sampled = 0; sampled < 2; ++sampled) {
+        if (!(A.spec_samp & (1 << sampled))) continue;
+        // plain, ks, ks reversed, plain
+        std::vector<int> order = {-2};
+        for (int k : ks) order.push_back(k);
+        for (auto it = ks.rbegin(); it != ks.rend(); ++it) order.push_back(*it);
+        order.push_back(-2);
+        std::map<int, std::vector<RunStat>> stats;
+        std::vector<Stream> ref;
+        bool all_same = true;
+        std::string names;
+        for (int j = 0; j < n; ++j) names += (j ? "+" : "") + pr[(t0 + j) % np].name;
+        for (size_t oi = 0; oi < order.size(); ++oi) {
+          const int k = order[oi];
+          std::vector<Stream> out;
+          RunStat st;
+          run(n, t0, sampled != 0, k, out, st, &ref);
+          stats[k].push_back(st);
+          if (oi == 0) {
+            ref = out;
+            continue;
+          }
+          int same = 0;
+          for (int j = 0; j < n; ++j) same += out[j].tok == ref[j].tok && out[j].bits == ref[j].bits;
+          all_same &= same == n;
+          if (same != n && rk == 0)
+            for (int j = 0; j < n; ++j)
+              if (out[j].tok != ref[j].tok || out[j].bits != ref[j].bits) {
+                size_t i = 0;
+                while (i < out[j].tok.size() && i < ref[j].tok.size() && out[j].tok[i] == ref[j].tok[i] &&
+                       out[j].bits[2 * i] == ref[j].bits[2 * i] && out[j].bits[2 * i + 1] == ref[j].bits[2 * i + 1])
+                  ++i;
+                record(0, "spec\tDIFFER\t%s\tsession %d\tk %d\tfirst difference at token %zu of %zu", names.c_str(), j, k, i,
+                       out[j].tok.size());
+              }
+        }
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (const Stream& s : ref) h = fnv(s.tok.data(), s.tok.size() * 4, h);
+        uint64_t every[4];
+        ring.allgather_host(&h, every, 8);
+        bool ranks = true;
+        for (int r = 1; r < 4; ++r) ranks &= every[r] == every[0];
+        check(rk, all_same && ranks, "spec %s, %d session%s, %s: every speculative run (k %s) emits the plain run's tokens, "
+              "logit values and logprobs bit for bit (%d tokens a session; hash %016llx, every rank the same)",
+              names.c_str(), n, n > 1 ? "s" : "", sampled ? "sampled T 0.8 top-p 0.95" : "greedy", [&] {
+                std::string s;
+                for (int k : ks) s += (s.empty() ? "" : ",") + (k == -1 ? std::string("gate") : k == -3 ? std::string("oracle") : std::to_string(k));
+                return s;
+              }().c_str(), N, (unsigned long long)h);
+        // the measurements: both runs of each configuration
+        const std::vector<RunStat>& pl = stats[-2];
+        const double plain_ms = (pl[0].gpu_ms / pl[0].steps + pl[1].gpu_ms / pl[1].steps) / 2;
+        const double plain_tps = (pl[0].emitted / pl[0].wall_s + pl[1].emitted / pl[1].wall_s) / 2;
+        record(rk, "spec\t%s\tn %d\t%s\tplain\tsteps %d\tgpu %.2f / %.2f ms a step\twall tok/s %.2f / %.2f (all sessions)",
+               names.c_str(), n, sampled ? "sampled" : "greedy", pl[0].steps, pl[0].gpu_ms / pl[0].steps,
+               pl[1].gpu_ms / pl[1].steps, pl[0].emitted / pl[0].wall_s, pl[1].emitted / pl[1].wall_s);
+        for (int k : ks) {
+          const std::vector<RunStat>& v = stats[k];
+          double tps = 0, ms = 0, tpst = 0, acc = 0, rows = 0;
+          for (const RunStat& s : v) {
+            tps += s.emitted / s.wall_s / v.size(), ms += s.gpu_ms / s.steps / v.size();
+            tpst += (double)s.emitted / s.steps / n / v.size(), rows += (double)s.rows / s.steps / v.size();
+            acc += (s.verified ? (double)s.accepted / s.verified : 0.0) / v.size();
+          }
+          std::string hist;
+          if (n == 1)
+            for (int a = 0; a <= kMaxDrafts; ++a) {
+              char b[24];
+              std::snprintf(b, sizeof b, "%s%ld", a ? "/" : "", v[0].hist_acc[a] + v[1].hist_acc[a]);
+              hist += b;
+            }
+          record(rk, "spec\t%s\tn %d\t%s\tk %s\tsteps %d / %d\tgpu %.2f ms a step (%.2f rows)\ttokens a step a session %.3f\t"
+                 "accepted %.3f of drafts\twall tok/s %.2f (plain %.2f, x %.3f)\tgpu-time tok/s %.2f (plain %.2f, x %.3f)\t"
+                 "accepted 0..%d: %s",
+                 names.c_str(), n, sampled ? "sampled" : "greedy", k == -1 ? "gate" : k == -3 ? "oracle" : std::to_string(k).c_str(), v[0].steps,
+                 v[1].steps, ms, rows, tpst, acc, tps, plain_tps, tps / plain_tps, 1e3 * tpst * n / ms, 1e3 * n / plain_ms,
+                 (tpst * n / ms) / (n / plain_ms), kMaxDrafts, hist.c_str());
+        }
+        ring.barrier();
+      }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -737,6 +1255,17 @@ int main(int argc, char** argv) {
     else if (a == "--sample-rows") A.sample_rows = expand(nx());
     else if (a == "--via") A.via = nx();
     else if (a == "--dump-layers") A.dump_layers = parse_list(nx());
+    else if (a == "--gold") A.gold = expand(nx());
+    else if (a == "--seqs") A.seqs = nx();
+    else if (a == "--passes") A.passes = std::stoi(nx());
+    else if (a == "--sess") A.sess = parse_list(nx());
+    else if (a == "--ks") A.ks = parse_list(nx());
+    else if (a == "--kmax") A.kmax = std::stoi(nx());
+    else if (a == "--block") A.block = std::stoi(nx());
+    else if (a == "--spec-samp") A.spec_samp = std::stoi(nx());
+    else if (a == "--spec-cost") {
+      for (const int v : parse_list(nx())) A.spec_cost.push_back((float)v);
+    }
     else if (a[0] == '-') die("unknown option %s", a.c_str());
     else A.modes.push_back(a);
   }
@@ -791,6 +1320,8 @@ int main(int argc, char** argv) {
     else if (mode == "check") check_state(m, ring);
     else if (mode == "tf") tf(m, ring);
     else if (mode == "refhash") refhash(m, ring);
+    else if (mode == "spec") spec(m, ring);
+    else if (mode == "mtpgold") mtpgold(m, ring);
     else die("unknown mode %s", mode.c_str());
   }
   m.drain();

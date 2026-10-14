@@ -1,8 +1,9 @@
 // The step's sampling fused with its collective (ops.h sample): the DeepSeek engine's sampler
 // (ds41f-4xgx10-switchless/engine/model/sample.cu) with GLM's vocabulary split (38,720 logits a rank), the
-// padding ids masked, and without its speculative half (G7). One block per row: the producer half reduces this
-// rank's logits of the row to a RowCand, the consumer half picks the token from the four RowCands in rank order,
-// so every rank picks the same one.
+// padding ids masked. One block per row: the producer half reduces this rank's logits of the row to a RowCand, the
+// consumer half picks the token from the four RowCands in rank order, so every rank picks the same one. A verify
+// step's rows are sampled as any rows (the draw depends on the seed, the position and the logits only); its drafts
+// are judged against these samples after the sampler (ops::mtp_tokens; docs/engine.md, "Drafts").
 #include <climits>
 #include <cmath>
 
@@ -360,6 +361,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     o.rows = R;
     o.ctl = s_ctl;
     o.drafts = 0;
+    for (int i = 0; i < kMaxSess; ++i) o.accepted[i] = -1;  // ops::publish's, after draft passes
     if (publish) {
       __threadfence_system();
       st_release_sys_u32(&o.seq, in->step + 1);

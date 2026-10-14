@@ -19,6 +19,11 @@
 # experts while the pools are not filled, teacher-forced over the golden run's sequence (GOLDEN, SEQ, TOKENS), dumps
 # into DATA/tf/SEQ-{prefill,decode}TFTAG; compare with tools/compare_golden.py. tfsyn-prefill, tfsyn-decode: the same on
 # synthetic weights (DATA/tf/syn-SEQ-...TFTAG).
+# mtpgold: the MTP layer teacher-forced on the golden final hidden of SEQS (GOLD: tools/gold_prep.py's raw copies,
+# on every box) in blocks of BLOCK rows: its drafts against the reference's MTP and main argmax, chained acceptance,
+# layer 78's output against PREFIX.l78.bf16 on rank 0. spec: speculative against plain decoding (G7) on the golden
+# prompts SEQS at SESS sessions, KS (k drafts; -1 the gate, -3 the oracle), GEN tokens, both orders, bit for bit;
+# max_ctx SPECCTX, SLOTS slots. Both on the real rank files (WEIGHTS) with --fill-experts.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 DATA_NAME=${DATA_NAME:-glm53-model}  # the data tree under ~/dsgb10-data (install.sh, run4.sh read it too)
@@ -33,6 +38,7 @@ SEQ=${SEQ:-short}
 GDATA=$HOME/dsgb10-data/glm53-model  # the golden run's tokens and rows
 TOKENS=${TOKENS:-$GDATA/$SEQ.tokens.json}
 ROWS=${ROWS:-$GDATA/${SEQ}_rows.npy}
+GOLD=${GOLD:-~/dsgb10-data/glm53-g7/gold/all}  # mtpgold, spec: the golden set's raw copies (tools/gold_prep.py)
 mkdir -p "$(dirname "$OUT")"
 SRC=$(cat "$BIN/SOURCES" 2> /dev/null)
 echo "RUN	$(date '+%F %T %z')	$SRC" >> "$OUT"
@@ -79,6 +85,13 @@ for s in "${steps[@]}"; do
       cmd=($G $T --max-ctx 4096 --tokens "$TOKENS" --sample-rows "$ROWS" --dump-layers 0,1,2,3,4,77 --via "${s#tfsyn-}"
         --dir "$DATA/tf/syn-$SEQ-${s#tfsyn-}${TFTAG:-}" $EXTRA tf) ;;
     refhash) cmd=($G $T --max-ctx 4096 --steps 64 $EXTRA refhash) ;;
+    mtpgold)  # the MTP layer teacher-forced on the golden final hidden (GOLD: the raw copies on every box)
+      cmd=("$BIN/glm_run" --weights "$WEIGHTS" --fill-experts --out "$OUT" $T --max-ctx 27648 --drafts 5 --gold "$GOLD"
+        --seqs "${SEQS:-short,prose,python,agentic}" --passes 5 --block "${BLOCK:-16}" $EXTRA mtpgold) ;;
+    spec)  # speculative against plain decoding on the golden prompts: the same tokens, ms a step, tok/s, acceptance
+      cmd=("$BIN/glm_run" --weights "$WEIGHTS" --fill-experts --out "$OUT" $T --max-ctx "${SPECCTX:-8192}" --slots
+        "${SLOTS:-6}" --drafts 5 --splits 16 --gold "$GOLD" --seqs "${SEQS:-short,python}" --sess "${SESS:-1}" --ks
+        "${KS:-1,2,3,4,5,-1}" --steps "${GEN:-64}" $EXTRA spec) ;;
     *) echo "unknown step $s"; rc=2; continue ;;
   esac
   if [ "$s" = weights ]; then weights_step "$BIN" 2>&1 | tee -a "$LOG"

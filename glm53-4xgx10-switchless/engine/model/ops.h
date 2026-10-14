@@ -29,7 +29,7 @@ struct StepIn {
   int32_t sess[kMaxRows];
   int32_t rows, nsess;
   uint32_t step;  // the host's step number: where the sample goes, and its seq
-  int32_t pad;
+  int32_t spec;   // Batch::spec (prefill's one-row step may leave any value: one row accepts nothing either way)
   StepSamp samp[kMaxSess];
 };
 static_assert(sizeof(StepIn) % 4 == 0, "StepIn is copied word by word");
@@ -43,15 +43,26 @@ void embed_local(const uint16_t* table, const int32_t* tokens, int R, int rank, 
 void embed_pick(const uint16_t* ebuf, const int32_t* tokens, const int32_t* pos, bool zero_pos0, int R, uint16_t* out,
                 cudaStream_t s, bool pdl);
 
-// The MTP pass 1's tokens: row r's next token, the next row's input when it continues r's session (a verify or
-// teacher-forced run), else the row's sample (fb).
-void mtp_tokens(const StepIn* in, const int32_t* fb, int R, int32_t* tok, int32_t* pos, cudaStream_t s, bool pdl);
-// Chained pass k: tok[r] = the previous pass's draft (best[r].i), pos[r] += 1.
+// The MTP pass 1's rows and each session's chain row. Session s (rows [b, e)) accepts a rows: with in->spec, while
+// row b + a + 1's input equals row b + a's sample (a verify step's drafts), else e - b - 1 (every input given); its
+// chain row sel[s] = b + a, acc[s] = a. Row r's token: the next row's input for r < sel[s] (the given or accepted
+// token after it), else its sample (fb); pos[r] = in->pos[r].
+void mtp_tokens(const StepIn* in, const int32_t* fb, int R, int32_t* tok, int32_t* pos, int32_t* sel, int32_t* acc,
+                cudaStream_t s, bool pdl);
+// The chain's rows, one a session: row sel[s] of h, xn (bf16 [.][6144]) and topk ([.][2048]; for a row at a position
+// below 2048, which selects nothing, positions 0 .. 2047) into row s of ch, cxn, ctopk; cpos[s] = pos[sel[s]],
+// cslot[s] = in->slot[sel[s]].
+void mtp_select(const StepIn* in, const int32_t* sel, int nsess, const int32_t* pos, const uint16_t* h, const uint16_t* xn,
+                const int* topk, uint16_t* ch, uint16_t* cxn, int* ctopk, int32_t* cpos, int32_t* cslot, cudaStream_t s,
+                bool pdl);
+// After a pass's head: tok[r] = its draft (best[r].i), pos[r] += 1, draft_k[r] = the draft.
 void mtp_next(const comm::glm::Cand* best, int R, int32_t* tok, int32_t* pos, int32_t* draft_k, cudaStream_t s, bool pdl);
 // local argmax of this rank's logits [R][38720] (ids >= kVocabUsed masked; ties to the lowest id) as global ids
 void local_top1(const float* logits, int R, int vocab0, comm::glm::Cand* out, cudaStream_t s, bool pdl);
-// The step's drafts into its SampleOut, then its seq (the publish of a step with draft passes).
-void publish(SampleOut* outs, const StepIn* in, const int32_t* draft, int ndraft, uint32_t* counter, cudaStream_t s, bool pdl);
+// The step's drafts (draft [kMaxDrafts][kMaxSess]) and accepted counts (acc [kMaxSess]) into its SampleOut, then its
+// seq (the publish of a step with draft passes).
+void publish(SampleOut* outs, const StepIn* in, const int32_t* draft, const int32_t* acc, int ndraft, int nsess,
+             cudaStream_t s, bool pdl);
 
 // Prefill's sublayer ends on a reduce-scattered quarter: h = bf16(res + bf16(a)), or with b, h = bf16(res +
 // bf16(bf16(a) + bf16(b))) (the experts' finalize); n elements; h may be res.

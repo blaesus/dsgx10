@@ -25,7 +25,8 @@ self-consistency check passes (below).
 | `model.h` | the API: `Model` (bind a rank file or synthetic weights, `launch` a step of 1–16 rows, `wait`, `prefill`, `profile`), `Batch` (rows with token, position, slot, session; per-session `Sampling`), `SampleOut` |
 | `config.h` | the model's constants beyond attn.h/experts.h: the MTP layer 78, 79 caches, dense layers 0–2, vocabulary 154,856 used of 154,880, stop ids 154820/154827/154829 (protocol.md v2) |
 | `model.cu` | the decode step: one layer, the forward, one CUDA graph per row count, launch and wait, profiling, cache hashes |
-| `mtp.cu` | the MTP layer's draft passes (decode) and its eh_proj |
+| `mtp.cu` | the MTP layer's draft passes (decode: pass 1 over every row, the chains from each session's last accepted row), its eh_proj, the teacher-forced `mtp_forced` |
+| `spec.h` | the drafts' gate (how many drafts a session's next verify step feeds) and its cost model |
 | `prefill.cu` | prefill chunks of up to 8,192 rows (the projections through attn's `gemm()` / `gemm_bf16()`, `pf_proj`; the layers in two pieces of rows, each piece's collectives on a second stream beside the other's compute, `kTunePfOverlap`), the MTP cache fill |
 | `ops.cu`, `sample.cu` | the step-input ring, the vocabulary-split embedding, the top-1 for drafts, publishing; the DeepSeek sampler ported (38,720 ids a rank, ids ≥ 154,856 masked) |
 | `oproj.cu` | o_proj as the producer half of its all-reduce (`kTuneOproj`, off by default; [Closing the decode gap](#closing-the-decode-gap-2026-10-14)) |
@@ -63,8 +64,8 @@ sample", so the next step can be queued before the previous sample is known. Eac
 after it (the next row's input if the same session continues, else the sampled token; its embedding zeroed at
 position 0), x = eh_proj([enorm(e) | hnorm(h_p)]) (h_p after `model.norm`), layer 78 with its own cache and
 indexer, the shared head norm, the head, the masked greedy top-1. Pass k > 1 chains on the MTP's own output
-and the top-2048 of pass 1. Chained passes over multi-row sessions are refused (the pass would overwrite the
-next row's MTP entry before its verify; G7).
+and the top-2048 of pass 1. A verify step (`Batch::spec`) feeds a session's token and its drafts as rows and
+chains from its last accepted row ([Drafts](#drafts-g7-2026-10-14)).
 
 ## Prefill
 
@@ -486,6 +487,139 @@ routed experts (with two pieces the MoE end already runs during the other piece'
 all-gather after the reduce-scatter, the ring's copies with fewer bytes (the producer writing its partials straight
 into the send buffers, as decode's posted partials do; a chunk's partials are far beyond the 4 MiB buffers).
 
+## Drafts (G7, 2026-10-14)
+
+Speculative decoding with the model's own MTP layer, in the decode step and the server, the tokens unchanged.
+Code: `model.h` (`Batch::spec`, `Batch::passes`, `SampleOut::draft`/`accepted`), `mtp.cu`, `ops.cu`
+(`mtp_tokens`, `mtp_select`, `publish`), `spec.h` (the gate), `tools/glm_run.cu` (`spec`, `mtpgold`),
+`engine/server/cmd.cpp` (`spec_loop`; [serving.md](serving.md) § 3.1).
+
+**The verify step.** A session's rows are its last token and the k drafts the step before made for it, at
+consecutive positions. Every row is sampled as in any step: with a fixed split-K (`Options::attn_splits`; a
+verify step without one is refused) a row's bits do not depend on the other rows (the `check` above: 16 rows in
+one step = 16 one-row steps), and the sampler's Gumbel noise is keyed by (seed, position), so row j's sample is
+what a plain step at that position samples, greedy or seeded. On the device (`mtp_tokens`, one thread) the
+session's drafts are accepted while each equals the sample of the row before it; `SampleOut::accepted[s]` = a,
+and the session emits the samples of rows 0 .. a (the accepted drafts' successors and the bonus). Rows past a
+leave main-cache and MTP-cache entries past the session's history: the next step's rows write those positions
+again before any row reads them (attention reads positions up to the row's own), so nothing is rolled back by
+copying. DESIGN decision 9's batch invariance holds at the pinned split-K: every verify step's rows reproduce
+the plain one-row steps bit for bit (tokens, logit values, logprobs), at 1-4 sessions, checked below.
+
+**The MTP passes.** Pass 1 runs over every row of the step, each at its position p with the token after it: the
+next row's input while the drafts hold (`mtp_tokens`: rows before the chain row take the next row's token,
+the rest their own sample), so the MTP cache entries of the accepted rows and of the chain row are the ones a
+plain decode would write. Then each session's chain starts at its chain row c = first + a (`mtp_select`: its
+hidden, normed hidden, top-2048 and position into a row a session): the head on row c gives draft 1, and passes
+2 .. K run on one row a session at pos[c] + k - 1 on the previous pass's draft and the MTP's own output hidden,
+pass 1's top-2048 shared. Each chained pass writes its own provisional MTP entry at its own position (one row a
+session, its own position: no two drafts share an entry, the multi-row overwrite G4 refused is gone). `publish`
+writes draft[s][0 .. K) and accepted[s] for every session.
+
+**The gate** (`spec.h`, host code, the same float operations on every rank): per session p[j], an exponential
+average (1/8) of draft j + 1's acceptance given the ones before it; the next step verifies the k (0 .. kmax) that
+maximises (1 + p0 + p0 p1 + ...) / (c1 + k drow), with c1 = 44.5 ms and drow = 15.5 ms measured below. At k = 0
+the step still runs pass 1, so draft 1 is judged against the sample and the gate reopens when the text turns
+predictable. The step's passes are the most any of its sessions' gates may want next.
+
+**Graphs.** One CUDA graph per (rows, sessions, passes), captured on first use (`gkey`; a step's passes are a
+graph property, the drafts' count per session is data). The plain loop uses passes 0 (no MTP work) and rows =
+sessions; verify steps use passes 1 .. kmax and rows from sessions to 16. With kmax 3 and 4 slots that is at
+most 4 + 7 + 10 + 13 = 34 row/session shapes times 3 pass counts, of which a run meets the few its gates choose;
+one graph per k and batch size is not needed because the drafts a session feeds only change the rows (and the
+same rows cover every split of them between sessions).
+
+**Exactness** (bit for bit: token, logit value and logprob bits of every emitted token against the plain
+pipelined run, in the order plain, ks, ks reversed, plain; the real rank files, `--splits 16`; `run.sh spec`):
+
+| Job | Sessions | Prompts | Drafts | Result |
+|---|---|---|---|---|
+| 2026-10-14 01:55 | 1 | short, python; greedy and T 0.8 top-p 0.95 | k 1, 2, 3, 4, 5, gate, oracle | 4 of 4 PASS |
+| 02:52 | 2, 3, 4 | short, python, prose mixed | k 1, 2, gate, oracle | 6 of 6 PASS |
+| 03:03 | 1 | prose (4,762), agentic (26,834) | k 1, 2, 3, gate, oracle | 4 of 4 PASS |
+| 03:09 | 1, 2, 4 | short, python | oracle (accepted 0/1/2/3: 10/8/8/20 steps at one session) | 6 of 6 PASS |
+| 03:19 (merged code) | 1, 4 | short, python | k 1, gate, oracle | 6 of 6 PASS |
+
+With synthetic routed experts in layers 3-77 the MTP's own drafts are never accepted (the main model's text is
+noise), so the oracle (k = -3) feeds kmax drafts taken from the plain run's tokens with about one in four changed
+by a hash of the position: verify steps accept every length 0 .. 3, stops and limits included. Every rank's
+token hash is the same.
+
+**The MTP against the golden data** (`run.sh mtpgold`: the reference's final hidden of the four golden sequences,
+37,985 rows, teacher-forced through `Model::mtp_forced` in blocks of rows, every block's last row chained 5
+passes; rank 0 also compares layer 78's output with the reference's):
+
+| Sequence | draft = reference MTP argmax | draft = main argmax at t+1 (reference) | layer 78 cosine mean (min) |
+|---|---|---|---|
+| short (291) | 0.986 | 0.782 (0.786) | 0.9955 (0.971) |
+| prose (4,762) | 0.966 | 0.582 (0.581) | 0.9955 (0.980) |
+| python (6,106) | 0.973 | 0.680 (0.679) | 0.9946 (0.968) |
+| agentic (26,834) | 0.953 | 0.450 (0.449) | 0.9947 (0.964) |
+
+The engine's draft 1 is accepted by the main model's greedy token as often as the reference's own MTP is (the
+reference column: its MTP argmax against its main argmax). Layer 78's relative error, 9 %, is the NVFP4 the
+converter quantised the MTP's BF16 experts to (each matrix 9.5 %, [layout.md](layout.md) § 6).
+
+**A failure on the way: the workers' rank files.** The first runs (01:22-01:41) gave draft = main argmax 0.53
+on short against the reference's 0.79 and layer 78 cosine 0.58. The layer's input matched the reference (cosine
+0.9999), row 0's residual after attention too (0.99988), its router logits to 0.01; its MoE output did not. The
+cause: the copies of the rank files on ranks 1-3 (`~/glm53/weights/rank{1,2,3}.glw`, 5,560,139,776 bytes, 23:34
+on 2026-10-13) predate the MTP experts' fill; rank 0's file has them (6,919,143,424 bytes, 00:08), so rank 0 ran
+layer 78's real experts and ranks 1-3 synthetic ones, each rank's quarter of every expert summed together. With
+copies of the four filled files (SHA-256s as [layout.md](layout.md) § 8) every number above is the reference's.
+The fleet's copies on ranks 1-3 are still the old ones (not touched here); `glm53_rank` now warns when the
+ranks' files differ in the layers with experts from the file. `glm_run` does not check it.
+
+**Accepted lengths** (teacher-forced chains from every 4th row, greedy, against the main model's argmax; the
+tokens a verify step of k drafts emits are 1 + E[min(L, k)]):
+
+| Sequence | chains | P(L = 0 / 1 / 2 / 3 / 4 / 5) | tokens a step at k = 1 / 2 / 3 / 5 |
+|---|---|---|---|
+| short | 71 | 0.21 / 0.39 / 0.30 / 0.06 / 0 / 0.04 | 1.79 / 2.18 / 2.28 / 2.37 |
+| prose | 1,189 | 0.45 / 0.43 / 0.10 / 0.02 / 0.003 / 0.001 | 1.56 / 1.69 / 1.71 / 1.72 |
+| python | 1,525 | 0.31 / 0.45 / 0.14 / 0.06 / 0.02 / 0.03 | 1.69 / 1.93 / 2.04 / 2.11 |
+| agentic | 6,707 | 0.56 / 0.35 / 0.07 / 0.02 / 0.005 / 0.007 | 1.44 / 1.53 / 1.56 / 1.58 |
+
+Sampled decoding accepts less (a draft is accepted with the probability the main model's tempered distribution
+gives it); not measured here, the golden data holds only the greedy argmax.
+
+**The cost of a verify step** (one session, GPU ms a step, real non-expert files and synthetic routed experts in
+NVFP4 pools of the real size, `--splits 16`, both orders):
+
+| Rows | plain (no MTP) | 1 (k 0 + pass 1) | 2 (k 1) | 3 (k 2) | 4 (k 3) | 5 (k 4) | 6 (k 5) |
+|---|---|---|---|---|---|---|---|
+| ms | 41.4-45.6 | ~44.5 | 59.5-64.9 | 75.6-80.7 | 90.3-97.5 | 107.1-114.0 | 122.9-129.9 |
+
+Every row more costs ~16 ms: a row is another token's eight routed experts in each of 75 MoE layers, read from
+memory (the step is bound by the expert bytes, [Closing the decode gap](#closing-the-decode-gap-2026-10-14)), so
+a draft pays only if it is accepted more than ~35 % of the time. With more sessions a row costs less (n = 4: 74
+ms plain at 4 rows, 119 at 8, 159 at 12, 197 at 16; ~10 ms a row), but every row is still new experts.
+
+**Tokens a second.** Measured with the oracle (accepted 0.62-0.65 of 3 drafts, 2.78-2.82 tokens a step): 1
+session 29.1-30.8 tok/s against 21.7-24.1 plain (×1.22-1.34); 2 sessions ×1.15; 4 sessions ×1.05 (68.2 against
+64.6). With the MTP's own acceptance (the table above) and the measured costs, the best fixed k at one session is
+k = 1 on every sequence, decode only:
+
+| Sequence | plain | k 1 | k 2 | ×, best |
+|---|---|---|---|---|
+| short | 23.0 | 29.0 | 27.8 | 1.26 |
+| python | 23.0 | 27.4 | 24.6 | 1.19 |
+| prose | 23.0 | 25.2 | 21.5 | 1.10 |
+| agentic | 23.0 | 23.4 | 19.6 | 1.02 |
+
+(tok/s = tokens a step / (61.6 ms at k 1, 78.4 at k 2); plain 43.5 ms.) Against the published 49.3 (code) and
+30.0 (prose) tok/s, end to end, this is short of both: the plain step itself is at 23 tok/s, and the drafts add
+~10-26 % at one session. These are projections from teacher-forced acceptance and measured step costs, not an
+end-to-end run: with synthetic routed experts there is no real text to draft, and glmfront end to end would
+measure the gate's overhead only. With acceptance 0 the gate costs 9-13 % against plain (k 0 steps still run
+pass 1 and the verify loop is synchronous, one step at a time, where the plain loop queues a step ahead; and the
+gate's prior verifies a draft in ~9 % of the steps); `--no-spec` avoids it.
+
+**Not done.** Measured acceptance with sampling; end-to-end tok/s through glmfront on real text (needs the
+routed experts of layers 3-77); the verify loop queued a step ahead (the next step's rows depend on the
+accepted count: a step could be queued for the all-accepted case and redone otherwise); a batch-aware gate (its
+cost model is one session's; with 4 sessions a row costs ~10 ms, not 15.5).
+
 ## What remains
 
 - **Prefill** (1,086 tok/s at 8k after the 2026-10-14 overlap, 79 % of the published 1,374): the compute now
@@ -499,7 +633,9 @@ into the send buffers, as decode's posted partials do; a chunk's partials are fa
   1.25×): fewer collectives (merge the x-projection all-gather into the previous all-reduce's epilogue, the
   indexer queries' all-gather into it on full layers), the embedding all-gather onto the sampler's exchange, the
   ring's per-collective latency; the MoE is at its floor ([Closing the decode gap](#closing-the-decode-gap-2026-10-14)).
-- **Real routed experts**: the rank files' pools are reserved (the fill needs the user's disk decision); then
-  `tf` against the golden logits (top-1, top-20, KL) and the MTP's drafts against `mtp/` (G7's verify).
+- **Real routed experts**: the rank files' pools of layers 3-77 are reserved (the fill needs the user's disk
+  decision); then `tf` against the golden logits (top-1, top-20, KL) and the drafts' acceptance and tok/s on real
+  text, end to end. The MTP layer's drafts against `mtp/` are done ([Drafts](#drafts-g7-2026-10-14)); the
+  workers' copies of the rank files lack its experts (rank 0's has them).
 - `glw_kcheck --gpu`'s one SwiGLU output outside its bound.
 - Batch invariance under the default split-K (above).

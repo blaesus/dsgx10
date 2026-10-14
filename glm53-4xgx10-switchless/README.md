@@ -41,7 +41,7 @@ Scouting done on 2026-10-13; the plan is in [DESIGN.md](DESIGN.md). Nothing runs
   ([docs/reference.md](docs/reference.md)). Every experiment is indexed in
   [docs/experiments.md](docs/experiments.md).
 - **Not yet:** the routed experts in the rank files (disk: the fill is ~96 GiB a rank at NVFP4, ~80 at the
-  mixture), the quantiser's 3-bit fill and the KL bake-off against the master, MTP speculation (G7, in progress),
+  mixture), the quantiser's 3-bit fill and the KL bake-off against the master, the drafts' acceptance on real text (G7's speculative decoding is in and exact, [docs/engine.md](docs/engine.md#drafts-g7-2026-10-14)),
   the end-to-end check of logits against the golden data.
 | | |
 |---|---|
