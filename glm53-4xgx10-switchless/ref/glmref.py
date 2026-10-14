@@ -152,7 +152,10 @@ def rms_norm(x, w, eps):
 
 
 def linear(x, w):
-    """BF16 weight: bf16 GEMM, f32 accumulation, one rounding."""
+    """BF16 weight: bf16 GEMM, f32 accumulation, one rounding. An f32 weight (a quantised non-expert tensor,
+    dequantised: tracks mode) runs as an f32 GEMM with one rounding."""
+    if w.dtype == F32:
+        return F.linear(x.to(F32), w).to(BF16)
     return F.linear(x, w)
 
 
@@ -168,7 +171,7 @@ def out_linear(x, w):
     """A sublayer's last GEMM on a BF16 weight: bf16 output (transformers) or f32 (the contract)."""
     if COMBINE == "f32":
         return F.linear(x.to(F32), w.to(F32))
-    return F.linear(x, w)
+    return linear(x, w)
 
 
 def out_scaled_linear(x, w32, scale, chunk=4096):
@@ -215,11 +218,67 @@ def silu_mul(g, u):
 class LayerW:
     """One layer's non-expert weights, read on demand."""
 
-    def __init__(self, ck, l):
+    def __init__(self, ck, l, quant=None, cache=None):
         self.ck, self.p = ck, f"model.layers.{l}"
+        self.quant = quant or {}          # tracks mode: weight name -> "fp8b" | "nvfp4"
+        self.cache = cache if cache is not None else {}
 
     def __call__(self, name):
-        return self.ck.get(f"{self.p}.{name}")
+        fmt = self.quant.get(name)
+        if fmt is None:
+            return self.ck.get(f"{self.p}.{name}")
+        key = (self.p, name, fmt)
+        if key not in self.cache:
+            self.cache[key] = quantise_nonexpert(self.ck.get(f"{self.p}.{name}"), fmt)
+        return self.cache[key]
+
+
+def fp8_block(w):
+    """zai's FP8 release, recomputed from the BF16 master: per 128x128 block, scale = amax * f32(1/448)
+    (checked equal to the release's weight_scale_inv on 4 tensors, 100 %), codes e4m3(w / scale) (checked
+    equal to the release's codes, quantisation.md § 3.0). Returns the dequantised values in f32 (code ×
+    scale rounded once to f32)."""
+    w = w.to(F32)
+    R, C = w.shape
+    pr, pc = -R % 128, -C % 128
+    wp = F.pad(w, (0, pc, 0, pr))
+    blk = wp.reshape((R + pr) // 128, 128, (C + pc) // 128, 128)
+    sc = blk.abs().amax(dim=(1, 3), keepdim=True) * torch.tensor(1 / 448, dtype=F32)
+    q = (blk / torch.where(sc == 0, torch.ones_like(sc), sc)).to(torch.float8_e4m3fn).to(F32)
+    return (q * sc).reshape(R + pr, C + pc)[:R, :C].contiguous()
+
+
+def quantise_nonexpert(w, fmt):
+    if fmt == "fp8b":
+        return fp8_block(w)
+    if fmt == "nvfp4":
+        pk = quant_formats().nvfp4_rtn(w.to(F32))
+        wq, s2 = nvfp4_dequant(torch.from_numpy(pk["weight"]),
+                               torch.from_numpy(pk["weight_scale"]).view(torch.float8_e4m3fn),
+                               float(pk["weight_scale_2"]))
+        return wq * s2
+    raise ValueError(fmt)
+
+
+# Non-expert precision presets for tracks mode (--track ne:NAME). "fp8": DESIGN decision 2, zai's FP8 values
+# for the attention, indexer and shared-expert linears (the dense MLPs of layers 0-2 stay the checkpoint's
+# per-tensor FP8 in every track, the routers, norms, indexer weights_proj, embedding and head as shipped);
+# the others put some of them at NVFP4 round-to-nearest (NVIDIA's recipe, quant/formats.py nvfp4_rtn).
+NE_FP8 = ["self_attn.q_a_proj.weight", "self_attn.q_b_proj.weight", "self_attn.kv_a_proj_with_mqa.weight",
+          "self_attn.kv_b_proj.weight", "self_attn.o_proj.weight", "self_attn.indexer.wq_b.weight",
+          "self_attn.indexer.wk.weight", "mlp.shared_experts.gate_proj.weight", "mlp.shared_experts.up_proj.weight",
+          "mlp.shared_experts.down_proj.weight"]
+NE_NVFP4 = {"fp8": [], "o4": ["self_attn.o_proj.weight"],
+            "oqk4": ["self_attn.o_proj.weight", "self_attn.q_b_proj.weight", "self_attn.kv_b_proj.weight"],
+            "oqks4": ["self_attn.o_proj.weight", "self_attn.q_b_proj.weight", "self_attn.kv_b_proj.weight",
+                      "mlp.shared_experts.gate_proj.weight", "mlp.shared_experts.up_proj.weight",
+                      "mlp.shared_experts.down_proj.weight"]}
+
+
+def ne_preset(name):
+    q = {n: "fp8b" for n in NE_FP8}
+    q.update({n: "nvfp4" for n in NE_NVFP4[name]})
+    return q
 
 
 def indexer_topk(x, cq, W, cos, sin, block):
@@ -320,14 +379,95 @@ def bf16_mlp(x, W, p):
                   W(p + ".down_proj.weight"))
 
 
-def load_expert(ck, p, quantised):
-    """Reads only (runs on the I/O threads); dequantisation happens on the compute thread."""
-    if quantised:
-        return [nvfp4_raw(ck, f"{p}.{m}_proj") for m in ("gate", "up", "down")]
-    return [ck.get(f"{p}.{m}_proj.weight") for m in ("gate", "up", "down")]
+# ---------------------------------------------------------------------------------------------- expert sources
+# A source gives one routed expert's weights in two steps: load(e) only reads (it runs on the I/O threads),
+# prepare(raw) converts on the compute thread and returns ("scaled", (g, sg), (u, su), (d, sd)) with exact f32
+# values and a per-tensor scale, or ("bf16", g, u, d).
+
+class CkptExperts:
+    """The checkpoint's own experts: NVFP4 for layers 3-77, BF16 for the MTP layer."""
+
+    def __init__(self, ck, l):
+        self.ck, self.p, self.quantised = ck, f"model.layers.{l}.mlp.experts", l != MTP
+
+    def load(self, e):
+        if self.quantised:
+            return [nvfp4_raw(self.ck, f"{self.p}.{e}.{m}_proj") for m in ("gate", "up", "down")]
+        return [self.ck.get(f"{self.p}.{e}.{m}_proj.weight") for m in ("gate", "up", "down")]
+
+    def prepare(self, raw):
+        if self.quantised:
+            return ("scaled", *[nvfp4_dequant(*t) for t in raw])
+        return ("bf16", *raw)
 
 
-def moe(x, W, l, pool):
+class MasterExperts:
+    """BF16 master experts from fetch_master.py's directory (tensors/<name>.bin, raw little-endian bf16)."""
+
+    SHAPES = {"gate": (DFF, D), "up": (DFF, D), "down": (D, DFF)}
+
+    def __init__(self, root, l):
+        self.root, self.p = root, f"model.layers.{l}.mlp.experts"
+
+    @staticmethod
+    def available(root, l):
+        return os.path.exists(os.path.join(root, "tensors", f"model.layers.{l}.mlp.experts.255.down_proj.weight.bin"))
+
+    def load(self, e):
+        out = []
+        for m in ("gate", "up", "down"):
+            path = os.path.join(self.root, "tensors", f"{self.p}.{e}.{m}_proj.weight.bin")
+            with open(path, "rb") as f:
+                buf = bytearray(f.read())
+            os.posix_fadvise(os.open(path, os.O_RDONLY), 0, 0, os.POSIX_FADV_DONTNEED)
+            out.append(torch.frombuffer(buf, dtype=BF16).view(*self.SHAPES[m]))
+        return out
+
+    def prepare(self, raw):
+        return ("bf16", *raw)
+
+
+def quant_formats():
+    """The quantiser's formats (../quant/formats.py), imported on first use."""
+    qdir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "quant")
+    if qdir not in sys.path:
+        sys.path.insert(0, qdir)
+    import formats
+    return formats
+
+
+def requantise(fmt, g, u, d):
+    """BF16 expert -> the format's stored bytes -> exact f32 values and a per-tensor scale."""
+    fm = quant_formats()
+    g, u, d = g.to(F32), u.to(F32), d.to(F32)
+    if fmt == "nvfp4_rtn":
+        amax = torch.maximum(g.abs().max(), u.abs().max())     # gate and up share weight_scale_2
+        out = []
+        for w, a in ((g, amax), (u, amax), (d, None)):
+            pk = fm.nvfp4_rtn(w, a)
+            out.append(nvfp4_dequant(torch.from_numpy(pk["weight"]),
+                                     torch.from_numpy(pk["weight_scale"]).view(torch.float8_e4m3fn),
+                                     float(pk["weight_scale_2"])))
+        return ("scaled", *out)
+    raise ValueError(f"format {fmt}: not wired yet (only nvfp4_rtn until docs/quantiser.md names the others)")
+
+
+class FormatExperts:
+    """A base source's experts (BF16: the master or the MTP layer) requantised on the fly into `fmt`."""
+
+    def __init__(self, base, fmt):
+        self.base, self.fmt = base, fmt
+
+    def load(self, e):
+        return self.base.load(e)
+
+    def prepare(self, raw):
+        kind, *w = self.base.prepare(raw)
+        assert kind == "bf16", "requantising needs BF16 experts"
+        return requantise(self.fmt, *w)
+
+
+def moe(x, W, l, pool, src=None):
     """Routed experts + shared expert. Returns (out bf16, routing record, calibration sums)."""
     N = x.shape[0]
     logits = F.linear(x.to(F32), W("mlp.gate.weight").to(F32))
@@ -339,7 +479,7 @@ def moe(x, W, l, pool):
     w = s.gather(1, idx)
     w = w / (w.sum(dim=-1, keepdim=True) + 1e-20) * ROUTE_SCALE
     del logits, sel
-    quantised = l != MTP
+    src = src or CkptExperts(W.ck, l)
     acc = torch.zeros(N, D, dtype=F32)
     cnt = torch.zeros(NE, dtype=torch.int64)
     mass = torch.zeros(NE, dtype=torch.float64)
@@ -353,21 +493,21 @@ def moe(x, W, l, pool):
     def prefetch(j):
         if j < len(experts) and experts[j] not in futs:
             e = experts[j]
-            futs[e] = pool.submit(load_expert, W.ck, f"{W.p}.mlp.experts.{e}", quantised)
+            futs[e] = pool.submit(src.load, e)
 
     for j in range(min(3, len(experts))):
         prefetch(j)
     for j, e in enumerate(experts):
         prefetch(j + 3)
-        raw = futs.pop(e).result()
+        kind, *wts = src.prepare(futs.pop(e).result())
         r, k = (idx == e).nonzero(as_tuple=True)
         xe = x[r]
-        if quantised:
-            (g, sg), (u, su), (d, sd) = [nvfp4_dequant(*t) for t in raw]
+        if kind == "scaled":
+            (g, sg), (u, su), (d, sd) = wts
             h = silu_mul(scaled_linear(xe, g, sg), scaled_linear(xe, u, su))
             y = out_scaled_linear(h, d, sd)
         else:
-            g, u, d = raw
+            g, u, d = wts
             h = silu_mul(linear(xe, g), linear(xe, u))
             y = out_linear(h, d)
         we = w[r, k]
@@ -376,7 +516,7 @@ def moe(x, W, l, pool):
         mass[e] = we.double().sum()
         gu_sq[e] = xe.to(F32).pow(2).sum(0)
         dn_sq[e] = h.to(F32).pow(2).sum(0)
-        del raw, g, u, d, xe, h, y
+        del wts, g, u, d, xe, h, y
     if COMBINE == "f32":
         out = acc + bf16_mlp(x, W, "mlp.shared_experts")                                  # f32, rounded with the residual
     else:
@@ -473,8 +613,8 @@ class Run:
         return sets
 
     # -- one decoder layer over all sequences
-    def layer(self, l, h, prev, seqs, positions_of):
-        W = LayerW(self.ck, l)
+    def layer(self, l, h, prev, seqs, src=None, quant=None, cache=None):
+        W = LayerW(self.ck, l, quant, cache)
         t0 = time.time()
         x = rms_norm(h, W("input_layernorm.weight"), 1e-5)
         a = torch.empty_like(h)
@@ -495,7 +635,7 @@ class Run:
         if l < 3:
             m = dense_mlp(x, W)
         else:
-            m, route, calib = moe(x, W, l, self.pool)
+            m, route, calib = moe(x, W, l, self.pool, src)
         h = add_residual(h, m)
         del m, x
         return h, topk, saved, route, calib, t_att, time.time() - t0
@@ -552,6 +692,10 @@ class Run:
         a = self.args
         nmax = max(s["n"] for s in self.seqs)
         self.rope, self.rope_s = rope_tables(nmax)
+        if a.mtp_from:
+            return self.run_mtp_from()
+        if a.track:
+            return self.run_tracks()
         prog = self.progress()
         if prog["next"] != 0:  # a resume must keep the run's rounding order (runs before --combine were bf16)
             assert prog.get("combine", "bf16") == COMBINE, f"this run used --combine {prog.get('combine', 'bf16')}"
@@ -595,9 +739,117 @@ class Run:
             self.save_state("done")
         log(f"pass done ({time.time() - t_pass:.0f} s this invocation)")
 
-    def run_mtp(self):
+    def run_mtp_from(self):
+        """Experiment 5: replay the MTP layer over a finished run's final hidden states (its state/hfinal.pt),
+        with the MTP experts from --mtp-experts. The run's final/ is linked in for the comparisons."""
+        a = self.args
+        src_ids = np.load(os.path.join(a.mtp_from, "tokens.npy"))
+        assert np.array_equal(src_ids, self.ids.numpy()), "--mtp-from run has other tokens"
+        fin = os.path.join(self.out, "final")
+        if not os.path.exists(fin):
+            os.symlink(os.path.join(os.path.abspath(a.mtp_from), "final"), fin)
+        hn = torch.load(os.path.join(a.mtp_from, "state", "hfinal.pt"))
+        src = None if a.mtp_experts == "bf16" else FormatExperts(CkptExperts(self.ck, MTP), a.mtp_experts)
+        self.run_mtp(hn, src)
+        log("MTP replay done")
+
+    def run_tracks(self):
+        """Experiment 3: carry a master track and one track per --track FORMAT@LAYERS through the pass.
+        Master track: BF16 master experts where --master has the layer, the checkpoint's NVFP4 elsewhere.
+        A format track: at its layers that the master has, the master's experts requantised into FORMAT;
+        everywhere else the master track's experts. Reports per layer the hidden-state difference and the
+        routing-set agreement against the master track, and at the end KL(master || track) and top-1."""
+        a = self.args
+        mroot = os.path.expanduser(a.master) if a.master else None
+        have = {l for l in range(3, NL) if mroot and MasterExperts.available(mroot, l)}
+        tracks = [("master", None, set())]
+        quant = {"master": None}
+        for t in a.track:
+            if t.startswith("ne:"):                     # non-expert precision preset, experts as the master's
+                tracks.append((t, None, set()))
+                quant[t] = ne_preset(t[3:])
+                continue
+            fmt, _, ls = t.partition("@")
+            lay = have if ls in ("", "all") else {int(x) for x in ls.split(",")} & have
+            tracks.append((t, fmt, lay))
+            quant[t] = None
+        refs = ["master"] + [r for r in a.track_ref if r in quant]
+        log(f"master layers {sorted(have)}; tracks {[(n, sorted(l)) for n, _, l in tracks]}")
+
+        def source(fmt, lay, l):
+            if l < 3 or l not in have:
+                return None
+            m = MasterExperts(mroot, l)
+            return FormatExperts(m, fmt) if l in lay else m
+
+        h0 = self.ck.rows("model.embed_tokens.weight", self.ids.tolist())
+        H = {n: h0 for n, _, _ in tracks}
+        prev = {n: {} for n, _, _ in tracks}
+        report = {"tracks": [n for n, _, _ in tracks], "master_layers": sorted(have), "layers": {}, "final": {}}
+        for l in range(a.layers if a.layers is not None else NL):
+            routes, t0, cache = {}, time.time(), {}
+            for n, fmt, lay in tracks:
+                H[n], prev[n], _, routes[n], _, _, _ = self.layer(l, H[n], prev[n], self.seqs,
+                                                                   source(fmt, lay, l) if fmt else source(None, set(), l),
+                                                                   quant[n], cache)
+            del cache
+            rl = {}
+            hm = H["master"].to(F32)
+            for n, _, _ in tracks[1:]:
+                rel = ((H[n].to(F32) - hm).norm(dim=1) / hm.norm(dim=1)).numpy()
+                r = {"hidden_rel_median": float(np.median(rel)), "hidden_rel_max": float(rel.max())}
+                if routes[n] is not None:
+                    same = (np.sort(routes[n]["route_idx"], 1) == np.sort(routes["master"]["route_idx"], 1)).all(1)
+                    r["route_sets_equal"] = float(same.mean())
+                rl[n] = r
+            report["layers"][l] = rl
+            log(f"layer {l:2d} {time.time() - t0:6.1f} s  " + "  ".join(
+                f"{n}: rel {v['hidden_rel_median']:.2e} routes {v.get('route_sets_equal', 1):.4f}" for n, v in rl.items()))
+            with open(os.path.join(self.out, "tracks.json"), "w") as f:
+                json.dump(report, f, indent=1)
+        # the head on every track, KL(master || track) per row
+        Wn, Wh = self.ck.get("model.norm.weight"), self.ck.get("lm_head.weight").to(F32)
+        hn = {n: rms_norm(H[n], Wn, 1e-5) for n, _, _ in tracks}
+        names = [n for n, _, _ in tracks]
+        pairs = [(r, n) for r in refs for n in names if n != r and not (n in refs and names.index(n) < names.index(r))]
+        kl = {p: np.empty(self.N, np.float64) for p in pairs}
+        same = {p: np.empty(self.N, bool) for p in pairs}
+        dmax = {p: np.empty(self.N, np.float64) for p in pairs}
+        am_master = np.empty(self.N, np.int64)
+        B = 128
+        for i in range(0, self.N, B):
+            lg = {n: F.linear(hn[n][i:i + B].to(F32), Wh).double() for n in names}
+            lp = {n: torch.log_softmax(v, -1) for n, v in lg.items()}
+            am_master[i:i + B] = lp["master"].argmax(-1).numpy()
+            for r, n in pairs:
+                kl[(r, n)][i:i + B] = (lp[r].exp() * (lp[r] - lp[n])).sum(-1).numpy()
+                same[(r, n)][i:i + B] = (lp[n].argmax(-1) == lp[r].argmax(-1)).numpy()
+                dmax[(r, n)][i:i + B] = (lg[n] - lg[r]).abs().max(-1).values.numpy()
+            del lg, lp
+        ids = self.ids.numpy()
+        for r, n in pairs:
+            res = {}
+            for sq in self.seqs:
+                o, m = sq["off"], sq["n"]
+                res[sq["name"]] = {"kl_mean": float(kl[(r, n)][o:o + m].mean()),
+                                   "kl_p99": float(np.percentile(kl[(r, n)][o:o + m], 99)),
+                                   "kl_max": float(kl[(r, n)][o:o + m].max()),
+                                   "top1_agree": float(same[(r, n)][o:o + m].mean()),
+                                   "max_abs_dlogit": float(dmax[(r, n)][o:o + m].max()),
+                                   "mean_max_abs_dlogit": float(dmax[(r, n)][o:o + m].mean())}
+            report["final"][f"{n} vs {r}"] = res
+            tag = lambda x: x.replace("@", "_at_").replace(",", "-").replace(":", "_")
+            np.save(os.path.join(self.out, f"kl_{tag(n)}_vs_{tag(r)}.npy"), kl[(r, n)])
+        report["final"]["master_top1_vs_next"] = {
+            sq["name"]: float((am_master[sq["off"]:sq["off"] + sq["n"] - 1] == ids[sq["off"] + 1:sq["off"] + sq["n"]]).mean())
+            for sq in self.seqs}
+        with open(os.path.join(self.out, "tracks.json"), "w") as f:
+            json.dump(report, f, indent=1)
+        log("tracks final " + json.dumps(report["final"]))
+
+    def run_mtp(self, hn=None, src=None):
         t0 = time.time()
-        hn = self.load_state("hfinal")
+        hn = self.load_state("hfinal") if hn is None else hn
         W = LayerW(self.ck, MTP)
         # MTP rows: for each sequence, rows t = 0..n-2 (input: hidden of t, token t+1; target: token t+2)
         mseqs, rows_main, tok_in = [], [], []
@@ -619,7 +871,7 @@ class Run:
         del e, g
         keep = set(self.sample.tolist())
         msample = torch.tensor([i for i, r in enumerate(rows_main.tolist()) if r in keep])
-        h, topk, saved, route, calib, t_att, t_all = self.layer(MTP, x, {}, mseqs, None)
+        h, topk, saved, route, calib, t_att, t_all = self.layer(MTP, x, {}, mseqs, src)
         self.write_layer(MTP, h, saved, route, calib, {"attention_s": t_att, "layer_s": t_all}, rows_map=msample)
         log(f"layer 78 (MTP) {t_all:.1f} s (attention {t_att:.1f} s)")
         hd = rms_norm(h, W("shared_head.norm.weight"), 1e-5)
@@ -669,6 +921,14 @@ def main():
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--layers", type=int, default=None, help="stop after this many layers (a wiring test; logits then meaningless)")
     ap.add_argument("--no-mtp", action="store_true")
+    ap.add_argument("--mtp-from", default=None, help="experiment 5: replay only the MTP layer over this finished run")
+    ap.add_argument("--mtp-experts", default="bf16", help="with --mtp-from: bf16 (as shipped) or a format, e.g. nvfp4_rtn")
+    ap.add_argument("--track", action="append", default=[], metavar="FORMAT@LAYERS",
+                    help="experiment 3: a track with the master's experts requantised into FORMAT at LAYERS "
+                         "(comma list or 'all'); repeatable; compared with the master track")
+    ap.add_argument("--track-ref", action="append", default=[],
+                    help="tracks mode: another track to compare every track against, besides the master (e.g. ne:fp8)")
+    ap.add_argument("--master", default=None, help="fetch_master.py's directory of BF16 master experts")
     ap.add_argument("--combine", choices=("f32", "bf16"), default="f32",
                     help="f32: sublayer outputs summed in f32 and rounded once with the residual (the contract, TP=4 "
                          "engine order); bf16: transformers' per-GEMM rounding")
@@ -680,6 +940,7 @@ def main():
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     torch.set_grad_enabled(False)
+    torch.use_deterministic_algorithms(True)  # raises on any op without a deterministic implementation
     global COMBINE
     COMBINE = args.combine
     log("args", vars(args))
