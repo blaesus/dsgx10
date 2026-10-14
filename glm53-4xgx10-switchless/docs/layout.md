@@ -22,6 +22,10 @@ kernels read, cut on the CPU from NVIDIA's checkpoint (the BF16 master) and zai'
 
 ## 1. Status
 
+- **The first fill (C1, 2026-10-14): all four rank files hold every routed expert at NVFP4**, 101.369 GiB
+  each (108,844,417,024 B), no reserved entry left: layers 3–77 NVIDIA's own NVFP4 bytes re-tiled, the MTP layer
+  nvfp4_rtn of its BF16; installed on every rank (§ 8), the non-expert-only files kept beside them as
+  `rankR.glw.prefill-only`. Verified with every check in § 7 (§ 6, "The first fill, run").
 - **Files for all four ranks written and verified**: 6.444 GiB each (6,919,143,424 B): every non-expert tensor
   (5.178 GiB) plus the MTP layer's 256 routed experts at NVFP4 (1.266 GiB); 21,377 TOC entries of which 19,275
   are reserved routed-expert entries (layers 3–77). Every byte checked against the master by an
@@ -217,6 +221,24 @@ and 2.0 GB of memory. Checks: `glw_check` (CRCs, padding, geometry), `verify.py 
 format), and `glw_expert_fill_test` on experts 0, 17, 255: every value of every matrix read through its
 descriptor with `gx::read_q4` equals `gx::canon_q4` of the canonical slice (28,311,552 values, 0 differ).
 
+**The first fill, run (C1, 2026-10-14)**: on rank 2 (its local copy of NVIDIA's checkpoint, same revision; the
+copied 6.9 GB files as the start), `experts_fill.py --reset-from 78 --layers 3 … 78` over all four files in one
+pass: the MTP layer (filled before 3–77) returned to reserved and the files cut at its descriptor table, then
+layers 3–78 in TOC order, each layer committed (data synced, then TOC, header, manifest) so a rerun resumes after
+the last whole layer. 48 min for the 76 layers (35–37 s a layer for four ranks, ~15 s of it after the last expert: the descriptor
+tables and the commit's sync of 5.1 GB; layer 78 161 s with its quantisation), then 12 min for the four files' SHA-256; 1.4 GB peak, nice 19,
+8 threads on cores 10–19, CPU only. Every NVFP4 matrix written is read back (`unpack_nvfp4`) against its source
+slice before its entry is committed: 0 failures, no checkpoint tensor out of shape or with a non-positive
+scale_2. Layer 78 came out byte-identical to the earlier MTP fill (257 of 257 entry SHA-256s) and every
+non-expert entry kept its offset and SHA-256 (1,845 of 1,845). Checks: `glw_check` (CRCs of all 21,377 entries,
+no reserved entry), `glw_kcheck --rank R` (178,877 checks a rank, 0 bad), `glw_expert_fill_test` on experts 0
+and 255 of layers 3, 20, 40, 60, 77, 78 of every rank (18,874,368 values each, 0 differ), `verify.py --crc`
+(every tensor's and the files' SHA-256, 24 min), `--indep` (6,596 checks, 0 bad: every layer's descriptor table
+and experts 0, 1, 17, 128, 255 of every layer and rank against NVIDIA's bytes; 17 min), `--fresh` (7,380 of
+7,380). Copies: rank 0's pulled by rsync (355 s, 306 MB/s), ranks 1 and 3 streamed through rank 0 (179–197 s,
+~550 MB/s), each hashed on arrival, then renamed into place (the old file hard-linked as `.prefill-only` first,
+so the name never goes missing). Logs: `~/glm53-fill/logs/` on rank 2.
+
 **The second fill** (S3 from the quantiser) writes the same entries with their own tags; it rewrites the expert
 tail (truncate at the first expert entry, append again), leaving the non-expert bytes in place. Its packing is
 [s3x2_pack.py](../engine/weights/s3x2_pack.py) (E1, [experts.md § 13](experts.md#13-2026-10-14-e1-s32-the-quantisers-format-in-the-engine)):
@@ -261,6 +283,20 @@ one chunk moves out of the old bound (a worst-case 3·(K/64)·2⁻²³ Σ\|x·w\
 
 ## 8. Files written
 
+**The first fill (C1, 2026-10-14)**, every routed expert at NVFP4 (layers 3–77 NVIDIA's bytes, layer 78
+nvfp4_rtn); the non-expert bytes are those of the table below (same converter run, T128 shared expert). Installed
+as `rankR.glw` with its manifest: rank 0 in `/data/dsgb10/glm53/weights/`, ranks 1–3 in `~/glm53/weights/` on
+their boxes; the files below kept beside them as `rankR.glw.prefill-only`.
+
+| File | Bytes | SHA-256 | TOC CRC |
+|---|---:|---|---|
+| `rank0.glw` | 108,844,417,024 | `f1010873955c07b6a9358c990cc4d48322da356957f66dab486f1ac284bb21e9` | `e9576659` |
+| `rank1.glw` | 108,844,417,024 | `e4c1b6897aebce72e60a5c39834c3c8326037e597eeeb82596d35bf7e035d55f` | `2b56d7c8` |
+| `rank2.glw` | 108,844,417,024 | `f8b0c628a5139c94aa2ca2f4951c2a39dec702d711bd0a0d58190814ac630da8` | `7ea92e9f` |
+| `rank3.glw` | 108,844,417,024 | `a0c8e8cd80171a99e0f98114128d2691e9cd008c9e6ea5e33022ab85a3482f4e` | `6d1ccdb3` |
+
+The MTP-only files (now `rankR.glw.prefill-only`):
+
 `/data/dsgb10/glm53/weights/` on rank 0 (converted 2026-10-13 23:19, tool `63b15f221d924873f8a6358e1e2e8cd46bf41cb290005df4715788c41a75e4a5`, `--commit e33e73f`,
 shared expert in T128; the MTP layer's experts filled 2026-10-14, § 6). The workers' copies (`~/glm53/weights/rank{r}.glw`
 on ranks 1–3) held the 5,560,139,776-byte files without layer 78's experts until 2026-10-14 (G7 found the mixed state: rank
@@ -292,7 +328,8 @@ python -I fp8check.py --ckpt NV --cache CACHE [--rule pack]       # FP8 reproduc
 python -I convert.py --ckpt NV --cache CACHE --plan [--list]      # the plan, bytes a rank, coverage
 python -I convert.py --ckpt NV --cache CACHE --out-dir DIR [--ranks 0 1 2 3] [--only SUBSTR] [--shared-layout t64|t128]
 python -I verify.py DIR/rank{0,1,2,3}.glw --crc --fresh --indep --ckpt NV --cache CACHE
-python -I experts_fill.py --ckpt NV --file DIR/rank{0,1,2,3}.glw --layers 78 [--rtn-check MASTER] [--dump-canon D]
+python -I experts_fill.py --ckpt NV --file DIR/rank{0,1,2,3}.glw --layers 3 ... 78 [--reset-from L] [--recipe nvfp4|mix|s3x2]
+    [--master BF16DIR] [--provenance all.jsonl] [--threads 8] [--rtn-check MASTER] [--dump-canon D]   # rerun to resume
 glw_check FILE ...;  glw_kcheck FILE --rank R [--gpu | --partial --layers L];  glw_rank_test --file FILE R
 glw_load FILE --rank R [--verify-crc];  glw_expert_fill_test FILE R D L E ...
 ```
@@ -303,13 +340,12 @@ glw_load FILE --rank R [--verify-crc];  glw_expert_fill_test FILE R D L E ...
   (`moe_decode`/`moe_prefill` read `SharedW`: gate, up, down in T128 with `[N/128][K/128]` scales), so that is the
   path the engine runs and the attention side's shared-expert GEMV (pack.py's interleaved T64 form) is unused.
   T128 is the default; `--shared-layout t64` still writes the other form (kcheck and verify check either).
-- **The full expert fill of layers 3–77** (NVFP4 first: ~95 GiB a rank, ~10 s a layer a rank of CPU, so the time
-  is disk) is for the orchestrator to schedule; rank 1 needs ~20 GB freed (quantisation § 4); rank 0's disk had
-  38 GB free after the MTP fill. The S3 fill from the quantiser is a later item. (The MTP layer's experts are
-  done, § 6.)
+- The NVFP4 fill of every layer is done and installed (C1, § 6, § 8). The S3 fill from the quantiser (C2) waits for
+  the BF16 master of layers 3–77.
 - `glw_load` on the device, in a ring window (`glw_kcheck --gpu` ran 2026-10-14, § 7).
 - `engine/attn/tools/pack.py`'s `fp8_from_master` used `amax / 448` until 2026-10-14; it now uses zai's rule
   (`amax × f32(1/448)`, § 4), checked byte for byte against the converter by `engine/attn/tools/fp8_vs_converter.py`.
 - The router is replicated (0.22 GiB, as quantisation § 2); a split by output (64 rows a rank, logits
   all-gathered) is a one-line plan change if G4 prefers it.
-- Ranks 1–3's files are on rank 0's disk; copying them to their boxes (and recording the copies' hashes) is G4's.
+- Ranks 1–3's first-fill files are installed on their boxes (§ 8); the fill's working copies of ranks 0, 1 and 3
+  (~300 GB) are still in `~/glm53-fill/out/` on rank 2, to delete when no longer wanted.
