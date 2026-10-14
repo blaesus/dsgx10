@@ -27,6 +27,7 @@ OUT=${OUT:-$DATA/results.tsv}
 PORT=${PORT:-18895}
 PHASES=${PHASES:-main batch front kept spec}
 SPEC_KS=${SPEC_KS:-1 2 3}
+SPEC_GATE=${SPEC_GATE:-1}  # 0: the spec phase without its gate server
 WEIGHTS=${WEIGHTS---synthetic}
 SOCK=/tmp/altar1-test.$$.sock
 STATE=$DATA/serve_state.json
@@ -62,12 +63,14 @@ start() {  # the four ranks; rank 0 in the background, until its socket is up
 }
 stop() {  # a planned stop: SIGTERM to rank 0 (it keeps the sessions and stops the others)
   local i
+  [ -n "$R0" ] && kill -0 "$R0" 2> /dev/null || { R0=; return 0; }
   kill -TERM "$R0"
   for ((i = 0; i < 240; i++)); do kill -0 "$R0" 2> /dev/null || break; sleep 0.5; done
   wait "$R0"
   echo "rank 0 exited: rc $?"
   sleep 2
   ranks_stop
+  R0=
 }
 step() {  # name command...: run and record
   local name=$1 rc
@@ -81,7 +84,8 @@ step() {  # name command...: run and record
 RC=0
 ranks_ship "$BIN" || exit 3
 : > "$LRD/logs/$NAME.0.log"
-start || { cleanup; exit 1; }
+# the first server, unless the job is the spec phase alone (it starts its own)
+[ "$PHASES" = spec ] || start || { cleanup; exit 1; }
 grep -E "^(disk tier|cache pool|weights|serve: listening)" "$LRD/logs/$NAME.0.log"
 for p in $PHASES; do
   case $p in
@@ -118,6 +122,7 @@ for p in $PHASES; do
           --save "$DATA/spec_forced_k$k.json"
         grep -E "^serve: (req .*drafts|run of)" "$LRD/logs/$NAME.0.log" | tail -n 8
       done
+      [ "$SPEC_GATE" = 1 ] || continue
       stop
       ARGS=$BASE_ARGS
       start || { cleanup; exit 1; }
