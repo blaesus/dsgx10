@@ -300,6 +300,15 @@ and missed by 1–8 points elsewhere. The small-K shapes (W_UK K = 192, W_UV and
 by output and activation bytes, not MMAs. Tried and not kept: 64 × 128 tiles (config 1: 29–37 TFLOPS on wide
 N); 128 × 128 with 16 warps (config 5: the split-K variant spills); 3 stages on unsplit shapes (equal or worse).
 
+*BF16 weights (2026-10-14, the runner's prefill pass, [engine.md](engine.md#prefill-gemms-2026-10-14)):*
+`gemm_bf16()` is the same kernel for row-major BF16 weights (the MoE router, the head): the BF16 GEMV's arithmetic
+(the four MMAs of a 64-k chunk accumulate straight into the sum, no scale; split-K parts added in part order), a
+stage's weights staged as each lane's 32 bytes, one tile shape (128 × 64, 3 stages, 72 KiB; warps 64 × 16 for a
+split-K, 32 × 32 otherwise). Three new P checks at S = 4600 (rank 0's head rows: the router's shape 256 × 6144 at
+split-K 4, the whole head 38,720 × 6144, 1000 rows at split-K 2 with bf16 out) = the 16-row BF16 GEMV bit for bit;
+`attn_tests` 44 pass at S = 300 and 96 at S = 4600, memcheck (A C B F P, S = 300) clean. In the runner the router
+at 8,192 rows takes 0.64 ms a layer against 15.1 ms as 16-row GEMVs.
+
 **Prefill indexer: keys in registers, queries streamed** (`k_q_stage` + `k_score_pf`). A CTA holds 256 keys as
 MMA A fragments (8 warps × 2 tiles, `k_score`'s lane map) and streams up to 256 rows' RoPE'd queries (staged once
 a row by `k_q_stage`) through two cp.async buffers; each row runs `k_score`'s MMA chain and head sum, so the

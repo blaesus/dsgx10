@@ -9,7 +9,9 @@ DeepSeek service through its `ring.sh` (jobs of 15 s to 2 min).
 routed experts, layer 3 also with its real NVFP4 experts. Decode step at 1 row **46.4 ms** (21.6 tok/s) against
 a 34.2 ms bandwidth floor (1.35×); after the 2026-10-14 decode-gap pass 43.6 ms (1.27×) in the interleaved A/B, ~44 ms
 on undisturbed ranks, the MoE at its floor and the rest the collectives' latency and attention ([Closing the
-decode gap](#closing-the-decode-gap-2026-10-14)); prefill **400–434 tok/s** (GEMV-bound, see "What remains"). Against the
+decode gap](#closing-the-decode-gap-2026-10-14)); prefill **854 / 802 / 704 tok/s** at 2,600 / 8,192 / 32,768
+tokens (2.0–2.2× the 16-row GEMV path's 381 / 374 / 350; [Prefill GEMMs](#prefill-gemms-2026-10-14)), 58 % of the
+published 1,374 tok/s at 8k, the collectives now 38 % of a chunk. Against the
 reference's golden data the residual stream after layers 0–3 agrees to cosine 0.9998 (mean), relative error
 1.2–2.1 %, the size the FP8 requantisation predicts (each FP8 tensor 2.6 % relative error). Every
 self-consistency check passes (below).
@@ -22,13 +24,13 @@ self-consistency check passes (below).
 | `config.h` | the model's constants beyond attn.h/experts.h: the MTP layer 78, 79 caches, dense layers 0–2, vocabulary 154,856 used of 154,880, stop ids 154820/154827/154829 (protocol.md v2) |
 | `model.cu` | the decode step: one layer, the forward, one CUDA graph per row count, launch and wait, profiling, cache hashes |
 | `mtp.cu` | the MTP layer's draft passes (decode) and its eh_proj |
-| `prefill.cu` | prefill chunks of up to 8,192 rows, the MTP cache fill |
+| `prefill.cu` | prefill chunks of up to 8,192 rows (the projections through attn's `gemm()` / `gemm_bf16()`, `pf_proj`), the MTP cache fill |
 | `ops.cu`, `sample.cu` | the step-input ring, the vocabulary-split embedding, the top-1 for drafts, publishing; the DeepSeek sampler ported (38,720 ids a rank, ids ≥ 154,856 masked) |
 | `oproj.cu` | o_proj as the producer half of its all-reduce (`kTuneOproj`, off by default; [Closing the decode gap](#closing-the-decode-gap-2026-10-14)) |
-| `tools/step_profile.py` | the per-kernel critical-path profile of `glm_run trace`'s nsys reports, every rank |
+| `tools/step_profile.py` | the per-kernel critical-path profile of `glm_run trace`'s nsys reports, every rank; `--prefill`: one prefill chunk's (`glm_run pftrace`), per kernel kind and per class |
 | `l2pf.cu` | the paced L2 prefetch (DeepSeek's l2pf): the next weights during collectives and attention |
 | `bind.cu` | binding a `.glw` rank file (names, sizes and layouts checked), synthetic weights, synthetic routed experts for a file whose pools are not filled |
-| `tools/glm_run.cu` | the driver: `bench`, `l2pf`, `ab` (two lever sets, interleaved, timing and output bits), `trace` (under nsys), `prefill`, `check`, `tf`, `refhash` |
+| `tools/glm_run.cu` | the driver: `bench`, `l2pf`, `ab` (two lever sets, interleaved, timing and output bits), `trace` (under nsys), `prefill`, `pfab` (prefill, two lever sets A B B A, timing and output bits), `pftrace` (one chunk under nsys), `check`, `tf`, `refhash` |
 | `tools/compare_golden.py` | the `tf` dumps against the golden files (reference.md § 7) |
 | `install.sh`, `run4.sh`, `run.sh` | out-of-tree build (-j4) with the sources' hash; the ring launcher (comm's pattern, binaries under `~/dsgb10-data/glm53-model/`); the resumable ring steps |
 
@@ -64,9 +66,13 @@ next row's MTP entry before its verify; G7).
 
 ## Prefill
 
-Chunks of ≤ 8,192 rows (`Options::prefill_rows`): the embedding all-gathered in 1,024-row pieces; the attention
-projections as 16-row GEMV launches; the indexer for rows at position ≥ 2,048 in batches sized to a 512 MiB
-score scratch (rows below attend densely); `sparse_attn` without split; each sublayer ends with an f32
+Chunks of ≤ 8,192 rows (`Options::prefill_rows`): the embedding all-gathered in 1,024-row pieces; every FP8
+projection (x-projection, q_b + wq_b, W_UK, W_UV, o_proj, the dense gate/up and down, the MTP fill's eh_proj and
+x-projection) one launch of attn's tensor-core `gemm()` over the chunk, the BF16 router one launch of
+`gemm_bf16()` (both the 16-row GEMV's bits; since 2026-10-14, [Prefill GEMMs](#prefill-gemms-2026-10-14)); the
+indexer for rows at position ≥ 2,048 through `index_select`'s prefill path (staged queries, `k_score_pf`, the
+merged `k_sel_thresh` + `k_sel_compact` selection) in batches sized to a 512 MiB score scratch (rows below attend
+densely); `sparse_attn` without split; each sublayer ends with an f32
 reduce-scatter by rows, the residual add and the next norm on the rank's quarter of the rows and one
 all-gather of h and the normed rows; the MoE through `moe_prefill`. The MTP cache fill runs after each chunk
 (eh_proj, layer 78's norm, x-projection, all-gather and `attn_prep` only — no MoE), the chunk's last row kept
@@ -153,7 +159,8 @@ of the 12 ms gap to the floor is the MoE at ~83 % of its bytes' floor at one row
 **L2 prefetch, A/B and B/A** (`run.sh l2pf`): 1 row +0.1 %, 6 rows +4.1 %, 16 rows +2.8 %. Kept on.
 
 **Prefill** (synthetic, from position 0): 414 / 434 / 419 / 403 / 400 tok/s for chunks of 512 / 1,024 / 2,048
-/ 4,096 / 8,192 rows (1.24 s to 20.5 s a chunk), after the expert prefill tuning (6cb6fce); 397–416 before.
+/ 4,096 / 8,192 rows (1.24 s to 20.5 s a chunk), after the expert prefill tuning (6cb6fce); 397–416 before. With
+the prefill GEMMs (2026-10-14): 854 / 802 / 704 tok/s at 2,600 / 8,192 / 32,768 tokens, below.
 
 ## Closing the decode gap (2026-10-14)
 
@@ -275,12 +282,105 @@ reduce-scatter design, ring.md), and the ring's per-collective latency itself (t
 here). Operationally: keep CPU jobs off the ring's boxes (or off cores 5–8) while
 measuring or serving; a busy box costs 2–4 ms at 1 row and ~6 ms at 6.
 
+## Prefill GEMMs (2026-10-14)
+
+The prefill path's projections moved from 16-row GEMV launches to the attention side's tuned tensor-core GEMM
+(T2, [attention.md § 5](attention.md)), outputs unchanged bit for bit. Seven ring jobs of 1–6 minutes on the four
+ranks and one on rank 0 (attn's tests), 01:11–01:49 (+0100); synthetic weights except `tf`.
+
+**What changed.** `prefill.cu`'s `pf_proj` runs an FP8 projection over the whole chunk as one `gemm()` launch at
+the GEMV's split-K: the x-projection (split-K 4; also the MTP fill's), q_b with the indexer's wq_b (two segments),
+W_UK and W_UV (grouped), o_proj, the dense gate/up (SwiGLU) and down, and the MTP layer's eh_proj (`mtp.cu`;
+1–16 rows at decode stay one GEMV). attn's test P shows each of these shapes equal to the 16-row GEMVs in all six
+tile configurations (eh_proj, 1536 × 12288, is not in P; the runner's checks below cover it). The router is BF16,
+which `gemm()` does not take: attn's `gemm()` gained a BF16-weight form, `gemm_bf16()` (gemm.cu: the BF16 GEMV's
+arithmetic, the four MMAs of each 64-k chunk accumulating straight into the sum, the weights staged as each lane's
+32 bytes; one 128 × 64 tile shape, 3 stages, 72 KiB), tested equal to the 16-row BF16 GEMV in three new P checks
+at 4,600 rows (the router's shape at split-K 4, the whole head, a 1000-row bf16-out case). Two `Tune` bits switch
+them, both in `kTuneDefault` (now 0x77): `kTunePfGemm` (32) the FP8 projections, `kTunePfRouter` (64) the router.
+Kept as GEMVs: the head (BF16, only for `kFlagLogits`, i.e. `tf`; its logits buffer holds 16 rows, so it stays
+16 rows a launch), `index_weights` (BF16, 8 rows, its own kernel: 10 ms a chunk) and any chunk of ≤ 16 rows. The
+shared expert is not attn's: `moe_prefill` already runs it as a dense FP8 GEMM in the experts' own layout. **The
+indexer** already took attn's prefill path: `index_select` with more than 16 rows stages the queries and runs
+`k_score_pf` and the merged `k_sel_thresh` + `k_sel_compact` (4 launches a call, T2), the trace below shows it, so
+nothing changed there; a batch tail of ≤ 16 rows takes the decode kernels, the same bits (attn test E). The
+batches are 512 MiB of scores: 3,971 rows at `max_ctx` 33,792, 512 at 256k (attn measured calls of 512 rows
+~10 % slower than of 2,048 at 32k).
+
+**Method.** `glm_run pfab` (`run.sh pfab`): one process, two lever sets, for each chunk A B B A (A = 0x17, the
+16-row GEMVs; B = 0x77), the slot's caches before the chunk filled with hashed values (`fill_cache`), a greedy
+`Sampling` on the last row and one MTP draft (so that the MTP layer's cache holds every row's final normed hidden),
+`prefill_ms` (events around the whole call: the chunk, the MTP fill, the last row's sample and draft pass); both
+lever sets warmed with a 512-row prefill first. After each run: the hash of every layer's cache (KV, index keys,
+the MTP layer's) over positions 0 to the chunk's end and the sampled token and value; A and B must agree in all four
+runs and on every rank. "2,600 / 8,192 / 32,768 tokens" are one chunk each: 2,600 rows from 0, 8,192 from 0, and
+the last 8,192-row chunk of a 32,768-token prompt (at position 24,576). `--max-ctx 33792`. The breakdown: `glm_run
+pftrace` (`run.sh pftrace`: one 8,192-row chunk at 24,576 after a warm one, inside the profiler range, no drafts)
+under nsys on every rank, read by `tools/step_profile.py --prefill` (per kernel kind and class, the critical-path
+increments of the main stream as in [Closing the decode gap](#closing-the-decode-gap-2026-10-14)).
+
+**Prefill throughput** (sources sha256 225b0ca7cb2def35, 01:28–01:31; ms of the two runs of each side):
+
+| Tokens (chunk at) | 16-row GEMVs (A) | tok/s | gemm + gemm_bf16 (B) | tok/s | B/A speed |
+|---|---:|---:|---:|---:|---:|
+| 2,600 (0) | 6,836.7 / 6,801.0 | 381 | 3,043.6 / 3,043.3 | **854** | 2.24× |
+| 8,192 (0) | 21,742.2 / 22,007.7 | 374 | 10,217.3 / 10,222.0 | **802** | 2.14× |
+| 32,768 (8,192 at 24,576) | 23,236.4 / 23,560.6 | 350 | 11,622.5 / 11,659.9 | **704** | 2.01× |
+
+The two levers apart: the FP8 projections alone (B = 0x37, an earlier build of the same code, 01:11–01:15)
+768 / 725 / 641 tok/s (2.02 / 1.94 / 1.84×); the router's `gemm_bf16` on top (0x37 against 0x77, 8,192 from 0,
+01:31) 723 → 799 tok/s, 1.105×. Repeats agree within 1.5 %. **Against the published bar** (1,374 tok/s cold at 8k,
+DESIGN.md): 802 tok/s is 58 % of it; the 8,192-row chunk takes 10.2 s where the bar needs 6.0.
+
+**Where a chunk goes** (8,192 rows at 24,576; ms, rank 0, the range over the four ranks in brackets; "before":
+0x17, 23.47–23.49 s; "after": 0x77, 11.67–11.71 s):
+
+| Class (kernels) | before | after | share after |
+|---|---:|---:|---:|
+| collectives, waiting included: all-gather of h + normed rows 1,380, reduce-scatter after o_proj / dense down 1,018, of the routed partials 937, of the shared partials 809, x-projection all-gather 175, the rest 110 | 4,927 | **4,429** (4,155–4,754) | 37.8 % |
+| attention: `k_attn` (33 ms a layer, no split) 2,592, `k_prep` 32 | 2,620 | **2,624** (2,512–2,721) | 22.4 % |
+| MoE prefill: `k_pdown_c` 1,220, `k_pup_ws` 996 + 180 (two launch shapes a layer), `k_pdown` 175 (four a layer), the rest 9 | 2,545 | **2,580** (2,454–2,686) | 22.0 % |
+| projections: o_proj + dense down 645, q_b (+ wq_b) 182, x-projection 109, W_UV 72, W_UK 64, router 48, dense gate/up 35 | 12,484 | **1,154** (1,117–1,192) | 9.9 % |
+| indexer: `k_score_pf` 497, `k_sel_compact` 179, `k_sel_thresh` 64, `k_q_stage` 15, index weights 10, the rest 10 | 770 | **775** (712–775) | 6.6 % |
+| norms, residual adds, embedding | 149 | **149** | 1.3 % |
+
+Before, the projections were 53 % of the chunk (the router's 16-row BF16 GEMVs alone 1,132 ms); after, they are
+10 % (o_proj 8.0 ms at 8,192 rows: 52 TFLOPS, as attn measured it). **What is left is the ring and two kernels.**
+A MoE layer's collectives move three 201 MB f32 reduce-scatters (o_proj's, the routed and the shared partials) and
+two 201 MB bf16 all-gathers (h and the normed rows, after each sublayer). The shared partials' reduce-scatter
+follows the routed one, so the ranks arrive together: 10.8 ms on every rank, ~14 GB/s a rank of the 151 MB it
+sends. So ~4 s of a chunk is the ring's bandwidth, not its latency, and it runs on the compute stream: nothing
+overlaps it. Then sparse attention without split (33 ms a layer at 8,192 rows: ~18 TFLOPS of its MMAs) and the
+expert GEMMs at T1's level. For 1,374 tok/s the 8k chunk must lose 4.3 s of its 10.2. Overlapping the collectives
+with the compute (a second stream and sub-chunks; rows are independent, so outputs stay exact) bounds the traced
+chunk by its compute, ~7.3 s (~1,120 tok/s; the chunk from position 0, not traced, is 1.4 s shorter); the rest has
+to come from attention and the experts.
+
+**Exactness.** `pfab`: A and B the same bits at all three chunks, in all four runs and on every rank (hashes
+f561aaa161f5703e, b5d2be0e85c00e60, 01f4fa4803ca445f; the same in the earlier build), and 0x37 against 0x77 too.
+`tf` via prefill on the real rank files (`run.sh tf-prefill`, the 291-token `short` sequence, layers 0–3 real,
+routed experts synthetic): all 20 dump files (argmax, top-20, log-probabilities, lse, logits, the sampled rows,
+the hidden rows after layers 0–4 and 77) byte-identical between the base build (067ba12, its own default 0x17),
+this build's default and this build with `--tune 17`, and identical to the `short-prefill` dump of 2026-10-13.
+`run.sh check` passes (chunking, decode = prefill, 16 rows = 16 one-row steps, graph = eager, ranks agree,
+sampling), run on both builds. attn's tests: 44 pass at S = 300, 96 at S = 4,600 (93 before, plus the three BF16
+checks), memcheck on A C B F P at S = 300 clean (41 pass; the BF16 checks need the head data of S = 4,600 and were
+not run under memcheck). The server's ring tests (`server/tests/ring_job.sh`: serve, batch, front, kept) pass on a
+`glm53_rank` built from this tree (sources b8ba34daeb3d6f71). On the final sources (merged with glm53 at 05cf496,
+comments changed since; `glm_run` d32601a9e8517dd6, `glm53_rank` 2930a17b4553e7e6, 01:45–01:49): `check` passes,
+`pfab` at 2,600 rows the same bits and hash (384 → 855 tok/s), the server's ring tests pass. Decode is unchanged: the step's code is untouched
+except eh_proj's call, which at 1–16 rows is the same single GEMV launch.
+
+**What failed or was not done.** Nothing failed. The first A/B job overlapped a CPU build on rank 0 (nice 19);
+the table's job ran alone. Not measured: a whole 32,768-token prompt (four chunks), `pfab` without the MTP draft;
+not run: memcheck over `gemm_bf16`.
+
 ## What remains
 
-- **Prefill GEMMs.** The attention projections, o_proj, the dense MLP, the router and the head run as 16-row
-  GEMVs, so each weight is read once every 16 rows (~24 GB a layer a rank at 8,192 rows): prefill is bound by
-  that, not by the experts. Tensor-core FP8 GEMMs for these (DeepSeek's prefill kernels as the model) are the
-  next step; the target is the chunk's expert time.
+- **Prefill** (802 tok/s at 8k after the 2026-10-14 GEMMs, 58 % of the published 1,374): the collectives (38 % of a
+  chunk, bandwidth-bound, on the compute stream) want to overlap the compute; then `sparse_attn` at prefill (22 %,
+  no split, ~18 TFLOPS) and the expert GEMMs (22 %). The indexer's batches shrink to 512 rows at a 256k
+  `max_ctx` (512 MiB scratch).
 - **The decode gap** (1.27–1.30× at 1 row after the 2026-10-14 pass, ~1.29× on undisturbed ranks; G4's target
   1.25×): fewer collectives (merge the x-projection all-gather into the previous all-reduce's epilogue, the
   indexer queries' all-gather into it on full layers), the embedding all-gather onto the sampler's exchange, the

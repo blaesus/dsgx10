@@ -931,6 +931,30 @@ void test_gemm(int S) {
     T(ok, "P GEMM %s, %d rows: = the 16-row GEMV bit for bit in tile configurations 0-5%s%s", c.name.c_str(), S,
       ok ? "" : "; differ in", which.c_str());
   }
+  // BF16 weights (gemm_bf16 = the BF16 GEMV): rank 0's head rows, whole and in the router's shape (256 rows, split-K 4)
+  if (has("head_r0")) {
+    Dev<uint16_t> head = tu::to_dev<uint16_t>(L("head_r0"));
+    struct B {
+      const char* name;
+      int n, splitk;
+      GemvOut out;
+    };
+    for (const B& b : {B{"router shape 256x6144 split-K 4 (f32)", 256, 4, GemvOut::kF32},
+                       B{"head 38720x6144 (f32)", kVocabRank, 1, GemvOut::kF32},
+                       B{"1000x6144 split-K 2 (bf16 out)", 1000, 2, GemvOut::kBF16}}) {
+      const size_t es = b.out == GemvOut::kF32 ? 4 : 2;
+      Dev<uint8_t> ya((size_t)S * b.n * es), yb((size_t)S * b.n * es);
+      GemvSeg g;
+      g.w = head.p, g.n = b.n, g.y = ya.p, g.ldy = b.n;
+      gemv_rows(false, x.p, kDim, S, kDim, {g}, b.out, b.splitk);
+      sync();
+      const std::vector<uint8_t> ref = ya.down();
+      g.y = yb.p;
+      gemm_bf16(x.p, kDim, S, kDim, &g, 1, b.out, b.splitk, 0);
+      sync();
+      T(yb.down() == ref, "P GEMM BF16 %s, %d rows: = the 16-row BF16 GEMV bit for bit", b.name, S);
+    }
+  }
 }
 
 }  // namespace

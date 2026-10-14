@@ -12,6 +12,12 @@
 //             (the final normed rows, the sampled tokens and values, every layer's cache)
 //   trace     graph steps at --rows inside cudaProfilerStart/Stop (run under nsys; tools/step_profile.py)
 //   prefill   prefill chunks of --chunks (default 512,1024,2048,4096,8192) rows at position --ctx: tok/s
+//   pfab      prefill, the lever sets --ab-base and --ab, A B B A for each chunk of --chunks rows at position --at (a
+//             list beside --chunks; default --ctx), the caches before it filled with hashed values: ms and tok/s,
+//             and whether A and B give the same bits (every layer's cache, the last row's sample; with --drafts the
+//             MTP layer's cache holds every row's final normed hidden), every rank
+//   pftrace   one prefill chunk of --chunks[0] rows at --at[0] (after a warm one) inside cudaProfilerStart/Stop (nsys;
+//             tools/step_profile.py --prefill)
 //   check     the state checks on synthetic weights (chunking, prefill vs decode, batch invariance, determinism)
 //   tf        teacher-forced over --tokens FILE (--via prefill|decode): argmax, top-20, lse, next logprob, sampled
 //             rows' logits and hidden into --dir (the reference's golden format, docs/reference.md § 7)
@@ -96,7 +102,7 @@ struct Args {
   uint64_t seed = 1;
   int ctx = 4096, steps = 32, prompt = 0;
   float temp = 0.f, top_p = 1.f;
-  std::vector<int> rows = {1, 2, 4, 6, 8, 16}, chunks = {512, 1024, 2048, 4096, 8192};
+  std::vector<int> rows = {1, 2, 4, 6, 8, 16}, chunks = {512, 1024, 2048, 4096, 8192}, ats;
   std::vector<int> dump_layers;
   uint32_t ab_base = 0, ab = 0xffffffffu;
   int ab_rounds = 10;
@@ -328,6 +334,81 @@ void bench_prefill(Model& m, comm::Ring& ring) {
     record(rk, "prefill\tchunk %d\tat %d\t%.1f ms\t%.0f tok/s", C, A.ctx, ms, C * 1e3 / ms);
     ring.barrier();
   }
+}
+
+// pfab: prefill A B B A at each (chunk, position), timing and output bits
+void prefill_ab(Model& m, comm::Ring& ring) {
+  const int rk = ring.rank();
+  const uint32_t cfg[2] = {A.ab_base, A.ab};
+  Sampling sp;  // greedy
+  // warm both lever sets (lazy module loads, the prefill buffers)
+  {
+    std::vector<int32_t> tok(512);
+    for (int j = 0; j < 512; ++j) tok[j] = synth_token(A.seed + 5, j);
+    for (int k = 0; k < 2; ++k) {
+      m.set_tune(cfg[k]);
+      m.reset_slot(0);
+      m.wait(m.prefill(0, 0, std::min(512, m.options().prefill_rows), tok.data(), &sp));
+      m.drain();
+    }
+  }
+  for (size_t i = 0; i < A.chunks.size(); ++i) {
+    const int C = A.chunks[i], at = i < A.ats.size() ? A.ats[i] : A.ctx;
+    if (C > m.options().prefill_rows) continue;
+    std::vector<int32_t> tok(C);
+    for (int j = 0; j < C; ++j) tok[j] = synth_token(A.seed + 3, at + j);
+    double ms[2][2] = {};
+    uint64_t h[2][2] = {};
+    for (int q = 0; q < 4; ++q) {  // A B B A
+      const int k = (q == 1 || q == 2) ? 1 : 0, o = q / 2;
+      m.set_tune(cfg[k]);
+      m.fill_cache(0, at, 9);
+      m.reset_slot(0);
+      ring.barrier();
+      const SampleOut& so = m.wait(m.prefill(0, at, C, tok.data(), &sp));
+      const int32_t t = so.row[0].token;
+      const float v = so.row[0].value;
+      ms[k][o] = m.prefill_ms();
+      const std::vector<uint64_t> c = m.cache_hashes(0, at + C);
+      uint64_t x = fnv(c.data(), c.size() * 8);
+      x = fnv(&t, 4, x), x = fnv(&v, 4, x);
+      h[k][o] = x;
+      ring.barrier();
+    }
+    uint64_t mine = h[1][0], all[4];
+    ring.allgather_host(&mine, all, 8);
+    bool ranks = true;
+    for (int r = 1; r < 4; ++r) ranks &= all[r] == all[0];
+    const double a = (ms[0][0] + ms[0][1]) / 2, b = (ms[1][0] + ms[1][1]) / 2;
+    record(rk, "pfab\tchunk %d\tat %d\tA %08x %.1f / %.1f ms\t%.0f tok/s\tB %08x %.1f / %.1f ms\t%.0f tok/s\t(A B B A)\t"
+           "B/A %.3f\tdrafts %d", C, at, cfg[0], ms[0][0], ms[0][1], C * 1e3 / a, cfg[1], ms[1][0], ms[1][1], C * 1e3 / b,
+           a / b, m.options().drafts);
+    check(rk, h[0][0] == h[0][1] && h[1][0] == h[1][1] && h[0][0] == h[1][0] && ranks,
+          "pfab chunk %d at %d: A and B the same bits (caches of positions 0-%d, the last row's sample; hash %016llx), "
+          "every rank the same", C, at, at + C - 1, (unsigned long long)h[1][0]);
+  }
+  m.set_tune(A.mo.tune);
+}
+
+// pftrace: one prefill chunk inside the profiler range (nsys --capture-range=cudaProfilerApi)
+void prefill_trace(Model& m, comm::Ring& ring) {
+  const int C = A.chunks.at(0), at = A.ats.empty() ? A.ctx : A.ats[0];
+  std::vector<int32_t> tok(C);
+  for (int j = 0; j < C; ++j) tok[j] = synth_token(A.seed + 3, at + j);
+  m.fill_cache(0, at, 9);
+  m.reset_slot(0);
+  m.prefill(0, at, C, tok.data());  // warm
+  m.drain();
+  m.fill_cache(0, at, 9);
+  m.reset_slot(0);
+  ring.barrier();
+  CUDA_CHECK(cudaProfilerStart());
+  m.prefill(0, at, C, tok.data());
+  const float ms = m.prefill_ms();
+  m.drain();
+  CUDA_CHECK(cudaProfilerStop());
+  record(ring.rank(), "pftrace\tchunk %d\tat %d\t%.1f ms\t%.0f tok/s", C, at, ms, C * 1e3 / ms);
+  ring.barrier();
 }
 
 // ---- check (synthetic) ------------------------------------------------------------------------------------------
@@ -640,6 +721,7 @@ int main(int argc, char** argv) {
     else if (a == "--ab-rounds") A.ab_rounds = std::stoi(nx());
     else if (a == "--ab-base") A.ab_base = (uint32_t)std::stoul(nx(), nullptr, 16);
     else if (a == "--chunks") A.chunks = parse_list(nx());
+    else if (a == "--at") A.ats = parse_list(nx());
     else if (a == "--steps") A.steps = std::stoi(nx());
     else if (a == "--prompt") A.prompt = std::stoi(nx());
     else if (a == "--temp") A.temp = std::stof(nx());
@@ -699,6 +781,8 @@ int main(int argc, char** argv) {
     else if (mode == "trace") trace(m, ring);
     else if (mode == "ab") ab(m, ring);
     else if (mode == "prefill") bench_prefill(m, ring);
+    else if (mode == "pfab") prefill_ab(m, ring);
+    else if (mode == "pftrace") prefill_trace(m, ring);
     else if (mode == "check") check_state(m, ring);
     else if (mode == "tf") tf(m, ring);
     else if (mode == "refhash") refhash(m, ring);

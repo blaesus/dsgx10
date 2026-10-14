@@ -5,7 +5,11 @@
 #   OWNER=glm53-model ds41f-4xgx10-switchless/engine/server/ring.sh glm53-4xgx10-switchless/engine/model/run.sh [step...]
 # Steps (synthetic weights in the real layouts): check, bench, mtp (bench with one draft), l2pf, prefill, refhash,
 # ab (the speed levers ABBASE, default none, against AB, default all, A/B/B/A at ABROWS: time and output bits),
-# trace (graph steps at TROWS, default 1,6, under nsys on every rank: run/nsys/glm_run.<rank>.nsys-rep).
+# trace (graph steps at TROWS, default 1,6, under nsys on every rank: run/nsys/glm_run.<rank>.nsys-rep),
+# pfab (prefill A B B A of the lever sets PFA, default 17: the 16-row GEMVs, against PFB, default 77: attn's gemm()
+# and gemm_bf16(), for chunks of PFCHUNKS rows at positions PFAT, default 2600, 8192, 8192 rows at 0, 0, 24576; time
+# and output bits; one MTP draft (PFDRAFTS) so that the MTP cache carries the final rows), pftrace (one chunk of
+# PFCHUNKS, default 8192, at PFAT, default 24576, under nsys on every rank; tools/step_profile.py --prefill).
 # Binaries: BIN (default ~/dsgb10-data/glm53-model/bin, installed by install.sh with the sources' hash); results:
 # OUT (TSV; the log beside it). EXTRA: more glm_run options for every step.
 # weights: every rank loads its fleet rank file to the GPU with the CRCs checked (glw_load --verify-crc), and rank 0
@@ -63,6 +67,9 @@ for s in "${steps[@]}"; do
     prefill) cmd=($G $T --max-ctx 16384 --ctx 0 --chunk 8192 $EXTRA prefill) ;;
     ab) cmd=($G $T --max-ctx 8192 --ctx 4096 --rows ${ABROWS:-1,2,4,6,16} --ab ${AB:-ffffffff} --ab-base ${ABBASE:-0} $EXTRA ab) ;;
     trace) cmd=($G $T --max-ctx 8192 --ctx 4096 --rows ${TROWS:-1,6} $EXTRA trace) ;;
+    pfab) cmd=($G $T --max-ctx 33792 --drafts ${PFDRAFTS:-1} --chunks ${PFCHUNKS:-2600,8192,8192} --at ${PFAT:-0,0,24576}
+      --ab-base ${PFA:-17} --ab ${PFB:-77} $EXTRA pfab) ;;
+    pftrace) cmd=($G $T --max-ctx 33792 --chunks ${PFCHUNKS:-8192} --at ${PFAT:-24576} $EXTRA pftrace) ;;
     weights) cmd=() ;;
     tf-prefill | tf-decode)
       cmd=("$BIN/glm_run" --weights "$WEIGHTS" --fill-experts --out "$OUT" $T --max-ctx 4096 --tokens "$TOKENS"
@@ -74,7 +81,7 @@ for s in "${steps[@]}"; do
     *) echo "unknown step $s"; rc=2; continue ;;
   esac
   if [ "$s" = weights ]; then weights_step "$BIN" 2>&1 | tee -a "$LOG"
-  elif [ "$s" = trace ]; then NSYS=1 "$HERE/run4.sh" "${cmd[@]}" 2>&1 | tee -a "$LOG"
+  elif [ "$s" = trace ] || [ "$s" = pftrace ]; then NSYS=1 "$HERE/run4.sh" "${cmd[@]}" 2>&1 | tee -a "$LOG"
   else "$HERE/run4.sh" "${cmd[@]}" 2>&1 | tee -a "$LOG"; fi
   r=${PIPESTATUS[0]}
   if [ "$r" = 0 ]; then

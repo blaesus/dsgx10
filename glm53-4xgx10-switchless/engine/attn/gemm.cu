@@ -8,6 +8,9 @@
 // per n-tile reads the lane's 16 weight bytes, widens them exactly to bf16 and runs, for each m-tile, the
 // GEMV's four MMAs from zero; the stage's f32 result is scaled and added to the accumulator (acc += s * c),
 // k in order. With split-K the parts' sums are kept apart and added in part order, as the GEMV's warps do.
+// BF16 weights (gemm_bf16; row-major [N][K], no scales): the BF16 GEMV's arithmetic instead, the four MMAs of a
+// chunk accumulating straight into the sum (k in order), the weights staged as each lane's 32 bytes (row g,
+// k = 16t .. 16t + 15 of the chunk: the GEMV's two 16-byte loads).
 #include <algorithm>
 
 #include "attn/attn.h"
@@ -46,13 +49,14 @@ __device__ __forceinline__ void mma_z(float (&d)[4], uint32_t a0, uint32_t a1, u
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(0.f));
 }
 
-template <int OUT, bool SPLIT, int BM, int BN, int WM, int WN, int STAGES>
+template <int OUT, bool SPLIT, int BM, int BN, int WM, int WN, int STAGES, bool BW = false>
 __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {  // 1 CTA an SM
   constexpr int NWM = BM / WM, NTH = NWM * (BN / WN) * 32;
   constexpr int MI = WM / 16, NI = WN / 8;
-  constexpr int SA = BM * 128, SB = BN * 64, STG = SA + SB;
-  constexpr int ACH = BM * 8 / NTH, BCH = BN * 4 / NTH;
-  static_assert(ACH * NTH == BM * 8 && BCH * NTH == BN * 4, "tile shape");
+  constexpr int WB = BW ? 2 : 1;  // weight bytes a value
+  constexpr int SA = BM * 128, SB = BN * 64 * WB, STG = SA + SB;
+  constexpr int ACH = BM * 8 / NTH, BCH = BN * 4 * WB / NTH;
+  static_assert(ACH * NTH == BM * 8 && BCH * NTH == BN * 4 * WB, "tile shape");
   extern __shared__ __align__(128) uint8_t smem[];
   pdl_trigger();
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -83,10 +87,18 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
   bool bok[BCH];
 #pragma unroll
   for (int j = 0; j < BCH; ++j) {
-    const int i = tid + j * NTH, nt = i >> 5, l = i & 31, n = n0 + 8 * nt;
-    bok[j] = n < sg.n;
-    bsrc[j] = sg.w + ((size_t)(bok[j] ? n >> 3 : 0) * J) * 512 + 16 * l;
-    bdst[j] = SA + nt * 512 + 16 * l;
+    const int i = tid + j * NTH;
+    if constexpr (BW) {  // 16-byte half hf of lane l's 32 bytes: row 8 nt + g, k = 16t + 8hf .. + 7
+      const int nt = i >> 6, l = (i >> 1) & 31, hf = i & 1, n = n0 + 8 * nt + (l >> 2);
+      bok[j] = n < sg.n;
+      bsrc[j] = sg.w + ((size_t)(bok[j] ? n : 0) * K + 16 * (l & 3) + 8 * hf) * 2;
+      bdst[j] = SA + nt * 1024 + 32 * l + 16 * hf;
+    } else {
+      const int nt = i >> 5, l = i & 31, n = n0 + 8 * nt;
+      bok[j] = n < sg.n;
+      bsrc[j] = sg.w + ((size_t)(bok[j] ? n >> 3 : 0) * J) * 512 + 16 * l;
+      bdst[j] = SA + nt * 512 + 16 * l;
+    }
   }
   const uint32_t s_base = smem_u32(smem);
   auto load_stage = [&](int kt, int buf) {
@@ -94,7 +106,7 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
 #pragma unroll
     for (int j = 0; j < ACH; ++j) cp16(s0 + adst[j], asrc[j] + kt * 128, aok[j]);
 #pragma unroll
-    for (int j = 0; j < BCH; ++j) cp16(s0 + bdst[j], bsrc[j] + (size_t)kt * 512, bok[j]);
+    for (int j = 0; j < BCH; ++j) cp16(s0 + bdst[j], bsrc[j] + (size_t)kt * (BW ? 128 : 512), bok[j]);
   };
   // scales: the warp's n-tiles (SwiGLU: lane t's intermediate's gate row, up at + K / ks)
   const float* sp[NI];
@@ -103,8 +115,8 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
   for (int ni = 0; ni < NI; ++ni) {
     const int n = n0 + wn * WN + ni * 8;
     nok[ni] = n < sg.n;
-    const int nn = nok[ni] ? n : 0;
-    sp[ni] = OUT == (int)GemvOut::kSwiGLU ? sg.s + (size_t)(((nn >> 1) + t) >> sg.lrs) * 2 * (K >> sg.lks)
+    const int nn = nok[ni] && !BW ? n : 0;
+    sp[ni] = BW ? nullptr : OUT == (int)GemvOut::kSwiGLU ? sg.s + (size_t)(((nn >> 1) + t) >> sg.lrs) * 2 * (K >> sg.lks)
                                           : sg.s + (size_t)(nn >> sg.lrs) * (K >> sg.lks);
   }
   const int sup = K >> sg.lks;
@@ -120,11 +132,13 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
   int part = 0, pend = SPLIT ? J / a.splitk : J;  // the GEMV's part boundaries: J * p / splitk
   float sn0[NI], sn1[NI];  // the next stage's scales
   auto load_scales = [&](int kt) {
+    if constexpr (!BW) {
 #pragma unroll
-    for (int ni = 0; ni < NI; ++ni) {
-      const float* b = sp[ni] + ((kt * 64) >> sg.lks);
-      sn0[ni] = __ldg(b);
-      sn1[ni] = OUT == (int)GemvOut::kSwiGLU ? __ldg(b + sup) : sn0[ni];
+      for (int ni = 0; ni < NI; ++ni) {
+        const float* b = sp[ni] + ((kt * 64) >> sg.lks);
+        sn0[ni] = __ldg(b);
+        sn1[ni] = OUT == (int)GemvOut::kSwiGLU ? __ldg(b + sup) : sn0[ni];
+      }
     }
   };
   load_scales(0);
@@ -162,6 +176,19 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
     }
 #pragma unroll
     for (int ni = 0; ni < NI; ++ni) {
+      if constexpr (BW) {
+        const uint8_t* wb = sb0 + (wn * (WN / 8) + ni) * 1024 + 32 * lane;
+        const uint4 w0 = *reinterpret_cast<const uint4*>(wb), w1 = *reinterpret_cast<const uint4*>(wb + 16);
+#pragma unroll
+        for (int mi = 0; mi < MI; ++mi) {
+          float(&c)[4] = acc[mi][ni];
+          mma_bf16(c, xa[mi][0].x, xc[mi][0].x, xa[mi][0].y, xc[mi][0].y, w0.x, w0.y);
+          mma_bf16(c, xa[mi][0].z, xc[mi][0].z, xa[mi][0].w, xc[mi][0].w, w0.z, w0.w);
+          mma_bf16(c, xa[mi][1].x, xc[mi][1].x, xa[mi][1].y, xc[mi][1].y, w1.x, w1.y);
+          mma_bf16(c, xa[mi][1].z, xc[mi][1].z, xa[mi][1].w, xc[mi][1].w, w1.z, w1.w);
+        }
+        continue;
+      }
       const uint4 wv = *reinterpret_cast<const uint4*>(sb0 + (wn * (WN / 8) + ni) * 512 + 16 * lane);
       uint32_t o[8];
       fp8x4_to_bf16(wv.x, o[0], o[1]);
@@ -257,25 +284,81 @@ int ilog2g(int v, const char* what) {
   return l;
 }
 
-template <int OUT, bool SPLIT, int BM, int BN, int WM, int WN, int STAGES>
+template <int OUT, bool SPLIT, int BM, int BN, int WM, int WN, int STAGES, bool BW = false>
 void launch_gemm(const GArgs& a, int gx, cudaStream_t s, bool pdl) {
   constexpr int NTH = BM / WM * (BN / WN) * 32;
-  const size_t smem = (size_t)STAGES * (BM * 128 + BN * 64);
+  const size_t smem = (size_t)STAGES * (BM * 128 + BN * 64 * (BW ? 2 : 1));
   static bool once = [&] {
-    CUDA_CHECK(cudaFuncSetAttribute(k_gemm<OUT, SPLIT, BM, BN, WM, WN, STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    (int)smem));
+    CUDA_CHECK(cudaFuncSetAttribute(k_gemm<OUT, SPLIT, BM, BN, WM, WN, STAGES, BW>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     return true;
   }();
   (void)once;
-  launch(k_gemm<OUT, SPLIT, BM, BN, WM, WN, STAGES>, dim3(gx, (a.rows + BM - 1) / BM), dim3(NTH), smem, s, pdl, a);
+  launch(k_gemm<OUT, SPLIT, BM, BN, WM, WN, STAGES, BW>, dim3(gx, (a.rows + BM - 1) / BM), dim3(NTH), smem, s, pdl, a);
   CUDA_CHECK(cudaGetLastError());
 }
 
 int g_gemm_cfg = -1;  // a bench knob: tile configurations (-1, the default: by shape)
 
+// the launch arguments; returns the CTA columns (BN weight rows a CTA)
+int gemm_args(GArgs& a, const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out,
+              int splitk, int BN, bool fp8) {
+  a = GArgs{};
+  a.x = x;
+  a.ldx = ldx;
+  a.rows = rows;
+  a.K = K;
+  a.splitk = splitk;
+  a.nseg = nseg;
+  int c0 = 0;
+  for (int i = 0; i < nseg; ++i) {
+    const GemvSeg& g = segs[i];
+    if (g.n % 8) die("gemm: segment %d has %d rows", i, g.n);
+    if (g.group_rows && g.group_rows % BN) die("gemm: groups of %d rows (tiles of %d)", g.group_rows, BN);
+    if (fp8 && (g.rs < 8 || g.ks < 64)) die("gemm: scale block %dx%d", g.rs, g.ks);
+    GSeg& d = a.s[i];
+    d.w = static_cast<const uint8_t*>(g.w);
+    d.s = fp8 ? g.s : nullptr;
+    d.y = g.y;
+    d.n = g.n;
+    d.ldy = g.ldy;
+    d.lrs = fp8 ? ilog2g(g.rs, "rs") : 0;
+    d.lks = fp8 ? ilog2g(g.ks, "ks") : 0;
+    d.group_rows = g.group_rows;
+    d.x_group = g.x_group;
+    d.cta0 = c0;
+    {
+      const size_t es = out == GemvOut::kF32 ? 4 : 2;
+      d.vec = (reinterpret_cast<uintptr_t>(g.y) % 16 == 0) && ((size_t)g.ldy * es % 16 == 0);
+    }
+    c0 += (g.n + BN - 1) / BN;
+  }
+  return c0;
+}
+
 }  // namespace
 
 void gemm_config(int cfg) { g_gemm_cfg = cfg; }
+
+void gemm_bf16(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
+               cudaStream_t s, bool pdl) {
+  if (rows < 1) die("gemm_bf16: %d rows", rows);
+  if (K % 64 || nseg < 1 || nseg > kMaxSegs) die("gemm_bf16: K %d, %d segments", K, nseg);
+  if (splitk != 1 && splitk != 2 && splitk != 4) die("gemm_bf16: splitk %d", splitk);
+  if (K / 64 < splitk) die("gemm_bf16: K %d for split-K %d", K, splitk);
+  if (out == GemvOut::kSwiGLU) die("gemm_bf16: no SwiGLU output");
+  // one tile shape: 128 x 64, 3 stages (72 KiB: a stage's bf16 weights take twice the FP8 bytes); warps 64 x 16
+  // for a split-K (the FP8 split-K default's), 32 x 32 otherwise
+  GArgs a;
+  const int c0 = gemm_args(a, x, ldx, rows, K, segs, nseg, out, splitk, 64, false);
+  if (out == GemvOut::kBF16) {
+    if (splitk > 1) launch_gemm<(int)GemvOut::kBF16, true, 128, 64, 64, 16, 3, true>(a, c0, s, pdl);
+    else launch_gemm<(int)GemvOut::kBF16, false, 128, 64, 32, 32, 3, true>(a, c0, s, pdl);
+  } else {
+    if (splitk > 1) launch_gemm<(int)GemvOut::kF32, true, 128, 64, 64, 16, 3, true>(a, c0, s, pdl);
+    else launch_gemm<(int)GemvOut::kF32, false, 128, 64, 32, 32, 3, true>(a, c0, s, pdl);
+  }
+}
 
 void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int nseg, GemvOut out, int splitk,
           cudaStream_t s, bool pdl) {
@@ -288,36 +371,8 @@ void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int 
   // 32 x 32, 3); 4: as 0 with 3 stages; 5: 128 x 128, 32 x 32 (16 warps), 4 (split-K: 3)
   const int cfg = g_gemm_cfg >= 0 ? g_gemm_cfg : splitk > 1 ? 4 : 0;  // by shape: measured on GB10
   const int BN = splitk > 1 ? (cfg == 1 || cfg == 5 ? 128 : 64) : (cfg == 2 ? 64 : 128);
-  GArgs a{};
-  a.x = x;
-  a.ldx = ldx;
-  a.rows = rows;
-  a.K = K;
-  a.splitk = splitk;
-  a.nseg = nseg;
-  int c0 = 0;
-  for (int i = 0; i < nseg; ++i) {
-    const GemvSeg& g = segs[i];
-    if (g.n % 8) die("gemm: segment %d has %d rows", i, g.n);
-    if (g.group_rows && g.group_rows % BN) die("gemm: groups of %d rows (tiles of %d)", g.group_rows, BN);
-    if (g.rs < 8 || g.ks < 64) die("gemm: scale block %dx%d", g.rs, g.ks);
-    GSeg& d = a.s[i];
-    d.w = static_cast<const uint8_t*>(g.w);
-    d.s = g.s;
-    d.y = g.y;
-    d.n = g.n;
-    d.ldy = g.ldy;
-    d.lrs = ilog2g(g.rs, "rs");
-    d.lks = ilog2g(g.ks, "ks");
-    d.group_rows = g.group_rows;
-    d.x_group = g.x_group;
-    d.cta0 = c0;
-    {
-      const size_t es = out == GemvOut::kF32 ? 4 : 2;
-      d.vec = (reinterpret_cast<uintptr_t>(g.y) % 16 == 0) && ((size_t)g.ldy * es % 16 == 0);
-    }
-    c0 += (g.n + BN - 1) / BN;
-  }
+  GArgs a;
+  const int c0 = gemm_args(a, x, ldx, rows, K, segs, nseg, out, splitk, BN, true);
 #define GO(O, SP, BM_, BN_, WM_, WN_, ST) launch_gemm<(int)O, SP, BM_, BN_, WM_, WN_, ST>(a, c0, s, pdl)
 #define CFGS(O)                                                         \
   if (splitk > 1) {                                                     \
