@@ -64,9 +64,11 @@ void local_top1(const float* logits, int R, int vocab0, comm::glm::Cand* out, cu
 void publish(SampleOut* outs, const StepIn* in, const int32_t* draft, const int32_t* acc, int ndraft, int nsess,
              cudaStream_t s, bool pdl);
 
-// Prefill's sublayer ends on a reduce-scattered quarter: h = bf16(res + bf16(a)), or with b, h = bf16(res +
-// bf16(bf16(a) + bf16(b))) (the experts' finalize); n elements; h may be res.
-void add_rows(const uint16_t* res, const float* a, const float* b, size_t n, uint16_t* h, cudaStream_t s);
+// Prefill's sublayer ends on a reduce-scattered quarter: h = bf16(res + a), one rounding (decision 8; round2:
+// bf16(res + bf16(a)), the double rounding), or with b (the old MoE combine), h = bf16(res + bf16(bf16(a) + bf16(b)))
+// (the experts' finalize); n elements; h may be res.
+void add_rows(const uint16_t* res, const float* a, const float* b, size_t n, uint16_t* h, cudaStream_t s,
+              bool round2 = false);
 // pos[i] = p0 + i, slot[i] = sl (i < n)
 void iota(int32_t* pos, int32_t* slot, int p0, int sl, int n, cudaStream_t s);
 // rows of bf16 [n][cols] at in (stride ldi) -> out (stride ldo)

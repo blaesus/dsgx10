@@ -96,7 +96,7 @@ template <bool kNorm, bool kTwo = false, bool kPosted = false>
 __global__ void __launch_bounds__(512) k_allreduce_hidden(DevChannel ch, const float* part, int R, int S, int RG,
                                                           float* out_f32, uint16_t* out_bf16, const uint16_t* res,
                                                           uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn,
-                                                          const float* part2 = nullptr) {
+                                                          const float* part2 = nullptr, bool r2 = false) {
   extern __shared__ float sh[];  // kNorm: [RG][768 / S * 8] the slice's h values; then [RG] rstd
   const int items = 768 / S, tpr = (items + 31) / 32 * 32;
   const int slice = blockIdx.x % S, grp = blockIdx.x / S;
@@ -154,15 +154,15 @@ __global__ void __launch_bounds__(512) k_allreduce_hidden(DevChannel ch, const f
       *reinterpret_cast<uint4*>(out_bf16 + (size_t)row * kDim + c0) = make_uint4(q[0], q[1], q[2], q[3]);
     }
   } else {
-    // h = bf16(res + bf16(sum)): the new residual
+    // h = bf16(res + sum), one rounding (decision 8; r2: bf16(res + bf16(sum)), the double rounding before it)
     float h[8];
     if (item) {
       const uint32_t rw[4] = {rv.x, rv.y, rv.z, rv.w};
       uint32_t q[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        h[2 * j] = bfround(__fadd_rn(bf2f(rw[j]), bfround(v[2 * j])));
-        h[2 * j + 1] = bfround(__fadd_rn(bf2f(rw[j] >> 16), bfround(v[2 * j + 1])));
+        h[2 * j] = bfround(__fadd_rn(bf2f(rw[j]), r2 ? bfround(v[2 * j]) : v[2 * j]));
+        h[2 * j + 1] = bfround(__fadd_rn(bf2f(rw[j] >> 16), r2 ? bfround(v[2 * j + 1]) : v[2 * j + 1]));
         q[j] = (uint32_t)f2bf(h[2 * j]) | (uint32_t)f2bf(h[2 * j + 1]) << 16;
       }
       *reinterpret_cast<uint4*>(res_out + (size_t)row * kDim + c0) = make_uint4(q[0], q[1], q[2], q[3]);
@@ -228,7 +228,7 @@ __global__ void __launch_bounds__(512) k_allreduce_hidden(DevChannel ch, const f
 template <bool kTwo, bool kPosted>
 __global__ void __launch_bounds__(768) k_ar_norm_row(DevChannel ch, const float* part, int R, const uint16_t* res,
                                                      uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn,
-                                                     const float* part2) {
+                                                     const float* part2, bool r2) {
   __shared__ float hs[kDim];
   __shared__ float ss[256];
   __shared__ float rstd_sh;
@@ -273,8 +273,8 @@ __global__ void __launch_bounds__(768) k_ar_norm_row(DevChannel ch, const float*
     uint32_t q[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      h[2 * j] = bfround(__fadd_rn(bf2f(rw[j]), bfround(v[2 * j])));
-      h[2 * j + 1] = bfround(__fadd_rn(bf2f(rw[j] >> 16), bfround(v[2 * j + 1])));
+      h[2 * j] = bfround(__fadd_rn(bf2f(rw[j]), r2 ? bfround(v[2 * j]) : v[2 * j]));  // as k_allreduce_hidden
+      h[2 * j + 1] = bfround(__fadd_rn(bf2f(rw[j] >> 16), r2 ? bfround(v[2 * j + 1]) : v[2 * j + 1]));
       q[j] = (uint32_t)f2bf(h[2 * j]) | (uint32_t)f2bf(h[2 * j + 1]) << 16;
     }
     *reinterpret_cast<uint4*>(res_out + (size_t)row * kDim + c0) = make_uint4(q[0], q[1], q[2], q[3]);
@@ -315,7 +315,7 @@ __global__ void __launch_bounds__(768) k_ar_norm_row(DevChannel ch, const float*
 template <bool kNorm, bool kTwo = false, bool kPosted = false>
 void launch_ar(const DevChannel& ch, const float* part, int R, float* out_f32, uint16_t* out_bf16, const uint16_t* res,
                uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st, bool pdl, int S,
-               const float* part2 = nullptr) {
+               const float* part2 = nullptr, bool r2 = false) {
   if (S == 0) S = 8;  // measured best or equal at 1-16 rows (docs/ring.md)
   if constexpr (kNorm) {
     if (S == 1) {  // one block a row
@@ -330,7 +330,7 @@ void launch_ar(const DevChannel& ch, const float* part, int R, float* out_f32, u
       attr[0].val.programmaticStreamSerializationAllowed = 1;
       cfg.attrs = attr;
       cfg.numAttrs = pdl ? 1 : 0;
-      CUDA_CHECK(cudaLaunchKernelEx(&cfg, k_ar_norm_row<kTwo, kPosted>, ch, part, R, res, res_out, w, eps, xn, part2));
+      CUDA_CHECK(cudaLaunchKernelEx(&cfg, k_ar_norm_row<kTwo, kPosted>, ch, part, R, res, res_out, w, eps, xn, part2, r2));
       return;
     }
   }
@@ -351,7 +351,7 @@ void launch_ar(const DevChannel& ch, const float* part, int R, float* out_f32, u
   cfg.attrs = attr;
   cfg.numAttrs = pdl ? 1 : 0;
   CUDA_CHECK(cudaLaunchKernelEx(&cfg, k_allreduce_hidden<kNorm, kTwo, kPosted>, ch, part, R, a.S, a.RG, out_f32, out_bf16, res,
-                                res_out, w, eps, xn, part2));
+                                res_out, w, eps, xn, part2, r2));
 }
 
 // ---- (b) all-gathers by rows -----------------------------------------------------------------------------------
@@ -455,24 +455,26 @@ void allreduce_hidden(const DevChannel& ch, const float* part, int R, float* out
 }
 
 void allreduce_add_norm(const DevChannel& ch, const float* part, int R, const uint16_t* res, uint16_t* res_out,
-                        const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st, bool pdl, int slices) {
-  launch_ar<true>(ch, part, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices);
+                        const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st, bool pdl, int slices, bool round2) {
+  launch_ar<true>(ch, part, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices, nullptr, round2);
 }
 
 void allreduce2_add_norm(const DevChannel& ch, const float* part, const float* part2, int R, const uint16_t* res,
                          uint16_t* res_out, const uint16_t* w, float eps, uint16_t* xn, cudaStream_t st, bool pdl,
-                         int slices) {
-  launch_ar<true, true>(ch, part, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices, part2);
+                         int slices, bool round2) {
+  launch_ar<true, true>(ch, part, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices, part2, round2);
 }
 
 void allreduce_add_norm_posted(const DevChannel& ch, int R, const uint16_t* res, uint16_t* res_out, const uint16_t* w,
-                               float eps, uint16_t* xn, cudaStream_t st, bool pdl, int slices) {
-  launch_ar<true, false, true>(ch, nullptr, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices);
+                               float eps, uint16_t* xn, cudaStream_t st, bool pdl, int slices, bool round2) {
+  launch_ar<true, false, true>(ch, nullptr, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices, nullptr,
+                               round2);
 }
 
 void allreduce2_add_norm_posted(const DevChannel& ch, int R, const uint16_t* res, uint16_t* res_out, const uint16_t* w,
-                                float eps, uint16_t* xn, cudaStream_t st, bool pdl, int slices) {
-  launch_ar<true, true, true>(ch, nullptr, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices, nullptr);
+                                float eps, uint16_t* xn, cudaStream_t st, bool pdl, int slices, bool round2) {
+  launch_ar<true, true, true>(ch, nullptr, R, nullptr, nullptr, res, res_out, w, eps, xn, st, pdl, slices, nullptr,
+                              round2);
 }
 
 void allgather_rows(const DevChannel& ch, const RowSeg* segs, int nseg, int rows, cudaStream_t st, int blocks,
