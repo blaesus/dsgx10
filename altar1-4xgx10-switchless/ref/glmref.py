@@ -73,6 +73,7 @@ VOCAB = 154880
 ROUTE_SCALE = 2.5
 ATT_SCALE = DQK ** -0.5
 GROUP = 32  # INT4 group size along K
+ROW_CHUNK = 4096  # rows a chunk where only memory, not a bit, depends on it
 
 ST_DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32, "U8": torch.uint8, "F8_E4M3": torch.float8_e4m3fn,
              "I32": torch.int32, "I64": torch.int64}
@@ -249,10 +250,13 @@ def out_scaled_linear(x, w32, scale, chunk=4096):
 
 
 def add_residual(h, y):
-    """bf16 residual + sublayer output: one rounding of the f32 sum (contract), or a bf16 add."""
-    if y.dtype == F32:
-        return (h.to(F32) + y).to(BF16)
-    return h + y
+    """bf16 residual + sublayer output: one rounding of the f32 sum (contract), or a bf16 add. Elementwise, in
+    row chunks (no full-size f32 temporaries)."""
+    out = torch.empty_like(h)
+    for r0 in range(0, h.shape[0], ROW_CHUNK):
+        hh, yy = h[r0:r0 + ROW_CHUNK], y[r0:r0 + ROW_CHUNK]
+        out[r0:r0 + ROW_CHUNK] = (hh.to(F32) + yy).to(BF16) if y.dtype == F32 else hh + yy
+    return out
 
 
 def scaled_linear(x, w32, scale, chunk=4096):
@@ -332,17 +336,25 @@ def attention(x, W, full, prev_topk, cos, sin, args):
     """MLA over one sequence (positions 0..S-1). Returns (out [S, D] bf16 or f32, topk, margin)."""
     S = x.shape[0]
     cq = rms_norm(linear(x, W("self_attn.q_a_proj.weight")), W("self_attn.q_a_layernorm.weight"), 1e-6)
-    q = linear(cq, W("self_attn.q_b_proj.weight")).view(S, NH, DQK)
-    q = torch.cat([q[..., :DN], rope(q[..., DN:], cos[:, None], sin[:, None])], dim=-1)  # [S, H, 256]
     ckv = linear(x, W("self_attn.kv_a_proj_with_mqa.weight"))
     c = rms_norm(ckv[:, :RKV], W("self_attn.kv_a_layernorm.weight"), 1e-6)
     k_rot = rope(ckv[:, RKV:], cos, sin)                                                 # [S, 64]
-    kv = linear(c, W("self_attn.kv_b_proj.weight")).view(S, NH, DN + DV)
+    # q, K and V are built in row chunks (a GEMM's rows are independent: batch invariance, glm53 reference
+    # § 6.5), so the full q_b and kv_b outputs (0.9 and 1.5 GB at 26.8k rows) never exist at once.
+    Wqb, Wkvb = W("self_attn.q_b_proj.weight"), W("self_attn.kv_b_proj.weight")
+    q = torch.empty(S, NH, DQK, dtype=BF16)
     K = torch.empty(NH, S, DQK, dtype=BF16)
-    K[:, :, :DN] = kv[:, :, :DN].transpose(0, 1)
+    V = torch.empty(NH, S, DV, dtype=BF16)
+    for r0 in range(0, S, ROW_CHUNK):
+        r1 = min(S, r0 + ROW_CHUNK)
+        qc = linear(cq[r0:r1], Wqb).view(r1 - r0, NH, DQK)
+        q[r0:r1] = torch.cat([qc[..., :DN], rope(qc[..., DN:], cos[r0:r1, None], sin[r0:r1, None])], dim=-1)
+        kv = linear(c[r0:r1], Wkvb).view(r1 - r0, NH, DN + DV)
+        K[:, r0:r1, :DN] = kv[:, :, :DN].transpose(0, 1)
+        V[:, r0:r1] = kv[:, :, DN:].transpose(0, 1)
+        del qc, kv
     K[:, :, DN:] = k_rot.unsqueeze(0)
-    V = kv[:, :, DN:].transpose(0, 1).contiguous()                                       # [H, S, 256]
-    del kv, ckv, c
+    del ckv, c
     margin = None
     if full:
         topk, margin = indexer_topk(x, cq, W, cos, sin, args.index_block)
@@ -377,16 +389,21 @@ def attention(x, W, full, prev_topk, cos, sin, args):
     return out, topk, margin
 
 
-def bf16_mlp(x, W, p, chunk=2048):
+def bf16_mlp(x, W, p, chunk=2048, add_to=None):
     """A BF16 SwiGLU MLP (the dense MLPs of layers 0-2, intermediate 12288; the shared experts), over row
-    chunks so the intermediate stays small. Row chunking changes no bit (glm53 reference § 6.5)."""
+    chunks so the intermediate stays small. Row chunking changes no bit (glm53 reference § 6.5). add_to: an f32
+    tensor the output is added to in place (acc + out, elementwise: the same bits as a separate sum)."""
     g, u, d = W(p + ".gate_proj.weight"), W(p + ".up_proj.weight"), W(p + ".down_proj.weight")
     if COMBINE == "f32":
         d = d.to(F32)
-    out = torch.empty(x.shape, dtype=F32 if COMBINE == "f32" else BF16)
+    out = add_to if add_to is not None else torch.empty(x.shape, dtype=F32 if COMBINE == "f32" else BF16)
     for i in range(0, x.shape[0], chunk):
         xi = x[i:i + chunk]
-        out[i:i + chunk] = out_linear(silu_mul(linear(xi, g), linear(xi, u)), d)
+        y = out_linear(silu_mul(linear(xi, g), linear(xi, u)), d)
+        if add_to is not None:
+            out[i:i + chunk] += y
+        else:
+            out[i:i + chunk] = y
     return out
 
 
@@ -507,7 +524,7 @@ def moe(x, W, l, pool, src=None):
         dn_sq[e] = h.to(F32).pow(2).sum(0)
         del wts, g, u, d, xe, h, y
     if COMBINE == "f32":
-        out = acc + bf16_mlp(x, W, "mlp.shared_experts")                                  # f32, rounded with the residual
+        out = bf16_mlp(x, W, "mlp.shared_experts", add_to=acc)                            # f32, rounded with the residual
     else:
         out = acc.to(BF16)
         del acc
@@ -626,19 +643,21 @@ class Run:
         W = LayerW(self.ck, l)
         t0 = time.time()
         x = rms_norm(h, W("input_layernorm.weight"), 1e-5)
-        a = torch.empty(h.shape, dtype=F32 if COMBINE == "f32" else BF16)
+        h1 = torch.empty_like(h)
         topk, saved = {}, {}
         for s in seqs:
             r0, n = s["off"], s["n"]
             cos, sin = self.rope[:n], self.rope_s[:n]
-            a[r0:r0 + n], tk, mg = attention(x[r0:r0 + n], W, self.full[l] if l != MTP else True,
-                                             prev.get(s["name"]), cos, sin, self.args)
+            a, tk, mg = attention(x[r0:r0 + n], W, self.full[l] if l != MTP else True,
+                                  prev.get(s["name"]), cos, sin, self.args)
+            h1[r0:r0 + n] = add_residual(h[r0:r0 + n], a)
+            del a
             topk[s["name"]] = tk
             if mg is not None:
                 saved[s["name"]] = (tk, mg)
         t_att = time.time() - t0
-        h = add_residual(h, a)
-        del a, x
+        h = h1
+        del h1, x
         x = rms_norm(h, W("post_attention_layernorm.weight"), 1e-5)
         route = calib = None
         if l < 3:
@@ -729,6 +748,7 @@ class Run:
                 prev = topk
                 self.write_layer(l, h, saved, route, calib, {"attention_s": t_att, "layer_s": t_all})
                 self.save_state(l + 1, h=h)
+                malloc_trim()
                 log(f"layer {l:2d} {'full' if self.full[l] else 'shared'} {t_all:7.1f} s (attention {t_att:6.1f} s)"
                     f"  rss {rss_gib():.1f} GiB  hwm {rss_gib('VmHWM'):.1f} GiB")
             if last < NL:
@@ -827,6 +847,15 @@ FILES = {
     "mtp/*": "as final/, for the MTP rows; next_logprob is log p(token t+2); rows_main maps MTP rows to main rows",
     "state/hfinal.pt": "the final hidden after model.norm, every row, bf16 [N, 6144] (gold_prep.py reads it)",
 }
+
+
+def malloc_trim():
+    """Hand freed heap back to the system after a layer (glibc keeps it otherwise: RSS 4-5 GiB between layers)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
 
 
 def rss_gib(key="VmRSS"):
