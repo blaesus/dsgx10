@@ -365,6 +365,26 @@ const std::vector<ACase>& altar_cases() {
       {"shared gate+up BF16 1024x6144 (SwiGLU)", {{WFmt::kBF16, 2 * kSharedInterRank}}, kDim, 0, 0, kDim, GemvOut::kSwiGLU, 4},
       {"shared down BF16 6144x512 (f32)", {{WFmt::kBF16, kDim}}, kSharedInterRank, 0, 0, kSharedInterRank, GemvOut::kF32, 1},
       {"head BF16 38720x6144", {{WFmt::kBF16, kVocabRank}}, kDim, 0, 0, kDim, GemvOut::kBF16, 1},
+      // the same BF16 shapes in the GEMV's lane order (kBF16T)
+      {"x-projection BF16T 688x6144", {{WFmt::kBF16T, kXRows}}, kDim, 0, 0, kDim, GemvOut::kBF16, 4},
+      {"indexer wq_b BF16T 1024x2048", {{WFmt::kBF16T, 1024}}, kQLora, 0, 0, kQLora, GemvOut::kBF16, 1},
+      {"q_b INT4 + wq_b BF16T (one call, two launches)", {{WFmt::kINT4, kOProjK}, {WFmt::kBF16T, 1024}}, kQLora, 0, 0,
+       kQLora, GemvOut::kBF16, 1},
+      {"W_UK^T BF16T 16x(512x192) grouped", {{WFmt::kBF16T, kHeads * kKvLora}}, kNope, kKvLora, kQkDim, kOProjK,
+       GemvOut::kBF16, 1},
+      {"q_b BF16T + wq_b BF16T (BF16 layers)", {{WFmt::kBF16T, kOProjK}, {WFmt::kBF16T, 1024}}, kQLora, 0, 0, kQLora,
+       GemvOut::kBF16, 1},
+      {"W_UV BF16T grouped (BF16 layers)", {{WFmt::kBF16T, kOProjK}}, kKvLora, kVDim, kKvLora, kHeads * kKvLora,
+       GemvOut::kBF16, 1},
+      {"o_proj BF16T 6144x4096 (f32, BF16 layers)", {{WFmt::kBF16T, kDim}}, kOProjK, 0, 0, kOProjK, GemvOut::kF32, 1},
+      {"dense gate+up BF16T 6144x6144 (SwiGLU)", {{WFmt::kBF16T, 2 * kDenseInterRank}}, kDim, 0, 0, kDim,
+       GemvOut::kSwiGLU, 1},
+      {"dense down BF16T 6144x3072 (f32)", {{WFmt::kBF16T, kDim}}, kDenseInterRank, 0, 0, kDenseInterRank, GemvOut::kF32, 1},
+      {"shared gate+up BF16T 1024x6144 (SwiGLU)", {{WFmt::kBF16T, 2 * kSharedInterRank}}, kDim, 0, 0, kDim,
+       GemvOut::kSwiGLU, 4},
+      {"shared down BF16T 6144x512 (f32)", {{WFmt::kBF16T, kDim}}, kSharedInterRank, 0, 0, kSharedInterRank,
+       GemvOut::kF32, 1},
+      {"head BF16T 38720x6144", {{WFmt::kBF16T, kVocabRank}}, kDim, 0, 0, kDim, GemvOut::kBF16, 1},
   };
   return cs;
 }

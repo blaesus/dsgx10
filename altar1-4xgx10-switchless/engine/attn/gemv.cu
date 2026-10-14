@@ -19,6 +19,7 @@ struct SegDev {
   const float* s;
   void* y;
   int ldy, lrs, lks, group_rows, x_group, tile0;
+  int tiled;  // BF16: kBF16T's lane order (else rows)
 };
 struct Segs {
   SegDev s[kMaxSegs];
@@ -187,8 +188,10 @@ __global__ void __launch_bounds__(NWP * 32) k_gemv(const uint16_t* __restrict__ 
   const int J = K >> 6;
   const int j0 = (J * pl.kpart) / splitk, j1 = (J * (pl.kpart + 1)) / splitk;
   // weights
-  const uint8_t* wp = FP8 ? sg.w + ((size_t)pl.lt * J) * 512 + lane * 16
-                          : sg.w + ((size_t)(n0 + g) * K + 16 * t) * 2;
+  const uint8_t* wp = FP8         ? sg.w + ((size_t)pl.lt * J) * 512 + lane * 16
+                     : sg.tiled ? sg.w + ((size_t)pl.lt * J) * 1024 + lane * 32
+                                : sg.w + ((size_t)(n0 + g) * K + 16 * t) * 2;
+  const int wstep = sg.tiled ? 1024 : 128;  // BF16: a chunk's stride
   // scale row: the tile's block; SwiGLU: lane t's intermediate (n0/2 + t)'s gate block row (up follows it)
   const float* sp = !FP8 ? nullptr
                     : OUT == (int)GemvOut::kSwiGLU ? sg.s + (size_t)(((n0 >> 1) + t) >> sg.lrs) * 2 * (K >> sg.lks)
@@ -200,8 +203,8 @@ __global__ void __launch_bounds__(NWP * 32) k_gemv(const uint16_t* __restrict__ 
     if constexpr (FP8) {
       b[0] = ldg_stream128(wp + (size_t)j * 512);
     } else {
-      b[0] = ldg_stream128(wp + (size_t)j * 128);
-      b[1] = ldg_stream128(wp + (size_t)j * 128 + 16);
+      b[0] = ldg_stream128(wp + (size_t)j * wstep);
+      b[1] = ldg_stream128(wp + (size_t)j * wstep + 16);
     }
   };
   if (pl.valid) {
@@ -443,7 +446,7 @@ void launch_gemv4(const uint16_t* x, int ldx, int rows, int K, const Segs& sd, i
 }
 
 const char* fmt_name(WFmt f) {
-  return f == WFmt::kBF16 ? "BF16" : f == WFmt::kINT4 ? "INT4" : f == WFmt::kFP8 ? "FP8" : "unset";
+  return f == WFmt::kBF16 ? "BF16" : f == WFmt::kBF16T ? "BF16T" : f == WFmt::kINT4 ? "INT4" : f == WFmt::kFP8 ? "FP8" : "unset";
 }
 
 // one launch: segments of one format
@@ -469,6 +472,7 @@ void gemv_one(WFmt fmt, const uint16_t* x, int ldx, int rows, int K, const GemvS
     d.x_group = g.x_group;
     if (g.group_rows && g.group_rows % 8) die("gemv: group of %d rows", g.group_rows);
     d.tile0 = t0;
+    d.tiled = g.fmt == WFmt::kBF16T;
     t0 += g.n / 8;
   }
   sd.tile_end = t0;
@@ -519,9 +523,10 @@ void gemv(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int 
     GemvSeg g[kMaxSegs];
     int n = 0;
     for (int i = 0; i < nseg; ++i) {
-      if (segs[i].fmt != WFmt::kBF16 && segs[i].fmt != WFmt::kINT4 && segs[i].fmt != WFmt::kFP8)
+      if (segs[i].fmt != WFmt::kBF16 && segs[i].fmt != WFmt::kBF16T && segs[i].fmt != WFmt::kINT4 &&
+          segs[i].fmt != WFmt::kFP8)
         die("gemv: segment %d has no weight format (%d)", i, (int)segs[i].fmt);
-      if (segs[i].fmt == f) g[n++] = segs[i];
+      if (segs[i].fmt == f || (f == WFmt::kBF16 && segs[i].fmt == WFmt::kBF16T)) g[n++] = segs[i];
     }
     if (!n) continue;
     const bool with_iw = iw && !iw_done && f != WFmt::kINT4;

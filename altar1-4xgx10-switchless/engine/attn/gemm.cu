@@ -25,7 +25,8 @@ struct GSeg {
   const float* s;
   void* y;
   int n, ldy, lrs, lks, group_rows, x_group, cta0;  // cta0: the segment's first CTA column
-  int vec;  // y rows 16-byte aligned: the epilogue stores 16-byte pieces
+  int vec;    // y rows 16-byte aligned: the epilogue stores 16-byte pieces
+  int tiled;  // BF16: kBF16T's lane order (else rows)
 };
 struct GArgs {
   const uint16_t* x;
@@ -102,7 +103,8 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
     if constexpr (BW) {  // 16-byte half hf of lane l's 32 bytes: row 8 nt + g, k = 16t + 8hf .. + 7
       const int nt = i >> 6, l = (i >> 1) & 31, hf = i & 1, n = n0 + 8 * nt + (l >> 2);
       bok[j] = n < sg.n;
-      bsrc[j] = sg.w + ((size_t)(bok[j] ? n : 0) * K + 16 * (l & 3) + 8 * hf) * 2;
+      bsrc[j] = sg.tiled ? sg.w + ((size_t)(bok[j] ? n >> 3 : 0) * J) * 1024 + 32 * l + 16 * hf
+                         : sg.w + ((size_t)(bok[j] ? n : 0) * K + 16 * (l & 3) + 8 * hf) * 2;
       bdst[j] = SA + nt * 1024 + 32 * l + 16 * hf;
     } else {
       const int nt = i >> 5, l = i & 31, n = n0 + 8 * nt;
@@ -112,12 +114,13 @@ __global__ void __launch_bounds__(BM / WM * (BN / WN) * 32, 1) k_gemm(GArgs a) {
     }
   }
   const uint32_t s_base = smem_u32(smem);
+  const size_t bstep = BW ? (sg.tiled ? 1024 : 128) : 512;  // a 64-k chunk's stride
   auto load_stage = [&](int kt, int buf) {
     const uint32_t s0 = s_base + buf * STG;
 #pragma unroll
     for (int j = 0; j < ACH; ++j) cp16(s0 + adst[j], asrc[j] + kt * 128, aok[j]);
 #pragma unroll
-    for (int j = 0; j < BCH; ++j) cp16(s0 + bdst[j], bsrc[j] + (size_t)kt * (BW ? 128 : 512), bok[j]);
+    for (int j = 0; j < BCH; ++j) cp16(s0 + bdst[j], bsrc[j] + (size_t)kt * bstep, bok[j]);
   };
   // scales: the warp's n-tiles (SwiGLU: lane t's intermediate's gate row, up at + K / ks)
   const float* sp[NI];
@@ -344,6 +347,7 @@ int gemm_args(GArgs& a, const uint16_t* x, int ldx, int rows, int K, const GemvS
     d.group_rows = g.group_rows;
     d.x_group = g.x_group;
     d.cta0 = c0;
+    d.tiled = g.fmt == WFmt::kBF16T;
     {
       const size_t es = out == GemvOut::kF32 ? 4 : 2;
       d.vec = (reinterpret_cast<uintptr_t>(g.y) % 16 == 0) && ((size_t)g.ldy * es % 16 == 0);
@@ -419,7 +423,8 @@ void gemm_bf16(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs,
                cudaStream_t s, bool pdl) {
   gemm_check("gemm_bf16", rows, K, nseg, splitk);
   for (int i = 0; i < nseg; ++i)
-    if (segs[i].fmt != WFmt::kNone && segs[i].fmt != WFmt::kBF16) die("gemm_bf16: segment %d is not BF16", i);
+    if (segs[i].fmt != WFmt::kNone && segs[i].fmt != WFmt::kBF16 && segs[i].fmt != WFmt::kBF16T)
+      die("gemm_bf16: segment %d is not BF16", i);
   gemm_bf16_run(x, ldx, rows, K, segs, nseg, out, splitk, s, pdl);
 }
 
@@ -430,7 +435,7 @@ void gemm(const uint16_t* x, int ldx, int rows, int K, const GemvSeg* segs, int 
   int nb = 0, nf = 0;
   for (int i = 0; i < nseg; ++i) {
     const GemvSeg& g = segs[i];
-    if (g.fmt == WFmt::kBF16) b[nb++] = g;
+    if (g.fmt == WFmt::kBF16 || g.fmt == WFmt::kBF16T) b[nb++] = g;
     else if (g.fmt == WFmt::kFP8) f[nf++] = g;
     else if (g.fmt != WFmt::kINT4) die("gemm: segment %d has no weight format (%d)", i, (int)g.fmt);
   }

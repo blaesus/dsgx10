@@ -387,6 +387,96 @@ void test_int4(int S) {
   }
 }
 
+// kBF16T, BF16 in the GEMV's lane order: [N/8][K/64][32 lanes][16 values], lane 4g + t: row 8i + g, k 64j + 16t ..
+std::vector<uint16_t> tile_bf16(const std::vector<uint16_t>& w, int N, int K) {
+  std::vector<uint16_t> o(w.size());
+  const int J = K / 64;
+  for (int i = 0; i < N / 8; ++i)
+    for (int j = 0; j < J; ++j)
+      for (int l = 0; l < 32; ++l)
+        for (int e = 0; e < 16; ++e)
+          o[(((size_t)i * J + j) * 32 + l) * 16 + e] = w[(size_t)(8 * i + (l >> 2)) * K + 64 * j + 16 * (l & 3) + e];
+  return o;
+}
+std::vector<uint16_t> rand_bf16(size_t n, uint64_t seed, float scale) {
+  std::vector<uint16_t> v(n);
+  uint64_t z = seed * 0x9E3779B97F4A7C15ull + 1;
+  for (auto& e : v) {
+    z = z * 6364136223846793005ull + 1442695040888963407ull;
+    e = tu::f2bf(scale * ((float)(int)((z >> 40) & 0xFFFF) / 32768.f - 1.f));
+  }
+  return v;
+}
+// T: the tiled BF16 weights (kBF16T) through the GEMV and the GEMM = the row-major BF16, bit for bit
+void test_bf16t(int S) {
+  struct Case {
+    const char* name;
+    int N, K, group_rows, x_group, ldx;
+    std::vector<int> splitks;
+  };
+  const int R = std::min(S, 600);
+  for (const Case& c : {Case{"x-projection 688x6144", kXRows, kDim, 0, 0, kDim, {4, 1}},
+                        Case{"q_b 4096x2048", kOProjK, kQLora, 0, 0, kQLora, {1, 2}},
+                        Case{"wq_b 1024x2048", 1024, kQLora, 0, 0, kQLora, {1}},
+                        Case{"W_UK^T grouped", kHeads * kKvLora, kNope, kKvLora, kQkDim, kOProjK, {1}},
+                        Case{"W_UV grouped", kOProjK, kKvLora, kVDim, kKvLora, kHeads * kKvLora, {1}},
+                        Case{"o_proj 6144x4096", kDim, kOProjK, 0, 0, kOProjK, {1, 2}},
+                        Case{"shared down 6144x512", kDim, kSharedInterRank, 0, 0, kSharedInterRank, {1}}}) {
+    const auto hw = rand_bf16((size_t)c.N * c.K, c.N + c.K, 0.05f);
+    Dev<uint16_t> w(hw), wt(tile_bf16(hw, c.N, c.K)), x(rand_bf16((size_t)R * c.ldx, 7, 1.f));
+    bool ok = true;
+    int cases = 0;
+    for (GemvOut out : {GemvOut::kBF16, GemvOut::kF32, GemvOut::kSwiGLU})
+      for (int sk : c.splitks)
+        for (int rows : {1, 6, 16, R}) {
+          const size_t es = out == GemvOut::kF32 ? 4 : 2, ny = out == GemvOut::kSwiGLU ? c.N / 2 : c.N;
+          Dev<uint8_t> ya((size_t)rows * ny * es), yb((size_t)rows * ny * es);
+          GemvSeg a = seg_bf16(wt.p, c.N, ya.p, (int)ny, c.group_rows, c.x_group);
+          GemvSeg b = seg_bf16(w.p, c.N, yb.p, (int)ny, c.group_rows, c.x_group);
+          a.fmt = WFmt::kBF16T;
+          if (rows <= kMaxRows) {
+            gemv(x.p, c.ldx, rows, c.K, &b, 1, out, sk, 0);
+            const auto ref = yb.down();
+            for (int cfg = -1; cfg < 6; ++cfg) {
+              gemv_config(cfg);
+              ya.zero();
+              gemv(x.p, c.ldx, rows, c.K, &a, 1, out, sk, 0);
+              ok = ok && ya.down() == ref;
+              ++cases;
+            }
+            gemv_config(-1);
+          } else {
+            gemm(x.p, c.ldx, rows, c.K, &b, 1, out, sk, 0);
+            const auto ref = yb.down();
+            for (int gm : {-1, 0, 3}) {
+              gemm_raster(gm);
+              ya.zero();
+              gemm(x.p, c.ldx, rows, c.K, &a, 1, out, sk, 0);
+              ok = ok && ya.down() == ref;
+              ++cases;
+            }
+            gemm_raster(-1);
+          }
+        }
+    T(ok, "T BF16 tiled (kBF16T) %s = row-major BF16, bit for bit (%d cases: GEMV at 1/6/16 rows in launch shapes "
+      "-1..5, GEMM at %d rows in rasters -1/0/3; bf16/f32/SwiGLU out, split-K)", c.name, cases, R);
+  }
+  // one call mixing the two (one launch): = each alone
+  {
+    const auto h1 = rand_bf16((size_t)kOProjK * kQLora, 1, 0.05f), h2 = rand_bf16((size_t)1024 * kQLora, 2, 0.05f);
+    Dev<uint16_t> w1(tile_bf16(h1, kOProjK, kQLora)), w2(h2), x(rand_bf16((size_t)16 * kQLora, 3, 1.f));
+    Dev<uint16_t> y1((size_t)16 * kOProjK), y2((size_t)16 * 1024), z1((size_t)16 * kOProjK), z2((size_t)16 * 1024);
+    GemvSeg s2[2] = {seg_bf16(w1.p, kOProjK, y1.p, kOProjK), seg_bf16(w2.p, 1024, y2.p, 1024)};
+    s2[0].fmt = WFmt::kBF16T;
+    gemv(x.p, kQLora, 16, kQLora, s2, 2, GemvOut::kBF16, 1, 0);
+    GemvSeg a = s2[0], b = s2[1];
+    a.y = z1.p, b.y = z2.p;
+    gemv(x.p, kQLora, 16, kQLora, &a, 1, GemvOut::kBF16, 1, 0);
+    gemv(x.p, kQLora, 16, kQLora, &b, 1, GemvOut::kBF16, 1, 0);
+    T(y1.down() == z1.down() && y2.down() == z2.down(), "T kBF16T + kBF16 segments in one launch = each alone, bit for bit");
+  }
+}
+
 // bf16 comparison with a summary line: pass when no value is off by more than one ulp in more than frac of them
 bool check_bf16(const char* what, const uint16_t* a, const uint16_t* b, size_t rows, size_t cols, size_t lda, size_t ldb,
                 double frac = 1e-4, bool exact = false) {
@@ -1288,14 +1378,14 @@ void test_real() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 2) die("usage: attn_tests DIR [--only ADCBPEFGSH]");
+  if (argc < 2) die("usage: attn_tests DIR [--only ADTCBPEFGSH]");
   g_dir = argv[1];
   if (manifest_str("kind") == "real") {  // tools/real_ref.py's data: real altar-1 tensors
     test_real();
     std::printf("%d passed, %d failed\n", T.pass, T.fail);
     return T.fail ? 1 : 0;
   }
-  std::string only = argc > 3 && std::string(argv[2]) == "--only" ? argv[3] : "ADCBPEFGSH";
+  std::string only = argc > 3 && std::string(argv[2]) == "--only" ? argv[3] : "ADTCBPEFGSH";
   const int S = manifest_int("S"), nd = manifest_int("decode");
   g_fmt = manifest_str("fmt");
   if (g_fmt.empty()) g_fmt = "fp8";
@@ -1320,6 +1410,7 @@ int main(int argc, char** argv) {
       case 'S': test_slots(S); break;
       case 'H': test_mlp(S, nd); break;
       case 'P': test_gemm(S); break;
+      case 'T': test_bf16t(S); break;
     }
   }
   std::printf("%d passed, %d failed\n", T.pass, T.fail);

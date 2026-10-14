@@ -75,11 +75,14 @@ enum class WFmt : int {
   kBF16 = 1,
   kINT4 = 2,
   kFP8 = 3,
+  kBF16T = 4,  // BF16 in the GEMV's lane order: [N/8][K/64][32 lanes][32 B], lane 4g + t of tile i, chunk j holding
+               // row 8i + g, k = 64j + 16t .. + 15 (each warp's chunk one contiguous 1 KB; the same values and
+               // arithmetic as kBF16, so the same outputs bit for bit; may share a launch with kBF16)
 };
 inline constexpr int kInt4BlkK = 512, kInt4Blk = 2368;  // the INT4 tile's block: 8 rows x 512 k, its bytes
 // a matrix's bytes in its format (FP8: the codes only)
 constexpr size_t weight_bytes(WFmt f, size_t N, size_t K) {
-  return f == WFmt::kBF16 ? N * K * 2 : f == WFmt::kINT4 ? N / 8 * (K / kInt4BlkK) * kInt4Blk : f == WFmt::kFP8 ? N * K : 0;
+  return f == WFmt::kBF16 || f == WFmt::kBF16T ? N * K * 2 : f == WFmt::kINT4 ? N / 8 * (K / kInt4BlkK) * kInt4Blk : f == WFmt::kFP8 ? N * K : 0;
 }
 enum class GemvOut : int {
   kBF16 = 0,    // y bf16 [rows][ldy]: a bf16 F.linear
