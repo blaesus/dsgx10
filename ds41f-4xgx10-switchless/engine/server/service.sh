@@ -24,6 +24,18 @@
 #   DSGB10_ENGINE_ARGS        the engine's arguments after --mode serve --socket <run/engine.sock>:
 #                             --max-ctx 262144 (the rest are serve's defaults)
 #   DSGB10_FRONT_ARGS         more of dsfront's arguments
+#   DSGB10_FRONT_HOST         dsfront on another host, so that rank 0's box does inference alone: an SSH
+#                             destination that rank 0 reaches key-only (user@address). The
+#                             supervisor stays here and keeps one SSH connection to it, which runs dsfront
+#                             there and forwards the two unix sockets: the engine's to that host (-R),
+#                             dsfront's admin socket back here (-L). DSGB10_ADDR are then that host's
+#                             addresses, DSGB10_KEY_FILE a file there, and dsfront's log, pid and table
+#                             are in the same directory there (SERVICE_DIR); its sshd needs
+#                             StreamLocalBindUnlink yes. The connection gone, dsfront there stops, and
+#                             the supervisor restarts both as it restarts a front-end that exited
+#   DSGB10_FRONT_HOST_BIN     with DSGB10_FRONT_HOST, the dsfront binary on that host (its own build for
+#                             its architecture), copied at start as DSGB10_FRONT_BIN is here. Here
+#                             DSGB10_FRONT_BIN is then the admin socket's client only
 #   DSGB10_NOTE               added to ring.owner: how long the service will hold the ring, say
 #   DSGB10_BIN, DSGB10_FRONT_BIN  the binaries, copied at start (to the workers once the service has
 #                             the ring), so a later build does not change a running service:
@@ -66,6 +78,7 @@ SOCK=$RUN/engine.sock ADMIN=$RUN/front.admin
 OWNERF=$RING_OWNER
 WS=("${FLEET_WORKERS[@]}")  # ranks 1-3
 MOCK=${DSGB10_MOCK:-0}
+FHOST= FHBIN=  # dsfront on another host (DSGB10_FRONT_HOST); a run/settings from before it has neither
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10)
 KEEP=${KEEP:-5} LOG_MIB=${LOG_MIB:-64}
 READY_S=${READY_S:-600}           # rank 0 must be listening this long after it starts (it takes ~60 s)
@@ -93,13 +106,19 @@ settings() {
   MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-100}
   YIELD_IDLE_S=${DSGB10_YIELD_IDLE_S:-600} HOLD_S=${DSGB10_HOLD_S:-600}
   KEEP_GIB=${DSGB10_KEEP_GIB:-4}
+  FHOST=${DSGB10_FRONT_HOST:-} FHBIN=${DSGB10_FRONT_HOST_BIN:-}
 }
 
 # the front-end's addresses, one per line; its URLs; every address's /health code; all of them 200
 addrs() { tr ', ' '\n\n' <<< "$ADDR" | sed '/^$/d'; }
 urls() { addrs | sed "s|.*|http://&:$PORT/v1|" | paste -sd' '; }
 health() {
-  local a
+  local a c
+  if [ -n "$FHOST" ]; then  # the addresses are the front host's: asked from there ("000" if it is not reached)
+    c=$("${SSH[@]}" -o ConnectTimeout=5 "$FHOST" "for a in $(addrs | paste -sd' '); do curl -s -m 3 -o /dev/null -w '%{http_code} ' http://\$a:$PORT/health; done" 2> /dev/null)
+    echo "${c:-000 }"
+    return
+  fi
   for a in $(addrs); do curl -s -m 3 -o /dev/null -w '%{http_code} ' "http://$a:$PORT/health"; done
 }
 health_ok() {
@@ -119,8 +138,16 @@ check() {
   [ "$(addrs | sort | uniq -d)" = "" ] || die "DSGB10_ADDR names an address twice"
   [[ $PORT =~ ^[0-9]+$ ]] || die "DSGB10_PORT '$PORT' is not a port"
   [ "$PORT" != 8888 ] || [ "${DSGB10_PROD:-}" = 1 ] || die "port 8888 is the production endpoint: DSGB10_PROD=1"
-  [ -r "$KEY" ] || die "no API key file $KEY"
-  [ $((8#$(stat -c %a "$KEY") & 8#077)) = 0 ] || die "$KEY can be read by others: chmod 600 it"
+  if [ -n "$FHOST" ]; then  # the key and dsfront's binary are the front host's
+    [ -n "$FHBIN" ] || die "DSGB10_FRONT_HOST needs DSGB10_FRONT_HOST_BIN, the dsfront binary on $FHOST"
+    "${SSH[@]}" "$FHOST" true || die "cannot reach $FHOST by SSH, key-only (BatchMode)"
+    "${SSH[@]}" "$FHOST" "[ -x '$FHBIN' ]" || die "no front-end binary $FHBIN on $FHOST"
+    "${SSH[@]}" "$FHOST" "[ -r '$KEY' ]" || die "no API key file $KEY on $FHOST"
+    "${SSH[@]}" "$FHOST" "[ \$((8#\$(stat -c %a '$KEY') & 8#077)) = 0 ]" || die "$KEY on $FHOST can be read by others: chmod 600 it"
+  else
+    [ -r "$KEY" ] || die "no API key file $KEY"
+    [ $((8#$(stat -c %a "$KEY") & 8#077)) = 0 ] || die "$KEY can be read by others: chmod 600 it"
+  fi
   [[ $YIELD_IDLE_S =~ ^[0-9]+$ && $HOLD_S =~ ^[0-9]+$ ]] || die "DSGB10_YIELD_IDLE_S and DSGB10_HOLD_S are seconds"
   [[ $KEEP_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "DSGB10_KEEP_GIB '$KEEP_GIB' is not GiB"
   if [ "$MOCK" = 1 ]; then  # a test instance must share nothing with the service
@@ -177,6 +204,14 @@ freeze() {  # the binaries as they are now, here, and the fleet file beside the 
     cp "$FLEET" "$H/bin/fleet.conf.new" && mv -f "$H/bin/fleet.conf.new" "$H/bin/fleet.conf" &&
     cp "$FBIN" "$H/bin/dsfront.new" && mv -f "$H/bin/dsfront.new" "$H/bin/dsfront" &&
     cp "$SRC/engine/server/tools/evict_cache.py" "$H/bin/"
+}
+freeze_front() {  # the front host's dsfront, frozen there; its run/ must exist before the connection forwards into it
+  [ -z "$FHOST" ] && return 0
+  FH=$("${SSH[@]}" "$FHOST" "mkdir -p $RH/bin $RH/logs $RH/run && chmod 700 $RH/run && cp '$FHBIN' $RH/bin/dsfront.new && mv -f $RH/bin/dsfront.new $RH/bin/dsfront && cd $RH && pwd") &&
+    [ -n "$FH" ] || {
+    log "copying the front-end binary on $FHOST failed"
+    return 1
+  }
 }
 BOXES=0
 freeze_boxes() {  # the frozen engine and fleet file on every worker, once, before the engine's first
@@ -265,8 +300,53 @@ stop_engine() {  # rank 0 first: on SIGTERM a server ends the request in flight,
   reap_all 10
 }
 
+# On the front host (DSGB10_FRONT_HOST), what the connection runs: dsfront (one a dropped connection
+# left is stopped first), while the connection lasts. Its parent is that connection's sshd: once that
+# goes it is reparented, and stops dsfront (SIGTERM, so dsfront saves its table)
+front_remote() {
+  local old
+  old=$(for ((i = KEEP - 1; i >= 1; i--)); do echo -n "$i "; done)
+  cat << EOF
+cd $RH || exit 1
+f=logs/front.log; if [ -s \$f ]; then for i in $old; do [ -f \$f.\$i ] && mv -f \$f.\$i \$f.\$((i + 1)); done; mv -f \$f \$f.1; fi
+exec >> \$f 2>&1 < /dev/null
+stopfe() { [ -n "\$1" ] && [ "\$(cat /proc/\$1/comm 2> /dev/null)" = dsfront ] || return 0; kill -TERM \$1; for i in \$(seq 40); do kill -0 \$1 2> /dev/null || return 0; sleep 0.5; done; kill -9 \$1; }
+stopfe "\$(cat run/front.pid 2> /dev/null)"
+pp=\$PPID
+setsid bin/dsfront serve $(addrs | sed "s|.*|--listen &:$PORT|" | paste -sd' ') --engine-socket $FH/run/engine.sock --api-key-file '$KEY' --admin-socket $FH/run/front.admin --hold-s $HOLD_S --table-file $FH/run/front.table $FARGS &
+p=\$!
+echo \$p > run/front.pid
+echo "\$(date '+%F %T') front-end pid \$p, for the supervisor on $(hostname)"
+while kill -0 \$p 2> /dev/null; do
+  if [ "\$(cut -d' ' -f4 /proc/\$\$/stat)" != "\$pp" ]; then
+    echo "\$(date '+%F %T') the supervisor's connection is gone: stopping the front-end"
+    stopfe \$p
+    break
+  fi
+  sleep 1
+done
+wait \$p
+rc=\$?
+rm -f run/front.pid
+exit \$rc
+EOF
+}
+front_stop_remote() {  # [host]: dsfront on the front host, by SIGTERM (it saves its table), 20 s, then kill -9
+  "${SSH[@]}" "${1:-$FHOST}" "p=\$(cat $RH/run/front.pid 2> /dev/null); [ -n \"\$p\" ] && [ \"\$(cat /proc/\$p/comm 2> /dev/null)\" = dsfront ] || exit 0; kill -TERM \$p; for i in \$(seq 40); do kill -0 \$p 2> /dev/null || exit 0; sleep 0.5; done; kill -9 \$p"
+}
+
 start_front() {
   rotate "$LOGS/front.log"
+  if [ -n "$FHOST" ]; then  # the connection's own messages are in front.log here; dsfront's in the front host's
+    rm -f "$ADMIN"
+    "${SSH[@]}" -n -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o StreamLocalBindUnlink=yes \
+      -R "$FH/run/engine.sock:$SOCK" -L "$ADMIN:$FH/run/front.admin" "$FHOST" "bash -c $(printf %q "$(front_remote)")" \
+      >> "$LOGS/front.log" 2>&1 6>&- 8>&- 9>&- &
+    FE=$! FE_T=$(date +%s)
+    echo "$FE" > "$RUN/front.pid"
+    log "front-end started on $FHOST: the connection's pid $FE, $(urls)"
+    return
+  fi
   "$H/bin/dsfront" serve $(addrs | sed "s|.*|--listen &:$PORT|") --engine-socket "$SOCK" --api-key-file "$KEY" \
     --admin-socket "$ADMIN" --hold-s "$HOLD_S" --table-file "$RUN/front.table" $FARGS >> "$LOGS/front.log" 2>&1 < /dev/null 6>&- 8>&- 9>&- &
   FE=$! FE_T=$(date +%s)
@@ -276,6 +356,7 @@ start_front() {
 
 stop_front() {
   local i
+  [ -n "$FHOST" ] && [ -n "$FE" ] && front_stop_remote  # then the connection ends by itself
   if [ -n "$FE" ] && kill -0 "$FE" 2> /dev/null; then
     kill -TERM "$FE"
     for ((i = 0; i < 20; i++)); do
@@ -358,7 +439,7 @@ supervise() {
   trap 'STOP=1' TERM INT
   log "supervisor pid $$: front-end $(urls), engine $EARGS"
   exec 6>> "$RING_RECLAIM"  # flock'd while requests wait during a lend: no job takes the ring before us
-  if ! freeze; then
+  if ! freeze || ! freeze_front; then
     state failed "copying the binaries failed"
     rm -f "$RUN/supervisor.pid"
     exit 1
@@ -383,7 +464,7 @@ supervise() {
     if [ -n "$FE" ] && ! kill -0 "$FE" 2> /dev/null; then
       wait "$FE"
       rc=$?
-      log "front-end exited (rc $rc) after $((now - FE_T)) s: $(tail -n 2 "$LOGS/front.log" | tr '\n' '|')"
+      log "front-end exited (rc $rc) after $((now - FE_T)) s: $(tail -n 2 "$LOGS/front.log" | tr '\n' '|')${FHOST:+ (its log: $FHOST:$RH/logs/front.log)}"
       FE=
       ((now - FE_T >= 600)) && fb=0
       failure "front-end exited (rc $rc)" || {
@@ -513,7 +594,7 @@ cmd_start() {
     return
   fi
   mkdir -p "$RUN" "$LOGS" && chmod 700 "$RUN" || die "cannot make $RUN"
-  declare -p ADDR PORT KEY EARGS FARGS NOTE BIN FBIN MIN_AVAIL_GIB YIELD_IDLE_S HOLD_S KEEP_GIB MOCK > "$RUN/settings"
+  declare -p ADDR PORT KEY EARGS FARGS NOTE BIN FBIN MIN_AVAIL_GIB YIELD_IDLE_S HOLD_S KEEP_GIB MOCK FHOST FHBIN > "$RUN/settings"
   rm -f "$RUN/state"
   setsid nohup bash "$SELF" _supervise > /dev/null 2>&1 < /dev/null &
   p=$!
@@ -556,6 +637,8 @@ cmd_stop() {
   # a test instance's cleanup must not reach the ranks; its other settings stay those of this command
   # (restart starts with this environment's)
   [ "$(source "$RUN/settings" 2> /dev/null; echo "$MOCK")" = 1 ] && MOCK=1 WS=()
+  local fh  # the running service's front host (restart's own settings may name another)
+  fh=$(source "$RUN/settings" 2> /dev/null; echo "$FHOST")
   if p=$(sup_pid); then
     echo "service.sh: stopping (supervisor pid $p)"
     kill -TERM "$p"
@@ -577,6 +660,10 @@ cmd_stop() {
     if flock -n 9; then
       p=$(cat "$RUN/front.pid" 2> /dev/null)
       [ -n "$p" ] && [ "$(cat "/proc/$p/comm" 2> /dev/null)" = dsfront ] && kill -TERM "$p"
+      if [ -n "$fh" ]; then  # the front host's dsfront, then the connection
+        front_stop_remote "$fh"
+        [ -n "$p" ] && [ "$(cat "/proc/$p/comm" 2> /dev/null)" = ssh ] && kill -TERM "$p"
+      fi
       p=$(cat "$RUN/rank0.pid" 2> /dev/null)
       if [ "$MOCK" = 1 ]; then
         [ -n "$p" ] && [ "$(cat "/proc/$p/comm" 2> /dev/null)" = dsfront ] && kill -TERM "$p"
@@ -609,6 +696,12 @@ cmd_forget() {
     return 1
   fi
   rm -f "$RUN/front.table" "$RUN/front.table.new"
+  local fh
+  fh=$(source "$RUN/settings" 2> /dev/null; echo "$FHOST")
+  if [ -n "$fh" ] && ! "${SSH[@]}" "$fh" "rm -f $RH/run/front.table $RH/run/front.table.new"; then
+    echo "service.sh: dsfront's table on $fh is left ($fh unreachable?): run forget again" >&2
+    return 1
+  fi
   if [ "$MOCK" = 0 ]; then
     # each box's spill directory: --disk-dir's, else the fleet's RANK<r>_SPILL ({rank}: r; its ~/ is
     # that box's)
@@ -652,7 +745,7 @@ cmd_status() {
   echo "  ring: $(cat "$OWNERF" 2> /dev/null)"
   code=$(health)
   fp=$(cat "$RUN/front.pid" 2> /dev/null)
-  echo "  front-end: $(urls), pid ${fp:-none}, /health ${code% } ($(health_ok && echo "the engine is connected" || echo "not serving"))"
+  echo "  front-end: ${FHOST:+on $FHOST, }$(urls), pid ${fp:-none}${FHOST:+ (the connection)}, /health ${code% } ($(health_ok && echo "the engine is connected" || echo "not serving"))"
   p=$(admin status) && echo "  gate: $p"
   p=$(wants)
   [ -n "$p" ] && echo "  waiting for the ring:" && sed 's/^/    /' <<< "$p"

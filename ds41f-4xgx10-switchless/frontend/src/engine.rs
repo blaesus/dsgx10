@@ -96,11 +96,19 @@ async fn run(inner: Arc<Inner>) {
     loop {
         match UnixStream::connect(&inner.path).await {
             Ok(stream) => {
-                backoff = Duration::from_millis(100);
-                logged_down = false;
-                match connection(&inner, stream).await {
-                    Ok(()) => eprintln!("engine: connection closed"),
-                    Err(e) => eprintln!("engine: connection lost: {e}"),
+                let r = connection(&inner, stream).await;
+                // a socket forwarded from another host (service.sh's DSGB10_FRONT_HOST) accepts while the
+                // engine is down and closes before HELLO: that is the engine being down, not a connection
+                if inner.info.borrow().is_some() {
+                    backoff = Duration::from_millis(100);
+                    logged_down = false;
+                    match r {
+                        Ok(()) => eprintln!("engine: connection closed"),
+                        Err(e) => eprintln!("engine: connection lost: {e}"),
+                    }
+                } else if !logged_down {
+                    eprintln!("engine: {} closed before HELLO ({}); retrying", inner.path.display(), r.err().unwrap_or_default());
+                    logged_down = true;
                 }
                 inner.info.send_replace(None);
                 let pending = {
