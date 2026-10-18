@@ -9,7 +9,13 @@ The checkpoint it was built and validated on is a community variant,
 [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8)
 at revision `d61c59ea` (MIT, derived from deepseek-ai/DeepSeek-V4.1-Flash): it shares the official checkpoint's
 architecture, config, tokenizer and tensor formats, and differs in the values of shards 13–39 (layers 10–36).
-Production serves that variant, and its served model name, `deepseek-v4.1-flash-uncensored`, reflects it.
+Production served that variant until 2026-10-18, and its served model name, `deepseek-v4.1-flash-uncensored`,
+reflects it. Since 2026-10-18 11:56 production serves
+[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) at `1bae0e10`, deepseek-ai's
+update with the same architecture, config, tokenizer and tensors and new values in every shard, the Engram tables
+included. Its rank files and Engram shards are cut with the same tools, and dsfront follows its chat encoding with
+`--encoding 1017` ([engine § The front-end against its references](docs/engine.md#the-front-end-against-its-references-2026-10-11)).
+The served name is unchanged.
 Since 2026-10-13 the figures to publish are measured on deepseek-ai's official checkpoint,
 [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) at `fb2764a5`: "Where it stands"
 below, with the SGLang kit measured on the same checkpoint the same day, and the reference hashes

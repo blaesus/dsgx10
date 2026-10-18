@@ -6,6 +6,11 @@ Runs anywhere with Python 3.10+ (encoding.py has no dependencies), e.g. in the c
     docker run --rm -v $PWD/ref/encoding:/enc:ro -v $PWD/frontend:/work:ro -v ~/dsgb10-data/frontend:/out \\
         --entrypoint /opt/sglang/bin/python3 dsv41-4x-spark:canary-roce /work/tools/gen_encoding_cases.py
 
+ENC (default /enc) is the encoding/ directory to follow: ref/encoding for DeepSeek-V4.1-Flash, or
+ref/encoding-1017 for DeepSeek-V4.1-Flash-1017, whose cases need `dsfront enccheck FILE --encoding 1017`.
+Against 1017's the suite also covers tool namespaces, tool results that do not start a turn and tool
+messages' own content blocks; V4.1's cases are the same as before.
+
 Writes /out/enc_cases.jsonl, one case per line:
   {"kind": "encode", "name", "messages", "context", "thinking_mode", "drop_thinking", "add_bos",
    "reasoning_effort" (absent = None), "prompt" | "error", "images"}
@@ -21,10 +26,12 @@ import os
 import random
 import sys
 
-sys.path.insert(0, "/enc")
+ENC = os.environ.get("ENC", "/enc")
+sys.path.insert(0, ENC)
 import encoding as enc  # noqa: E402
 
 OUT = os.environ.get("OUT", "/out")
+V1017 = hasattr(enc, "_split_tool_name")  # DeepSeek-V4.1-Flash-1017's encoding.py
 R = random.Random(20261011)
 
 TEXTS = [
@@ -90,6 +97,11 @@ def rand_arguments():
 def tool_call(i):
     tc = {"type": "function", "function": {"name": R.choice(["bash", "read", "edit", "noargs", "x"]),
                                            "arguments": rand_arguments()}}
+    if V1017 and R.random() < 0.2:
+        if R.random() < 0.5:
+            tc["namespace"] = R.choice(["web", "fs", {"name": "fs"}])
+        else:
+            tc["function"]["name"] = "web::" + tc["function"]["name"]
     r = R.random()
     if r < 0.8:
         tc["id"] = f"call_{i}"
@@ -147,6 +159,20 @@ def tool_msgs(calls):
     return out
 
 
+def namespaced(tools):
+    """1017 only: some tools get a namespace, given on the tool or in the name."""
+    out = []
+    for t in tools:
+        t = copy.deepcopy(t)
+        r = R.random()
+        if r < 0.25:
+            t["namespace"] = R.choice(NAMESPACES)
+        elif r < 0.35:
+            t["function"]["name"] = "ns::" + t["function"]["name"]
+        out.append(t)
+    return out
+
+
 def conversation():
     thinking = R.random() < 0.6
     msgs = []
@@ -195,7 +221,7 @@ def conversation():
                 m["task"] = R.choice(list(enc.DS_TASK_SP_TOKENS))
                 break
     if tools:
-        msgs[0]["tools"] = tools
+        msgs[0]["tools"] = namespaced(tools) if V1017 and R.random() < 0.5 else tools
     if R.random() < 0.05 and msgs[0]["role"] == "system":
         msgs[0]["response_format"] = {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}}
     return msgs, thinking
@@ -244,7 +270,7 @@ def add_parse(name, text, thinking_mode):
 
 
 def golden():
-    d = "/enc/tests"
+    d = f"{ENC}/tests"
     for i in range(1, 6):
         c = enc.load_cases(f"{d}/test_input_{i}.json")[0]
         mode = c.get("thinking_mode") or "chat"
@@ -331,6 +357,59 @@ def targeted():
                  "{\"a\": Infinity}", "{\"s\": \"\\u00e9\\n\"}", "{\"a\":1}  ", "{\"a\": 1} x"])]}], mode)
 
 
+NAMESPACES = ["web", {"name": "fs"}, {"name": "fs", "description": "File tools."}, {"name": "x", "description": ""}]
+
+
+def targeted_1017():
+    """Tool namespaces, tool results that do not start a turn, and tool messages' content blocks."""
+    u = {"role": "user", "content": "q"}
+    s = {"role": "system", "content": "sys"}
+    call = lambda name, i="a", **kw: dict({"id": i, "type": "function", "function": dict({"name": name, "arguments": "{\"x\": 1}"}, **kw.pop("f", {}))}, **kw)
+    for mode in ["chat", "thinking"]:
+        for ns in NAMESPACES + [None, "", 5, "a::b", {"description": "no name"}, ["::"], ["x"]]:
+            tool = {"type": "function", "namespace": ns, "function": {"name": "search", "description": "Search", "parameters": {}}}
+            add_encode(f"ns_tool_{ns!r}_{mode}", [dict(s, tools=[tool]), u], mode)
+        for name in ["web::search", "::x", "x::", "a::b::c", "plain", 7]:
+            add_encode(f"ns_tool_name_{name!r}_{mode}", [dict(s, tools=[{"type": "function", "function": {"name": name}}]), u], mode)
+        add_encode(f"ns_tool_desc_none_{mode}", [dict(s, tools=[{"type": "function", "namespace": {"name": "n", "description": "D"}, "function": {"name": "f"}}]), u], mode)
+        add_encode(f"ns_tool_desc_int_{mode}", [dict(s, tools=[{"type": "function", "namespace": {"name": "n", "description": "D"}, "function": {"name": "f", "description": 3}}]), u], mode)
+        add_encode(f"ns_tool_on_function_{mode}", [dict(s, tools=[{"type": "function", "function": {"name": "f", "namespace": "n", "parameters": {}}}]), u], mode)
+        add_encode(f"ns_tool_not_dict_{mode}", [dict(s, tools=[{"type": "function", "function": "f"}]), u], mode)
+        for i, c in enumerate([call("web::search"), call("search", namespace="web"), call("search", f={"namespace": "web"}),
+                               call("search", namespace={"name": "web"}), call("web::search", namespace="web"),
+                               call("web::search", namespace="other"), call("a::b::c"), call("search", namespace=""),
+                               call("search", namespace="", f={"namespace": "fn"}), call(7), call("s", namespace={"x": 1})]):
+            add_encode(f"ns_call_{i}_{mode}", [u, {"role": "assistant", "content": "", "tool_calls": [c]}, u], mode)
+        # tool results alone: the same turn, with and without tools declared
+        loop = [u, {"role": "assistant", "reasoning_content": "r1", "content": "", "tool_calls": [call("f")]},
+                {"role": "tool", "tool_call_id": "a", "content": "res"},
+                {"role": "assistant", "reasoning_content": "r2", "content": "", "tool_calls": [call("g", "b")]},
+                {"role": "tool", "tool_call_id": "b", "content": "res2"}]
+        for drop in [True, False]:
+            add_encode(f"turn_tool_loop_{drop}_{mode}", loop, mode, drop_thinking=drop)
+            add_encode(f"turn_tool_loop_then_user_{drop}_{mode}", loop + [{"role": "user", "content": "next"}], mode, drop_thinking=drop)
+            add_encode(f"turn_tool_loop_ctx_{drop}_{mode}", loop[3:], mode, context=loop[:3], drop_thinking=drop)
+            add_encode(f"turn_tool_loop_tools_{drop}_{mode}", [dict(s, tools=TOOLS[:1])] + loop, mode, drop_thinking=drop)
+        add_encode(f"turn_mid_system_{mode}", loop + [{"role": "system", "content": "now"}], mode)
+        add_encode(f"turn_blocks_text_and_result_{mode}", loop[:2] + [{"role": "user", "content_blocks": [
+            {"type": "tool_result", "tool_use_id": "a", "content": "r"}, {"type": "text", "text": "and"}]}], mode)
+        add_encode(f"turn_blocks_not_dict_{mode}", [u, {"role": "user", "content_blocks": ["x"]}], mode)
+        # tool messages' own content blocks
+        for i, m in enumerate([{"content_blocks": [{"type": "text", "text": "cb"}]},
+                               {"content": "str", "content_blocks": [{"type": "text", "text": "cb"}]},
+                               {"content": None, "content_blocks": [{"type": "text", "text": "cb"}, {"type": "audio"}]},
+                               {"content": [{"type": "text", "text": "list"}, {"type": "image_url", "image_url": {"url": "t.png"}}]},
+                               {"content_blocks": []}]):
+            add_encode(f"tool_blocks_{i}_{mode}", loop[:2] + [dict({"role": "tool", "tool_call_id": "a"}, **m)], mode)
+        add_encode(f"tool_placeholder_{mode}", loop[:2] + [{"role": "tool", "tool_call_id": "a", "content": "x" + enc.IMAGE_PLACEHOLDER}], mode)
+        add_encode(f"user_list_then_user_{mode}", [{"role": "user", "content": [{"type": "text", "text": "a"}]}, u], mode)
+        # images in tool results, in call order
+        two = {"role": "assistant", "content": "", "tool_calls": [call("f"), call("g", "b")]}
+        res = [{"role": "tool", "tool_call_id": i, "content": [{"type": "text", "text": f"r{i}"}, {"type": "image_url", "image_url": {"url": f"{i}.png"}}]} for i in "ba"]
+        add_encode(f"tool_images_order_{mode}", [u, two] + res, mode)
+        add_encode(f"tool_images_order_ctx_{mode}", res + [u], mode, context=[u, two])
+
+
 def random_cases(n):
     for i in range(n):
         msgs, thinking = conversation()
@@ -352,7 +431,7 @@ def completion(thinking):
     for i in range(R.choice([0, 0, 1, 2, 3])):
         args = rand_args()
         calls.append(enc.tool_call_template.format(dsml_token=enc.dsml_token, tool_call_tag_name=enc.tool_call_tag_name,
-                                                   name=R.choice(["bash", "read", "名", "a b"]),
+                                                   name=R.choice(["bash", "read", "名", "a b"] + (["web::search", "::x", "a::b::c"] if V1017 else [])),
                                                    arguments=enc.encode_arguments_to_dsml({"arguments": args})))
     if calls:
         parts.append("\n\n" + enc.tool_calls_template.format(dsml_token=enc.dsml_token, tool_calls="\n".join(calls),
@@ -400,6 +479,8 @@ def parse_cases(n):
 if __name__ == "__main__":
     golden()
     targeted()
+    if V1017:
+        targeted_1017()
     random_cases(int(os.environ.get("N_ENCODE", "6000")))
     parse_cases(int(os.environ.get("N_PARSE", "4000")))
     path = os.path.join(OUT, "enc_cases.jsonl")

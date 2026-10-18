@@ -36,7 +36,39 @@ const TASK_TOKENS: [(&str, &str); 6] = [
 
 /// encoding.py's REASONING_EFFORT_MAPPINGS and default.
 pub const EFFORT_NAMES: [(&str, i64); 4] = [("low", 25), ("high", 50), ("xhigh", 75), ("max", 100)];
+/// DeepSeek-V4.1-Flash-1017's encoding.py: no "xhigh", and each name one step up.
+pub const EFFORT_NAMES_1017: [(&str, i64); 3] = [("low", 50), ("high", 75), ("max", 100)];
 pub const DEFAULT_EFFORT_NAME: &str = "high";
+
+/// Which publisher's encoding.py the port follows. Both are the V4.1 format; 1017's adds tool
+/// namespaces (`namespace::name`), keeps the reasoning within a turn across tool calls (a user message
+/// of tool results alone does not start a turn), keeps a tool result's own content blocks, merges tool
+/// messages before images are collected, and renames the effort tiers (EFFORT_NAMES_1017).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Encoding {
+    /// `deepseek-ai/DeepSeek-V4.1-Flash` @ fb2764a5 (ref/encoding), and its uncensored variant.
+    #[default]
+    V41,
+    /// `deepseek-ai/DeepSeek-V4.1-Flash-1017` @ 1bae0e10 (ref/encoding-1017).
+    V41_1017,
+}
+
+impl Encoding {
+    pub fn parse(s: &str) -> Result<Self, EncodeError> {
+        match s {
+            "v4.1" | "v41" => Ok(Encoding::V41),
+            "1017" | "v4.1-1017" => Ok(Encoding::V41_1017),
+            _ => Err(err(format!("unknown encoding `{s}`: v4.1 or 1017"))),
+        }
+    }
+
+    fn effort_names(self) -> &'static [(&'static str, i64)] {
+        match self {
+            Encoding::V41 => &EFFORT_NAMES,
+            Encoding::V41_1017 => &EFFORT_NAMES_1017,
+        }
+    }
+}
 
 const TOOL_CALLS_BLOCK: &str = " calls";
 const TOOL_CALL_TAG: &str = " invoke";
@@ -76,13 +108,21 @@ pub struct EncodeOptions<'a> {
     pub context: Option<&'a [Value]>,
     pub drop_thinking: bool,
     pub add_default_bos_token: bool,
-    /// An int in [1, 100] or one of EFFORT_NAMES; None (or JSON null) means the default.
+    /// An int in [1, 100] or one of the encoding's effort names; None (or JSON null) means the default.
     pub reasoning_effort: Option<&'a Value>,
+    pub encoding: Encoding,
 }
 
 impl<'a> EncodeOptions<'a> {
     pub fn new(thinking_mode: ThinkingMode) -> Self {
-        EncodeOptions { thinking_mode, context: None, drop_thinking: true, add_default_bos_token: true, reasoning_effort: None }
+        EncodeOptions {
+            thinking_mode,
+            context: None,
+            drop_thinking: true,
+            add_default_bos_token: true,
+            reasoning_effort: None,
+            encoding: Encoding::V41,
+        }
     }
 }
 
@@ -119,19 +159,137 @@ fn is_task_set(m: &Value) -> bool {
 
 // ------------------------------------------------------------------ OpenAI-format conversions
 
-fn tools_from_openai_format(tools: &Value) -> Result<Vec<Value>, EncodeError> {
-    let arr = tools.as_array().ok_or_else(|| err("tools must be a list"))?;
-    arr.iter().map(|t| get(t, "function").cloned().ok_or_else(|| err("KeyError: 'function'"))).collect()
+/// Python None: absent or JSON null.
+fn py_none(v: Option<&Value>) -> bool {
+    matches!(v, None | Some(Value::Null))
 }
 
-fn tool_calls_from_openai_format(tcs: &Value) -> Result<Vec<(Value, Value)>, EncodeError> {
+/// Python `"::" in x` for a namespace: a substring of a str, a key of a dict, an item of a list.
+fn py_contains_sep(v: &Value) -> Result<bool, EncodeError> {
+    match v {
+        Value::String(s) => Ok(s.contains("::")),
+        Value::Object(o) => Ok(o.contains_key("::")),
+        Value::Array(a) => Ok(a.iter().any(|x| x.as_str() == Some("::"))),
+        _ => Err(err("TypeError: argument of type is not iterable")),
+    }
+}
+
+/// encoding.py (1017) _split_tool_name: `namespace::name` into its parts, checking an explicit namespace
+/// against the prefix. The namespace comes back as given (None, or any value) unless the name carries one.
+fn split_tool_name(name: Option<&Value>, namespace: Option<&Value>) -> Result<(Option<Value>, String), EncodeError> {
+    let name = match name {
+        None => return Err(err("KeyError: 'name'")),
+        Some(Value::String(s)) => s.as_str(),
+        Some(_) => return Err(err("AttributeError: tool name has no attribute 'partition'")),
+    };
+    let mut namespace = if py_none(namespace) { None } else { namespace.cloned() };
+    let mut name = name.to_string();
+    if let Some((prefix, bare)) = name.split_once("::") {
+        if !(namespace.is_none() || namespace.as_ref().and_then(Value::as_str) == Some(prefix)) {
+            return Err(err(format!("Conflicting tool namespaces: {} != {prefix}", py_str(namespace.as_ref().unwrap()))));
+        }
+        let (p, b) = (prefix.to_string(), bare.to_string());
+        namespace = Some(Value::String(p));
+        name = b;
+    }
+    if name.contains("::") {
+        return Err(err(format!("Tool name must not contain '::': {name}")));
+    }
+    if let Some(ns) = &namespace {
+        if py_contains_sep(ns)? {
+            return Err(err(format!("Tool namespace must not contain '::': {}", py_str(ns))));
+        }
+    }
+    Ok((namespace, name))
+}
+
+/// encoding.py (1017) _tool_name_for_encoding: the name as the prompt writes it, `namespace::name` or
+/// `name`; a namespace object stands for its "name".
+fn tool_name_for_encoding(tool: &Value) -> Result<String, EncodeError> {
+    let ns = match get(tool, "namespace") {
+        Some(Value::Object(o)) => Some(o.get("name").ok_or_else(|| err("KeyError: 'name'"))?),
+        other => other,
+    };
+    let (ns, name) = split_tool_name(get(tool, "name"), ns)?;
+    Ok(match ns {
+        None => name,
+        Some(ns) => format!("{}::{name}", py_str(&ns)),
+    })
+}
+
+/// The name of a tool call the model wrote, for the API. 1017's decode_dsml_to_arguments splits
+/// `namespace::name`, and its tool_calls_to_openai_format puts the namespace beside the function; a name
+/// with a second `::`, which it refuses, is reported as written. V4.1 reports every name as written.
+pub fn api_tool_name(enc: Encoding, name: &str) -> (Option<&str>, &str) {
+    if enc == Encoding::V41_1017 {
+        if let Some((ns, bare)) = name.split_once("::") {
+            if !bare.contains("::") {
+                return (Some(ns), bare);
+            }
+        }
+    }
+    (None, name)
+}
+
+fn tools_from_openai_format(tools: &Value, enc: Encoding) -> Result<Vec<Value>, EncodeError> {
+    let arr = tools.as_array().ok_or_else(|| err("tools must be a list"))?;
+    if enc == Encoding::V41 {
+        return arr.iter().map(|t| get(t, "function").cloned().ok_or_else(|| err("KeyError: 'function'"))).collect();
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for t in arr {
+        let t = t.as_object().ok_or_else(|| err("AttributeError: tool is not an object"))?;
+        let mut f = match t.get("function") {
+            None => return Err(err("KeyError: 'function'")),
+            Some(Value::Object(f)) => f.clone(),
+            Some(_) => return Err(err("TypeError: tool function is not a dict")),
+        };
+        if !py_none(t.get("namespace")) {
+            f.insert("namespace".into(), t["namespace"].clone());
+        }
+        let name = tool_name_for_encoding(&Value::Object(f.clone()))?;
+        f.insert("name".into(), Value::String(name));
+        if let Some(Value::Object(ns)) = f.shift_remove("namespace") {
+            if truthy(ns.get("description")) {
+                let nd = ns["description"].as_str().ok_or_else(|| err("TypeError: namespace description is not a str"))?;
+                let fd = match f.get("description") {
+                    d if !truthy(d) => "",
+                    Some(Value::String(s)) => s.as_str(),
+                    Some(_) => return Err(err("TypeError: tool description is not a str")),
+                    None => unreachable!(),
+                };
+                let d = format!("{nd}\n{fd}");
+                f.insert("description".into(), Value::String(d));
+            }
+        }
+        out.push(Value::Object(f));
+    }
+    Ok(out)
+}
+
+/// (name, arguments) per call. Under 1017 the name is the one the prompt writes, namespace included.
+fn tool_calls_from_openai_format(tcs: &Value, enc: Encoding) -> Result<Vec<(Value, Value)>, EncodeError> {
     let arr = tcs.as_array().ok_or_else(|| err("tool_calls must be a list"))?;
     arr.iter()
         .map(|tc| {
             let f = get(tc, "function").ok_or_else(|| err("KeyError: 'function'"))?;
-            let name = get(f, "name").cloned().ok_or_else(|| err("KeyError: 'name'"))?;
+            if enc == Encoding::V41 {
+                let name = get(f, "name").cloned().ok_or_else(|| err("KeyError: 'name'"))?;
+                let args = get(f, "arguments").cloned().ok_or_else(|| err("KeyError: 'arguments'"))?;
+                return Ok((name, args));
+            }
+            if !f.is_object() {
+                return Err(err("TypeError: tool call function is not a dict"));
+            }
+            // `tool_call.get("namespace") or function.get("namespace")`
+            let ns = get(tc, "namespace").filter(|v| truthy(Some(v))).or_else(|| get(f, "namespace"));
+            let (ns, name) = split_tool_name(get(f, "name"), ns)?;
             let args = get(f, "arguments").cloned().ok_or_else(|| err("KeyError: 'arguments'"))?;
-            Ok((name, args))
+            let mut call = json!({"name": name});
+            if let Some(ns) = ns {
+                call["namespace"] = ns;
+            }
+            Ok((Value::String(tool_name_for_encoding(&call)?), args))
         })
         .collect()
 }
@@ -157,17 +315,25 @@ fn decode_dsml_to_arguments(args: &[(String, String, String)]) -> String {
 
 // ------------------------------------------------------------------ preprocessing
 
-/// encoding.py merge_tool_messages.
-pub fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
+/// encoding.py merge_tool_messages. Under 1017 a tool message's content blocks are its result when
+/// its content is not a string, and a user message's list content is its blocks.
+pub fn merge_tool_messages(messages: &[Value], enc: Encoding) -> Vec<Value> {
     let mut merged: Vec<Value> = Vec::new();
     for msg in messages {
         let mut msg = msg.clone();
         match role(&msg) {
             Some("tool") => {
+                let mut content = get(&msg, "content").cloned().unwrap_or(json!(""));
+                if enc == Encoding::V41_1017
+                    && truthy(get(&msg, "content_blocks"))
+                    && !matches!(get(&msg, "content"), Some(Value::String(_)))
+                {
+                    content = get(&msg, "content_blocks").unwrap().clone();
+                }
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": get(&msg, "tool_call_id").cloned().unwrap_or(json!("")),
-                    "content": get(&msg, "content").cloned().unwrap_or(json!("")),
+                    "content": content,
                 });
                 let last_is_merged_user = merged
                     .last()
@@ -182,9 +348,10 @@ pub fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
             }
             Some("user") => {
                 let blocks = match get(&msg, "content_blocks") {
-                    None | Some(Value::Null) => {
-                        json!([{"type": "text", "text": get(&msg, "content").cloned().unwrap_or(json!(""))}])
-                    }
+                    None | Some(Value::Null) => match get(&msg, "content").cloned().unwrap_or(json!("")) {
+                        c @ Value::Array(_) if enc == Encoding::V41_1017 => c,
+                        c => json!([{"type": "text", "text": c}]),
+                    },
                     Some(b) => b.clone(),
                 };
                 let extend = merged.last().map_or(false, |m| {
@@ -371,10 +538,11 @@ pub fn process_image_messages(messages: &[Value]) -> Result<(Vec<Value>, Vec<Val
 
 // ------------------------------------------------------------------ rendering
 
-fn render_reasoning_effort(index: usize, mode: ThinkingMode, effort: Option<&Value>) -> Result<String, EncodeError> {
+fn render_reasoning_effort(index: usize, mode: ThinkingMode, effort: Option<&Value>, enc: Encoding) -> Result<String, EncodeError> {
+    let names = enc.effort_names();
     let budget = match effort {
-        None | Some(Value::Null) => EFFORT_NAMES.iter().find(|(n, _)| *n == DEFAULT_EFFORT_NAME).unwrap().1,
-        Some(Value::String(s)) => EFFORT_NAMES
+        None | Some(Value::Null) => names.iter().find(|(n, _)| *n == DEFAULT_EFFORT_NAME).unwrap().1,
+        Some(Value::String(s)) => names
             .iter()
             .find(|(n, _)| n == s)
             .map(|(_, b)| *b)
@@ -483,12 +651,34 @@ pub fn render_tool_calls(calls: &[(Value, Value)]) -> String {
     format!("\n\n<{DSML}{TOOL_CALLS_BLOCK}>\n{}\n</{DSML}{TOOL_CALLS_BLOCK}>", list.join("\n"))
 }
 
-/// encoding.py find_last_user_index (mid-conversation system messages count as user).
-pub fn find_last_user_index(messages: &[Value]) -> Option<usize> {
-    (0..messages.len()).rev().find(|&i| {
+/// encoding.py find_last_user_index (mid-conversation system messages count as user). Under 1017 a
+/// user message whose blocks hold no text or image, tool results alone, does not start a turn.
+pub fn find_last_user_index(messages: &[Value], enc: Encoding) -> Result<Option<usize>, EncodeError> {
+    for i in (0..messages.len()).rev() {
         let r = role(&messages[i]);
-        r == Some("user") || (r == Some("system") && i > 0)
-    })
+        if !(r == Some("user") || (r == Some("system") && i > 0)) {
+            continue;
+        }
+        let blocks = get(&messages[i], "content_blocks");
+        if enc == Encoding::V41_1017 && truthy(blocks) {
+            let blocks = blocks.unwrap().as_array().ok_or_else(|| err("AttributeError: content block is not an object"))?;
+            let mut starts_turn = false;
+            for b in blocks {
+                if !b.is_object() {
+                    return Err(err("AttributeError: content block is not an object"));
+                }
+                if matches!(get_str(b, "type"), Some("text") | Some("image") | Some("image_url")) {
+                    starts_turn = true;
+                    break;
+                }
+            }
+            if !starts_turn {
+                continue;
+            }
+        }
+        return Ok(Some(i));
+    }
+    Ok(None)
 }
 
 fn render_message(
@@ -497,17 +687,21 @@ fn render_message(
     mode: ThinkingMode,
     drop_thinking: bool,
     effort: Option<&Value>,
+    enc: Encoding,
 ) -> Result<String, EncodeError> {
     let msg = &messages[index];
-    let last_user = find_last_user_index(messages);
+    let last_user = find_last_user_index(messages, enc)?;
     let r = role(msg);
     let content = get(msg, "content");
-    let tools = if truthy(get(msg, "tools")) { Some(tools_from_openai_format(get(msg, "tools").unwrap())?) } else { None };
-    let tool_calls =
-        if truthy(get(msg, "tool_calls")) { Some(tool_calls_from_openai_format(get(msg, "tool_calls").unwrap())?) } else { None };
+    let tools = if truthy(get(msg, "tools")) { Some(tools_from_openai_format(get(msg, "tools").unwrap(), enc)?) } else { None };
+    let tool_calls = if truthy(get(msg, "tool_calls")) {
+        Some(tool_calls_from_openai_format(get(msg, "tool_calls").unwrap(), enc)?)
+    } else {
+        None
+    };
     let wo_eos = truthy(get(msg, "wo_eos"));
 
-    let effort_prompt = render_reasoning_effort(index, mode, effort)?;
+    let effort_prompt = render_reasoning_effort(index, mode, effort, enc)?;
     let mut prompt = String::new();
     if index == 0 && (!effort_prompt.is_empty() || r == Some("system")) {
         prompt.push_str(SYSTEM_SP);
@@ -650,8 +844,8 @@ fn render_message(
 }
 
 /// encoding.py _drop_thinking_messages.
-fn drop_thinking_messages(messages: &[Value]) -> Vec<Value> {
-    let last_user = find_last_user_index(messages);
+fn drop_thinking_messages(messages: &[Value], enc: Encoding) -> Result<Vec<Value>, EncodeError> {
+    let last_user = find_last_user_index(messages, enc)?;
     let keep = ["user", "system", "tool", "latest_reminder", "direct_search_results"];
     let mut out = Vec::new();
     for (idx, msg) in messages.iter().enumerate() {
@@ -668,20 +862,28 @@ fn drop_thinking_messages(messages: &[Value]) -> Vec<Value> {
             out.push(m);
         }
     }
-    out
+    Ok(out)
 }
 
+/// encoding.py _encode_messages_text. V4.1's merges the tool messages and sorts the results here;
+/// 1017's gets them merged and sorted (encode_messages).
 fn encode_messages_text(messages: &[Value], o: &EncodeOptions, context: &[Value]) -> Result<String, EncodeError> {
-    let merged = merge_tool_messages(messages);
-    let mut all: Vec<Value> = context.iter().cloned().chain(merged).collect();
-    sort_tool_results_by_call_order(&mut all);
-    let messages: Vec<Value> = all.split_off(context.len());
-    let context: Vec<Value> = if context.is_empty() {
-        Vec::new()
+    let enc = o.encoding;
+    let (messages, context): (Vec<Value>, Vec<Value>) = if enc == Encoding::V41 {
+        let merged = merge_tool_messages(messages, enc);
+        let mut all: Vec<Value> = context.iter().cloned().chain(merged).collect();
+        sort_tool_results_by_call_order(&mut all);
+        let messages: Vec<Value> = all.split_off(context.len());
+        let context: Vec<Value> = if context.is_empty() {
+            Vec::new()
+        } else {
+            let mut c = merge_tool_messages(context, enc);
+            sort_tool_results_by_call_order(&mut c);
+            c
+        };
+        (messages, context)
     } else {
-        let mut c = merge_tool_messages(context);
-        sort_tool_results_by_call_order(&mut c);
-        c
+        (messages.to_vec(), context.to_vec())
     };
     let mut full: Vec<Value> = context.iter().cloned().chain(messages.iter().cloned()).collect();
 
@@ -690,8 +892,8 @@ fn encode_messages_text(messages: &[Value], o: &EncodeOptions, context: &[Value]
     // Signed, as in Python: with odd roles in the context the count can come out negative (nothing
     // is rendered then).
     let (num_to_render, context_len): (isize, isize) = if o.thinking_mode == ThinkingMode::Thinking && effective_drop {
-        full = drop_thinking_messages(&full);
-        let n = full.len() as isize - drop_thinking_messages(&context).len() as isize;
+        full = drop_thinking_messages(&full, enc)?;
+        let n = full.len() as isize - drop_thinking_messages(&context, enc)?.len() as isize;
         (n, full.len() as isize - n)
     } else {
         (messages.len() as isize, context.len() as isize)
@@ -701,13 +903,29 @@ fn encode_messages_text(messages: &[Value], o: &EncodeOptions, context: &[Value]
         if i < 0 || i as usize >= full.len() {
             return Err(err("IndexError: message index out of range"));
         }
-        prompt.push_str(&render_message(i as usize, &full, o.thinking_mode, effective_drop, o.reasoning_effort)?);
+        prompt.push_str(&render_message(i as usize, &full, o.thinking_mode, effective_drop, o.reasoning_effort, enc)?);
     }
     Ok(prompt)
 }
 
 /// encoding.py encode_messages (text): the prompt string, plus the image records it found.
 pub fn encode_messages(messages: &[Value], o: &EncodeOptions) -> Result<(String, Vec<Value>), EncodeError> {
+    if o.encoding == Encoding::V41_1017 {
+        // validated before the merge, which can drop a tool message's own fields; the images are
+        // collected once the tool results are in their final order
+        let ctx = o.context.unwrap_or(&[]);
+        for m in ctx.iter().chain(messages) {
+            validate_no_image_sp_tokens(m)?;
+        }
+        let context = merge_tool_messages(ctx, o.encoding);
+        let mut all: Vec<Value> = context.iter().cloned().chain(merge_tool_messages(messages, o.encoding)).collect();
+        sort_tool_results_by_call_order(&mut all); // in place, so the context comes out sorted too
+        let merged = all.split_off(context.len());
+        let context = if all.is_empty() { Vec::new() } else { process_image_messages(&all)?.0 };
+        let (processed, images) = process_image_messages(&merged)?;
+        let prompt = encode_messages_text(&processed, o, &context)?;
+        return Ok((prompt, images));
+    }
     let context = match o.context {
         Some(c) if !c.is_empty() => process_image_messages(c)?.0,
         _ => Vec::new(),
@@ -833,12 +1051,14 @@ fn parse_tool_calls(mut index: usize, text: &str) -> Result<(usize, Option<Strin
 pub struct ParsedMessage {
     pub content: String,
     pub reasoning_content: String,
-    /// (name, arguments as a JSON string)
+    /// (name as the model wrote it, `namespace::name` under 1017 too (api_tool_name splits it),
+    /// arguments as a JSON string)
     pub tool_calls: Vec<(String, String)>,
 }
 
-/// encoding.py parse_message_from_completion_text: the whole completion, ending with EOS.
-pub fn parse_message_from_completion_text(text: &str, mode: ThinkingMode) -> Result<ParsedMessage, EncodeError> {
+/// encoding.py parse_message_from_completion_text: the whole completion, ending with EOS. 1017's
+/// refuses a tool name it cannot split (a second `::`).
+pub fn parse_message_from_completion_text(text: &str, mode: ThinkingMode, enc: Encoding) -> Result<ParsedMessage, EncodeError> {
     let tc_start = format!("\n\n<{DSML}{TOOL_CALLS_BLOCK}");
     let mut index = 0;
     let mut reasoning = String::new();
@@ -859,6 +1079,11 @@ pub fn parse_message_from_completion_text(text: &str, mode: ThinkingMode) -> Res
         let (i, s, c) = parse_tool_calls(index, text)?;
         index = i;
         calls = c;
+        if enc == Encoding::V41_1017 {
+            for (name, _) in &calls {
+                split_tool_name(Some(&Value::String(name.clone())), None)?;
+            }
+        }
         let _ = s;
         let (i, rest, s) = read_until_stop(index, text, &[EOS]);
         index = i;
@@ -1261,6 +1486,60 @@ impl StreamParser {
 mod tests {
     use super::*;
 
+    /// A tool loop with no tools declared: 1017 keeps the turn's reasoning across the tool result,
+    /// V4.1 drops it (the byte-exact check is enccheck against each encoding.py).
+    #[test]
+    fn reasoning_across_tool_calls_1017() {
+        let msgs: Vec<Value> = serde_json::from_str(
+            r#"[{"role":"user","content":"q"},
+                {"role":"assistant","reasoning_content":"first thought","tool_calls":[{"id":"a","function":{"name":"f","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"a","content":"r"}]"#,
+        )
+        .unwrap();
+        let mut o = EncodeOptions::new(ThinkingMode::Thinking);
+        let (v41, _) = encode_messages(&msgs, &o).unwrap();
+        o.encoding = Encoding::V41_1017;
+        let (e1017, _) = encode_messages(&msgs, &o).unwrap();
+        assert!(!v41.contains("first thought"));
+        assert!(e1017.contains("first thought</think>"));
+        assert!(e1017.ends_with("<tool_result>r</tool_result><｜Assistant｜><think>"));
+    }
+
+    #[test]
+    fn tool_namespaces_1017() {
+        let msgs: Vec<Value> = serde_json::from_str(
+            r#"[{"role":"system","content":"","tools":[{"type":"function","namespace":{"name":"web","description":"Web tools."},
+                  "function":{"name":"search","description":"Search","parameters":{}}}]},
+                {"role":"user","content":"q"},
+                {"role":"assistant","content":"","tool_calls":[{"id":"a","namespace":"web","function":{"name":"search","arguments":"{}"}}]}]"#,
+        )
+        .unwrap();
+        let mut o = EncodeOptions::new(ThinkingMode::Chat);
+        o.encoding = Encoding::V41_1017;
+        let (p, _) = encode_messages(&msgs, &o).unwrap();
+        assert!(p.contains(r#""name": "web::search", "description": "Web tools.\nSearch""#));
+        assert!(p.contains(r#"<｜DSML｜ invoke name="web::search">"#));
+        let bad: Vec<Value> = serde_json::from_str(
+            r#"[{"role":"user","content":"q"},{"role":"assistant","tool_calls":[{"namespace":"x","function":{"name":"web::search","arguments":"{}"}}]}]"#,
+        )
+        .unwrap();
+        assert!(encode_messages(&bad, &o).is_err()); // conflicting namespaces
+        assert_eq!(api_tool_name(Encoding::V41_1017, "web::search"), (Some("web"), "search"));
+        assert_eq!(api_tool_name(Encoding::V41_1017, "a::b::c"), (None, "a::b::c"));
+        assert_eq!(api_tool_name(Encoding::V41, "web::search"), (None, "web::search"));
+    }
+
+    #[test]
+    fn effort_names_1017() {
+        let msgs: Vec<Value> = serde_json::from_str(r#"[{"role":"user","content":"q"}]"#).unwrap();
+        let mut o = EncodeOptions::new(ThinkingMode::Thinking);
+        o.encoding = Encoding::V41_1017;
+        assert!(encode_messages(&msgs, &o).unwrap().0.contains("Reasoning Effort: 75 "));
+        let x = json!("xhigh");
+        o.reasoning_effort = Some(&x);
+        assert!(encode_messages(&msgs, &o).is_err());
+    }
+
     #[test]
     fn readme_example() {
         let msgs: Vec<Value> = serde_json::from_str(
@@ -1276,7 +1555,7 @@ mod tests {
             "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are a helpful assistant.<｜User｜>What is 2+2?<｜Assistant｜><think>"
         );
         let parsed =
-            parse_message_from_completion_text("Simple arithmetic.</think>2 + 2 = 4.<｜end▁of▁sentence｜>", ThinkingMode::Thinking)
+            parse_message_from_completion_text("Simple arithmetic.</think>2 + 2 = 4.<｜end▁of▁sentence｜>", ThinkingMode::Thinking, Encoding::V41)
                 .unwrap();
         assert_eq!(parsed.reasoning_content, "Simple arithmetic.");
         assert_eq!(parsed.content, "2 + 2 = 4.");
@@ -1285,7 +1564,7 @@ mod tests {
     #[test]
     fn stream_parser_tool_calls() {
         let text = "Let me look.</think>Checking.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">a.txt</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ls\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>";
-        let whole = parse_message_from_completion_text(text, ThinkingMode::Thinking).unwrap();
+        let whole = parse_message_from_completion_text(text, ThinkingMode::Thinking, Encoding::V41).unwrap();
         // feed in small pieces
         let mut p = StreamParser::new(ThinkingMode::Thinking);
         let mut out = Vec::new();
