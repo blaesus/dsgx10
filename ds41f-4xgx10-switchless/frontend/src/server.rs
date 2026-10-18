@@ -5,7 +5,7 @@
 //! matched to a session for prefix reuse, sent to rank 0, and the streamed ids are decoded, checked
 //! for stop strings and loops, and parsed into reasoning, content and tool calls.
 
-use crate::encoding::{encode_messages, Delta, EncodeOptions, StreamParser, ThinkingMode};
+use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Encoding, StreamParser, ThinkingMode};
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
@@ -35,6 +35,8 @@ pub struct ServerConfig {
     pub max_tokens_cap: u32,
     /// Reasoning effort budget when the request names none.
     pub default_effort: i64,
+    /// The chat encoding: the weights' own encoding.py (V4.1, or 1017's).
+    pub encoding: Encoding,
     pub default_thinking: bool,
     pub default_temperature: f32,
     pub default_top_p: f32,
@@ -266,7 +268,25 @@ fn tool_payload(t: &Value) -> Result<Value, String> {
             }
         }
     }
-    Ok(json!({"type": "function", "function": Value::Object(out)}))
+    let mut tool = json!({"type": "function", "function": Value::Object(out)});
+    if let Some(ns) = t.get("namespace").filter(|v| !v.is_null()) {
+        tool["namespace"] = ns.clone(); // 1017's encoding qualifies the name with it; V4.1's ignores it
+    }
+    Ok(tool)
+}
+
+/// A tool call for the API, as 1017's tool_calls_to_openai_format makes it: a `namespace::name` the
+/// model wrote is the bare name, with the namespace beside the function (api_tool_name).
+fn tool_call_json(enc: Encoding, index: Option<usize>, id_hex: String, name: &str, args: String) -> Value {
+    let (ns, name) = api_tool_name(enc, name);
+    let mut call = json!({"id": format!("call_{id_hex}"), "type": "function", "function": {"name": name, "arguments": args}});
+    if let Some(i) = index {
+        call["index"] = json!(i);
+    }
+    if let Some(ns) = ns {
+        call["namespace"] = json!(ns);
+    }
+    call
 }
 
 /// Messages for the encoder: OpenAI fields only, developer → system, null content → "".
@@ -365,6 +385,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     let mode = if thinking { ThinkingMode::Thinking } else { ThinkingMode::Chat };
     let mut o = EncodeOptions::new(mode);
     o.reasoning_effort = Some(&budget);
+    o.encoding = cfg.encoding;
     let (prompt, _) = encode_messages(&messages, &o).map_err(|e| format!("cannot encode messages: {e}"))?;
 
     // sampling and limits
@@ -740,8 +761,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
             match d {
                 Delta::Reasoning(s) => reasoning.push_str(&s),
                 Delta::Content(s) => content.push_str(&s),
-                Delta::ToolCall(_, name, args) => calls.push(json!({"id": format!("call_{}", app.random_hex(24)),
-                    "type": "function", "function": {"name": name, "arguments": args}})),
+                Delta::ToolCall(_, name, args) => calls.push(tool_call_json(app.cfg.encoding, None, app.random_hex(24), &name, args)),
             }
         }
         match end {
@@ -827,9 +847,9 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
                 let delta = match d {
                     Delta::Reasoning(s) => json!({"reasoning_content": s}),
                     Delta::Content(s) => json!({"content": s}),
-                    Delta::ToolCall(i, name, args) => json!({"tool_calls": [{"index": i,
-                        "id": format!("call_{}", app.random_hex(24)), "type": "function",
-                        "function": {"name": name, "arguments": args}}]}),
+                    Delta::ToolCall(i, name, args) => {
+                        json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, args)]})
+                    }
                 };
                 if send(chunk(delta, None)).await.is_err() {
                     return; // client gone; dropping gen cancels the request
@@ -869,6 +889,7 @@ mod tests {
             api_key: None,
             max_tokens_cap: 32768,
             default_effort: 75,
+            encoding: Encoding::V41,
             default_thinking: false,
             default_temperature: 1.0,
             default_top_p: 0.95,

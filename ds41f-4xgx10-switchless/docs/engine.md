@@ -2306,10 +2306,26 @@ agent's log.
 - **Rechecked on 2026-10-12** with master's dsfront (front-end sources as of a2e18c2): the
   tokeniser's three sets and the encoding's cases still give 0 mismatches. The SGLang check was not
   rerun, since it needs requests dumped from a session and the kit's image.
+- **DeepSeek-V4.1-Flash-1017's encoding** (2026-10-18), `dsfront serve --encoding 1017`. The
+  checkpoint (`deepseek-ai/DeepSeek-V4.1-Flash-1017` @ 1bae0e10) has the same config, tokenizer and
+  tensors as V4.1, and its encoding.py, in ref/encoding-1017, changes five things. Tools may carry a
+  namespace (on the tool, on a call, or in the name as `namespace::name`), which the prompt writes
+  as `namespace::name`. The API reports a call so named with its bare name and a `namespace` beside
+  the function. A user message of tool results alone no longer starts a turn, so with no tools
+  declared the reasoning within a turn is kept across its tool calls. A tool message's own content
+  blocks are its result. Tool messages are merged and sorted before images are collected. The effort
+  names are low 50, high 75 and max 100, with no xhigh; the server's table was already that. The
+  default, `--encoding v4.1`, is unchanged.
+  - **1017**: 0 mismatches on 6,305 encode cases (697 raise) and 4,009 parse cases (1,280 raise;
+    2,729 also streamed). gen_encoding_cases.py, run with `ENC=ref/encoding-1017`, adds cases for
+    each change above to its usual suite.
+  - **V4.1**: still 0 mismatches, both on the suite above and on a fresh one from `ENC=ref/encoding`.
+  - **Not checked**: the SGLang path, since the kit has no 1017 encoding.
 
 ```
 dsfront tokcheck ~/dsgb10-data/frontend/tok_corpus.jsonl  # also tok_fuzz and tok_sweep: tools/gen_tokenizer_cases.py
 dsfront enccheck ~/dsgb10-data/frontend/enc_cases.jsonl   # tools/gen_encoding_cases.py
+dsfront enccheck ~/dsgb10-data/enc1017/1017/enc_cases.jsonl --encoding 1017   # ENC=ref/encoding-1017
 dsfront tokbench FILE                                     # tok/s at 1, 4 and 16 threads
 frontend/tools/fe_bench.py http://127.0.0.1:PORT KEYFILE  # against the mock engine, as above
 ```

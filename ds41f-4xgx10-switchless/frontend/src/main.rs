@@ -15,6 +15,9 @@ fn usage() -> ! {
       --model-name NAME         deepseek-v4.1-flash-uncensored
       --max-tokens N            default and cap for max_tokens: 32768
       --effort N                reasoning effort budget when a request names none: 75
+      --encoding E              the chat encoding: v4.1 (DeepSeek-V4.1-Flash's encoding.py, the default)
+                                or 1017 (DeepSeek-V4.1-Flash-1017's: tool namespaces, the reasoning
+                                kept across a turn's tool calls)
       --thinking                thinking on when a request does not say (default off)
       --temperature T --top-p P sampling defaults: 1.0 and 0.95
       --no-loop-guard           do not stop repetition loops
@@ -35,7 +38,7 @@ fn usage() -> ! {
       --prefill-tps N           simulated prefill tokens/s: 20000
       --max-context N           1048576
   dsfront tokcheck <cases.jsonl>                      compare against reference ids ({{\"text\",\"ids\"}} per line)
-  dsfront enccheck <cases.jsonl>                      compare the chat encoding with encoding.py's (tools/gen_encoding_cases.py)
+  dsfront enccheck <cases.jsonl> [--encoding E]       compare the chat encoding with encoding.py's (tools/gen_encoding_cases.py)
   dsfront tokenize <file>                             print ids of a file's text
   dsfront tokbench <file>                             tokenisation throughput
   every command that tokenises takes --tokenizer PATH ({DEFAULT_TOKENIZER})"
@@ -51,6 +54,15 @@ fn parse_opt<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T
             std::process::exit(2)
         }),
     }
+}
+
+fn encoding_opt(args: &[String]) -> dsfront::encoding::Encoding {
+    opt(args, "--encoding").map_or(Default::default(), |v| {
+        dsfront::encoding::Encoding::parse(&v).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        })
+    })
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -97,6 +109,7 @@ fn serve(args: &[String]) {
         api_key,
         max_tokens_cap: parse_opt(args, "--max-tokens", 32768u32),
         default_effort: parse_opt(args, "--effort", 75i64).clamp(1, 100),
+        encoding: encoding_opt(args),
         default_thinking: args.iter().any(|a| a == "--thinking"),
         default_temperature: parse_opt(args, "--temperature", 1.0f32),
         default_top_p: parse_opt(args, "--top-p", 0.95f32),
@@ -305,6 +318,7 @@ fn enccheck(args: &[String]) {
         eprintln!("{path}: {e}");
         std::process::exit(1)
     });
+    let enc = encoding_opt(args);
     let (mut n_enc, mut n_parse, mut n_stream, mut bad) = (0usize, 0usize, 0usize, 0usize);
     let mut rng = 0x9E3779B97F4A7C15u64;
     let mut report = |name: &str, what: String| {
@@ -329,6 +343,7 @@ fn enccheck(args: &[String]) {
                 o.drop_thinking = c["drop_thinking"].as_bool().unwrap();
                 o.add_default_bos_token = c["add_bos"].as_bool().unwrap();
                 o.reasoning_effort = c.get("reasoning_effort");
+                o.encoding = enc;
                 let got = encode_messages(&msgs, &o);
                 match (got, c.get("prompt")) {
                     (Ok((p, imgs)), Some(Value::String(want))) => {
@@ -350,7 +365,7 @@ fn enccheck(args: &[String]) {
             Some("parse") => {
                 n_parse += 1;
                 let text = c["text"].as_str().unwrap();
-                let got = parse_message_from_completion_text(text, mode);
+                let got = parse_message_from_completion_text(text, mode, enc);
                 let want = c.get("result");
                 match (&got, want) {
                     (Ok(m), Some(w)) => {
@@ -358,7 +373,15 @@ fn enccheck(args: &[String]) {
                             .as_array()
                             .unwrap()
                             .iter()
-                            .map(|t| (t["function"]["name"].as_str().unwrap().to_string(), t["function"]["arguments"].as_str().unwrap().to_string()))
+                            .map(|t| {
+                                let name = t["function"]["name"].as_str().unwrap();
+                                // 1017 reports a namespace beside the function; the port keeps it in the name
+                                let name = match t.get("namespace").and_then(Value::as_str) {
+                                    Some(ns) => format!("{ns}::{name}"),
+                                    None => name.to_string(),
+                                };
+                                (name, t["function"]["arguments"].as_str().unwrap().to_string())
+                            })
                             .collect();
                         if m.content != w["content"].as_str().unwrap()
                             || m.reasoning_content != w["reasoning_content"].as_str().unwrap()
