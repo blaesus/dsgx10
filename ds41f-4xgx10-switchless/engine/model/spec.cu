@@ -609,12 +609,13 @@ void Model::Impl::spec_prefill_hidden(int L, int a, int M, const std::vector<int
 void Model::Impl::spec_prefill_accept(int a, int M, int handle, const std::vector<int>& snaps, bool ced,
                                       bool sampled) {
   NVTX_RANGE("spec_accept");
-  if (ced) {  // the replay's rows (ced_replay: spec_prefill_hidden(L, P - 128, 128, {})), then a snapshot at P
+  if (ced) {  // use the actual replay partition for DSpark main-hidden taps
     if (!sampled) return;
     const int P = a + M;
     std::vector<int> at_end;
     if (std::count(snaps.begin(), snaps.end(), P)) at_end.push_back(P);
-    return spec_prefill_accept(P - kReplay, kReplay, handle, at_end, false, true);
+    const int R = pf->ced_replay_rows;
+    return spec_prefill_accept(P - R, R, handle, at_end, false, true);
   }
   Spec& sp = *spec;
   int C;

@@ -53,6 +53,8 @@ constexpr int kMaxStop = 32;
 constexpr int kMaxSnaps = 8;
 constexpr int kMaxOps = 12;
 enum : int32_t {
+  kCmdVision = 9, // bounded chunk features
+  kCmdVisionLayout = 10, // full mask-only layout
   kCmdStop = 0,     // leave the command loop
   kCmdStep = 1,     // a golden-mode step (model::Ctl)
   kCmdDecode = 2,   // decode_loop
@@ -66,7 +68,7 @@ enum : int32_t {
   kCmdBatchTf = 20,
   kCmdSpecBatch = 8,  // spec_batch_loop (B3): the same with drafts; the Cmd's spec_* fields as kCmdDecode's
 };
-enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
+enum : uint32_t { kPfSample = 1, kPfCed = 2, kPfTailExact = 4 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
   int32_t op = kCmdStop;
   int32_t rows = 0, pos0 = 0;  // kCmdStep, kCmdRows, kCmdPrefill: the rows; kCmdDecode: the first position

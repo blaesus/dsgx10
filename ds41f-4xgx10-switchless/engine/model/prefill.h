@@ -4,6 +4,14 @@
 
 namespace model::detail {
 
+constexpr bool ced_tail_architecture_supported() {
+  if (kLayers != 2 * kCedDecoderLayers) return false;
+  for (int L = kCedDecoderLayers; L < kLayers; ++L)
+    if (kv_source(L) != kCedDecoderLayers || ratio_of(L) != 1 || engram_layer(L)) return false;
+  return true;
+}
+static_assert(ced_tail_architecture_supported(), "tail replay requires decoder KV projected from encoder output");
+
 // A window snapshot: the ring slots of positions [pos - 128, pos) of every layer (state.cu keeps them).
 constexpr int kSnapRows = 128;
 constexpr size_t kSnapKv = (size_t)kSnapRows * kHead;       // bytes per layer
@@ -18,10 +26,10 @@ inline uint8_t* snap_sc(uint8_t* b, int L) { return b + kLayers * kSnapKv + L * 
 // rows past M are padding.
 inline int q_rows(int M) { return ((M + 3) / 4 + 7) & ~7; }
 
-// CED (docs/ced.md): the decoder replays the last kReplay positions. Its input is layer 20's input as
-// the encoder left it, kept per position (slot = position mod kReplay) in records of kCedRow bytes: the
+// CED (docs/ced.md): the decoder replays the request's 128 or 2560 positions. Its input is layer 20's
+// input as the encoder left it, kept per position (slot = position mod replay_rows) in records: the
 // stream x, the normed input y with its act_quant (yq, ys) and layer 20's attention mixes.
-constexpr int kReplay = 128;
+constexpr int kReplay = kCedReplayRows;  // the legacy policy; a tail-policy request uses kCedTailRows
 // The dense index scans' rows per batch (dsk::index_topk_p: a batch's keys are selected while in L2).
 constexpr int kIdxBatch = 128;
 constexpr size_t kCedX = 0, kCedY = kCedX + (size_t)kHcDim * 2, kCedYq = kCedY + (size_t)kDim * 2,
@@ -58,6 +66,7 @@ struct Prefill {
   uint8_t *yq, *ys, *qq, *qs, *oq, *os, *gath;
   uint8_t *oqa, *osa;  // every rank's wo_a output (act_quant) for this rank's rows: [rank][Q][2048], scales
   uint8_t *lin_kv, *lin_sc;  // one layer's window: up to 127 positions before the chunk, then the chunk
+  int* image_mask;
   int *tok, *pos, *ridx, *counters, *topk_mine, *topk[kIdxSlots], *pool;
   // keys: a batch of the dense scans' rows (kIdxBatch x kstride), or the Reindex scans' rows (Q x the pool)
   uint16_t *keys, *bkeys, *topkey, *poolkey;
@@ -72,7 +81,8 @@ struct Prefill {
   // all-gather); per slot the position (-1: none) and the rank whose row it was; the end of the last
   // encoder chunk (a chunk that does not continue it starts a new run of positions)
   uint8_t *ced_rows, *ced_gath;
-  int ced_pos[kReplay], ced_src[kReplay];
+  int ced_pos[kCedTailRows], ced_src[kCedTailRows];
+  int ced_capacity = kReplay, ced_replay_rows = kReplay;
   int ced_end = -1;
   // Engram: two sets of lookups, so the next chunk's run while this one computes
   uint8_t *e_send[2][2], *e_gath, *e_xq, *e_xs, *e_part;

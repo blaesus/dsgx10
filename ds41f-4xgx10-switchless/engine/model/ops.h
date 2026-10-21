@@ -11,6 +11,11 @@
 namespace model::ops {
 
 using bf16 = __nv_bfloat16;
+struct VisionSpan { int32_t start, rows, offset; };
+// Mask the local prefill/replay rows and (when x != nullptr) replace their embedding,
+// before the first mHC boundary. x holds four copies of each 5120-dim row.
+void vision_rows(const int* pos, int R, const VisionSpan* spans, int count,
+                 const bf16* features, bf16* x, int* mask, cudaStream_t s);
 
 // What the host decides for a step, written to pinned memory before the launch (a ring of kInSlots,
 // so the next step can be queued while one runs); step_in copies the next slot to device memory first
@@ -167,7 +172,7 @@ void engram_pack(const uint8_t* rows, const uint32_t* off, int R, uint8_t* xq, u
 // kv [R][6400] from wkv; w [4][5120] = q_weight * k_weight (fp32).
 void engram_partial(const bf16* x, const bf16* kv, const float* w, int rank, int R, uint8_t* out, cudaStream_t s);
 // y = bf16(h + gate * value) from the gathered parts [4][R][kEngramPartBytes]; y may alias x.
-void engram_combine(const bf16* x, const uint8_t* gath, int R, bf16* y, cudaStream_t s);
+void engram_combine(const bf16* x, const uint8_t* gath, int R, bf16* y, cudaStream_t s, const int* image_mask = nullptr);
 
 // ---- collectives fused with their neighbours (fused.cu) ----
 // Each is a PDL launch: it waits (griddepcontrol.wait) for the kernel before it, posts its

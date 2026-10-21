@@ -169,7 +169,7 @@ void rmsnorm(const __nv_bfloat16* x, const __nv_bfloat16* w, int M, int D, float
 // Router selection from fp32 logits [M][E] (E <= 512): scores sqrt(softplus(l)), top-6 of
 // scores + bias (descending), weights = scores / (sum + 1e-20) * route_scale.
 void router_topk(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale,
-                 cudaStream_t st);
+                 cudaStream_t st, const float* bias_vl = nullptr, const int* image_mask = nullptr);
 
 // ---- MoE (routed MXFP4 experts + FP8 shared expert), per rank at TP=4: dim 5120, 576 intermediate
 

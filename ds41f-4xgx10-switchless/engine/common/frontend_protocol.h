@@ -3,11 +3,14 @@
 // Little-endian, no padding between arrays. Plain C++, no CUDA.
 #pragma once
 #include <cstddef>
+#include <array>
 #include <cstdint>
 
 namespace fe {
 
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 5;  // immutable local feature files; refuse an old frontend/engine pairing
+constexpr uint32_t kMaxImageSpans = 4096;
+constexpr uint32_t kMaxFeaturePathBytes = 4096;
 constexpr const char* kDefaultSocket = "/tmp/dsgb10-engine.sock";
 
 enum MsgType : uint16_t {
@@ -19,6 +22,7 @@ enum MsgType : uint16_t {
   // rank 0 -> front-end
   kHelloEngine = 0x81,  // HelloEngine, char name[name_len]
   kTokens = 0x82,       // TokensHeader, uint32 ids[n], [float logprob[n]], [TopLogprob top[n * n_top]]
+  kImageMiss = 0x84,    // retired in protocol 5; never emitted
   kDone = 0x83,         // DoneHeader, char error[error_len]
 };
 
@@ -37,7 +41,22 @@ enum SubmitFlags : uint32_t {
   kFlagSeed = 1,      // use SubmitHeader::seed
   kFlagKeep = 2,      // keep the session's state after DONE
   kFlagLogprobs = 4,  // send logprobs in TOKENS
+  kFlagFullPrefix = 16, // complete forward for text and images
+  kFlagTailPrefix = 32, // dependency-complete bounded decoder replay
 };
+
+inline constexpr bool valid_submit_flags(uint32_t flags) {
+  return (flags & ~(kFlagSeed | kFlagKeep | kFlagLogprobs | kFlagFullPrefix | kFlagTailPrefix)) == 0;
+}
+
+// These values are persisted by the server. The two policy flags are mutually exclusive.
+enum PrefillPolicy : int32_t { kLegacyPrefix = 0, kFullPrefix = 1, kTailPrefix = 2 };
+inline bool valid_prefill_flags(uint32_t flags) {
+  return (flags & (kFlagFullPrefix | kFlagTailPrefix)) != (kFlagFullPrefix | kFlagTailPrefix);
+}
+inline PrefillPolicy prefill_policy(uint32_t flags) {
+  return flags & kFlagTailPrefix ? kTailPrefix : flags & kFlagFullPrefix ? kFullPrefix : kLegacyPrefix;
+}
 
 struct SubmitHeader {
   uint64_t req_id;           // unique per connection
@@ -53,8 +72,14 @@ struct SubmitHeader {
   uint32_t prefix_hint;      // prompt tokens the front-end expects to match the session (advisory)
   uint32_t n_stop_ids;       // ids that end generation (EOS is in here)
   uint32_t n_prompt;         // >= 1
-  uint32_t reserved;
+  uint32_t n_images;  // <= kMaxImageSpans and n_prompt; each ImageSpan is followed by u32 path length and UTF-8 path
 };
+struct ImageSpan {
+  uint32_t start, rows;  // absolute prompt positions, includes start/newline/end
+  std::array<uint8_t, 32> digest;  // encoder/checkpoint identity + exact image bytes
+  bool operator==(const ImageSpan&) const = default;
+};
+static_assert(sizeof(ImageSpan) == 40);
 
 struct Cancel {
   uint64_t req_id;

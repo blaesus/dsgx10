@@ -23,8 +23,9 @@
 // CED (docs/ced.md "What the engine has to do"): an encoder chunk runs layers 0-19, then layer 20's
 // compressor for its rows (the decoder's global KV and index keys, the exact path's), and keeps its
 // last 128 positions' layer-20 input (ced_keep). The chunk that samples then replays layers 20-39 over
-// [P - 128, P) as a chunk of 128 rows whose window starts at P - 128 (ced_replay), and the head reads it.
+// the selected bounded suffix as one chunk whose window starts at that suffix (ced_replay).
 #include "model/prefill.h"
+#include "model/vision_layout.h"
 
 #include <algorithm>
 
@@ -84,6 +85,7 @@ void Model::Impl::prefill_alloc(comm::Ring* ring) {
   p.lin_sc = dalloc<uint8_t>((size_t)(M + 127) * kHead / 32);
   p.tok = dalloc<int>(M);
   p.pos = dalloc<int>(M);
+  p.image_mask = dalloc<int>(p.Q);
   p.ridx = dalloc<int>((size_t)M4 * kTopK);
   p.counters = dalloc<int>(Q);
   p.topk_mine = dalloc<int>((size_t)Q * kIdxTopk);
@@ -107,7 +109,7 @@ void Model::Impl::prefill_alloc(comm::Ring* ring) {
   p.tok_h = halloc<int32_t>(M);
   p.ced_rows = dalloc<uint8_t>((size_t)kReplay * kCedRow);
   p.ced_gath = dalloc<uint8_t>((size_t)kRanks * kReplay * kCedRow);
-  std::fill(p.ced_pos, p.ced_pos + kReplay, -1);
+  std::fill(p.ced_pos, p.ced_pos + kCedTailRows, -1);
   const size_t seg = (size_t)M * kEngramCols * kEngramRow;  // one rank may own every cell
   for (int set = 0; set < 2; ++set)
     for (int e = 0; e < 2; ++e) {
@@ -218,7 +220,7 @@ void Model::Impl::prefill_engram(int a, int M, int set) {
     }
   if ((int)hist.size() < a + M) die("prefill: Engram lookups for [%d, %d) with %zu tokens", a, a + M, hist.size());
   p.ids[set].resize((size_t)M * 2 * kEngramCols);
-  engram::hash_positions(*emap, hist.data(), nullptr, a, M, p.ids[set].data());
+  engram::hash_positions(*emap, hist.data(), live_of(cur_slot), a, M, p.ids[set].data());
   for (int e = 0; e < 2; ++e) {
     engram::CellMap cm;
     cm.build(store->split(), e, p.ids[set].data(), M);
@@ -256,7 +258,7 @@ void Model::Impl::engram_apply_p(int L, int M, int set) {
   for (int r = 0; r < kRanks; ++r)
     ops::engram_partial(p.x, p.e_kv + (size_t)r * p.Q * kEngramN, w.e_w, r, n, p.e_part + (size_t)r * n * kEngramPartBytes,
                         st);
-  ops::engram_combine(p.x, p.e_part, n, p.x, st);
+  ops::engram_combine(p.x, p.e_part, n, p.x, st, vision_count ? p.image_mask : nullptr);
   (void)M;
 }
 
@@ -446,7 +448,7 @@ void Model::Impl::ffn_p(int L, int M) {
   if (n > 0) {
     dsk::gemm_bf16_p(p.y, n, w.gate, kExperts, kDim, p.gl, st);
     dsk::router_topk(p.gl, w.gate_bias, n, kExperts, p.ridx + (size_t)r0 * kTopK, p.rwts + (size_t)r0 * kTopK,
-                     kRouteScale, st);
+                     kRouteScale, st, w.gate_bias_vl, vision_count ? p.image_mask : nullptr);
   }
   // every row's act_quant and routes for the MoE
   const comm::AgSeg ag[4] = {{p.yq + (size_t)r0 * kDim, p.yq, (size_t)Q * kDim},
@@ -526,44 +528,48 @@ void Model::Impl::ced_project(int M) {
                         k.compressed(), k.keys(), nullptr, 0, st);
 }
 
-// After an encoder chunk [a, a + M): the layer-20 input of its last kReplay positions (this rank's rows
-// of them) into their slots.
+// After an encoder chunk [a, a + M): the layer-20 input of its last replay_rows positions (this rank's
+// rows of them) into their slots. The caller must supply at least that many new encoder rows over
+// the complete request, so a saved/forked session never depends on this transient scratch buffer.
 void Model::Impl::ced_keep(int a, int M) {
   NVTX_RANGE("ced_keep");
   Prefill& p = *pf;
-  const int lo = std::max(a, a + M - kReplay);
-  for (int q = lo; q < a + M; ++q) p.ced_pos[q % kReplay] = q, p.ced_src[q % kReplay] = (q - a) / p.rq;
+  const int R = p.ced_replay_rows;
+  const int lo = std::max(a, a + M - R);
+  for (int q = lo; q < a + M; ++q) p.ced_pos[q % R] = q, p.ced_src[q % R] = (q - a) / p.rq;
   for (int i = std::max(0, lo - a - p.r0); i < p.n;) {
-    const int slot = (a + p.r0 + i) % kReplay, cnt = std::min(p.n - i, kReplay - slot);
+    const int slot = (a + p.r0 + i) % R, cnt = std::min(p.n - i, R - slot);
     ced_copy(p, p.ced_rows + (size_t)slot * kCedRow, i, cnt, true, st);
     i += cnt;
   }
 }
 
-// The decoder replay: layers 20-39 over [P - 128, P) as a chunk of 128 rows (this rank's 32 from the
-// records of the ranks that ran them), the window truncated at P - 128, the decoder rings rewritten.
+// Decoder replay over the request's bounded suffix. The legacy policy is 128; the tail policy is
+// 2560. For the latter only the suffix beginning at ced_valid_from(P, R) is safe for later restarts.
 void Model::Impl::ced_replay(int P, const std::vector<std::pair<int, uint8_t*>>& snaps) {
   NVTX_RANGE("replay P=%d", P);
   Prefill& p = *pf;
-  const int s = P - kReplay, M = kReplay;
+  const int R = p.ced_replay_rows, s = P - R, M = R;
 #ifdef DSGB10_NVTX
   g_dump_a = s;
 #endif
   for (int q = s; q < P; ++q)
-    if (p.ced_pos[q % kReplay] != q) die("model: CED replay of [%d, %d) without the encoder's position %d", s, P, q);
+    if (p.ced_pos[q % R] != q) die("model: CED replay of [%d, %d) without the encoder's position %d", s, P, q);
   p.rq = q_rows(M), p.r0 = rank * p.rq, p.n = std::max(0, std::min(p.rq, M - p.r0));
-  comm::allgather(ch, p.ced_rows, p.ced_gath, (size_t)kReplay * kCedRow, st);
+  comm::allgather(ch, p.ced_rows, p.ced_gath, (size_t)R * kCedRow, st);
   for (int i = 0; i < p.n;) {  // runs of consecutive slots from one rank
-    const int slot = (s + p.r0 + i) % kReplay, src = p.ced_src[slot];
+    const int slot = (s + p.r0 + i) % R, src = p.ced_src[slot];
     int cnt = 1;
-    while (i + cnt < p.n && slot + cnt < kReplay && p.ced_src[slot + cnt] == src) ++cnt;
-    ced_copy(p, p.ced_gath + ((size_t)src * kReplay + slot) * kCedRow, i, cnt, false, st);
+    while (i + cnt < p.n && slot + cnt < R && p.ced_src[slot + cnt] == src) ++cnt;
+    ced_copy(p, p.ced_gath + ((size_t)src * R + slot) * kCedRow, i, cnt, false, st);
     i += cnt;
   }
   ops::iota(p.pos, s, M, st);
+  if (vision_count) ops::vision_rows(p.pos + p.r0, p.n, vision_spans, vision_count,
+                                    vision_features, nullptr, p.image_mask, st);
   for (int L = 20; L < kLayers; ++L) {
     NVTX_RANGE("rep L%02d", L);
-    // here x holds this rank's replay rows' layer-L input (DSpark's hidden-state hook, a = s, M = 128)
+    // DSpark gathers the last 256 rows using this replay's actual sequence-parallel partition.
     if (spec) spec_prefill_hidden(L, s, M, {});  // DSpark: main_hidden of the replay's rows
     attention_p(L, s, M, snaps, s);
     ffn_p(L, M);
@@ -573,7 +579,7 @@ void Model::Impl::ced_replay(int P, const std::vector<std::pair<int, uint8_t*>>&
 // ---- a chunk ---------------------------------------------------------------------------------------
 
 uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snap_pos,
-                              bool ced) {
+                              bool ced, int replay_rows) {
   NVTX_RANGE("chunk a=%d M=%d%s%s", a, M, ced ? " ced" : "", sp ? " sample" : "");
   if (!bound) die("model: prefill before bind");
   prefill_alloc();
@@ -581,8 +587,22 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   if (M < 1 || M > p.cap || a < 0 || a + M > opt.max_ctx) die("model: bad prefill [%d, +%d)", a, M);
   if ((int)hist.size() < a + M) die("model: prefill [%d, %d) with %zu tokens", a, a + M, hist.size());
   if (opt.first_layer != 0 || opt.n_layers != kLayers) die("model: prefill runs the whole model");
-  if (ced && sp && a + M < kReplay) die("model: CED prefill ending at %d (the replay needs %d positions)", a + M, kReplay);
+  if (!ced_replay_supported(replay_rows)) die("model: unsupported CED replay length %d", replay_rows);
+  if (ced && replay_rows > p.cap)
+    die("model: CED replay needs %d rows, but prefill capacity is %d", replay_rows, p.cap);
+  if (ced && sp && a + M < replay_rows)
+    die("model: CED prefill ending at %d (the replay needs %d positions)", a + M, replay_rows);
   drain();  // the decode buffers and the Engram sets are free; earlier steps' state is in place
+  if (ced && replay_rows > p.ced_capacity) {
+    // One bounded growth, outside capture and after draining. Do not grow ordinary prefill scratch
+    // or retain a second old/new record pool. The production chunk capacity already exceeds 2560.
+    sync();
+    CUDA_CHECK(cudaFree(p.ced_rows));
+    CUDA_CHECK(cudaFree(p.ced_gath));
+    p.ced_rows = dalloc<uint8_t>((size_t)replay_rows * kCedRow);
+    p.ced_gath = dalloc<uint8_t>((size_t)kRanks * replay_rows * kCedRow);
+    p.ced_capacity = replay_rows;
+  }
   // this chunk's Engram lookups, unless prefill_lookup() started them
   int set = -1;
   for (int k = 0; k < 2; ++k)
@@ -605,7 +625,13 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   CUDA_CHECK(cudaMemcpyAsync(p.tok, p.tok_h, (size_t)M * 4, cudaMemcpyHostToDevice, st));
   ops::iota(p.pos, a, M, st);
   if (p.n > 0) ops::embed(embed, p.tok + p.r0, p.n, p.x, p.pm, st);
-  if (ced && a != p.ced_end) std::fill(p.ced_pos, p.ced_pos + kReplay, -1);  // a new run of positions
+  // Always initialize the current chunk's mask when the request has images: an all-text chunk
+  // after an image chunk must not inherit its old router/Engram mask.
+  if (vision_count) ops::vision_rows(p.pos + p.r0, p.n, vision_feature_spans, vision_feature_count,
+                                    vision_features, p.x, p.image_mask, st);
+  if (ced && (a != p.ced_end || p.ced_replay_rows != replay_rows))
+    std::fill(p.ced_pos, p.ced_pos + kCedTailRows, -1);  // a new run or policy
+  p.ced_replay_rows = replay_rows;
   p.ced_end = ced ? a + M : -1;
 #ifdef DSGB10_NVTX
   g_dump_a = a;
@@ -637,7 +663,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
     }
   }
   CUDA_CHECK(cudaEventRecord(ev_pf[2], st));
-  const int Mh = ced ? kReplay : M;  // the rows of the pass the head reads
+  const int Mh = ced ? replay_rows : M;  // the rows of the pass the head reads
   uint64_t n = ~0ull;
   if (sp) {  // the last row through the head and the sampling, as a step of one row
     NVTX_RANGE("head");
@@ -663,6 +689,51 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
 
 // ---- Model -----------------------------------------------------------------------------------------
 
+void Model::set_vision_layout(const std::vector<ops::VisionSpan>& spans) {
+  auto& d = *d_;
+  d.drain();  // no prior request/graph/lookup reads the buffers or host mask after this boundary
+  if (!detail::valid_vision_layout(spans, d.opt.max_ctx)) die("model: bad vision layout");
+  auto& live = d.vision_live[d.cur_slot];
+  detail::vision_live_layout(live, spans, d.opt.max_ctx);
+  if (!spans.empty()) {
+    if (spans.size() > size_t(d.vision_span_capacity)) {
+      if (d.vision_spans) CUDA_CHECK(cudaFree(d.vision_spans));
+      d.vision_spans = dalloc<ops::VisionSpan>(spans.size());
+      d.vision_span_capacity = (int)spans.size();
+    }
+    CUDA_CHECK(cudaMemcpyAsync(d.vision_spans, spans.data(), spans.size() * sizeof(spans[0]), cudaMemcpyHostToDevice, d.st));
+    CUDA_CHECK(cudaStreamSynchronize(d.st));
+  }
+  d.vision_count = (int)spans.size();
+  d.vision_feature_count = 0;  // a new request must explicitly install each chunk's features
+  // A cancelled request may have prefetched the same position in the alternate Engram set.
+  if (d.pf) for (int k = 0; k < 2; ++k) d.pf->e_pos0[k] = -1, d.pf->e_n[k] = 0;
+}
+
+void Model::set_vision_chunk(const std::vector<ops::VisionSpan>& spans, const uint16_t* features, int rows) {
+  auto& d = *d_;
+  d.drain();  // old chunk's device feature reads have finished; host lookup mask remains unchanged
+  if (!detail::valid_vision_chunk(spans, rows, d.opt.max_ctx)) die("model: bad vision chunk");
+  if (!spans.empty()) {
+    if (spans.size() > size_t(d.vision_feature_span_capacity)) {
+      if (d.vision_feature_spans) CUDA_CHECK(cudaFree(d.vision_feature_spans));
+      d.vision_feature_spans = dalloc<ops::VisionSpan>(spans.size());
+      d.vision_feature_span_capacity = (int)spans.size();
+    }
+    if (rows > d.vision_capacity) {
+      if (d.vision_features) CUDA_CHECK(cudaFree(d.vision_features));
+      d.vision_features = dalloc<bf16>((size_t)rows * kDim);
+      d.vision_capacity = rows;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(d.vision_feature_spans, spans.data(), spans.size() * sizeof(spans[0]), cudaMemcpyHostToDevice, d.st));
+    CUDA_CHECK(cudaMemcpyAsync(d.vision_features, features, (size_t)rows * kDim * 2, cudaMemcpyHostToDevice, d.st));
+    CUDA_CHECK(cudaStreamSynchronize(d.st));
+  }
+  d.vision_feature_count = (int)spans.size();
+  // In particular: do not clear e_pos0/e_n. run_prefill already queued the next lookup using
+  // the complete immutable vision_live layout, not this feature window.
+}
+
 void Model::set_tokens(int pos0, int n, const int32_t* tokens) {
   auto& h = d_->hist;
   if (pos0 < 0 || n < 0) die("model: set_tokens(%d, %d)", pos0, n);
@@ -684,8 +755,9 @@ void Model::prefill_lookup(int a, int M) {
   d_->prefill_engram(a, M, 1 - p.e_last);
 }
 
-uint64_t Model::prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced) {
-  return d_->prefill(a, M, sp, handle, snaps, ced);
+uint64_t Model::prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced,
+                        int replay_rows) {
+  return d_->prefill(a, M, sp, handle, snaps, ced, replay_rows);
 }
 
 }  // namespace model

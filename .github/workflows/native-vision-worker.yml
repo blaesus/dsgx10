@@ -1,0 +1,47 @@
+name: Native vision worker CPU contracts
+
+on:
+  push:
+    branches: [native-vision-worker]
+    paths:
+      - 'ds41f-4xgx10-switchless/vision/**'
+      - 'ds41f-4xgx10-switchless/ref/inference/config.json'
+      - '.github/workflows/native-vision-worker.yml'
+  pull_request:
+    paths:
+      - 'ds41f-4xgx10-switchless/vision/**'
+      - 'ds41f-4xgx10-switchless/ref/inference/config.json'
+      - '.github/workflows/native-vision-worker.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vision-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CPU-only dependencies
+        run: |
+          python -m pip install 'torch>=2.4' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r ds41f-4xgx10-switchless/vision/requirements.txt
+      - name: Verify public worker source pins
+        run: |
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path('ds41f-4xgx10-switchless/vision')
+          pins = json.loads((root / 'PROVENANCE.json').read_text())['public_source_sha256']
+          for name, expected in pins.items():
+              actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
+              assert actual == expected, (name, actual, expected)
+          PY
+      - name: Synthetic preprocessing and cache tests
+        env:
+          CUDA_VISIBLE_DEVICES: ''
+        run: python -m unittest discover -s ds41f-4xgx10-switchless/vision/tests -v

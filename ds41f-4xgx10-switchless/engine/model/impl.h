@@ -59,7 +59,7 @@ struct LayerW {
   const bf16* ix_wproj = nullptr;
   // FFN
   uint8_t* gate = nullptr;  // bf16 [384][5120], tile_fp8 layout: every rank's 96 rows, all-gathered at bind
-  const float* gate_bias = nullptr;
+  const float *gate_bias = nullptr, *gate_bias_vl = nullptr;
   dsk::MoeWeights moe{};
   // mHC: the full projections [24][20480] (all-gathered at bind), base [24], scale [3]
   float* hc_fn[2] = {};
@@ -173,6 +173,13 @@ struct Model::Impl {
   std::vector<int32_t> hist;  // token ids of the sequence so far (hashing reads 3 back): the current slot's
   std::vector<int32_t> hists[kMaxSlots];  // the other slots' (use_slot swaps them in and out)
   std::vector<int32_t>& hist_of(int s) { return s == cur_slot ? hist : hists[s]; }
+  std::vector<uint8_t> vision_live[kMaxSlots];  // fixed max_ctx mask for each active slot; empty = text
+  const uint8_t* live_of(int s) const { return vision_live[s].empty() ? nullptr : vision_live[s].data(); }
+  ops::VisionSpan* vision_spans = nullptr;  // complete absolute layout, used by CED's mask-only replay
+  ops::VisionSpan* vision_feature_spans = nullptr;  // images intersecting the current encoder chunk
+  bf16* vision_features = nullptr;
+  int vision_count = 0, vision_capacity = 0, vision_span_capacity = 0;  // shared prefill-only buffers, never read by decode graphs
+  int vision_feature_count = 0, vision_feature_span_capacity = 0;
   std::vector<uint32_t> ids;  // [R][2][24]
   uint8_t* e_send[2];         // pinned: this rank's packed records per Engram layer
   uint32_t* e_off[2];         // pinned: [R][24] offsets into the gathered segments
@@ -288,7 +295,8 @@ struct Model::Impl {
   void wave_probe(int L, int a, int M);
   // positions [p0, p1) between layer L's ring and the linear window buffer that starts at position base
   void ring_copy(int L, int p0, int p1, int base, bool to_lin);
-  uint64_t prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced);
+  uint64_t prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced,
+                   int replay_rows);
   // CED (docs/ced.md): layer 20's compressor for an encoder chunk's rows; keeping the chunk's last
   // positions' layer-20 input; the decoder replay of [P - 128, P)
   void ced_project(int M);

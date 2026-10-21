@@ -28,3 +28,17 @@ with its licence:
   separate checkout.
 
 No model weights are included.
+
+## Native vision worker
+
+`ds41f-4xgx10-switchless/vision/reference_image_processor.py` is copied from
+bundled `ref/inference/image_processor.py` with LF-normalized line endings.
+`vision/reference_vision.py` adapts bundled `ref/inference/vision.py` with an
+explicit SDPA batch dimension and cosine/sine device transfer. These
+DeepSeek-derived files remain under the MIT license, Copyright (c) 2023 DeepSeek,
+reproduced in `ds41f-4xgx10-switchless/ref/LICENSE-deepseek`.
+
+The worker, tests and integration documentation are provided under the project's
+MIT license. External Python packages and model weights retain their own terms.
+See `ds41f-4xgx10-switchless/vision/PROVENANCE.json` for source hashes. No additional
+model weights, private requests or service configuration are included.
