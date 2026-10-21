@@ -1,0 +1,6 @@
+# Install a PyTorch build supporting your GPU/CUDA separately if needed.
+# The deployed worker used torch 2.13.0+cu130; CPU helpers also run with 2.4.1.
+torch>=2.4
+numpy>=1.26
+Pillow>=10
+safetensors>=0.4
