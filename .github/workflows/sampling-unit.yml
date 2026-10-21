@@ -1,0 +1,21 @@
+name: Sampling open interval
+on:
+  push:
+    paths:
+      - 'ds41f-4xgx10-switchless/engine/model/sample.cu'
+      - 'ds41f-4xgx10-switchless/micro/sampling_unit/**'
+      - '.github/workflows/sampling-unit.yml'
+  pull_request:
+    paths:
+      - 'ds41f-4xgx10-switchless/engine/model/sample.cu'
+      - 'ds41f-4xgx10-switchless/micro/sampling_unit/**'
+      - '.github/workflows/sampling-unit.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  host-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 ds41f-4xgx10-switchless/micro/sampling_unit/check.py

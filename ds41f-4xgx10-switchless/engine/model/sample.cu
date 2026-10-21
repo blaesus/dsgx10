@@ -49,7 +49,9 @@ __device__ __forceinline__ uint64_t mix64(uint64_t x) {
   x ^= x >> 32;
   return x;
 }
-__device__ __forceinline__ float unit(uint64_t h) { return ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f); }
+// 23-bit midpoints remain representable in float and strictly inside (0,1).
+// With 24 bits, the upper midpoint rounds to 1, giving an infinite Gumbel.
+__device__ __forceinline__ float unit(uint64_t h) { return ((float)(h >> 41) + 0.5f) * (1.0f / 8388608.0f); }
 
 __device__ __forceinline__ bool better(float a, int ia, float b, int ib) { return a > b || (a == b && ia < ib); }
 
