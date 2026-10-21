@@ -27,8 +27,45 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisionPrefixPolicy {
+    Legacy,
+    Exact,
+    TailExact,
+}
+
+impl VisionPrefixPolicy {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "exact" => Ok(Self::Exact),
+            "tail-exact" => Ok(Self::TailExact),
+            _ => Err("--vision-prefix-policy must be legacy, exact, or tail-exact".into()),
+        }
+    }
+
+    pub fn flags(self) -> u32 {
+        match self {
+            Self::Legacy => 0,
+            Self::Exact => crate::protocol::FLAG_FULL_PREFIX,
+            Self::TailExact => crate::protocol::FLAG_TAIL_PREFIX,
+        }
+    }
+
+    fn cache_tag(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy-v1",
+            Self::Exact => "full-v1",
+            Self::TailExact => "tail-v1",
+        }
+    }
+
+    pub fn shared_image_prefix(self) -> bool { self != Self::Legacy }
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    pub vision_prefix_policy: VisionPrefixPolicy,
     pub vision_socket: Option<String>,
     pub vision_revision: Option<String>,
     pub model_name: String,
@@ -361,7 +398,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         Some(Value::String(s)) if s.len() <= 4096 => s,
         _ => return Err("cache_salt must be a string of at most 4096 bytes".into()),
     };
-    let cache_namespace = format!("vision-serving-v5:{:?}:{}", cfg.encoding, salt);
+    let cache_namespace = format!("vision-serving-v5:{:?}:{}:{}", cfg.encoding, cfg.vision_prefix_policy.cache_tag(), salt);
     let msgs = r.get("messages").and_then(Value::as_array).ok_or("messages must be a list")?;
     if msgs.is_empty() {
         return Err("messages must not be empty".into());
@@ -674,7 +711,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         return Err(unavailable("engine not connected".into()));
     };
     let request_started = Instant::now();
-    let expanded = if p.images.is_empty() {
+    let expanded = if p.images.is_empty() && !app.cfg.vision_prefix_policy.shared_image_prefix() {
         crate::vision::Expanded { prompt: p.prompt.clone(), scope: p.cache_namespace.clone(), images: Vec::new(), cache_images: Vec::new() }
     } else {
         let mut cache = app.vision_cache.lock().await;
@@ -723,7 +760,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         top_p: p.top_p,
         top_k: p.top_k,
         max_new_tokens: max_new,
-        flags: FLAG_KEEP | if p.seed.is_some() { FLAG_SEED } else { 0 },
+        flags: FLAG_KEEP | app.cfg.vision_prefix_policy.flags() | if p.seed.is_some() { FLAG_SEED } else { 0 },
         n_top_logprobs: 0,
         prefix_hint: plan.reused as u32,
         stop_ids: stop_ids.clone(),
@@ -935,6 +972,7 @@ mod tests {
     fn cfg() -> ServerConfig {
         ServerConfig {
             model_name: "m".into(),
+            vision_prefix_policy: VisionPrefixPolicy::Legacy,
             vision_socket: None,
             vision_revision: None,
             api_key: None,

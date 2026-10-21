@@ -15,6 +15,7 @@ fn usage() -> ! {
       --model-name NAME         deepseek-v4.1-flash-uncensored
       --max-tokens N            default and cap for max_tokens: 32768
       --effort N                reasoning effort budget when a request names none: 75
+      --vision-prefix-policy P  legacy (default), exact, or tail-exact
       --encoding E              the chat encoding: v4.1 (DeepSeek-V4.1-Flash's encoding.py, the default)
                                 or 1017 (DeepSeek-V4.1-Flash-1017's: tool namespaces, the reasoning
                                 kept across a turn's tool calls)
@@ -70,7 +71,7 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn serve(args: &[String]) {
-    use dsfront::server::{router, App, ServerConfig};
+    use dsfront::server::{router, App, ServerConfig, VisionPrefixPolicy};
     let mut listen: Vec<std::net::SocketAddr> = opts(args, "--listen")
         .iter()
         .map(|v| {
@@ -104,7 +105,13 @@ fn serve(args: &[String]) {
     if api_key.is_none() {
         eprintln!("warning: no --api-key-file, requests are not authenticated");
     }
+    let policy = VisionPrefixPolicy::parse(&opt(args, "--vision-prefix-policy").unwrap_or_else(|| "legacy".into()))
+        .unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2); });
+    if policy.shared_image_prefix() && (std::env::var("DSGB10_VISION_SOCKET").is_err() || std::env::var("DSGB10_VISION_REVISION").is_err()) {
+        eprintln!("shared vision-prefix policy requires the bound native vision encoder"); std::process::exit(2);
+    }
     let cfg = ServerConfig {
+        vision_prefix_policy: policy,
         vision_socket: std::env::var("DSGB10_VISION_SOCKET").ok(),
         vision_revision: std::env::var("DSGB10_VISION_REVISION").ok(),
         model_name: opt(args, "--model-name").unwrap_or_else(|| "deepseek-v4.1-flash-uncensored".into()),

@@ -399,6 +399,7 @@ class Io {
 };
 
 struct Session {
+  int32_t prefill_policy = fe::kLegacyPrefix;
   std::vector<fe::ImageSpan> images;
   int h = 0;                   // the store's handle, the same on every rank
   int slot = -1;               // the slot whose working state is this session's (-1: none, the store's only)
@@ -417,7 +418,7 @@ struct Session {
 // The server's index of a planned stop's kept sessions (keep(); keepfile.h: 0600 in a 0700 directory,
 // whole or not at all): a header, then each session: id, handle, restart ranges, LRU clock and time,
 // history, encoder-only snapshots.
-constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'V', '5'};
+constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'T', '5'};
 struct SrvHeader {
   char magic[8];
   uint64_t gen;  // the store's (state.cu): both indexes come from the same stop
@@ -427,7 +428,6 @@ struct SrvHeader {
   uint64_t body_bytes, body_hash;
 };
 
-constexpr int kReplay = 128;  // upstream text-only CED replay
 constexpr int kNever = 1 << 30;       // Session::dec_lo of rings that are valid nowhere
 
 // The window snapshots a session keeps, by their distance d from its history's end E: every one (each
@@ -574,6 +574,8 @@ class Server {
       for (int i = 0; i < hd.n_sess && r.ok; ++i) {
         const uint64_t id = r.get<uint64_t>();
         Session s;
+        s.prefill_policy = r.get<int32_t>();
+        if (s.prefill_policy < fe::kLegacyPrefix || s.prefill_policy > fe::kTailPrefix) r.ok = false;
         const uint32_t ni = r.get<uint32_t>();
         if (ni > uint32_t(o_.max_ctx) || ni > (r.n - r.at) / sizeof(fe::ImageSpan)) { r.ok = false; break; }
         for (uint32_t k = 0; k < ni; ++k) s.images.push_back(r.get<fe::ImageSpan>());
@@ -698,6 +700,7 @@ class Server {
       if (!m_.state_info(s.h).on_disk) continue;
       ++n;
       put<uint64_t>(f, id);
+      put<int32_t>(f, s.prefill_policy);
       put<uint32_t>(f, (uint32_t)s.images.size());
       for (const auto& image : s.images) put<fe::ImageSpan>(f, image);
       put<int32_t>(f, s.h), put<int32_t>(f, s.pe_snap);
@@ -937,6 +940,10 @@ class Server {
     else if (f.rq.stop.size() > (size_t)kMaxStop) err = "more than " + std::to_string(kMaxStop) + " stop ids";
     else if (!(h.temperature >= 0.f) || !(h.top_p > 0.f && h.top_p <= 1.f)) err = "bad sampling parameters";
     if (!fe::valid_submit_flags(h.flags)) err = "unknown submit flags";
+    if (!fe::valid_prefill_flags(h.flags)) err = "conflicting prefill policy flags";
+    for (uint64_t id : {h.session_id, h.base_session_id})
+      if (const Session* s = find(id); s && s->prefill_policy != fe::prefill_policy(h.flags))
+        err = "cross-prefill-policy session reuse rejected";
     for (const auto& image : f.rq.images)
       for (uint32_t i = image.start; i < image.start + image.rows; ++i)
         if (f.rq.prompt[i] != 129264) err = "image span must contain image token IDs";
@@ -998,11 +1005,14 @@ class Server {
     if (s < 0) s = pick_slot(keep);
     if (s < 0) die("serve: no slot for request %llu", (unsigned long long)h.req_id);  // admit() saw one
     const bool src_live = src && src->slot == s;
-    const int replay_rows = kReplay;
-    // Image requests use full-layer prefill; text requests keep upstream CED128.
-    const bool allow_ced = o_.ced && f.rq.images.empty();
+    const auto policy = fe::prefill_policy(h.flags);
+    const int replay_rows = policy == fe::kTailPrefix ? model::kCedTailRows : model::kCedReplayRows;
+    // Only the new policy uses a dependency-complete decoder tail for images.
+    // Legacy preserves its existing text-only, approximate 128-row policy.
+    const bool allow_ced = o_.ced && policy != fe::kFullPrefix &&
+                           (policy == fe::kTailPrefix || f.rq.images.empty());
     const int p = src ? std::min({lcp(src->hist, prompt), n - 1,
-                                 vision_prefix_limit(src->images, f.rq.images)}) : 0;
+                                 vision_prefix_limit(src->images, f.rq.images, src->prefill_policy != fe::kLegacyPrefix)}) : 0;
     const Plan pl = src ? choose(*src, src_live, p, n, allow_ced, replay_rows) : Plan{};
     const int q = pl.q;
     NVTX_RANGE("req %llu new %d ctx %d %s", (unsigned long long)h.req_id, n - q, n, kHow[pl.how]);
@@ -1042,6 +1052,7 @@ class Server {
     }
     if (!S) {
       Session ns;
+      ns.prefill_policy = policy;
       ns.images = f.rq.images;
       ns.h = next_h_++;
       S = &sess_.emplace(h.session_id, std::move(ns)).first->second;
@@ -1182,7 +1193,8 @@ class Server {
         S->w = std::max(S->w, pos + R + (m_.spec() ? model::ops::kDrafts : 0));  // its draft's block keys
       } else {
         c.op = kCmdPrefill;
-        c.flags = (last ? kPfSample : 0) | (ced ? kPfCed : 0);
+        c.flags = (last ? kPfSample : 0) | (ced ? kPfCed : 0) |
+                  (ced && policy == fe::kTailPrefix ? kPfTailExact : 0);
         const int rest = n - pos - R;
         c.next = rest > o_.small_rows || (ced && rest > 0) ? std::min(o_.prefill_rows, rest) : 0;
         for (int i = 0; i < c.n_snaps; ++i)
@@ -1204,7 +1216,7 @@ class Server {
     const double t_first = now_s();
     if (resume) f.resume_s += t_first - t0;
     else f.t_first = t_first;
-    if (ced && !cancelled) S->dec_lo = n - kReplay;
+    if (ced && !cancelled) S->dec_lo = model::ced_valid_from(n, replay_rows);
     auto drain = [&] {
       wd_.started = now_s();
       m_.drain();

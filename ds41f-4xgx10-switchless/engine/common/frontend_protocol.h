@@ -41,10 +41,21 @@ enum SubmitFlags : uint32_t {
   kFlagSeed = 1,      // use SubmitHeader::seed
   kFlagKeep = 2,      // keep the session's state after DONE
   kFlagLogprobs = 4,  // send logprobs in TOKENS
+  kFlagFullPrefix = 16, // complete forward for text and images
+  kFlagTailPrefix = 32, // dependency-complete bounded decoder replay
 };
 
 inline constexpr bool valid_submit_flags(uint32_t flags) {
-  return (flags & ~(kFlagSeed | kFlagKeep | kFlagLogprobs)) == 0;
+  return (flags & ~(kFlagSeed | kFlagKeep | kFlagLogprobs | kFlagFullPrefix | kFlagTailPrefix)) == 0;
+}
+
+// These values are persisted by the server. The two policy flags are mutually exclusive.
+enum PrefillPolicy : int32_t { kLegacyPrefix = 0, kFullPrefix = 1, kTailPrefix = 2 };
+inline bool valid_prefill_flags(uint32_t flags) {
+  return (flags & (kFlagFullPrefix | kFlagTailPrefix)) != (kFlagFullPrefix | kFlagTailPrefix);
+}
+inline PrefillPolicy prefill_policy(uint32_t flags) {
+  return flags & kFlagTailPrefix ? kTailPrefix : flags & kFlagFullPrefix ? kFullPrefix : kLegacyPrefix;
 }
 
 struct SubmitHeader {

@@ -12,6 +12,7 @@
 #include "comm/ring.h"
 #include "engram/engram.h"
 #include "model/config.h"
+#include "model/ced_policy.h"
 #include "model/ops.h"
 #include "weights/loader.h"
 
@@ -224,9 +225,9 @@ class Model {
   // for it), else ~0. prefill_lookup() starts a chunk's Engram lookups early (the next chunk's, while
   // this one runs); prefill() starts them itself when they were not.
   // With ced (docs/ced.md) the chunk runs the encoder (layers 0-19) and layer 20's KV projection only;
-  // the chunk that samples then replays layers 20-39 over its last 128 positions [P - 128, P) from
-  // fresh decoder rings, and samples that replay's last row. Those 128 positions must have run through
-  // CED chunks of one run (each chunk starting where the one before ended), P >= 128. Of the snapshots
+  // the chunk that samples then replays layers 20-39 over its last replay_rows positions from
+  // fresh decoder rings, and samples that replay's last row. All replay rows must have run through
+  // CED chunks of one run (each chunk starting where the one before ended), P >= replay_rows. Of the snapshots
   // only one at P covers the decoder layers; the others hold the encoder layers' rings only.
   void set_tokens(int pos0, int n, const int32_t* tokens);
   // Complete image layout for the current slot, including cached history. Installed once per
@@ -241,7 +242,7 @@ class Model {
   // the barrier. Returns this rank's free device memory afterwards.
   size_t prefill_init(comm::Ring& ring);
   uint64_t prefill(int a, int M, const Sampling* sp = nullptr, int handle = -1, const std::vector<int>& snaps = {},
-                   bool ced = false);
+                   bool ced = false, int replay_rows = kCedReplayRows);
   // The last prefill chunk's GPU time in ms (waits for the chunk): [0] the encoder (layers 0-19; every
   // layer without ced), [1] CED's projection, keep and replay, [2] the head and the sampling, [3] the
   // draft module's windows.

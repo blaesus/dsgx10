@@ -4,9 +4,13 @@
 int main() {
   using fe::ImageSpan;
   for (uint32_t f=0; f<8; ++f) assert(fe::valid_submit_flags(f));
-  for (uint32_t f : {8u,16u,32u,0x80000000u}) assert(!fe::valid_submit_flags(f));
+  for (uint32_t f : {8u,0x80000000u}) assert(!fe::valid_submit_flags(f));
   ImageSpan a{100,32,{1}}, b{500,32,{2}}, c{900,32,{3}};
   using V=std::vector<ImageSpan>;
+  assert(fe::valid_submit_flags(16) && fe::valid_submit_flags(32));
+  assert(!fe::valid_prefill_flags(16|32));
+  assert(srv::vision_prefix_limit(V{},V{a},true)==100);
+  assert(srv::vision_prefix_limit(V{a},V{},true)==100);
   assert(srv::vision_prefix_limit(V{a,b},V{a,b,c})==900);
   auto replacement=b; replacement.digest[0]=7;
   assert(srv::vision_prefix_limit(V{a,b,c},V{a,replacement,c})==500);

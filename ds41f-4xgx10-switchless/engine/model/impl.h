@@ -295,7 +295,8 @@ struct Model::Impl {
   void wave_probe(int L, int a, int M);
   // positions [p0, p1) between layer L's ring and the linear window buffer that starts at position base
   void ring_copy(int L, int p0, int p1, int base, bool to_lin);
-  uint64_t prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced);
+  uint64_t prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced,
+                   int replay_rows);
   // CED (docs/ced.md): layer 20's compressor for an encoder chunk's rows; keeping the chunk's last
   // positions' layer-20 input; the decoder replay of [P - 128, P)
   void ced_project(int M);

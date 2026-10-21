@@ -68,7 +68,7 @@ enum : int32_t {
   kCmdBatchTf = 20,
   kCmdSpecBatch = 8,  // spec_batch_loop (B3): the same with drafts; the Cmd's spec_* fields as kCmdDecode's
 };
-enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
+enum : uint32_t { kPfSample = 1, kPfCed = 2, kPfTailExact = 4 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
   int32_t op = kCmdStop;
   int32_t rows = 0, pos0 = 0;  // kCmdStep, kCmdRows, kCmdPrefill: the rows; kCmdDecode: the first position

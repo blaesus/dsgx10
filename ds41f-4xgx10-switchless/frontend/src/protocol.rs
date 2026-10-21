@@ -21,6 +21,8 @@ pub const T_IMAGE_MISS: u16 = 0x84;
 pub const FLAG_SEED: u32 = 1;
 pub const FLAG_KEEP: u32 = 2;
 pub const FLAG_LOGPROBS: u32 = 4;
+pub const FLAG_FULL_PREFIX: u32 = 16;
+pub const FLAG_TAIL_PREFIX: u32 = 32;
 
 pub const TOK_LOGPROBS: u32 = 1;
 pub const TOK_TOP: u32 = 2;
