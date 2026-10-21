@@ -18,6 +18,9 @@ if(DSGB10_NVTX)
 endif()
 
 # Explicit CUDA test binary; never launched by CTest.
-add_executable(vision_test tests/vision_test.cu)
-target_link_libraries(vision_test dsmodel)
-target_compile_options(vision_test PRIVATE -UNDEBUG)
+option(DSGB10_BUILD_VISION_GPU_TEST "Build the opt-in vision CUDA test" OFF)
+if(DSGB10_BUILD_VISION_GPU_TEST)
+  add_executable(vision_test tests/vision_test.cu)
+  target_link_libraries(vision_test dsmodel)
+  target_compile_options(vision_test PRIVATE -UNDEBUG)
+endif()
