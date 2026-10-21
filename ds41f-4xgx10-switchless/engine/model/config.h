@@ -31,6 +31,9 @@ constexpr int kQLora = 1280, kQaPart = kQLora / kRanks;  // wq_a: 320 rows per r
 constexpr int kHead = 512, kKvPart = kHead / kRanks;     // wkv: 128 rows per rank
 constexpr int kCompPart = kHead / kRanks;                // compressor wkv / wgate: 128 rows per rank
 constexpr int kHeads = 16;                               // query heads per rank
+// Bound feature memory, not image count. Each span can contain 1..1024 rows.
+constexpr uint64_t kMaxVisionFeatureBytes = 512ull << 20;
+constexpr int kMaxVisionRows = kMaxVisionFeatureBytes / (kDim * 2);
 constexpr int kQ = kHeads * kHead;                       // wq_b: 8192 rows per rank
 constexpr int kOGroupRows = 1024;                        // wo_a rows per group (2 groups per rank)
 constexpr int kOPart = 2 * kOGroupRows;                  // 2048 = wo_a rows = wo_b columns per rank

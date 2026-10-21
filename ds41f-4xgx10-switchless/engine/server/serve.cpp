@@ -46,6 +46,9 @@
 // whose store reused those files reads them back in (load_kept), and the front-end's session ids find
 // their sessions as before the stop.
 #include "server/serve.h"
+#include "server/vision_prefix.h"
+#include "server/vision_files.h"
+#include "server/vision_window.h"
 
 #include <poll.h>
 #include <signal.h>
@@ -80,7 +83,7 @@
 namespace srv {
 namespace {
 
-constexpr uint32_t kMaxFrame = 64u << 20;
+constexpr uint32_t kMaxFrame = 32u << 20;  // protocol 5 carries paths, never BF16 feature payloads
 constexpr int kIoCpu = 12;
 
 std::atomic<bool> g_stop{false};
@@ -121,6 +124,7 @@ struct Conn {
   const int fd;
   std::atomic<bool> dead{false};
   std::mutex mu;
+  std::set<uint64_t> admitted; // protocol req IDs are single-use per connection
   std::set<uint64_t> cancel;  // CANCELs received (ids are per connection)
   explicit Conn(int f) : fd(f) {}
   ~Conn() { close(fd); }
@@ -134,6 +138,8 @@ struct Request {
   ConnP conn;
   fe::SubmitHeader h{};
   std::vector<int32_t> stop, prompt;
+  std::vector<fe::ImageSpan> images;
+  std::vector<VisionFile::Data> image_features;
   double t_recv = 0;
 };
 
@@ -260,12 +266,65 @@ class Io {
       Request& r = e.rq;
       if (p.size() < sizeof r.h) return false;
       std::memcpy(&r.h, p.data(), sizeof r.h);
-      if (p.size() != sizeof r.h + 4 * (size_t(r.h.n_stop_ids) + r.h.n_prompt)) return false;
+      const size_t text_end = sizeof r.h + 4 * (size_t(r.h.n_stop_ids) + r.h.n_prompt);
+      if (p.size() < text_end || r.h.n_images > r.h.n_prompt) return false;
+      size_t offset = text_end;
+      uint64_t end = 0;
+      uint64_t feature_bytes = 0, path_bytes = 0;
+      std::string image_error;
+      if (r.h.n_images > fe::kMaxImageSpans) image_error = "image descriptor budget exceeded (maximum 4096)";
+      struct Opened { fe::ImageSpan image; VisionFile::Data data; };
+      std::map<std::string, Opened> opened;
+      if (c->admitted.count(r.h.req_id)) return false;
+      for (uint32_t i = 0; i < r.h.n_images; ++i) {
+        if (p.size() - offset < sizeof(fe::ImageSpan)) return false;
+        fe::ImageSpan image{};
+        std::memcpy(&image, p.data() + offset, sizeof image);
+        offset += sizeof image;
+        if (!image.rows || image.rows > 1024 || image.start < end ||
+            uint64_t(image.start) + image.rows > r.h.n_prompt) return false;
+        end = uint64_t(image.start) + image.rows;
+        const size_t elements = size_t(image.rows) * model::kDim;
+        feature_bytes += elements * 2;
+        if (p.size()-offset < 4) return false;
+        uint32_t bytes; std::memcpy(&bytes,p.data()+offset,4); offset += 4;
+        if (bytes == 0 || bytes > fe::kMaxFeaturePathBytes || p.size()-offset < bytes) return false;
+        const std::string path(p.data()+offset, bytes);
+        VisionFile::Data feature;
+        if (image_error.empty()) {
+          auto prior = opened.find(path);
+          if (prior != opened.end()) {
+            if (prior->second.image.rows != image.rows || prior->second.image.digest != image.digest)
+              image_error = "one image feature path has inconsistent identity or shape";
+            else feature = prior->second.data;
+          } else {
+            feature = VisionFile::open(image, path, image_error);
+            if (feature) opened.emplace(path, Opened{image, feature});
+          }
+        }
+        r.image_features.push_back(std::move(feature));
+        offset += bytes; path_bytes += bytes;
+        r.images.push_back(image);
+      }
+      if (offset != p.size()) return false;
       r.stop.resize(r.h.n_stop_ids);
       r.prompt.resize(r.h.n_prompt);
       const char* a = p.data() + sizeof r.h;
       if (!r.stop.empty()) std::memcpy(r.stop.data(), a, r.stop.size() * 4);
       if (!r.prompt.empty()) std::memcpy(r.prompt.data(), a + r.stop.size() * 4, r.prompt.size() * 4);
+      if (!image_error.empty()) {
+        // Only this request fails, before queue/GPU/session mutation. Never kill the connection.
+        c->admitted.insert(r.h.req_id);
+        fe::DoneHeader d{};
+        d.req_id = r.h.req_id; d.reason = fe::kError; d.error_len = image_error.size();
+        send(c,Frame(fe::kDone).add(&d).add(image_error.data(),image_error.size()).take());
+        return true;
+      }
+      c->admitted.insert(r.h.req_id);
+      std::printf("serve: req %llu vision wire: total %zu, inline bytes 0, logical feature bytes %llu, "
+                  "path bytes %llu, unique open files %zu\n",
+                  (unsigned long long)r.h.req_id,r.images.size(),(unsigned long long)feature_bytes,
+                  (unsigned long long)path_bytes,opened.size());
       r.conn = c;
       r.t_recv = now_s();
       push(std::move(e));
@@ -340,6 +399,7 @@ class Io {
 };
 
 struct Session {
+  std::vector<fe::ImageSpan> images;
   int h = 0;                   // the store's handle, the same on every rank
   int slot = -1;               // the slot whose working state is this session's (-1: none, the store's only)
   std::vector<int32_t> hist;   // the tokens whose state the session holds: positions [0, size)
@@ -357,7 +417,7 @@ struct Session {
 // The server's index of a planned stop's kept sessions (keep(); keepfile.h: 0600 in a 0700 directory,
 // whole or not at all): a header, then each session: id, handle, restart ranges, LRU clock and time,
 // history, encoder-only snapshots.
-constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '1'};
+constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'V', '5'};
 struct SrvHeader {
   char magic[8];
   uint64_t gen;  // the store's (state.cu): both indexes come from the same stop
@@ -367,7 +427,7 @@ struct SrvHeader {
   uint64_t body_bytes, body_hash;
 };
 
-constexpr int kReplay = 128;          // CED's decoder replay
+constexpr int kReplay = 128;  // upstream text-only CED replay
 constexpr int kNever = 1 << 30;       // Session::dec_lo of rings that are valid nowhere
 
 // The window snapshots a session keeps, by their distance d from its history's end E: every one (each
@@ -428,6 +488,8 @@ struct Flight {
   int slices = 0, decoded = 0, batched = 0;  // runs; tokens decoded, of them in batches
   DecodeEnd de;                      // the slices' drafts, summed
   double spec_tok = 1, spec_ms = 0;  // the drafts' rate (SpecRate) from slice to slice
+  std::string error;  // a bounded feature-file failure ends this flight, not the engine
+  uint64_t vision_disk_bytes = 0, vision_peak_chunk_bytes = 0, vision_file_reads = 0;
 };
 
 // b's drafts and steps added to a's (a request's decode slices)
@@ -512,6 +574,9 @@ class Server {
       for (int i = 0; i < hd.n_sess && r.ok; ++i) {
         const uint64_t id = r.get<uint64_t>();
         Session s;
+        const uint32_t ni = r.get<uint32_t>();
+        if (ni > uint32_t(o_.max_ctx) || ni > (r.n - r.at) / sizeof(fe::ImageSpan)) { r.ok = false; break; }
+        for (uint32_t k = 0; k < ni; ++k) s.images.push_back(r.get<fe::ImageSpan>());
         s.h = r.get<int32_t>(), s.pe_snap = r.get<int32_t>();
         s.end_lo = r.get<int32_t>(), s.end_clo = r.get<int32_t>(), s.end_w = r.get<int32_t>(), s.end_dec_lo = r.get<int32_t>();
         s.used = r.get<uint64_t>();
@@ -632,7 +697,10 @@ class Server {
     for (const auto& [id, s] : sess_) {
       if (!m_.state_info(s.h).on_disk) continue;
       ++n;
-      put<uint64_t>(f, id), put<int32_t>(f, s.h), put<int32_t>(f, s.pe_snap);
+      put<uint64_t>(f, id);
+      put<uint32_t>(f, (uint32_t)s.images.size());
+      for (const auto& image : s.images) put<fe::ImageSpan>(f, image);
+      put<int32_t>(f, s.h), put<int32_t>(f, s.pe_snap);
       put<int32_t>(f, s.end_lo), put<int32_t>(f, s.end_clo), put<int32_t>(f, s.end_w), put<int32_t>(f, s.end_dec_lo);
       put<uint64_t>(f, s.used), put<double>(f, s.t_used);
       put<int32_t>(f, (int32_t)s.hist.size()), put<int32_t>(f, (int32_t)s.enc_snaps.size());
@@ -778,15 +846,15 @@ class Server {
 
   // The restart point for continuing session s (its state live or stored) after a common prefix of p,
   // for a prompt of n positions.
-  Plan choose(const Session& s, bool live, int p, int n) const {
+  Plan choose(const Session& s, bool live, int p, int n, bool allow_ced, int replay_rows) const {
     Plan best;
     const model::Model::StateInfo info = m_.state_info(s.h);
     p = live ? p : std::min(p, info.saved);  // a stored session's compressed caches go as far as its pages
     auto consider = [&](int q, int how, int snap) {
       if (q > best.q) best = Plan{q, how, snap};
     };
-    // CED: a restart at q leaving fewer than 128 positions needs the decoder's rings valid at q
-    auto usable = [&](int q, bool dec_ok) { return !o_.ced || n - q >= kReplay || dec_ok; };
+    // A restart leaving fewer than this policy's replay rows needs valid decoder rings at q.
+    auto usable = [&](int q, bool dec_ok) { return (allow_ced && n - q >= replay_rows) || dec_ok; };
     // with the ring and the carries as they were at position `end` (exact for [max(lo, w - 256), end)
     // and [max(clo, w - 16), end)), at most at `cap`
     auto from_ring = [](int end, int cap, int lo, int clo, int w) {
@@ -798,7 +866,7 @@ class Server {
     auto ring = [&](int end, int lo, int clo, int w, int dec_lo) {
       const int q = from_ring(end, p, lo, clo, w);
       return q < 0 || usable(q, std::max(0, q - 127) >= dec_lo) ? q
-                                                                 : from_ring(end, std::min(p, n - kReplay), lo, clo, w);
+                                                                 : allow_ced ? from_ring(end, std::min(p, n - replay_rows), lo, clo, w) : -1;
     };
     if (live) consider(ring((int)s.hist.size(), s.lo, s.clo, s.w, s.dec_lo), kLive, -1);
     if (info.end_pos >= 0) consider(ring(info.end_pos, s.end_lo, s.end_clo, s.end_w, s.end_dec_lo), kEnd, -1);
@@ -868,6 +936,10 @@ class Server {
     else if (h.max_new_tokens < 1) err = "max_new_tokens 0";
     else if (f.rq.stop.size() > (size_t)kMaxStop) err = "more than " + std::to_string(kMaxStop) + " stop ids";
     else if (!(h.temperature >= 0.f) || !(h.top_p > 0.f && h.top_p <= 1.f)) err = "bad sampling parameters";
+    if (!fe::valid_submit_flags(h.flags)) err = "unknown submit flags";
+    for (const auto& image : f.rq.images)
+      for (uint32_t i = image.start; i < image.start + image.rows; ++i)
+        if (f.rq.prompt[i] != 129264) err = "image span must contain image token IDs";
     for (const int32_t t : f.rq.prompt)
       if (err.empty() && (t < 0 || t >= model::kVocab)) err = "token id out of range";
     if (!err.empty() || Io::cancelled(f.rq)) {
@@ -926,8 +998,12 @@ class Server {
     if (s < 0) s = pick_slot(keep);
     if (s < 0) die("serve: no slot for request %llu", (unsigned long long)h.req_id);  // admit() saw one
     const bool src_live = src && src->slot == s;
-    const int p = src ? std::min(lcp(src->hist, prompt), n - 1) : 0;
-    const Plan pl = src ? choose(*src, src_live, p, n) : Plan{};
+    const int replay_rows = kReplay;
+    // Image requests use full-layer prefill; text requests keep upstream CED128.
+    const bool allow_ced = o_.ced && f.rq.images.empty();
+    const int p = src ? std::min({lcp(src->hist, prompt), n - 1,
+                                 vision_prefix_limit(src->images, f.rq.images)}) : 0;
+    const Plan pl = src ? choose(*src, src_live, p, n, allow_ced, replay_rows) : Plan{};
     const int q = pl.q;
     NVTX_RANGE("req %llu new %d ctx %d %s", (unsigned long long)h.req_id, n - q, n, kHow[pl.how]);
     if (!resume) {
@@ -966,6 +1042,7 @@ class Server {
     }
     if (!S) {
       Session ns;
+      ns.images = f.rq.images;
       ns.h = next_h_++;
       S = &sess_.emplace(h.session_id, std::move(ns)).first->second;
     }
@@ -985,6 +1062,7 @@ class Server {
     S->slot = s;
     S->used = ++clock_;
     S->t_used = unix_now();
+    S->images = f.rq.images;
     S->hist.assign(prompt.begin(), prompt.begin() + q);
     if (S->pe_snap > q) S->pe_snap = -1;  // dropped
     // CED: S's encoder-only snapshots up to q (a fork's are src's), where its decoder rings are valid
@@ -995,7 +1073,10 @@ class Server {
                 : pl.how == kSnap       ? std::max(0, q - 127)
                 : pl.how == kEnd        ? src->end_dec_lo
                                         : src->dec_lo;
-    const bool ced = o_.ced && n - q >= kReplay;  // else an exact continuation
+    // Short extensions continue through all layers from the live decoder
+    // state. A long extension reconstructs its own tail, wholly at/after q.
+    // Complete image layout covers that replay even when its rows precede the final feature window.
+    const bool ced = allow_ced && n - q >= replay_rows;
     if (ced) S->dec_lo = kNever;                  // until the replay has run
 
     // ---- the prompt's tokens (Engram hashes 3 positions back), with the state operations, in the slot
@@ -1022,6 +1103,18 @@ class Server {
       m_.set_tokens(c.pos0, c.n, t.data());
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
+    // Complete layout is independent of the feature window: Engram reads three positions back,
+    // and CED's final replay can begin before the last encoder chunk.
+    {
+      Cmd c{}; c.op = kCmdVisionLayout; c.slot = s;
+      std::vector<model::ops::VisionSpan> spans;
+      for (const auto& image : f.rq.images)
+        spans.push_back({(int)image.start, (int)image.rows, 0});
+      c.n = (int)spans.size();
+      issue(c);
+      bcast_payload(ring_, spans.data(), spans.size() * sizeof(spans[0]), 0);
+      m_.set_vision_layout(spans);
+    }
     // ---- prefill [q, n): chunks of prefill_rows; a short remainder as one step
     int pos = q;
     model::SampleOut first{};
@@ -1034,6 +1127,40 @@ class Server {
       }
       const int R = std::min(o_.prefill_rows, n - pos);
       const bool last = pos + R == n;
+      if (!f.rq.images.empty()) {
+        std::vector<size_t> indices;
+        uint64_t bytes = 0;
+        std::string error;
+        if (!vision_window(f.rq.images, pos, R, model::kMaxVisionFeatureBytes, indices, bytes, error)) {
+          f.error = error; m_.drain(); return ended(f, fe::kError);
+        }
+        std::vector<model::ops::VisionSpan> spans;
+        std::vector<uint16_t> features(size_t(bytes / 2));
+        f.vision_peak_chunk_bytes = std::max(f.vision_peak_chunk_bytes, bytes);
+        size_t at = 0;
+        for (size_t image_index : indices) {
+          const auto& image = f.rq.images[image_index];
+          spans.push_back({int(image.start), int(image.rows), int(at / model::kDim)});
+          const auto& file = f.rq.image_features[image_index];
+          ++f.vision_file_reads;
+          if (!file || !file->read(features.data() + at, [&] { return Io::cancelled(f.rq); }, error, &f.vision_disk_bytes)) {
+            m_.drain();
+            if (Io::cancelled(f.rq)) return ended(f, fe::kCancelled);
+            f.error = error.empty() ? "missing image feature file" : error;
+            return ended(f, fe::kError);
+          }
+          at += size_t(image.rows) * model::kDim;
+        }
+        // No rank waits on a payload until every needed file is read and validated.
+        if (Io::cancelled(f.rq)) { m_.drain(); return ended(f, fe::kCancelled); }
+        Cmd v{}; v.op = kCmdVision; v.slot = s; v.n = spans.size(); v.rows = bytes / (model::kDim * 2);
+        issue(v);
+        bcast_payload(ring_, spans.data(), spans.size() * sizeof(spans[0]), 0);
+        bcast_payload(ring_, features.data(), features.size() * 2, 0);
+        m_.set_vision_chunk(spans, features.data(), v.rows);
+        std::printf("serve: req %llu vision chunk: pos %d, rows %d, images %zu, feature bytes %llu\n",
+                    (unsigned long long)h.req_id, pos, R, indices.size(), (unsigned long long)bytes);
+      }
       Cmd c{};
       c.slot = s;
       c.pos0 = pos;
@@ -1044,7 +1171,7 @@ class Server {
         if (sn >= 128 && c.n_snaps < kMaxSnaps && (!o_.snap_thin || keep_snap(sn, n, o_.snap_every)))
           c.snaps[c.n_snaps++] = sn;  // none that the prompt's end would thin at once
       wd_.started = now_s();
-      if (R <= o_.small_rows && !ced) {
+      if (R <= o_.small_rows && !ced && f.rq.images.empty()) {
         c.op = kCmdRows;
         std::copy(prompt.begin() + pos, prompt.begin() + pos + R, c.tokens);
         issue(c);
@@ -1072,6 +1199,7 @@ class Server {
       wd_.started = 0;
       S->hist.insert(S->hist.end(), prompt.begin() + pos, prompt.begin() + pos + R);
       pos += R;
+      // Completed at the existing wait/drain boundary: no additional GPU sync.
     }
     const double t_first = now_s();
     if (resume) f.resume_s += t_first - t0;
@@ -1408,13 +1536,13 @@ class Server {
   // requests held for the session go on.
   void finish(Flight& f, uint32_t why) {
     const fe::SubmitHeader& h = f.rq.h;
-    done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
+    done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first, f.error);
     Io::forget(f.rq);
     const double t_end = now_s();
     flying_.erase(h.session_id);
     const bool released = later_.erase(h.session_id) > 0;  // the front-end let it go meanwhile
     forget_evicted();
-    Session* S = (h.flags & fe::kFlagKeep) && !released ? find(h.session_id) : nullptr;
+    Session* S = why != fe::kError && (h.flags & fe::kFlagKeep) && !released ? find(h.session_id) : nullptr;
     if (S) thin(*S);
     const model::Model::StateInfo si = S ? m_.state_info(S->h) : model::Model::StateInfo{};
     const DecodeEnd* de = &f.de;
@@ -1441,9 +1569,19 @@ class Server {
                 1e3 * (f.t_first > 0 ? f.t_first - f.t_start : 0.0),
                 (h.n_prompt - f.q) / std::max(1e-9, f.t_first - f.t_start), f.out.size(), 1e3 * t_dec,
                 f.decoded / std::max(1e-9, t_dec),
-                why == fe::kStop ? "stop" : why == fe::kLength ? "length" : why == fe::kCancelled ? "cancelled" : "context",
+                why == fe::kStop ? "stop" : why == fe::kLength ? "length" : why == fe::kCancelled ? "cancelled" :
+                why == fe::kError ? "error" : "context",
                 m_.state_bytes() / 1048576.0, S ? (int)S->hist.size() : 0, si.bytes / 1048576.0, si.snaps.size(), sl);
     const Turn& u = f.tu;
+    if (!f.rq.images.empty()) {
+      uint64_t rows = 0;
+      for (const auto& image : f.rq.images) rows += image.rows;
+      std::printf("serve: req %llu vision audit: history_images=%zu history_rows=%llu logical_feature_bytes=%llu "
+                  "disk_read_bytes=%llu max_chunk_feature_bytes=%llu file_reads=%llu inline_bytes=0\n",
+                  (unsigned long long)h.req_id, f.rq.images.size(), (unsigned long long)rows,
+                  (unsigned long long)(rows * model::kDim * 2), (unsigned long long)f.vision_disk_bytes,
+                  (unsigned long long)f.vision_peak_chunk_bytes, (unsigned long long)f.vision_file_reads);
+    }
     std::printf("serve: req %llu turn: state ops %.1f ms (GPU %.1f), %d chunks: layers 0-19 %.1f ms, replay %.1f ms, "
                 "head %.1f ms, draft windows %.1f ms, rows %.1f ms; first token to decode %.1f ms, first decode step "
                 "%.1f ms\n",

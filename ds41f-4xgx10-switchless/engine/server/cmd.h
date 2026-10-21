@@ -53,6 +53,8 @@ constexpr int kMaxStop = 32;
 constexpr int kMaxSnaps = 8;
 constexpr int kMaxOps = 12;
 enum : int32_t {
+  kCmdVision = 9, // bounded chunk features
+  kCmdVisionLayout = 10, // full mask-only layout
   kCmdStop = 0,     // leave the command loop
   kCmdStep = 1,     // a golden-mode step (model::Ctl)
   kCmdDecode = 2,   // decode_loop

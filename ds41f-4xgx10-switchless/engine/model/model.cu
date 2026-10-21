@@ -277,6 +277,7 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
       w.gate = dalloc<uint8_t>((size_t)kExperts * kDim * 2);
       comm::allgather(ch, g, w.gate, (size_t)kGatePart * kDim * 2, st);
       w.gate_bias = reinterpret_cast<const float*>(need(p + "ffn.gate.bias", DType::F32, {kExperts}));
+      w.gate_bias_vl = reinterpret_cast<const float*>(need(p + "ffn.gate.bias_vl", DType::F32, {kExperts}));
     }
     {
       dsk::MoeWeights& m = w.moe;
@@ -417,7 +418,7 @@ attn::CompressorCarry Model::Impl::step_carry(int k) const {
 // records of both Engram layers (completion seqs seq[0], seq[1]); the GPU waits for them only when it
 // reaches layer 1 / 14.
 void Model::Impl::engram_prepare(int pos0, int R, const uint64_t seq[2]) {
-  engram::hash_positions(*emap, hist.data(), nullptr, pos0, R, ids.data());
+  engram::hash_positions(*emap, hist.data(), live_of(cur_slot), pos0, R, ids.data());
   engram_submit(R, seq);
 }
 
@@ -430,7 +431,7 @@ void Model::Impl::engram_rows(int R, const int32_t* tok, const int32_t* pos, con
   }
   for (int r0 = 0, r1; r0 < R; r0 = r1) {  // a session's rows: consecutive positions of one slot
     for (r1 = r0 + 1; r1 < R && slot[r1] == slot[r0] && pos[r1] == pos[r1 - 1] + 1;) ++r1;
-    engram::hash_positions(*emap, hist_of(slot[r0]).data(), nullptr, pos[r0], r1 - r0,
+    engram::hash_positions(*emap, hist_of(slot[r0]).data(), live_of(slot[r0]), pos[r0], r1 - r0,
                            ids.data() + (size_t)r0 * 2 * kEngramCols);
   }
   engram_submit(R, seq);

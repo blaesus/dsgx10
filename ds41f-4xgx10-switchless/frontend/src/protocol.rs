@@ -4,10 +4,10 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 5;
 pub const DEFAULT_SOCKET: &str = "/tmp/dsgb10-engine.sock";
 /// Larger frames are a protocol error (a 1M-token prompt is 4 MB).
-pub const MAX_FRAME: usize = 64 << 20;
+pub const MAX_FRAME: usize = 32 << 20; // 1M token IDs + <=4096 paths, never feature payloads
 
 pub const T_HELLO: u16 = 0x01;
 pub const T_SUBMIT: u16 = 0x02;
@@ -16,6 +16,7 @@ pub const T_RELEASE: u16 = 0x04;
 pub const T_HELLO_ENGINE: u16 = 0x81;
 pub const T_TOKENS: u16 = 0x82;
 pub const T_DONE: u16 = 0x83;
+pub const T_IMAGE_MISS: u16 = 0x84;
 
 pub const FLAG_SEED: u32 = 1;
 pub const FLAG_KEEP: u32 = 2;
@@ -46,6 +47,14 @@ impl DoneReason {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ImageSpan {
+    pub start: u32,
+    pub rows: u32,
+    pub digest: [u8; 32],
+    pub feature: crate::feature_file::FeatureFile, // immutable file, little-endian BF16 [rows, 5120]
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Submit {
     pub req_id: u64,
     pub session_id: u64,
@@ -60,6 +69,7 @@ pub struct Submit {
     pub prefix_hint: u32,
     pub stop_ids: Vec<u32>,
     pub prompt: Vec<u32>,
+    pub images: Vec<ImageSpan>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +114,7 @@ pub enum Frame {
     HelloEngine(HelloEngine),
     Tokens(Tokens),
     Done(Done),
+    ImageMiss { req_id: u64, indices: Vec<u32> },
 }
 
 // ------------------------------------------------------------------ encoding
@@ -157,8 +168,19 @@ impl Frame {
                 w.u64(s.req_id).u64(s.session_id).u64(s.base_session_id).u64(s.seed);
                 w.f32(s.temperature).f32(s.top_p).u32(s.top_k).u32(s.max_new_tokens);
                 w.u32(s.flags).u32(s.n_top_logprobs).u32(s.prefix_hint);
-                w.u32(s.stop_ids.len() as u32).u32(s.prompt.len() as u32).u32(0);
+                w.u32(s.stop_ids.len() as u32).u32(s.prompt.len() as u32).u32(s.images.len() as u32);
                 w.u32s(&s.stop_ids).u32s(&s.prompt);
+                for image in &s.images {
+                    w.u32(image.start).u32(image.rows);
+                    w.0.extend_from_slice(&image.digest);
+                    w.u32(image.feature.path().len() as u32);
+                    w.0.extend_from_slice(image.feature.path().as_bytes());
+                }
+                w.finish()
+            }
+            Frame::ImageMiss { req_id, indices } => {
+                let mut w = W::new(T_IMAGE_MISS);
+                w.u64(*req_id).u32(indices.len() as u32).u32(0).u32s(indices);
                 w.finish()
             }
             Frame::Cancel { req_id } => {
@@ -228,9 +250,29 @@ impl Frame {
                 let prefix_hint = r.u32()?;
                 let n_stop = r.u32()? as usize;
                 let n_prompt = r.u32()? as usize;
-                r.u32()?;
+                let n_images = r.u32()? as usize;
+                if n_images > crate::feature_file::MAX_IMAGES || n_images > n_prompt { return Err("more image spans than prompt tokens".into()); }
                 let stop_ids = r.u32s(n_stop)?;
                 let prompt = r.u32s(n_prompt)?;
+                let mut images = Vec::new();
+                let mut end = 0u64;
+                let mut image_rows = 0usize;
+                for _ in 0..n_images {
+                    let start = r.u32()?;
+                    let rows = r.u32()?;
+                    if rows == 0 || rows > 1024 || (start as u64) < end || start as u64 + rows as u64 > n_prompt as u64 {
+                        return Err("invalid image span".into());
+                    }
+                    end = start as u64 + rows as u64;
+                    image_rows = image_rows.checked_add(rows as usize).ok_or("image rows overflow")?;
+                    if image_rows > crate::feature_file::MAX_IMAGE_ROWS { return Err("image rows exceed context budget".into()); }
+                    let digest = r.bytes(32)?.try_into().unwrap();
+                    let size = r.u32()? as usize;
+                    if size == 0 || size > 4096 { return Err("invalid feature path length".into()); }
+                    let path = std::str::from_utf8(r.bytes(size)?).map_err(|_| "invalid feature path UTF8")?;
+                    let feature = crate::feature_file::FeatureFile::descriptor(path, rows as usize * 5120 * 2)?;
+                    images.push(ImageSpan { start, rows, digest, feature });
+                }
                 Frame::Submit(Submit {
                     req_id,
                     session_id,
@@ -245,7 +287,13 @@ impl Frame {
                     prefix_hint,
                     stop_ids,
                     prompt,
+                    images,
                 })
+            }
+            T_IMAGE_MISS => {
+                let req_id = r.u64()?; let n = r.u32()? as usize;
+                if r.u32()? != 0 || n == 0 || n > 52428 { return Err("bad image miss frame".into()); }
+                Frame::ImageMiss { req_id, indices: r.u32s(n)? }
             }
             T_CANCEL => Frame::Cancel { req_id: r.u64()? },
             T_RELEASE => Frame::Release { session_id: r.u64()? },
@@ -348,6 +396,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_resolution_history_exceeding_512_mib_is_metadata_only() {
+        let mut s=Submit { req_id:1,session_id:1,base_session_id:0,seed:1017,temperature:0.,top_p:1.,
+            top_k:0,max_new_tokens:1,flags:FLAG_KEEP,n_top_logprobs:0,prefix_hint:0,
+            stop_ids:vec![1],prompt:vec![129264;58*1024],images:Vec::new() };
+        s.images=(0..58).map(|i|ImageSpan { start:i*1024,rows:1024,digest:[i as u8;32],
+            feature:crate::feature_file::FeatureFile::descriptor(
+                &format!("/tmp/dsgb10-vision-features/test/f{i}"),1024*5120*2).unwrap() }).collect();
+        assert_eq!(s.images.iter().map(|i|i.feature.len()).sum::<usize>(),580<<20);
+        let b=Frame::Submit(s.clone()).encode();
+        assert!(b.len()<256<<10,"all historical feature bytes must stay outside the frame");
+        assert_eq!(Frame::decode(T_SUBMIT,&b[8..],|_|0).unwrap(),Frame::Submit(s));
+        // Bad root / path truncation / trailing inline bytes are protocol errors.
+        let mut bad=b.clone();
+        let path_at=8+72+4+58*1024*4+44;
+        bad[path_at]=b'x';
+        assert!(Frame::decode(T_SUBMIT,&bad[8..],|_|0).is_err());
+        assert!(Frame::decode(T_SUBMIT,&b[8..b.len()-1],|_|0).is_err());
+        let mut bad=b.clone();bad.push(0);
+        assert!(Frame::decode(T_SUBMIT,&bad[8..],|_|0).is_err());
+        let mut bad=b;bad[8+68..8+72].copy_from_slice(&4097u32.to_le_bytes());
+        assert!(Frame::decode(T_SUBMIT,&bad[8..],|_|0).is_err());
+    }
+
+    #[test]
     fn roundtrip_and_layout() {
         let s = Submit {
             req_id: 7,
@@ -363,11 +435,30 @@ mod tests {
             prefix_hint: 5,
             stop_ids: vec![1],
             prompt: vec![0, 10, 20],
+            images: Vec::new(),
         };
         let b = Frame::Submit(s.clone()).encode();
         assert_eq!(b.len(), 8 + 72 + 4 + 12); // header, SubmitHeader, stop id, prompt
         assert_eq!(u32::from_le_bytes(b[8 + 64..8 + 68].try_into().unwrap()), 3); // n_prompt at offset 64
         assert_eq!(Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap(), Frame::Submit(s));
+        let mut image_submit = match Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap() {
+            Frame::Submit(s) => s, _ => unreachable!()
+        };
+        image_submit.prompt=vec![0,129264,129264,10];
+        image_submit.images=vec![ImageSpan { start:1, rows:2, digest:[7;32], feature:crate::feature_file::FeatureFile::descriptor("/tmp/dsgb10-vision-features/test/file",2*5120*2).unwrap() }];
+        let image_frame=Frame::Submit(image_submit.clone()).encode();
+        assert_eq!(Frame::decode(T_SUBMIT,&image_frame[8..],|_|0).unwrap(),Frame::Submit(image_submit.clone()));
+        assert!(Frame::decode(T_SUBMIT,&image_frame[8..image_frame.len()-1],|_|0).is_err());
+        // An agent can accumulate many historical images; preserve every span.
+        let mut history=image_submit.clone();
+        history.prompt=vec![129264;128];
+        history.images=(0..64).map(|i| ImageSpan {start:i*2, rows:2, digest:[i as u8;32], feature:crate::feature_file::FeatureFile::descriptor("/tmp/dsgb10-vision-features/test/file",2*5120*2).unwrap()}).collect();
+        let history_frame=Frame::Submit(history.clone()).encode();
+        assert_eq!(Frame::decode(T_SUBMIT,&history_frame[8..],|_|0).unwrap(),Frame::Submit(history.clone()));
+        history.images[63].start=125; // overlaps the preceding image
+        assert!(Frame::decode(T_SUBMIT,&Frame::Submit(history).encode()[8..],|_|0).is_err());
+        image_submit.images[0].start=4;
+        assert!(Frame::decode(T_SUBMIT,&Frame::Submit(image_submit).encode()[8..],|_|0).is_err());
         let d = Done {
             req_id: 1,
             reason: DoneReason::Length,

@@ -58,6 +58,7 @@ struct Prefill {
   uint8_t *yq, *ys, *qq, *qs, *oq, *os, *gath;
   uint8_t *oqa, *osa;  // every rank's wo_a output (act_quant) for this rank's rows: [rank][Q][2048], scales
   uint8_t *lin_kv, *lin_sc;  // one layer's window: up to 127 positions before the chunk, then the chunk
+  int* image_mask;
   int *tok, *pos, *ridx, *counters, *topk_mine, *topk[kIdxSlots], *pool;
   // keys: a batch of the dense scans' rows (kIdxBatch x kstride), or the Reindex scans' rows (Q x the pool)
   uint16_t *keys, *bkeys, *topkey, *poolkey;
