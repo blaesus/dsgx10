@@ -9,7 +9,8 @@ inline bool vision_needs_replay(const fe::ImageSpan& image, int q) {
   return image.start + image.rows > uint32_t(std::max(0, q - 3));
 }
 // Pure token LCP is insufficient because different images share token 129264.
-// Text CED and image exact-prefill states never cross this policy boundary.
+// Legacy text CED and image full-prefill states cannot cross this boundary.
+// Shared full/tail policies may reuse the causal prefix before the first image change.
 inline int vision_prefix_limit(const std::vector<fe::ImageSpan>& a,
                                const std::vector<fe::ImageSpan>& b, bool full_prefix = false) {
   if (!full_prefix && a.empty() != b.empty()) return 0;

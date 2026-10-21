@@ -990,6 +990,36 @@ mod tests {
     }
 
     #[test]
+    fn prefix_policies_preserve_prompt_and_sampling_but_isolate_cache() {
+        let req = json!({"messages": [{"role": "user", "content": "Compare these shapes."}],
+                         "temperature": 0.8, "top_p": 0.9, "cache_salt": "tenant-a"});
+        let mut c = cfg();
+        let legacy = prepare(&c, &req).unwrap();
+        let mut scopes = std::collections::HashSet::new();
+        for (name, policy, flag) in [
+            ("legacy", VisionPrefixPolicy::Legacy, 0),
+            ("exact", VisionPrefixPolicy::Exact, 16),
+            ("tail-exact", VisionPrefixPolicy::TailExact, 32),
+        ] {
+            assert_eq!(VisionPrefixPolicy::parse(name).unwrap(), policy);
+            assert_eq!(policy.flags(), flag);
+            c.vision_prefix_policy = policy;
+            let p = prepare(&c, &req).unwrap();
+            assert_eq!(p.prompt, legacy.prompt);
+            assert_eq!((p.temperature, p.top_p, p.max_tokens),
+                       (legacy.temperature, legacy.top_p, legacy.max_tokens));
+            assert!(scopes.insert(p.cache_namespace.clone()), "policy cache collision");
+            assert_eq!(p.cache_namespace, prepare(&c, &req).unwrap().cache_namespace);
+            let other = prepare(&c, &json!({"messages": [{"role": "user", "content": "Compare these shapes."}],
+                                           "cache_salt": "tenant-b"})).unwrap();
+            assert_ne!(p.cache_namespace, other.cache_namespace);
+        }
+        for invalid in ["", "tail", "EXACT", "exact,tail-exact"] {
+            assert!(VisionPrefixPolicy::parse(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn efforts() {
         for (v, want) in [
             (json!("low"), 50),
