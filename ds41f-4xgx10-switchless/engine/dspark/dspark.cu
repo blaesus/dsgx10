@@ -1,3 +1,9 @@
+// Probabilistic speculative-sampling additions (2026): reimplemented for
+// dsgx10's CUDA/ring execution path after consulting DeepInfer, revision
+// 8b16149741a4935e1dec8cea27853f273b374c5b. Relevant upstream portions retain
+// their MIT notices. DeepInfer-derived additions are provided under Apache-2.0;
+// see repository NOTICE, LICENSES/Apache-2.0-DeepInfer.txt, and
+// docs/probabilistic-speculation.md for source mapping and changes.
 // DSpark draft module: kernels and host side (dspark.h, README.md).
 #include "dspark/dspark.h"
 
@@ -173,12 +179,15 @@ __global__ void __launch_bounds__(32 * kDraft) router3_kernel(const float* logit
 // and emb, its ids (ids + 8 ent[q]), column q of the pass's candidates [j][4] (gcand, cand), its own CTA
 // candidates and counter: the chain of each entry as alone, in the same order. Without BATCH every offset is
 // zero and the kernel is the one-session one.
-template <bool F8, bool BATCH>
+template <bool F8, bool BATCH, bool PROB = false>
 __global__ void __launch_bounds__(256) markov_kernel(int j, const int* ids, const Cand* gcand, const int* forced,
                                                      const uint16_t* membed, const uint8_t* mhead,
                                                      const uint8_t* mscale, const float* logits, float* dl,
                                                      float* bias_out, uint16_t* emb, Cand* cta, Cand* cand,
-                                                     unsigned* counter, int vbase, const int* ent) {
+                                                     unsigned* counter, int vbase, const int* ent,
+                                                     const spec_sampling::Params* sampling, const int* gate, const int* anchor,
+                                                     const int* slots, int current_slot, float* proposal_logits,
+                                                     spec_sampling::ProposalMeta* proposal_meta) {
   __shared__ float e[kMarkov];
   __shared__ Cand red[8];
   __shared__ bool last;
@@ -243,6 +252,25 @@ __global__ void __launch_bounds__(256) markov_kernel(int j, const int* ids, cons
     if (bias_out) bias_out[(size_t)jr * kVocabRank + row] = acc;
   }
   int id = vbase + row;
+  if constexpr (PROB) {
+    const int entry = BATCH ? ent[q] : 0;
+    const int qs = slots ? slots[BATCH ? q * kDraft : 0] : current_slot;
+    const spec_sampling::Params sp = sampling ? sampling[entry] : spec_sampling::Params{};
+    const bool prob = sampling && !forced && spec_sampling::eligible(sp) && (!gate || *gate != 1);
+    const int first_pos = anchor[entry] + 2;
+    if (prob) {
+      if ((lane & 3) == 0)
+        proposal_logits[((size_t)qs * kDraft + j) * kVocabRank + row] = v;
+      v = v * (1.f / sp.temperature) - logf(-logf(spec_sampling::uniform(sp.seed, first_pos + j,
+          spec_sampling::kDraftStream, id)));
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      if (j == 0) proposal_meta[qs].valid = 0;
+      if (j == kDraft - 1)
+        proposal_meta[qs] = spec_sampling::ProposalMeta{sp.seed, sp.temperature, first_pos,
+                                                       prob ? 1 : -1, {0, 0, 0}};
+    }
+  }
 #pragma unroll
   for (int o = 16; o >= 4; o >>= 1) {
     const float ov = __shfl_xor_sync(0xffffffffu, v, o);
@@ -751,6 +779,8 @@ Comm* standin_comm() {
 // ---- Draft -----------------------------------------------------------------------------------------------------
 
 struct Draft::Buf {
+  float* proposal_logits = nullptr;
+  spec_sampling::ProposalMeta* proposal_meta = nullptr;
   void* arena = nullptr;
   // accept
   uint8_t *hq, *hs;
@@ -845,10 +875,27 @@ Draft::~Draft() {
   cudaFree(b_->arena);
   cudaFree(b_->probe_arena);
   cudaFree(b_->batch_arena);
+  cudaFree(b_->proposal_logits);
+  cudaFree(b_->proposal_meta);
   delete b_;
 }
 
 const float* Draft::logits() const { return b_->dl; }
+const float* Draft::proposal_logits() const { return b_->proposal_logits; }
+const spec_sampling::ProposalMeta* Draft::proposal_meta() const { return b_->proposal_meta; }
+void Draft::enable_probabilistic() {
+  if (b_->proposal_logits) return;
+  if (vrows_ != kVocabRank) die("probabilistic DSpark requires the complete vocabulary");
+  CUDA_CHECK(cudaMalloc(&b_->proposal_logits, (size_t)slots_ * kDraft * kVocabRank * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&b_->proposal_meta, (size_t)slots_ * sizeof(spec_sampling::ProposalMeta)));
+  CUDA_CHECK(cudaMemset(b_->proposal_meta, 0, (size_t)slots_ * sizeof(spec_sampling::ProposalMeta)));
+}
+void Draft::invalidate_proposals(int slot, cudaStream_t s) {
+  if (!b_->proposal_meta) return;
+  if (slot < -1 || slot >= slots_) die("proposal invalidation slot %d of %d", slot, slots_);
+  CUDA_CHECK(cudaMemsetAsync(b_->proposal_meta + (slot < 0 ? 0 : slot), 0,
+      (size_t)(slot < 0 ? slots_ : 1) * sizeof(spec_sampling::ProposalMeta), s));
+}
 attn::Window Draft::window(int b) const { return win(b, nullptr); }
 
 void Draft::use_slot(int s) {
@@ -927,7 +974,7 @@ void Draft::mix(const uint16_t* x, const float* fn, const float* fn_all, const f
                b.pre);
 }
 
-void Draft::draft(const int* token, cudaStream_t s, const int* slot) {
+void Draft::draft(const int* token, cudaStream_t s, const int* slot, const spec_sampling::Params* sampling, const int* gate) {
   Buf& b = *b_;
   // wq_b and wo_b with two MMA tiles per warp: half the CTAs, each row's sums as with one (~10 us less per block)
   dsk::GemvCfg c8k{1, 1, 8}, cqb{2, 1, 8}, cob{2, 1, 16}, cw{1, 4, 4}, cg{1, 1, 8}, ch{2, 1, 16}, ch8{2, 1, 8};
@@ -1005,10 +1052,12 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot) {
     dsk::gemv_bf16(bf(b.hxn), kDraft, w_.head, kVocabRank, kDim, b.logits, nullptr, ch, false, s);
   tap(taps.logits, b.logits, (size_t)kDraft * kVocabRank * 4, s);
   for (int j = 0; j < kDraft; ++j) {
-    launch(w_.markov8 ? markov_kernel<true, false> : markov_kernel<false, false>, dim3(vrows_ / 64), dim3(256), 0, s,
+    launch(b.proposal_logits ? (w_.markov8 ? markov_kernel<true, false, true> : markov_kernel<false, false, true>)
+                             : (w_.markov8 ? markov_kernel<true, false> : markov_kernel<false, false>), dim3(vrows_ / 64), dim3(256), 0, s,
            true, j, (const int*)ids_, (const Cand*)b.gcand, inject.ids, w_.markov_embed,
            w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.logits, b.dl, taps.bias, b.emb,
-           b.cta, b.cand, b.counter, kVocabRank * rank_, (const int*)nullptr);
+           b.cta, b.cand, b.counter, kVocabRank * rank_, (const int*)nullptr,
+           sampling, gate, (const int*)b.start, slot, cur_, b.proposal_logits, b.proposal_meta);
     comm_->argmax(b.cand + j, b.gcand + j, s);  // COLLECTIVE: argmax over the ranks' candidates
   }
   tap(taps.markov_embed, b.emb, kDraft * kMarkov * 2, s);
@@ -1149,10 +1198,12 @@ void Draft::draft_batch(const BatchPass& p, cudaStream_t s) {
   }
   const int ncand = (p.n + 1) & ~1;  // the pass's candidates per step, an even count (argmax_rows's 16 bytes)
   for (int j = 0; j < kDraft; ++j) {
-    launch(w_.markov8 ? markov_kernel<true, true> : markov_kernel<false, true>, dim3(vrows_ / 64, p.n), dim3(256), 0,
+    launch(b.proposal_logits ? (w_.markov8 ? markov_kernel<true, true, true> : markov_kernel<false, true, true>)
+                             : (w_.markov8 ? markov_kernel<true, true> : markov_kernel<false, true>), dim3(vrows_ / 64, p.n), dim3(256), 0,
            s, true, j, (const int*)b.bids, (const Cand*)b.bgcand, (const int*)nullptr, w_.markov_embed,
            w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.blogits, b.bdl, (float*)nullptr,
-           b.bemb, b.bcta, b.bcand, b.bcounter, kVocabRank * rank_, p.ent);
+           b.bemb, b.bcta, b.bcand, b.bcounter, kVocabRank * rank_, p.ent,
+           p.sampling, p.gate, (const int*)b.bstart, p.slot, cur_, b.proposal_logits, b.proposal_meta);
     comm_->argmax_rows(b.bcand + j * 4, b.bgcand + j * 4, ncand, s);  // COLLECTIVE: the entries' argmaxes
   }
   launch(conf_kernel<true>, dim3(p.n), dim3(32 * kDraft), 0, s, true, (const uint16_t*)b.bhx, (const uint16_t*)b.bemb,
@@ -1197,7 +1248,9 @@ void Draft::probe(const int* path, cudaStream_t s) {
     launch(w_.markov8 ? markov_kernel<true, false> : markov_kernel<false, false>, dim3(kMarkovCtas), dim3(256), 0, s,
            true, j, (const int*)ids_, (const Cand*)b.gcand, (const int*)b.pr_forced, w_.markov_embed,
            w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.logits, b.pr_dl, nullptr,
-           b.pr_emb, b.cta, b.pr_cand, b.counter, vbase, (const int*)nullptr);
+           b.pr_emb, b.cta, b.pr_cand, b.counter, vbase, (const int*)nullptr,
+           (const spec_sampling::Params*)nullptr, (const int*)nullptr, (const int*)nullptr, (const int*)nullptr, 0,
+           (float*)nullptr, (spec_sampling::ProposalMeta*)nullptr);
   launch(probe_topk_kernel, dim3(kDraft), dim3(1024), 0, s, true, (const float*)b.pr_dl, path, vbase, b.pr_rec);
   launch(conf_kernel<false>, dim3(1), dim3(32 * kDraft), 0, s, true, (const uint16_t*)b.hx, (const uint16_t*)b.pr_emb,
          w_.conf, (const Cand*)b.pr_cand, b.pr_ids, b.pr_conf, (const int*)nullptr);

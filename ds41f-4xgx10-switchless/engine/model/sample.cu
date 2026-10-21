@@ -1,8 +1,15 @@
+// Probabilistic speculative-sampling additions (2026): reimplemented for
+// dsgx10's CUDA/ring execution path after consulting DeepInfer, revision
+// 8b16149741a4935e1dec8cea27853f273b374c5b. Relevant upstream portions retain
+// their MIT notices. DeepInfer-derived additions are provided under Apache-2.0;
+// see repository NOTICE, LICENSES/Apache-2.0-DeepInfer.txt, and
+// docs/probabilistic-speculation.md for source mapping and changes.
 // The step's sampling fused with its collective (ops.h sample). One block per row: the producer half
 // reduces this rank's 32320 logits of the row to a RowCand, the consumer half picks the token from the
 // four RowCands in rank order, so every rank picks the same one.
 #include <climits>
 #include <cmath>
+#include <type_traits>
 
 #include "attn/launch.h"
 #include "comm/ring_dev.cuh"
@@ -30,11 +37,17 @@ struct RowCand {   // one rank's view of one row
   int32_t id[kCand];
 };
 static_assert(sizeof(RowCand) % 16 == 0, "RowCand");
+struct ProbRowCand : RowCand {
+  float qm, qz, pl, ql;
+  int32_t valid, pad[3];
+};
+struct ResidualCand { float g; int32_t id; float lp; int32_t valid; };
+static_assert(sizeof(ProbRowCand) == sizeof(RowCand) + 32 && sizeof(ResidualCand) == 16, "prob row ABI");
 constexpr int kHdr = 16;  // rank 0's control word, padded
 // a rank's contribution: the control word and a RowCand per block (RB = sample's max_rows: kLowRows or kMaxRows)
-template <int RB>
-constexpr uint32_t kBytes = kHdr + RB * sizeof(RowCand);
-constexpr int kChunks = sizeof(RowCand) / 16;
+template <bool PROB> using SampleCand = std::conditional_t<PROB, ProbRowCand, RowCand>;
+template <int RB, bool PROB = false>
+constexpr uint32_t kBytes = kHdr + RB * sizeof(SampleCand<PROB>);
 
 __device__ __forceinline__ void wait_prev() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void st_release_sys_u32(uint32_t* p, uint32_t v) {
@@ -102,10 +115,14 @@ __device__ __forceinline__ int bin_of(float m, float l) {
 
 // RB blocks (one per row of the step's at most RB): the instance of kLowRows is the kernel of before B4, launch
 // and bytes alike, the one of kMaxRows serves steps of 9..16 rows.
-template <int RB>
+template <int RB, bool PROB = false>
 __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const float* logits, int vocab0,
                                                      const StepIn* in, const uint32_t* ctl, SampleOut* outs,
-                                                     int32_t* fb, uint32_t* counter, SpecState* ss) {
+                                                     int32_t* fb, uint32_t* counter, SpecState* ss,
+                                                     const float* qlogits, const spec_sampling::ProposalMeta* qmeta,
+                                                     int qslots) {
+  using RC = SampleCand<PROB>;
+  constexpr int kChunks = sizeof(RC) / 16;
   __shared__ float sv[32];
   __shared__ int si[32];
   __shared__ int hist[257];
@@ -113,7 +130,8 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
   __shared__ float s_gl;
   __shared__ float cv[kCand];
   __shared__ int ci[kCand];
-  __shared__ __align__(16) RowCand all[kRanks];
+  __shared__ __align__(16) RC all[kRanks];
+  __shared__ __align__(16) ResidualCand residual[kRanks];
   __shared__ float uv[kRanks * kCand];
   __shared__ int ui[kRanks * kCand];
   __shared__ uint32_t s_ctl;
@@ -136,7 +154,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     const uint32_t c = ch.rank == 0 ? *reinterpret_cast<const volatile uint32_t*>(ctl) : 0u;
     *reinterpret_cast<uint4*>(sb) = make_uint4(c, 0, 0, 0);
   }
-  RowCand* mine = reinterpret_cast<RowCand*>(sb + kHdr) + b;
+  RC* mine = reinterpret_cast<RC*>(sb + kHdr) + b;
   if (b < R) {
     const float4* l4 = reinterpret_cast<const float4*>(logits + (size_t)b * kVocabPart);
     // the max and its lowest id; ids ascend within a thread (vector i covers ids 4i .. 4i + 3)
@@ -238,12 +256,52 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     mine->gv = -INFINITY, mine->gi = INT_MAX, mine->gl = 0.f;
     mine->t = -INFINITY, mine->n = 0;
   }
-  comm::post_grid(ch, s, kBytes<RB>);
+  // q belongs to a real cache slot, not a transient batch entry. It is consumed before
+  // this graph's next draft pass overwrites it. Given steps and bonus rows never use q.
+  const bool verify_row = b < R && ss && in->spec == kSpecVerify
+      && b + 1 < R && in->sess[b + 1] == in->sess[b];
+  const float* qrow = nullptr;
+  if constexpr (PROB) {
+    const int qs = b < R ? in->slot[b] : -1;
+    if (verify_row && in->gate != kGateRatio && qmeta && qlogits && qs >= 0 && qs < qslots
+        && spec_sampling::matches(qmeta[qs], sp, pos + 1))
+      qrow = qlogits + ((size_t)qs * kDrafts + pos + 1 - qmeta[qs].first_pos) * kVocabPart;
+    float qm = -INFINITY, qz = 0.f;
+    if (qrow) {
+      for (int i = t; i < kVocabPart; i += kThreads) qm = fmaxf(qm, qrow[i]);
+      qm = block_max(qm, sv);
+      // Match p's float4 traversal and within-thread addition order. In particular p == q
+      // must not acquire a spurious residual solely because the normalisers sum differently.
+      if (isfinite(qm)) {
+        const float4* q4 = reinterpret_cast<const float4*>(qrow);
+        for (int i = t; i < kVec; i += kThreads) {
+          const float4 q = q4[i];
+          const float e[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+          for (int c = 0; c < 4; ++c) qz += expf((e[c] - qm) * invT);
+        }
+      }
+      qz = block_sum(qz, sv);
+    }
+    if (t == 0) {
+      mine->qm = qm; mine->qz = qz;
+      mine->valid = qrow ? 1 : (verify_row && qmeta && qs >= 0 && qs < qslots && qmeta[qs].valid == -1 ? -1 : 0);
+      mine->pl = mine->ql = -INFINITY;
+      if (qrow) {
+        const int d = in->tokens[b + 1] - vocab0;
+        if (d >= 0 && d < kVocabPart) {
+          mine->pl = logits[(size_t)b * kVocabPart + d]; mine->ql = qrow[d];
+        }
+      }
+      mine->pad[0] = mine->pad[1] = mine->pad[2] = 0;
+    }
+  }
+  comm::post_grid(ch, s, kBytes<RB, PROB>);
   comm::wait_all(ch, s);
   if (b < R)
     for (int k = t; k < kRanks * kChunks; k += kThreads) {
       const int r = k / kChunks, c = k % kChunks;
-      reinterpret_cast<uint4*>(&all[r])[c] = comm::ld_cv16(comm::src(ch, s, r) + kHdr + (size_t)b * sizeof(RowCand) + 16 * c);
+      reinterpret_cast<uint4*>(&all[r])[c] = comm::ld_cv16(comm::src(ch, s, r) + kHdr + (size_t)b * sizeof(RC) + 16 * c);
     }
   if (t == 0) s_ctl = comm::ld_cv16(comm::src(ch, s, 0)).x;
   comm::finish_grid(ch, s);  // starts with a barrier: the copies above are done
@@ -333,6 +391,79 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
       }
     }
   }
+  if constexpr (PROB) {
+    __syncthreads();  // original target sample is the exact-match fallback and the bonus
+    bool valid = verify_row && qrow;
+    float pm = -INFINITY, qm = -INFINITY, pz = 0.f, qz = 0.f;
+    float pl = -INFINITY, ql = -INFINITY;
+    if (verify_row) {
+      for (int r = 0; r < kRanks; ++r) {
+        valid = valid && all[r].valid == 1;
+        pm = fmaxf(pm, all[r].m); qm = fmaxf(qm, all[r].qm);
+        pl = fmaxf(pl, all[r].pl); ql = fmaxf(ql, all[r].ql);
+      }
+      for (int r = 0; r < kRanks; ++r) {
+        if (all[r].z > 0.f) pz += all[r].z * expf((all[r].m - pm) * invT);
+        if (all[r].qz > 0.f) qz += all[r].qz * expf((all[r].qm - qm) * invT);
+      }
+      valid = valid && pz > 0.f && qz > 0.f && isfinite(pz) && isfinite(qz) && isfinite(ql);
+    }
+    const float lpz = logf(pz), lqz = logf(qz);
+    const float lp = (pl - pm) * invT - lpz, lq = (ql - qm) * invT - lqz;
+    const bool accepted = valid && logf(spec_sampling::uniform(sp.seed, pos + 1,
+        spec_sampling::kAcceptStream)) < fminf(0.f, lp - lq);
+    float rg = -INFINITY, rlp = -INFINITY;
+    int ri = INT_MAX;
+    if (valid && !accepted) {
+      for (int i = t; i < kVocabPart; i += kThreads) {
+        const float pi = (logits[(size_t)b * kVocabPart + i] - pm) * invT - lpz;
+        const float qi = (qrow[i] - qm) * invT - lqz;
+        const float lr = spec_sampling::log_positive_difference(pi, qi);
+        if (!isfinite(lr)) continue;
+        const int id = vocab0 + i;
+        const float g = lr - logf(-logf(spec_sampling::uniform(sp.seed, pos + 1,
+            spec_sampling::kResidualStream, id)));
+        if (better(g, id, rg, ri)) rg = g, ri = id, rlp = pi;
+      }
+      const int my = ri; const float mylp = rlp;
+      block_argmax(rg, ri, sv, si);
+      if (my == ri && ri != INT_MAX) s_gl = mylp;
+      __syncthreads();
+      rlp = ri == INT_MAX ? -INFINITY : s_gl;
+    }
+    // Fixed collective count across ranks and batch layouts, including fallback/bonus rows.
+    // finish_grid(s) is not a grid barrier: use the known successor s+1 (not next_seq).
+    // wait_all(s+1) proves all blocks have finished consuming s before this finish_grid.
+    const uint64_t rs = s + 1;
+    auto* rm = reinterpret_cast<ResidualCand*>(comm::send_buf(ch, rs)) + b;
+    if (t == 0) *rm = ResidualCand{rg, ri, rlp, ri != INT_MAX};
+    comm::post_grid(ch, rs, RB * sizeof(ResidualCand));
+    comm::wait_all(ch, rs);
+    if (t < kRanks)
+      reinterpret_cast<uint4*>(residual)[t] = comm::ld_cv16(comm::src(ch, rs, t) + b * sizeof(ResidualCand));
+    comm::finish_grid(ch, rs);
+    if (t == 0 && verify_row) {
+      if (!valid) {
+        o.row[b].flags |= spec_sampling::eligible(sp) && in->gate != kGateRatio ? kSampProbFallback : kSampProbSkipped;
+        // Independent target draw + equality is still exact. Unsupported requests retain greedy proposals.
+      } else if (accepted) {
+        o.row[b] = SampleRow{in->tokens[b + 1], lp, pl, kSampProb};
+        fb[b] = in->tokens[b + 1];
+      } else {
+        ResidualCand win{-INFINITY, INT_MAX, -INFINITY, 0};
+        for (int r = 0; r < kRanks; ++r)
+          if (residual[r].valid && better(residual[r].g, residual[r].id, win.g, win.id)) win = residual[r];
+        if (win.valid) {
+          o.row[b] = SampleRow{win.id, win.lp, win.g, kSampProb | kSampProbReject};
+          fb[b] = win.id;
+        } else {
+          // An impossible mathematical event (reject with no positive residual) is observable.
+          // Keep a finite target token but force rejection; qualification requires zero such rows.
+          o.row[b].flags |= kSampProb | kSampProbReject | kSampResidualZero;
+        }
+      }
+    }
+  }
   // the last block to finish publishes the step
   __threadfence_system();
   __syncthreads();
@@ -356,7 +487,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
       // one-session rule below (spec_batch.h; no row reads another entry's). Entry k's rows are consecutive,
       // sess[r] = k; the step is published after the entries' draft passes (spec.cu, k_spec_publish_batch).
       SpecVerdict v[kMaxSess];
-      spec_batch_verdicts(*in, vfb, spec == kSpecVerify, v);
+      spec_batch_verdicts(*in, vfb, spec == kSpecVerify, v, o.row);
       for (int k = 0; k < kMaxSess; ++k) {
         o.sess_row0[k] = v[k].row0, o.sess_step_rows[k] = v[k].step_rows, o.sess_rows[k] = v[k].rows;
         o.sess_pos0[k] = v[k].pos0;
@@ -377,7 +508,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     int n = R - 1;
     if (spec == kSpecVerify) {
       n = 0;
-      while (n < R - 1 && vfb[n] == in->tokens[n + 1]) ++n;
+      while (n < R - 1 && spec_row_accepted(vfb[n], in->tokens[n + 1], o.row[n].flags)) ++n;
     }
     o.rows = n + 1;
     o.pos0 = in->pos[0];
@@ -390,17 +521,25 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
 
 }  // namespace
 
+template <int RB, bool PROB>
+void launch_sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in,
+                   const uint32_t* ctl, SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s,
+                   SpecState* ss, const float* q, const spec_sampling::ProposalMeta* qm, int qs) {
+  if (kBytes<RB, PROB> > ch.cap) die("sample: %u bytes exceed the channel's %u", kBytes<RB, PROB>, ch.cap);
+  attn::launch(k_sample<RB, PROB>, dim3(RB), dim3(kThreads), 0, s, true,
+               ch, logits, vocab0, in, ctl, outs, fb, counter, ss, q, qm, qs);
+}
 void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in, const uint32_t* ctl,
-            SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss, int max_rows) {
-  if (kBytes<kMaxRows> > ch.cap) die("sample: %u bytes exceed the channel's %u", kBytes<kMaxRows>, ch.cap);
-  if (max_rows == kLowRows)
-    attn::launch(k_sample<kLowRows>, dim3(kLowRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb,
-                 counter, ss);
-  else if (max_rows == kMaxRows)
-    attn::launch(k_sample<kMaxRows>, dim3(kMaxRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb,
-                 counter, ss);
-  else
-    die("sample: max_rows %d (kLowRows %d or kMaxRows %d)", max_rows, kLowRows, kMaxRows);
+            SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss, int max_rows,
+            const float* q, const spec_sampling::ProposalMeta* qm, int qs) {
+  if ((q == nullptr) != (qm == nullptr) || (q && qs < 1)) die("sample: incomplete proposal storage");
+  if (max_rows == kLowRows) {
+    if (q) launch_sample<kLowRows, true>(ch, logits, vocab0, in, ctl, outs, fb, counter, s, ss, q, qm, qs);
+    else launch_sample<kLowRows, false>(ch, logits, vocab0, in, ctl, outs, fb, counter, s, ss, q, qm, qs);
+  } else if (max_rows == kMaxRows) {
+    if (q) launch_sample<kMaxRows, true>(ch, logits, vocab0, in, ctl, outs, fb, counter, s, ss, q, qm, qs);
+    else launch_sample<kMaxRows, false>(ch, logits, vocab0, in, ctl, outs, fb, counter, s, ss, q, qm, qs);
+  } else die("sample: max_rows %d (kLowRows %d or kMaxRows %d)", max_rows, kLowRows, kMaxRows);
 }
 
 }  // namespace model::ops

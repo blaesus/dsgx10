@@ -141,6 +141,19 @@ struct DecodeEnd {
                        // drafts; the draft module's windows hold its block keys up to 5 past the anchor)
   // DSpark: verify steps, the drafts they verified and accepted, and how many verified 0..5
   int vsteps = 0, verified = 0, accepted = 0;
+  // Evaluated verification rows (including rows discarded after the first rejection).
+  int prob_rows = 0, prob_accept = 0, prob_reject = 0, prob_fallback = 0, prob_skipped = 0, residual_zero = 0;
+  void probability(const model::SampleOut& o, int r0, int nr) {
+    for (int r = r0; r < r0 + nr; ++r) {
+      const auto f = o.row[r].flags;
+      prob_rows += !!(f & model::ops::kSampProb);
+      prob_accept += !!(f & model::ops::kSampProb) && !(f & model::ops::kSampProbReject);
+      prob_reject += !!(f & model::ops::kSampProbReject);
+      prob_fallback += !!(f & model::ops::kSampProbFallback);
+      prob_skipped += !!(f & model::ops::kSampProbSkipped);
+      residual_zero += !!(f & model::ops::kSampResidualZero);
+    }
+  }
   int rows_hist[model::ops::kDrafts + 1] = {};
   double gpu_ms[model::kMaxRows + 1] = {};  // spec steps' GPU time (rows, draft pass) by rows, summed
   int gpu_n[model::kMaxRows + 1] = {};

@@ -28,3 +28,20 @@ with its licence:
   separate checkout.
 
 No model weights are included.
+
+## Probabilistic speculative-sampling additions
+
+Additions in `ds41f-4xgx10-switchless/engine/common/spec_sampling.h`,
+`engine/model/sample.cu`, and `engine/dspark/dspark.cu` were reimplemented
+after consulting DeepInfer, https://github.com/deepseek-ai/DeepInfer, revision
+`8b16149741a4935e1dec8cea27853f273b374c5b`, specifically
+`deepinfer/model_executor/models/mtp/dflash.py` and
+`deepinfer/model_executor/layers/tilelang_ops/cuda/fused_sample.py`.
+The DeepInfer-derived additions are provided under Apache-2.0; its license text
+is included with LF line endings in `LICENSES/Apache-2.0-DeepInfer.txt`. Existing dsgx10
+portions retain their MIT terms. These additions adapt probability proposals,
+acceptance, and residual resampling to the C++/CUDA native ring, per-slot state,
+CUDA Graphs, and independent random streams. The complete DeepInfer runtime
+and its residual penalty constant were not copied. See
+`docs/probabilistic-speculation.md` for source links and scope. The referenced
+DeepInfer revision has no root NOTICE file; this is this fork's attribution.

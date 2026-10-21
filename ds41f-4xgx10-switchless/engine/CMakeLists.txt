@@ -20,6 +20,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+include(CTest)
 
 foreach(dir common weights comm kernels attn dspark engram model server tests)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${dir}/CMakeLists.txt)

@@ -898,7 +898,7 @@ void Model::step(const Ctl& c, int32_t* sampled, Sink* sink) {
   const SampleOut& o = d_->wait(d_->launch(c.rows, c.pos0, c.tokens, sp, c.flags, sink));
   for (int r = 0; r < c.rows; ++r) sampled[r] = o.row[r].token;
 }
-void Model::reset() { d_->hist.clear(); }
+void Model::reset() { d_->hist.clear(); d_->spec_invalidate(d_->cur_slot); }
 void Model::set_pos_stride(int stride, int group) {
   d_->pos_stride = std::max(1, stride);
   d_->pos_group = std::max(1, group);

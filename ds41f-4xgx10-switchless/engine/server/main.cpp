@@ -300,6 +300,7 @@ struct Args {
   int slice = 64;  // serve: time-slicing's turns, in tokens (0: none)
   bool snap_all = false;
   size_t ring_cap = 4u << 20;  // the ring's per-rank collective size (prefill's bulk collectives post cap / 4)
+  bool spec_probabilistic = false;
   bool spec = false, no_spec = false, draft_fp8 = false, draft_bf16 = false, draft_head4 = false, draft_markov8 = false;
   bool head_raw = false, no_l2pf = false;
   int spec_drafts = 5;
@@ -394,6 +395,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--small-rows") a.small_rows = std::atoi(val().c_str());
     else if (s == "--ring-cap") a.ring_cap = std::strtoull(val().c_str(), nullptr, 10);
     else if (s == "--spec") a.spec = true;
+    else if (s == "--spec-probabilistic") a.spec_probabilistic = true;
     else if (s == "--no-spec") a.no_spec = true;
     else if (s == "--draft-fp8") a.draft_fp8 = true;
     else if (s == "--draft-bf16") a.draft_bf16 = true;
@@ -473,7 +475,7 @@ Args parse(int argc, char** argv) {
     die("--small-rows must be 0..%d (a small turn runs as one step of one session)", model::kMaxSessRows);
   if (a.batch_rows < 1 || a.batch_rows > model::kMaxSessRows)
     die("--batch-rows must be 1..%d (one session's rows in a step)", model::kMaxSessRows);
-  if (a.mode == "serve") a.spec = !a.no_spec;  // the drafts change the speed, never the tokens
+  if (a.mode == "serve") a.spec = !a.no_spec;  // legacy drafts preserve the token trajectory; probability proposals preserve the sampling law
   if (a.mode == "serve") a.draft_fp8 = !a.draft_bf16;  // nor does the drafter's FP8 head
   if (a.draft_fp8 && a.draft_bf16) die("--draft-fp8 or --draft-bf16");
   if (a.draft_head4 && a.draft_bf16) die("--draft-head4 or --draft-bf16");
@@ -489,6 +491,8 @@ Args parse(int argc, char** argv) {
        a.chain_every < 0))
     die("--route-file FILE [--route-every 1..%d] [--chain-every N] [--props FILE]: --mode spectf only",
         model::kMaxSessRows);
+  if (a.spec_probabilistic && (!a.spec || a.no_spec || !a.tree_probe.empty() || a.bgraph_check || a.spec_gate == model::ops::kGateRatio))
+    die("--spec-probabilistic requires --spec and excludes tree-probe/bgraph-check/ratio gate");
   if (a.spec_drafts < 0 || a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..5");
   if (a.spec && (a.mode == "decode" || a.mode == "generate") && !a.big)
     die("--spec: the prompt goes through the prefill path (--big), which fills the draft module's windows");
@@ -581,6 +585,7 @@ int main(int argc, char** argv) {
   mo.draft_fp8 = a.draft_fp8;
   mo.draft_head4 = a.draft_head4, mo.draft_markov8 = a.draft_markov8;
   mo.tree_probe = !a.tree_probe.empty();
+  mo.spec_probabilistic = a.spec_probabilistic;
   mo.slots = a.slots;
   mo.bgraph_bodies = a.bgraph_bodies, mo.bgraph_noif = a.bgraph_noif, mo.bgraph_check = a.bgraph_check;
   mo.l2pf = !a.no_l2pf;

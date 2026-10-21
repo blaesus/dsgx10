@@ -12,10 +12,13 @@ Run without model weights, CUDA, network, or a running server:
 python3 ds41f-4xgx10-switchless/micro/sampling_unit/check.py
 ```
 
-The test compiles the **actual function body** extracted from `sample.cu`,
+The test compiles the **actual function body** extracted from `sample.cu`
+(including the actual `common/spec_sampling.h` when it is a forwarding wrapper),
 exhausts all 16,777,216 high-24-bit patterns, checks open bounds, finite Gumbel
 values, endpoint values, low-bit invariance and uniform paired representation,
 and reproduces the one endpoint failure in the old expression.
+
+On Windows, run from an MSVC developer environment with `--cxx cl`.
 
 On a spare GPU, the same standalone test can explicitly be run with:
 

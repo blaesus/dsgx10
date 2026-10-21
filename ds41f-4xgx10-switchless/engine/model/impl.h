@@ -322,6 +322,7 @@ struct Model::Impl {
   // ---- DSpark (spec.cu) -----------------------------------------------------------------------
   void bind_spec(dsw::WeightFile& wf);
   void spec_head_coded();  // code_head: the draft module's bf16 head GEMV on the coded head
+  void spec_invalidate(int slot = -1); // proposal distributions are never cache/snapshot state
   void spec_use_slot(int s);  // the draft module's eager paths act on slot s's windows
   void spec_hidden(int L, int R);  // main_hidden of the step's rows at the input of layer L
   // prefill: main_hidden of the rows that enter the draft's window (the chunk's last 256, the 128 before

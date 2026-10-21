@@ -7,6 +7,7 @@
 
 #include "comm/collectives.h"
 #include "model/config.h"
+#include "common/spec_sampling.h"
 
 namespace model::ops {
 
@@ -33,13 +34,7 @@ constexpr int kLowRows = 8;
 constexpr int row_budget(int R) { return R <= kLowRows ? kLowRows : kMaxRows; }
 constexpr int kSessTok = 1 + kDrafts;  // a session's rows in a spec step, at most: its bonus token and its drafts
 static_assert(kSessTok <= kMaxSessRows, "a session's spec rows fit its rows of a step");
-struct StepSamp {  // one session's sampling (model::Sampling)
-  uint64_t seed;
-  float temperature;  // 0: greedy
-  float top_p;        // 1: off
-  int32_t top_k;      // 0: off
-  int32_t n_top;      // top logprobs per row, 0..kTopLogprobs
-};
+using StepSamp = spec_sampling::Params;  // unchanged per-session sampling ABI
 struct StepIn {
   int32_t tokens[kMaxRows];  // >= 0: the token; -1 - j: row j of the previous step's sample (decode
                              // queued before the previous step ended)
@@ -89,7 +84,13 @@ struct SampleRow {
   float value;     // what won: the logit (greedy, top-k / top-p) or the Gumbel-perturbed logit / T
   uint32_t flags;  // kSampApprox: the kept candidates reached past the exactly known ones
 };
-enum : uint32_t { kSampApprox = 1 };
+enum : uint32_t {
+  kSampApprox = 1, kSampProb = 2, kSampProbReject = 4,
+  kSampProbFallback = 8, kSampResidualZero = 16, kSampProbSkipped = 32
+};
+__host__ __device__ inline bool spec_row_accepted(int sampled, int proposed, uint32_t flags) {
+  return (flags & kSampProb) ? !(flags & kSampProbReject) : sampled == proposed;
+}
 // One step's result in pinned memory (a ring of kOutSlots, by StepIn::step), the same on every rank. Its
 // rows are the step's, up to kMaxRows (a batch step's) or kMaxSessRows (one session's).
 struct SampleOut {
@@ -139,12 +140,18 @@ struct SpecState {
 // the non-speculative sampler's (noise from the seed and position), so the tokens are its tokens. The
 // step's final rows and the token after them go to ss and row[] (SampleOut::rows); the step is
 // published later, after its draft pass (spec.cu).
+// With proposal_logits/meta, eligible verify rows instead apply min(1,p(d)/q(d)); a rejection
+// samples max(p-q,0) with an independent RNG stream. Explicit flags, not token equality, end the
+// accepted prefix. Bonus rows and unsupported/stale proposals use the original target sampler.
+// q is [real cache slot][5][kVocabPart], raw FP32 biased draft logits; metadata is never restored
+// from a prefix cache. A probability launch has two fixed collectives, an off launch keeps one.
 // max_rows (kLowRows or kMaxRows, row_budget): the grid, a block per row, and the bytes each rank posts; the
 // step's rows must not exceed it (a captured launch serves every step of its graph: the one-session spec graph's
 // kLowRows, a batch graph's kMaxRows).
 void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in, const uint32_t* ctl,
             SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss = nullptr,
-            int max_rows = kMaxRows);
+            int max_rows = kMaxRows, const float* proposal_logits = nullptr,
+            const spec_sampling::ProposalMeta* proposal_meta = nullptr, int proposal_slots = 0);
 
 // x [R][4][5120] = embed[tokens[r]] in every copy; pre_mix [R][4] = (1, 0, 0, 0).
 void embed(const bf16* table, const int* tokens, int R, bf16* x, float* pre_mix, cudaStream_t s);

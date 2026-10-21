@@ -577,6 +577,7 @@ void Model::Impl::state_save(int h, int from, int to) {
 }
 
 void Model::Impl::state_load(int h, int to) {
+  spec_invalidate(cur_slot);
   if (!store_of().sess.count(h)) die("state: session %d loads with nothing stored", h);
   Store::Sess& ss = use_blocks(*this, h);
   if (to > ss.saved) die("state: session %d loads %d positions of %d", h, to, ss.saved);
@@ -657,6 +658,7 @@ void Model::Impl::state_snap_spec(int h, int pos) {
 }
 
 void Model::Impl::state_restore(int h, int pos) {
+  spec_invalidate(cur_slot);
   if (!store_of().sess.count(h)) die("state: session %d restores with nothing stored", h);
   Store::Sess& ss = use_blocks(*this, h);
   if (!ss.snaps.count(pos)) die("state: session %d has no snapshot at %d", h, pos);
@@ -690,6 +692,7 @@ void Model::Impl::state_snap_end(int h, int pos) {
 }
 
 void Model::Impl::state_restore_end(int h) {
+  spec_invalidate(cur_slot);
   if (!store_of().sess.count(h)) die("state: session %d restores its end with nothing stored", h);
   Store::Sess& ss = use_blocks(*this, h);
   if (!ss.end) die("state: session %d has no end snapshot", h);
@@ -749,6 +752,7 @@ void Model::Impl::state_drop(int h, int from) {
 }
 
 void Model::Impl::state_free(int h) {
+  spec_invalidate();
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end()) return;
@@ -762,6 +766,7 @@ void Model::Impl::state_free(int h) {
 
 // src's snapshots up to upto into dst (src is kept while they are copied); those without room are not.
 void Model::Impl::state_copy_snaps(int src, int dst, int upto) {
+  spec_invalidate();
   Store& s = store_of();
   const auto it = s.sess.find(src);
   if (it == s.sess.end() || src == dst) return;

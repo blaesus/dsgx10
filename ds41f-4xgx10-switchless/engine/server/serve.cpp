@@ -433,6 +433,8 @@ struct Flight {
 // b's drafts and steps added to a's (a request's decode slices)
 void add(DecodeEnd& a, const DecodeEnd& b) {
   a.vsteps += b.vsteps, a.verified += b.verified, a.accepted += b.accepted;
+  a.prob_rows += b.prob_rows; a.prob_accept += b.prob_accept; a.prob_reject += b.prob_reject;
+  a.prob_fallback += b.prob_fallback; a.prob_skipped += b.prob_skipped; a.residual_zero += b.residual_zero;
   for (int r = 0; r <= model::ops::kDrafts; ++r) a.rows_hist[r] += b.rows_hist[r];
   for (int r = 0; r <= model::kMaxRows; ++r) a.gpu_ms[r] += b.gpu_ms[r], a.gpu_n[r] += b.gpu_n[r];
   if (b.gate_n) {
@@ -1429,6 +1431,11 @@ class Server {
         if (de->gpu_n[r]) std::printf(" %d: %.2f (%d)", r, de->gpu_ms[r] / de->gpu_n[r], de->gpu_n[r]);
       std::printf("\n");
     }
+    if (de->vsteps)
+      std::printf("serve: req %llu spec_probability prob_rows=%d prob_accept=%d prob_reject=%d "
+                  "prob_fallback=%d prob_skipped=%d residual_zero=%d\n",
+                  (unsigned long long)h.req_id, de->prob_rows, de->prob_accept, de->prob_reject,
+                  de->prob_fallback, de->prob_skipped, de->residual_zero);
     // the decode's time: from the first token to the end, less the time paused and resuming
     const double t_dec = f.t_first > 0 ? std::max(0.0, t_end - f.t_first - f.paused_s - f.resume_s) : 0;
     char sl[128] = "";  // (a request waits a moment in the turns between its first token and its decode)

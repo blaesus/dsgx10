@@ -3,6 +3,7 @@
 
 Default: host C++ compiler. --cuda: explicit, opt-in standalone GPU check.
 The function body is extracted from sample.cu instead of duplicating the fix.
+If it delegates to the shared sampler helper, that actual header is compiled.
 """
 import argparse
 import pathlib
@@ -33,6 +34,11 @@ def main():
 static_assert(std::numeric_limits<float>::is_iec559 &&
               std::numeric_limits<float>::digits == 24, "requires IEEE binary32");
 '''
+    # The probability branch shares its real helper with the draft sampler.
+    # Compile the actual wrapper and header; do not replace it with a copied
+    # expected formula, which could pass while the runtime helper is broken.
+    if 'spec_sampling::' in match.group(1):
+        common += '#include "common/spec_sampling.h"\n'
     common += f'{qualifier} float actual(uint64_t h) {{ {match.group(1)} }}\n'
     common += f'{qualifier} float original(uint64_t h) {{ {OLD} }}\n'
     # Independent properties: open interval, finite transformed value, exact
@@ -90,7 +96,15 @@ int main() {
         exe = path / 'check'
         src.write_text(common, encoding='utf-8')
         compiler = args.nvcc if args.cuda else args.cxx
-        subprocess.run([compiler, '-O2', '-std=c++17', str(src), '-o', str(exe)], check=True)
+        if not args.cuda and pathlib.Path(compiler).name.lower() in ('cl', 'cl.exe'):
+            exe = path / 'check.exe'
+            command = [compiler, '/nologo', '/O2', '/std:c++17', '/EHsc', '/utf-8',
+                       '/I' + str(ROOT / 'engine'), str(src),
+                       '/Fe:' + str(exe), '/Fo:' + str(path / 'check.obj')]
+        else:
+            command = [compiler, '-O2', '-std=c++17', '-I', str(ROOT / 'engine'),
+                       str(src), '-o', str(exe)]
+        subprocess.run(command, check=True)
         subprocess.run([str(exe)], check=True)
 
 
