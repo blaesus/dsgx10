@@ -1,0 +1,33 @@
+name: Probability host checks
+
+on:
+  pull_request:
+    paths:
+      - 'ds41f-4xgx10-switchless/engine/common/spec_sampling.h'
+      - 'ds41f-4xgx10-switchless/engine/model/**'
+      - 'ds41f-4xgx10-switchless/engine/dspark/**'
+      - 'ds41f-4xgx10-switchless/engine/tests/**'
+      - '.github/workflows/probability-host.yml'
+  push:
+    paths:
+      - 'ds41f-4xgx10-switchless/engine/common/spec_sampling.h'
+      - 'ds41f-4xgx10-switchless/engine/model/**'
+      - 'ds41f-4xgx10-switchless/engine/dspark/**'
+      - 'ds41f-4xgx10-switchless/engine/tests/**'
+      - '.github/workflows/probability-host.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure CPU-only helpers
+        run: cmake -S ds41f-4xgx10-switchless/engine/tests -B build-probability-host -DCMAKE_BUILD_TYPE=Release
+      - name: Compile
+        run: cmake --build build-probability-host -j2
+      - name: Test RNG, metadata, residuals, and independent distribution oracle
+        run: ctest --test-dir build-probability-host --output-on-failure

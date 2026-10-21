@@ -9,6 +9,7 @@
 // giving 5 greedy draft tokens and the confidence head's survival probabilities. A batch spec step of several
 // sessions runs their accepts, then one draft_batch() over their blocks side by side (B3 phase 2a).
 #pragma once
+#include "common/spec_sampling.h"
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -213,7 +214,12 @@ class Draft {
   // The draft after the anchor p: *token (the token at p + 1) and four noise tokens at positions p + 1 .. p + 5
   // through the blocks and the head; then tokens() holds d1..d5, greedy drafts for positions p + 2 .. p + 6.
   // `slot` as accept()'s (kDraft entries, all the anchor's session's).
-  void draft(const int* token, cudaStream_t s, const int* slot = nullptr);
+  void draft(const int* token, cudaStream_t s, const int* slot = nullptr,
+             const spec_sampling::Params* sampling = nullptr, const int* gate = nullptr);
+  void enable_probabilistic();
+  void invalidate_proposals(int slot, cudaStream_t s); // -1: all; ordered with graph work
+  const float* proposal_logits() const;
+  const spec_sampling::ProposalMeta* proposal_meta() const;
   void use_slot(int s);
 
   // B3 phase 2a (docs/batching.md): one pass over the drafts of several entries (sessions), their rows side by
@@ -233,6 +239,8 @@ class Draft {
     const int* tok;    // device: entry k's token at tok[k * tok_stride]
     int tok_stride;    // in ints
     const int* slot;   // device [kDraft * n]: each row's session slot
+    const spec_sampling::Params* sampling = nullptr; // device, indexed by ent[q]
+    const int* gate = nullptr; // ratio selection is not causal for random proposals
   };
   void enable_batch();
   void draft_batch(const BatchPass& p, cudaStream_t s);

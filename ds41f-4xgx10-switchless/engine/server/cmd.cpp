@@ -202,6 +202,7 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     e.written = std::max(e.written, o.pos0 + std::max(o.step_rows, o.rows + kD));
     if (i > 0) {
       ++e.vsteps, e.verified += o.step_rows - 1, e.accepted += o.rows - 1;
+      e.probability(o, 0, o.step_rows - 1);
       ++e.rows_hist[std::min(o.step_rows - 1, kD)];
     }
     if (i > 4)  // the step before (done; past the graphs' captures): its GPU time by its rows
@@ -649,6 +650,7 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       }
       if (i > 0) {
         ++d.vsteps, d.verified += sr - 1, d.accepted += er - 1;
+        d.probability(o, r0, sr - 1);
         ++d.rows_hist[std::min(sr - 1, kD)];
       }
       rate[k].add(c, er, sr);

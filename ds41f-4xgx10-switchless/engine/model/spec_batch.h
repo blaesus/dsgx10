@@ -73,7 +73,7 @@ struct SpecVerdict {
   int32_t row0, step_rows, rows, pos0, bonus;
 };
 __host__ __device__ inline void spec_batch_verdicts(const StepIn& in, const volatile int32_t* fb, bool verify,
-                                                    SpecVerdict* v) {
+                                                    SpecVerdict* v, const SampleRow* samples = nullptr) {
   for (int k = 0; k < kMaxSess; ++k) v[k] = SpecVerdict{0, 0, 0, 0, 0};
   const int R = in.rows < 1 ? 1 : in.rows > kMaxRows ? kMaxRows : in.rows;
   int r0 = 0;
@@ -84,7 +84,8 @@ __host__ __device__ inline void spec_batch_verdicts(const StepIn& in, const vola
     int n = nk - 1;
     if (verify) {
       n = 0;
-      while (n < nk - 1 && fb[r0 + n] == in.tokens[r0 + n + 1]) ++n;
+      while (n < nk - 1 && spec_row_accepted(fb[r0 + n], in.tokens[r0 + n + 1],
+                                            samples ? samples[r0 + n].flags : 0)) ++n;
     }
     v[k] = SpecVerdict{r0, nk, n + 1, in.pos[r0], fb[r0 + n]};
     r0 += nk;

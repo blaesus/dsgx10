@@ -547,6 +547,12 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
   cudaFree(hc_tmp);
   sp.draft = std::make_unique<dspark::Draft>(dw, rank, sp.comm.get(), sp.rope, nslots);
   sp.draft->use_slot(cur_slot);
+  if (opt.spec_probabilistic) {
+    if (opt.tree_probe || opt.bgraph_check) die("probabilistic DSpark: tree_probe/bgraph_check are unsupported");
+    sp.draft->enable_probabilistic();
+    if (rank == 0) std::fprintf(stderr, "spec_probability enabled=1 slots=%d q_bytes=%zu support=Tpositive_P1_K0\n",
+        nslots, (size_t)nslots * dspark::kDraft * dspark::kVocabRank * sizeof(float));
+  }
   if (opt.tree_probe) sp.draft->enable_probe();
   static_assert(kMaxRows <= dspark::kMaxHidden, "a batch spec step's rows fit the draft module's main_hidden tap");
   sp.mh = dalloc<uint16_t>((size_t)kMaxRows * dspark::kMainK);
@@ -685,11 +691,12 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   // the verdicts (the sampler's grid of kLowRows blocks: the bodies hold at most that many rows), the draft
   // module, the next step's rows, the publication
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &sw, nullptr, 1, mode));
-  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss, ops::kLowRows);
+  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss, ops::kLowRows,
+              sp.draft->proposal_logits(), sp.draft->proposal_meta(), nslots);
   // the step's session's windows (every entry of its slot table holds its slot)
   const int* slot = nslots > 1 ? in_d->slot : nullptr;
   sp.draft->accept(sp.mh, &sp.ss->count, &sp.ss->pos0, st, slot);
-  sp.draft->draft(&sp.ss->bonus, st, slot);
+  sp.draft->draft(&sp.ss->bonus, st, slot, in_d->samp, &in_d->gate);
   if (opt.tree_probe) {  // EXPERIMENT (docs/engine.md, "Draft trees")
     sp.draft->probe(in_d->probe, st);
     k_probe_out<<<1, 128, 0, st>>>(in_d, sp.draft->probe_out(), out_h);
@@ -776,7 +783,8 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   }
   // the verdicts, per entry
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &sw, nullptr, 1, mode));
-  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss);
+  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss, kMaxRows,
+              sp.draft->proposal_logits(), sp.draft->proposal_meta(), nslots);
   CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &deps, nullptr, &nd));
   std::vector<cudaGraphNode_t> tail(deps, deps + nd);
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
@@ -834,6 +842,8 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
         bp.tok = &sp.ss[0].bonus;
         bp.tok_stride = (int)(sizeof(ops::SpecState) / sizeof(int32_t));
         bp.slot = sp.pstab + (size_t)c0 * ops::kDrafts;
+        bp.sampling = in_d->samp;
+        bp.gate = &in_d->gate;
         sp.draft->draft_batch(bp, st);
       }
       CUDA_CHECK(cudaStreamEndCapture(st, &cap));
@@ -858,7 +868,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
     CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, body, nullptr, nullptr, 0, mode));
     const int* slot = sp.stab + (size_t)k * dspark::kMaxAcc;
     sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k);
-    sp.draft->draft(&sp.ss[k].bonus, st, slot);
+    sp.draft->draft(&sp.ss[k].bonus, st, slot, in_d->samp + k, &in_d->gate);
     k_spec_draft_check<<<1, 32, 0, st>>>(sp.draft->ids(), sp.draft->confidence(), sp.draft->batch_ids(k),
                                          sp.draft->batch_confidence(k), sp.mism);
     CUDA_CHECK(cudaGetLastError());
@@ -944,6 +954,9 @@ void Model::Impl::spec_graphs() {
                 spec->bnodes, (double)(clock() - t1) / CLOCKS_PER_SEC, ((double)free1 - (double)free2) / 1073741824.0);
 }
 
+void Model::Impl::spec_invalidate(int slot) {
+  if (spec && spec->draft) spec->draft->invalidate_proposals(slot, st);
+}
 void Model::Impl::spec_use_slot(int s) {
   if (spec && spec->draft) spec->draft->use_slot(s);
 }
@@ -970,6 +983,7 @@ uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const 
   if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
   ops::StepIn& in = next_in(n, R, pos0, tokens, sp);
   spec_fill(in, ops::kSpecGiven, c);
+  spec_invalidate(cur_slot);
   if (store) {
     if (late.on) die("model: a step waits for its tokens");
     const uint64_t seq[2] = {e_seq + 1, e_seq + 2};
@@ -1074,6 +1088,7 @@ uint64_t Model::Impl::launch_spec_batch(const SpecBatch& b) {
   in.nsess = b.n;
   in.step = (uint32_t)n;
   spec_fill_batch(in, ops::kSpecGiven, b);
+  for (int k = 0; k < b.n; ++k) if (b.on[k]) spec_invalidate(b.slot[k]);
   if (store) {
     if (late.on) die("model: a step waits for its tokens");
     const uint64_t seq[2] = {e_seq + 1, e_seq + 2};

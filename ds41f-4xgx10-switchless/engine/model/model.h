@@ -125,6 +125,7 @@ struct Options {
   bool draft_head4 = false;    // the head as MXFP4, made from the FP8 copy (dspark::head_fp4; +88 MB, the FP8
                                // copy freed): the study's simulated FP4 head bit for bit
   bool draft_markov8 = false;  // the Markov head as FP8 (dspark::markov_fp8; +8.3 MB)
+  bool spec_probabilistic = false; // opt-in full-support probability proposals (T>0/P1/K0)
   int slots = 1;            // session slots (docs/batching.md): live sessions' states side by side (each one's
                             // window rings, compressed caches, index keys, carries and draft windows), up to
                             // kMaxSlots; ~240 MB a slot at 262,144 positions

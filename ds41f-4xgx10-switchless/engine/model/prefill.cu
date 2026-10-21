@@ -574,6 +574,7 @@ void Model::Impl::ced_replay(int P, const std::vector<std::pair<int, uint8_t*>>&
 
 uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snap_pos,
                               bool ced) {
+  spec_invalidate(cur_slot);
   NVTX_RANGE("chunk a=%d M=%d%s%s", a, M, ced ? " ced" : "", sp ? " sample" : "");
   if (!bound) die("model: prefill before bind");
   prefill_alloc();
@@ -664,6 +665,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
 // ---- Model -----------------------------------------------------------------------------------------
 
 void Model::set_tokens(int pos0, int n, const int32_t* tokens) {
+  d_->spec_invalidate(d_->cur_slot);
   auto& h = d_->hist;
   if (pos0 < 0 || n < 0) die("model: set_tokens(%d, %d)", pos0, n);
   h.resize(pos0 + n);
