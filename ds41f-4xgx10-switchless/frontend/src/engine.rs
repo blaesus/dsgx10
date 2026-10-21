@@ -20,6 +20,7 @@ pub enum Event {
 struct Pending {
     tx: mpsc::UnboundedSender<Event>,
     n_top: u32,
+    _submit: Submit, // pins immutable feature files until Done or a connection failure
 }
 
 #[derive(Default)]
@@ -54,6 +55,7 @@ impl EngineClient {
         self.inner.info.borrow().clone()
     }
 
+
     pub async fn wait_connected(&self, timeout: Duration) -> Option<HelloEngine> {
         let mut rx = self.inner.info.subscribe();
         let _ = tokio::time::timeout(timeout, rx.wait_for(|i| i.is_some())).await;
@@ -63,16 +65,31 @@ impl EngineClient {
     /// Send a request (its req_id is assigned here). Events arrive on the receiver; the last one is
     /// always Done.
     pub fn submit(&self, mut s: Submit) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
+        if s.images.len()>crate::feature_file::MAX_IMAGES || s.prompt.len()>crate::feature_file::MAX_IMAGE_ROWS {
+            return Err("image span or context budget exceeded".into());
+        }
+        if s.images.iter().any(|i|!i.feature.is_owned() || i.rows==0 || i.rows>1024 ||
+            i.feature.len()!=i.rows as usize*5120*2) {
+            return Err("request image has no valid immutable feature owner".into());
+        }
         s.req_id = self.inner.next_req.fetch_add(1, Ordering::Relaxed);
+        let encoded=Frame::Submit(s.clone()).encode();
+        if encoded.len()>crate::protocol::MAX_FRAME+8 { return Err("request metadata frame exceeds 32 MiB".into()); }
         let (tx, rx) = mpsc::unbounded_channel();
         let mut c = self.inner.conn.lock().unwrap();
         let wtx = c.tx.clone().ok_or("engine not connected")?;
-        c.pending.insert(s.req_id, Pending { tx, n_top: if s.flags & crate::protocol::FLAG_LOGPROBS != 0 { s.n_top_logprobs } else { 0 } });
-        if wtx.send(Frame::Submit(s.clone()).encode()).is_err() {
-            c.pending.remove(&s.req_id);
+        c.pending.insert(s.req_id, Pending { tx, _submit: s.clone(), n_top: if s.flags & crate::protocol::FLAG_LOGPROBS != 0 { s.n_top_logprobs } else { 0 } });
+        let req_id = s.req_id;
+        if !s.images.is_empty() {
+            eprintln!("vision_file_submit req={} images={} logical_feature_bytes={} path_bytes={} wire_bytes={} inline_feature_bytes=0",
+                s.req_id,s.images.len(),s.images.iter().map(|i|i.feature.len()).sum::<usize>(),
+                s.images.iter().map(|i|i.feature.path().len()).sum::<usize>(),encoded.len());
+        }
+        if wtx.send(encoded).is_err() {
+            c.pending.remove(&req_id);
             return Err("engine not connected".into());
         }
-        Ok((s.req_id, rx))
+        Ok((req_id, rx))
     }
 
     pub fn cancel(&self, req_id: u64) {
@@ -109,7 +126,7 @@ async fn run(inner: Arc<Inner>) {
                     std::mem::take(&mut c.pending)
                 };
                 for (req_id, p) in pending {
-                    let _ = p.tx.send(Event::Done(Done {
+                    let done = Done {
                         req_id,
                         reason: DoneReason::Error,
                         prompt_tokens: 0,
@@ -119,7 +136,8 @@ async fn run(inner: Arc<Inner>) {
                         prefill_us: 0,
                         decode_us: 0,
                         error: "engine connection lost".into(),
-                    }));
+                    };
+                    let _ = p.tx.send(Event::Done(done));
                 }
             }
             Err(e) => {
@@ -176,11 +194,12 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
         };
         match frame {
             Ok(Frame::Tokens(t)) => {
-                let c = inner.conn.lock().unwrap();
-                if let Some(p) = c.pending.get(&t.req_id) {
+                let mut c = inner.conn.lock().unwrap();
+                if let Some(p) = c.pending.get_mut(&t.req_id) {
                     let _ = p.tx.send(Event::Tokens(t));
                 }
             }
+            Ok(Frame::ImageMiss { .. }) => break Err("image miss is invalid in file-backed protocol 5".into()),
             Ok(Frame::Done(d)) => {
                 let p = inner.conn.lock().unwrap().pending.remove(&d.req_id);
                 if let Some(p) = p {

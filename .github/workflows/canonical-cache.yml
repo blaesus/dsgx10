@@ -1,0 +1,17 @@
+name: Canonical input cache
+on:
+  push:
+    paths: ['ds41f-4xgx10-switchless/frontend/**', '.github/workflows/canonical-cache.yml']
+  pull_request:
+    paths: ['ds41f-4xgx10-switchless/frontend/**', '.github/workflows/canonical-cache.yml']
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test frontend and synthetic noncanonical history
+        working-directory: ds41f-4xgx10-switchless/frontend
+        run: cargo test --locked -j2

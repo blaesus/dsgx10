@@ -1,9 +1,9 @@
 //! Session matching for exact prefix reuse (docs/protocol.md, "Sessions and exact prefix reuse").
 //!
-//! Clients do not name their conversation, so a request is matched by text: the session whose text
-//! (prompt plus generated output) shares the longest prefix with the new prompt. The shared part is
-//! sent as that session's own token ids, which is what is in the engine's KV state; the rest is
-//! tokenised on its own from a cut next to an added token, where tokenisation restarts anyway.
+//! Match candidates by text and image identity, but always tokenize the complete incoming prompt.
+//! Model-generated IDs can spell the same bytes using noncanonical BPE segmentation. Reusing them
+//! as the next request's INPUT changes that request according to cache history and can move image
+//! spans. Reuse only an exactly matching canonical ID prefix; the backend independently checks it.
 //!
 //! The table outlives a stop (`save`, `load`; docs/engine.md, "Kept sessions"): the engine keeps its
 //! sessions across a planned stop, and the table is what finds them again. It holds the conversations'
@@ -22,7 +22,25 @@ const MIN_SHARED: usize = 64;
 /// the session's prompt; the encoding may rewrite the tail of the prompt (`<think>` → `</think>`).
 const PROMPT_SLACK: usize = 16;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageKey {
+    pub start: usize, // byte boundary in the expanded prompt
+    pub len: usize,
+    pub digest: [u8; 32],
+}
+
+// Token spellings alone do not identify an image. Invalidate from the first
+// changed/added/removed span, preserving only the identical causal prefix.
+fn image_prefix_limit(a: &[ImageKey], b: &[ImageKey]) -> usize {
+    let k = a.iter().zip(b).take_while(|(x,y)| x == y).count();
+    a.get(k).map_or(usize::MAX, |x| x.start)
+        .min(b.get(k).map_or(usize::MAX, |x| x.start))
+}
+
 struct Session {
+    images: Vec<ImageKey>,
+    pending_images: Vec<ImageKey>,
+    scope: String,
     text: String,
     ids: Vec<u32>,
     /// ends[i] = byte length of the text of ids[..=i]
@@ -38,7 +56,7 @@ pub struct Plan {
     pub session_id: u64,
     /// The session a new session may fork from (0 = none).
     pub base_session_id: u64,
-    /// Leading ids taken from a session (the rest is tokenised).
+    /// Exact token-ID prefix shared with the selected cached session, clipped at changed images.
     pub reused: usize,
     pub ids: Vec<u32>,
     /// For the log, counts only: the session whose text shares the most with the prompt (0: none
@@ -89,7 +107,7 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-const TABLE_MAGIC: &[u8; 8] = b"DSFT0001";
+const TABLE_MAGIC: &[u8; 8] = b"DSFT0003";
 
 fn fnv(b: &[u8]) -> u64 {
     b.iter().fold(1469598103934665603u64, |h, &x| (h ^ x as u64).wrapping_mul(1099511628211))
@@ -150,6 +168,14 @@ impl SessionTable {
                 continue;
             }
             n += 1;
+            body.extend((s.scope.len() as u64).to_le_bytes());
+            body.extend(s.scope.as_bytes());
+            body.extend((s.images.len() as u64).to_le_bytes());
+            for image in &s.images {
+                body.extend((image.start as u64).to_le_bytes());
+                body.extend((image.len as u64).to_le_bytes());
+                body.extend(image.digest);
+            }
             for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64] {
                 body.extend(v.to_le_bytes());
             }
@@ -224,6 +250,16 @@ impl SessionTable {
         let mut r = Bytes { b: body, at: 0 };
         let mut got = HashMap::new();
         for _ in 0..n {
+            let scope_len = r.u64()? as usize;
+            if scope_len > 8192 { return Err("bad cache scope length".into()); }
+            let scope = std::str::from_utf8(r.take(scope_len)?).map_err(|_| "bad cache scope")?.to_string();
+            let ni = r.u64()? as usize;
+            if ni > (r.b.len() - r.at) / 48 { return Err("bad image count".into()); }
+            let mut images = Vec::with_capacity(ni);
+            for _ in 0..ni {
+                images.push(ImageKey { start: r.u64()? as usize, len: r.u64()? as usize,
+                    digest: r.take(32)?.try_into().unwrap() });
+            }
             let (id, last_used, t_used, prompt_len, text_len) = (r.u64()?, r.u64()?, r.u64()?, r.u64()? as usize, r.u64()? as usize);
             let text = r.take(text_len)?;
             let n_ids = r.u64()? as usize;
@@ -243,7 +279,11 @@ impl SessionTable {
             if at != text.len() || tok.decode_bytes(&ids) != text.as_bytes() {
                 continue; // another tokenizer's ids
             }
-            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used });
+            if images.iter().any(|x| x.len == 0 || x.start.checked_add(x.len).map_or(true, |e| e > prompt_len))
+                || images.windows(2).any(|w| w[0].start + w[0].len > w[1].start) {
+                return Err("bad image boundaries".into());
+            }
+            got.insert(id, Session { images, pending_images: Vec::new(), scope, text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used });
         }
         if r.at != body.len() {
             return Err("a bad body".into());
@@ -265,56 +305,52 @@ impl SessionTable {
     /// Choose the session and the token ids for a prompt. The chosen session is busy until
     /// `finish` or `abandon`. Returns the plan and the sessions to RELEASE on the engine.
     pub fn plan(&mut self, text: &str, tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
+        self.plan_scoped(text, "", tok, threads)
+    }
+
+    pub fn plan_scoped(&mut self, text: &str, scope: &str, tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
+        self.plan_images(text, scope, &[], tok, threads)
+    }
+
+    pub fn plan_images(&mut self, text: &str, scope: &str, images: &[ImageKey], tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
         self.clock += 1;
         let mut top: Option<(u64, usize)> = None;
         for (&id, s) in &self.sessions {
-            let n = common_prefix(text.as_bytes(), s.text.as_bytes());
+            if s.scope != scope { continue; }
+            let n = common_prefix(text.as_bytes(), s.text.as_bytes()).min(image_prefix_limit(&s.images, images));
             if n > 0 && top.map_or(true, |(_, bn)| n > bn) {
                 top = Some((id, n));
             }
         }
         let best = top.filter(|&(_, n)| n >= MIN_SHARED);
-        let (mut plan, cut) = match best {
-            None => (Plan { session_id: self.new_id(), base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }, 0),
-            Some((sid, mut shared)) => {
-                while !text.is_char_boundary(shared) {
-                    shared -= 1;
-                }
+        let mut plan = match best {
+            None => Plan { session_id: self.new_id(), base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 },
+            Some((sid, shared)) => {
                 let s = &self.sessions[&sid];
-                // The last cut point within the shared text that is a token boundary of the session
-                // and an edge of an added token in the new text.
-                let mut cut = (0, 0); // (byte position, ids before it)
-                for (a, e) in tok.added_spans(text) {
-                    if a > shared {
-                        break;
-                    }
-                    for p in [a, e] {
-                        if p <= shared && p > cut.0 {
-                            if let Ok(k) = s.ends.binary_search(&p) {
-                                cut = (p, k + 1);
-                            }
-                        }
-                    }
-                }
-                let ids = s.ids[..cut.1].to_vec();
-                let in_place = !s.busy && shared + PROMPT_SLACK >= s.prompt_len;
-                let plan = if in_place {
-                    Plan { session_id: sid, base_session_id: 0, reused: cut.1, ids, matched: 0, shared: 0, common: 0 }
+                if !s.busy && shared + PROMPT_SLACK >= s.prompt_len {
+                    Plan { session_id: sid, base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }
                 } else {
-                    Plan { session_id: self.new_id(), base_session_id: sid, reused: cut.1, ids, matched: 0, shared: 0, common: 0 }
-                };
-                (plan, cut.0)
+                    Plan { session_id: self.new_id(), base_session_id: sid, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }
+                }
             }
         };
-        plan.ids.extend(tok.encode_parallel(&text[cut..], threads));
+        // This must be independent of which session happened to be resident.
+        plan.ids = tok.encode_parallel(text, threads);
         if let Some((sid, n)) = top {
             plan.matched = sid;
             plan.shared = n;
-            let s = &self.sessions[&sid].ids;
-            plan.common = s.iter().zip(&plan.ids).take_while(|(a, b)| a == b).count();
+            let s = &self.sessions[&sid];
+            plan.common = s.ids.iter().zip(&plan.ids).take_while(|(a, b)| a == b).count();
+            if best.is_some() {
+                let image_safe = s.ends.partition_point(|&end| end <= n);
+                plan.reused = plan.common.min(image_safe);
+            }
         }
         let clock = self.clock;
         let s = self.sessions.entry(plan.session_id).or_insert_with(|| Session {
+            images: Vec::new(),
+            pending_images: Vec::new(),
+            scope: scope.to_string(),
             text: String::new(),
             ids: Vec::new(),
             ends: Vec::new(),
@@ -323,6 +359,7 @@ impl SessionTable {
             last_used: clock,
             t_used: 0,
         });
+        s.pending_images = images.to_vec();
         s.busy = true;
         s.last_used = clock;
         s.t_used = unix_now();
@@ -348,6 +385,7 @@ impl SessionTable {
             ends.push(at);
         }
         debug_assert_eq!(at, text.len());
+        s.images = std::mem::take(&mut s.pending_images);
         s.text = text;
         s.ids = ids;
         s.ends = ends;
@@ -392,8 +430,40 @@ mod tests {
     const TOKENIZER: &str = "/data/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json";
 
     #[test]
-    fn reuses_the_models_own_ids() {
-        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+    #[ignore = "requires DSGB10_TEST_TOKENIZER; deployment runs with --include-ignored"]
+    fn mode_and_revision_scopes_survive_save_and_fork() {
+        let tok = Tokenizer::from_file(&std::env::var("DSGB10_TEST_TOKENIZER").unwrap()).unwrap();
+        let mut t = SessionTable::new(32, 1 << 20);
+        let text = "<｜begin▁of▁sentence｜><｜System｜>A long shared system instruction for testing exact session isolation. Carefully follow it.<｜User｜>Hello, please explain the details of cache isolation across modes.<｜Assistant｜></think>";
+        let (normal,_) = t.plan_scoped(text,"revision-A:asset-A:scope-a",&tok,1);
+        t.finish(normal.session_id,text,&normal.ids,&tok.encode("Hi"),&tok);
+        for scope in ["revision-A:asset-A:scope-b","revision-B:asset-A:scope-a","revision-A:asset-B:scope-a"] {
+            let (p,_) = t.plan_scoped(text,scope,&tok,1);
+            assert_eq!(p.reused,0); assert_eq!(p.base_session_id,0);
+            assert_ne!(p.session_id,normal.session_id);
+            t.finish(p.session_id,text,&p.ids,&tok.encode("Hi"),&tok);
+        }
+        let (same,_) = t.plan_scoped(text,"revision-A:asset-A:scope-a",&tok,1);
+        assert_eq!(same.session_id,normal.session_id); assert!(same.reused>0);
+        t.finish(same.session_id,text,&same.ids,&tok.encode("Hi"),&tok);
+        let forktext=text.replace("Hello","An unrelated question");
+        let (fork,_) = t.plan_scoped(&forktext,"revision-A:asset-A:scope-a",&tok,1);
+        assert_eq!(fork.base_session_id,normal.session_id);
+        t.finish(fork.session_id,&forktext,&fork.ids,&tok.encode("Hi"),&tok);
+        let dir=std::env::temp_dir().join(format!("dsfront-scopes-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap(); let path=dir.join("table");
+        t.save(&path,3600).unwrap();
+        let mut u=SessionTable::new(32,1<<20); u.load(&path,&tok,3600).unwrap();
+        let (restored,_) = u.plan_scoped(text,"revision-A:asset-A:scope-a",&tok,1);
+        assert_eq!(restored.session_id,normal.session_id);
+        let (different,_) = u.plan_scoped(text,"revision-C:asset-A:scope-a",&tok,1);
+        assert_eq!(different.reused,0); assert_eq!(different.base_session_id,0);
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn canonical_input_is_independent_of_generated_segmentation() {
+        let Ok(tok) = Tokenizer::from_file(&std::env::var("DSGB10_TEST_TOKENIZER").unwrap_or_else(|_| TOKENIZER.into())) else { return };
         let mut t = SessionTable::new(8, 1 << 20);
         let sys = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.";
         let p1 = format!("{sys}<｜User｜>hello<｜Assistant｜></think>");
@@ -409,8 +479,12 @@ mod tests {
         let mut want = plan.ids.clone();
         want.extend(&gen);
         want.extend(tok.encode("<｜User｜>next<｜Assistant｜></think>"));
-        assert_eq!(plan2.ids, want);
-        assert_eq!(plan2.reused, plan.ids.len() + gen.len());
+        assert_ne!(want, tok.encode(&p2), "fixture must use a genuinely different segmentation");
+        assert_eq!(plan2.ids, tok.encode(&p2), "warm input must equal cold input token for token");
+        assert!(plan2.reused < plan.ids.len() + gen.len());
+        assert!(plan2.reused >= plan.ids.len());
+        let mut cold = SessionTable::new(8, 1 << 20);
+        assert_eq!(plan2.ids, cold.plan(&p2, &tok, 2).0.ids);
         assert_eq!(tok.decode(&plan2.ids), p2);
         // the same system prompt in another conversation forks instead of taking over the session
         let p3 = format!("{sys}<｜User｜>something else entirely<｜Assistant｜></think>");
@@ -422,7 +496,7 @@ mod tests {
 
     #[test]
     fn the_plan_says_where_it_starts() {
-        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let Ok(tok) = Tokenizer::from_file(&std::env::var("DSGB10_TEST_TOKENIZER").unwrap_or_else(|_| TOKENIZER.into())) else { return };
         let mut t = SessionTable::new(8, 1 << 20);
         // pi-like: a long system text that ends with the time, then the tools and the first message
         let body = "You are an expert coding assistant. Read files, run commands and edit code.\n".repeat(40);
@@ -462,7 +536,7 @@ mod tests {
 
     #[test]
     fn a_saved_table_finds_its_sessions_again() {
-        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let Ok(tok) = Tokenizer::from_file(&std::env::var("DSGB10_TEST_TOKENIZER").unwrap_or_else(|_| TOKENIZER.into())) else { return };
         let dir = std::env::temp_dir().join(format!("dsfront-table-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();

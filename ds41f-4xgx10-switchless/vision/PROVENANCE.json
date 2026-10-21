@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "source": "Released native vision worker with a byte-bounded BF16 cache",
+  "runtime_source_sha256": {
+    "encoder.py": "14e54451800ca94e4eaec78fb7d42d133ba6f91680b350d26024add0646aace6",
+    "reference_vision.py": "4a512e9aeb9aaf4bb264aeb39f0bf17e3dd804456a7aff4843f14154f03fa0da",
+    "reference_image_processor.py": "5a49da691715c144eceb0eb2dfaccb992a085a6cc8abb7590982c0115d58ce49"
+  },
+  "checkpoint_tested": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "checkpoint_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "third_party": {
+    "reference_image_processor.py": {
+      "source": "../ref/inference/image_processor.py",
+      "relationship": "Same source content as bundled reference, with LF-normalized line endings",
+      "license": "../ref/LICENSE-deepseek"
+    },
+    "reference_vision.py": {
+      "source": "../ref/inference/vision.py",
+      "relationship": "adapted: explicit batch dimension for SDPA and move cosine/sine tensors to input device",
+      "license": "../ref/LICENSE-deepseek"
+    }
+  },
+  "notes": [
+    "Checkpoint identity is not a claim of independently downloading every reference source at that revision.",
+    "Only these three files participate in the encoder source identity; helper tests and metadata do not change it.",
+    "The public CPU suite uses generated images and no checkpoint, GPU, network or user sessions.",
+    "runtime_source_sha256 records the historical deployed files; public_source_sha256 records this public LF-normalized copy.",
+    "Encoder identity hashes the actual three source files, so LF normalization can change the identity. Old encoder/cache identities must not be reused for a rebuilt public copy."
+  ],
+  "public_source_sha256": {
+    "encoder.py": "14e54451800ca94e4eaec78fb7d42d133ba6f91680b350d26024add0646aace6",
+    "reference_vision.py": "e66e47b74b600ca99c6ba0e7f7ddea82517883e7f65ee0ddb32c85e43b0092bc",
+    "reference_image_processor.py": "482759e3bcc4e9bb5ee582b244cc563f5d0e163d8b48dda91ebb7106e62f9272"
+  },
+  "public_line_endings": "LF",
+  "historical_runtime_equivalence": "The recorded runtime hashes match either these public LF bytes or their uniform CRLF representation; Python source content is unchanged."
+}

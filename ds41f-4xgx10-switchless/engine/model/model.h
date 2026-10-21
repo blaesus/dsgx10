@@ -229,6 +229,11 @@ class Model {
   // CED chunks of one run (each chunk starting where the one before ended), P >= 128. Of the snapshots
   // only one at P covers the decoder layers; the others hold the encoder layers' rings only.
   void set_tokens(int pos0, int n, const int32_t* tokens);
+  // Complete image layout for the current slot, including cached history. Installed once per
+  // request/resume before Engram lookups; CED replay uses this layout without original features.
+  void set_vision_layout(const std::vector<ops::VisionSpan>& spans);
+  // Bounded features for one encoder chunk. Does not change the complete layout or Engram prefetch.
+  void set_vision_chunk(const std::vector<ops::VisionSpan>& spans, const uint16_t* features, int rows);
   void prefill_lookup(int a, int M);
   // The prefill path's buffers and the weights it gathers, made now instead of by the first prefill:
   // every rank at the same point, after set_engram(). This rank's allocations come before ring's host

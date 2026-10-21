@@ -1,0 +1,25 @@
+name: Paired image-serving CPU checks
+on:
+  push:
+    paths: ['ds41f-4xgx10-switchless/frontend/**', 'ds41f-4xgx10-switchless/engine/**', '.github/workflows/vision-serving.yml']
+  pull_request:
+    paths: ['ds41f-4xgx10-switchless/frontend/**', 'ds41f-4xgx10-switchless/engine/**', '.github/workflows/vision-serving.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -j2 --manifest-path ds41f-4xgx10-switchless/frontend/Cargo.toml
+  host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S ds41f-4xgx10-switchless/engine/tests -B build/vision-host -DBUILD_TESTING=ON -DDSGB10_ENABLE_FILE_TESTS=ON
+      - run: cmake --build build/vision-host --parallel 2
+      - run: ctest --test-dir build/vision-host --output-on-failure

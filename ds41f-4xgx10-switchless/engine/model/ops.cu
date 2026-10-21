@@ -30,6 +30,23 @@ __device__ float block_sum(float v, float* red) {
   return s;
 }
 
+__global__ void k_vision_rows(const int* pos, const VisionSpan* spans, int count,
+                               const bf16* features, bf16* x, int* mask) {
+  const int r = blockIdx.x, position = pos[r];
+  int source = -1;
+  for (int k = 0; k < count; ++k)
+    if (position >= spans[k].start && position < spans[k].start + spans[k].rows)
+      source = spans[k].offset + position - spans[k].start;
+  if (threadIdx.x == 0) mask[r] = source >= 0;
+  if (source < 0 || !x) return;
+  const uint4* src = reinterpret_cast<const uint4*>(features + (size_t)source * kDim);
+  uint4* dst = reinterpret_cast<uint4*>(x + (size_t)r * kHcDim);
+  for (int i = threadIdx.x; i < kDim / 8; i += blockDim.x) {
+    const uint4 v = src[i];
+    for (int c = 0; c < kHc; ++c) dst[c * (kDim / 8) + i] = v;
+  }
+}
+
 __global__ void k_embed(const bf16* table, const int* tokens, bf16* x, float* pre_mix) {
   const int r = blockIdx.x;
   const uint4* src = reinterpret_cast<const uint4*>(table + (size_t)tokens[r] * kDim);
@@ -132,10 +149,15 @@ __global__ void k_engram_partial(const bf16* x, const bf16* kv, const float* w, 
 }
 
 // grid (R, 4): one copy of one row.
-__global__ void k_engram_combine(const bf16* x, const uint8_t* gath, int R, bf16* y) {
+__global__ void k_engram_combine(const bf16* x, const uint8_t* gath, int R, bf16* y, const int* image_mask) {
   __shared__ float red[32];
   const int p = blockIdx.x, c = blockIdx.y;
   const bf16* h = x + ((size_t)p * kHc + c) * kDim;
+  if (image_mask && image_mask[p]) {
+    bf16* yo = y + ((size_t)p * kHc + c) * kDim;
+    if (yo != h) for (int j = threadIdx.x; j < kDim; j += blockDim.x) yo[j] = h[j];
+    return;  // image spans take no Engram contribution, including their delimiters
+  }
   float hs = 0.f;
   for (int j = threadIdx.x; j < kDim; j += blockDim.x) {
     const float v = bf(h[j]);
@@ -186,6 +208,11 @@ void step_in(const StepIn* ring, uint32_t* counter, const int32_t* fb, StepIn* d
   CUDA_CHECK(cudaGetLastError());
 }
 
+void vision_rows(const int* pos, int R, const VisionSpan* spans, int count,
+                 const bf16* features, bf16* x, int* mask, cudaStream_t s) {
+  if (R > 0) k_vision_rows<<<R, 256, 0, s>>>(pos, spans, count, features, x, mask);
+}
+
 void embed(const bf16* table, const int* tokens, int R, bf16* x, float* pre_mix, cudaStream_t s) {
   k_embed<<<R, 256, 0, s>>>(table, tokens, x, pre_mix);
   CUDA_CHECK(cudaGetLastError());
@@ -233,8 +260,8 @@ void engram_partial(const bf16* x, const bf16* kv, const float* w, int rank, int
   CUDA_CHECK(cudaGetLastError());
 }
 
-void engram_combine(const bf16* x, const uint8_t* gath, int R, bf16* y, cudaStream_t s) {
-  k_engram_combine<<<dim3(R, kHc), 256, 0, s>>>(x, gath, R, y);
+void engram_combine(const bf16* x, const uint8_t* gath, int R, bf16* y, cudaStream_t s, const int* image_mask) {
+  k_engram_combine<<<dim3(R, kHc), 256, 0, s>>>(x, gath, R, y, image_mask);
   CUDA_CHECK(cudaGetLastError());
 }
 

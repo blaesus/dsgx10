@@ -745,6 +745,18 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       std::vector<std::vector<int32_t>> t;
       bcast_tf(ring, c, e, t, rank);
       batch_tf_loop(m, c, e, t, wd, nullptr);
+    } else if (c.op == kCmdVision) {
+      if (c.n < 0 || c.n > c.rows || c.rows < 0 || c.rows > model::kMaxVisionRows) die("bad vision command");
+      std::vector<model::ops::VisionSpan> spans(c.n);
+      std::vector<uint16_t> features((size_t)c.rows * model::kDim);
+      bcast_payload(ring, spans.data(), spans.size() * sizeof(spans[0]), rank);
+      bcast_payload(ring, features.data(), features.size() * 2, rank);
+      m.set_vision_chunk(spans, features.data(), c.rows);
+    } else if (c.op == kCmdVisionLayout) {
+      if (c.n < 0 || c.n > 4096) die("bad vision layout command");
+      std::vector<model::ops::VisionSpan> spans(c.n);
+      bcast_payload(ring, spans.data(), spans.size() * sizeof(spans[0]), rank);
+      m.set_vision_layout(spans);
     } else if (c.op == kCmdTokens) {
       std::vector<int32_t> t(c.n);
       bcast_payload(ring, t.data(), t.size() * 4, rank);

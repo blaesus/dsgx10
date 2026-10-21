@@ -25,6 +25,7 @@
 // last 128 positions' layer-20 input (ced_keep). The chunk that samples then replays layers 20-39 over
 // [P - 128, P) as a chunk of 128 rows whose window starts at P - 128 (ced_replay), and the head reads it.
 #include "model/prefill.h"
+#include "model/vision_layout.h"
 
 #include <algorithm>
 
@@ -84,6 +85,7 @@ void Model::Impl::prefill_alloc(comm::Ring* ring) {
   p.lin_sc = dalloc<uint8_t>((size_t)(M + 127) * kHead / 32);
   p.tok = dalloc<int>(M);
   p.pos = dalloc<int>(M);
+  p.image_mask = dalloc<int>(p.Q);
   p.ridx = dalloc<int>((size_t)M4 * kTopK);
   p.counters = dalloc<int>(Q);
   p.topk_mine = dalloc<int>((size_t)Q * kIdxTopk);
@@ -218,7 +220,7 @@ void Model::Impl::prefill_engram(int a, int M, int set) {
     }
   if ((int)hist.size() < a + M) die("prefill: Engram lookups for [%d, %d) with %zu tokens", a, a + M, hist.size());
   p.ids[set].resize((size_t)M * 2 * kEngramCols);
-  engram::hash_positions(*emap, hist.data(), nullptr, a, M, p.ids[set].data());
+  engram::hash_positions(*emap, hist.data(), live_of(cur_slot), a, M, p.ids[set].data());
   for (int e = 0; e < 2; ++e) {
     engram::CellMap cm;
     cm.build(store->split(), e, p.ids[set].data(), M);
@@ -256,7 +258,7 @@ void Model::Impl::engram_apply_p(int L, int M, int set) {
   for (int r = 0; r < kRanks; ++r)
     ops::engram_partial(p.x, p.e_kv + (size_t)r * p.Q * kEngramN, w.e_w, r, n, p.e_part + (size_t)r * n * kEngramPartBytes,
                         st);
-  ops::engram_combine(p.x, p.e_part, n, p.x, st);
+  ops::engram_combine(p.x, p.e_part, n, p.x, st, vision_count ? p.image_mask : nullptr);
   (void)M;
 }
 
@@ -446,7 +448,7 @@ void Model::Impl::ffn_p(int L, int M) {
   if (n > 0) {
     dsk::gemm_bf16_p(p.y, n, w.gate, kExperts, kDim, p.gl, st);
     dsk::router_topk(p.gl, w.gate_bias, n, kExperts, p.ridx + (size_t)r0 * kTopK, p.rwts + (size_t)r0 * kTopK,
-                     kRouteScale, st);
+                     kRouteScale, st, w.gate_bias_vl, vision_count ? p.image_mask : nullptr);
   }
   // every row's act_quant and routes for the MoE
   const comm::AgSeg ag[4] = {{p.yq + (size_t)r0 * kDim, p.yq, (size_t)Q * kDim},
@@ -561,6 +563,8 @@ void Model::Impl::ced_replay(int P, const std::vector<std::pair<int, uint8_t*>>&
     i += cnt;
   }
   ops::iota(p.pos, s, M, st);
+  if (vision_count) ops::vision_rows(p.pos + p.r0, p.n, vision_spans, vision_count,
+                                    vision_features, nullptr, p.image_mask, st);
   for (int L = 20; L < kLayers; ++L) {
     NVTX_RANGE("rep L%02d", L);
     // here x holds this rank's replay rows' layer-L input (DSpark's hidden-state hook, a = s, M = 128)
@@ -605,6 +609,9 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   CUDA_CHECK(cudaMemcpyAsync(p.tok, p.tok_h, (size_t)M * 4, cudaMemcpyHostToDevice, st));
   ops::iota(p.pos, a, M, st);
   if (p.n > 0) ops::embed(embed, p.tok + p.r0, p.n, p.x, p.pm, st);
+  // Clear the current mask even when this chunk contains no image rows.
+  if (vision_count) ops::vision_rows(p.pos + p.r0, p.n, vision_feature_spans, vision_feature_count,
+                                    vision_features, p.x, p.image_mask, st);
   if (ced && a != p.ced_end) std::fill(p.ced_pos, p.ced_pos + kReplay, -1);  // a new run of positions
   p.ced_end = ced ? a + M : -1;
 #ifdef DSGB10_NVTX
@@ -662,6 +669,51 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
 }
 
 // ---- Model -----------------------------------------------------------------------------------------
+
+void Model::set_vision_layout(const std::vector<ops::VisionSpan>& spans) {
+  auto& d = *d_;
+  d.drain();  // no prior request/graph/lookup reads the buffers or host mask after this boundary
+  if (!detail::valid_vision_layout(spans, d.opt.max_ctx)) die("model: bad vision layout");
+  auto& live = d.vision_live[d.cur_slot];
+  detail::vision_live_layout(live, spans, d.opt.max_ctx);
+  if (!spans.empty()) {
+    if (spans.size() > size_t(d.vision_span_capacity)) {
+      if (d.vision_spans) CUDA_CHECK(cudaFree(d.vision_spans));
+      d.vision_spans = dalloc<ops::VisionSpan>(spans.size());
+      d.vision_span_capacity = (int)spans.size();
+    }
+    CUDA_CHECK(cudaMemcpyAsync(d.vision_spans, spans.data(), spans.size() * sizeof(spans[0]), cudaMemcpyHostToDevice, d.st));
+    CUDA_CHECK(cudaStreamSynchronize(d.st));
+  }
+  d.vision_count = (int)spans.size();
+  d.vision_feature_count = 0;  // a new request must explicitly install each chunk's features
+  // A cancelled request may have prefetched the same position in the alternate Engram set.
+  if (d.pf) for (int k = 0; k < 2; ++k) d.pf->e_pos0[k] = -1, d.pf->e_n[k] = 0;
+}
+
+void Model::set_vision_chunk(const std::vector<ops::VisionSpan>& spans, const uint16_t* features, int rows) {
+  auto& d = *d_;
+  d.drain();  // old chunk's device feature reads have finished; host lookup mask remains unchanged
+  if (!detail::valid_vision_chunk(spans, rows, d.opt.max_ctx)) die("model: bad vision chunk");
+  if (!spans.empty()) {
+    if (spans.size() > size_t(d.vision_feature_span_capacity)) {
+      if (d.vision_feature_spans) CUDA_CHECK(cudaFree(d.vision_feature_spans));
+      d.vision_feature_spans = dalloc<ops::VisionSpan>(spans.size());
+      d.vision_feature_span_capacity = (int)spans.size();
+    }
+    if (rows > d.vision_capacity) {
+      if (d.vision_features) CUDA_CHECK(cudaFree(d.vision_features));
+      d.vision_features = dalloc<bf16>((size_t)rows * kDim);
+      d.vision_capacity = rows;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(d.vision_feature_spans, spans.data(), spans.size() * sizeof(spans[0]), cudaMemcpyHostToDevice, d.st));
+    CUDA_CHECK(cudaMemcpyAsync(d.vision_features, features, (size_t)rows * kDim * 2, cudaMemcpyHostToDevice, d.st));
+    CUDA_CHECK(cudaStreamSynchronize(d.st));
+  }
+  d.vision_feature_count = (int)spans.size();
+  // In particular: do not clear e_pos0/e_n. run_prefill already queued the next lookup using
+  // the complete immutable vision_live layout, not this feature window.
+}
 
 void Model::set_tokens(int pos0, int n, const int32_t* tokens) {
   auto& h = d_->hist;

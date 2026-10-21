@@ -10,3 +10,7 @@ pub mod pyjson;
 pub mod server;
 pub mod session;
 pub mod tokenizer;
+
+pub mod vision;
+pub mod feature_file;
+pub mod sha256;

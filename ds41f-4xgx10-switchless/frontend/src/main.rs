@@ -105,6 +105,8 @@ fn serve(args: &[String]) {
         eprintln!("warning: no --api-key-file, requests are not authenticated");
     }
     let cfg = ServerConfig {
+        vision_socket: std::env::var("DSGB10_VISION_SOCKET").ok(),
+        vision_revision: std::env::var("DSGB10_VISION_REVISION").ok(),
         model_name: opt(args, "--model-name").unwrap_or_else(|| "deepseek-v4.1-flash-uncensored".into()),
         api_key,
         max_tokens_cap: parse_opt(args, "--max-tokens", 32768u32),
