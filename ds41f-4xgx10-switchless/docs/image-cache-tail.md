@@ -28,8 +28,10 @@ shapes or a claim that every visual reasoning answer is correct.
 Only the suffix after the decoder input dependency boundary is advertised as
 valid for restarting a cached session. The entire 2,560-row scratch replay is
 not reusable state. Short requests use the full path when they cannot provide
-the required replay rows. Replay buffers grow within an explicit capacity
-check; DSpark consumes the actual replay partition rather than assuming 128
+the required replay rows. An engine configured with fewer than 2,560 prefill
+scratch rows also uses the full path, rather than terminating on an oversized
+replay. Replay buffers grow within an explicit capacity check; DSpark consumes
+the actual replay partition rather than assuming 128
 rows. A complete image layout remains available for Engram masks and replay,
 even when only the current chunk's BF16 features are resident.
 

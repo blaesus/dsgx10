@@ -146,6 +146,16 @@ void legacy_unchanged() {
   require(full.final_output.back() && last_kv_window_valid(full),
           "legacy replay beginning at absolute zero has no omitted prefix");
 }
+
+void scratch_capacity_control() {
+  for (int capacity : {1, 32, 127, 128, 512, 2559}) {
+    require(model::ced_replay_fits(128, capacity), "legacy minimum allocation changed");
+    require(!model::ced_replay_fits(2560, capacity), "undersized scratch must use full prefill");
+  }
+  for (int capacity : {2560, 4096, 8192})
+    require(model::ced_replay_fits(2560, capacity), "sufficient scratch rejected");
+  require(!model::ced_replay_fits(2541, 8192), "unsupported replay must remain rejected");
+}
 }  // namespace
 
 int main() {
@@ -155,7 +165,8 @@ int main() {
     tight_bound_control();
     absolute_prefix_zero();
     legacy_unchanged();
-    std::cout << "PASS: 5 CPU structural policy controls; no GPU or numerical-equivalence claim\n";
+    scratch_capacity_control();
+    std::cout << "PASS: 6 CPU structural policy controls; no GPU or numerical-equivalence claim\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

@@ -18,6 +18,12 @@ static_assert(kCedTailRows >= kCedDecoderLayers * kCedWindowReach + 1, "the last
 constexpr bool ced_replay_supported(int rows) {
   return rows == kCedReplayRows || rows == kCedTailRows;
 }
+// Prefill allocation reserves at least the legacy replay size. Never select a
+// larger replay than that scratch capacity; the server can run full prefill instead.
+constexpr bool ced_replay_fits(int rows, int prefill_rows) {
+  const int capacity = prefill_rows > kCedReplayRows ? prefill_rows : kCedReplayRows;
+  return ced_replay_supported(rows) && rows <= capacity;
+}
 // Earliest replay position whose input to every decoder layer (and DSpark's 37..39 taps) is valid.
 // Existing legacy replay retains its trained approximate semantics. Tail replay only exposes the
 // suffix beyond its dependency cone. A replay starting at zero has no truncated history.

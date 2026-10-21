@@ -1009,7 +1009,8 @@ class Server {
     const int replay_rows = policy == fe::kTailPrefix ? model::kCedTailRows : model::kCedReplayRows;
     // Only the new policy uses a dependency-complete decoder tail for images.
     // Legacy preserves its existing text-only, approximate 128-row policy.
-    const bool allow_ced = o_.ced && policy != fe::kFullPrefix &&
+    const bool allow_ced = o_.ced && model::ced_replay_fits(replay_rows, o_.prefill_rows) &&
+                           policy != fe::kFullPrefix &&
                            (policy == fe::kTailPrefix || f.rq.images.empty());
     const int p = src ? std::min({lcp(src->hist, prompt), n - 1,
                                  vision_prefix_limit(src->images, f.rq.images, src->prefill_policy != fe::kLegacyPrefix)}) : 0;
