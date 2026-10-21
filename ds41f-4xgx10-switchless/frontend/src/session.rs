@@ -1,9 +1,9 @@
 //! Session matching for exact prefix reuse (docs/protocol.md, "Sessions and exact prefix reuse").
 //!
-//! Clients do not name their conversation, so a request is matched by text: the session whose text
-//! (prompt plus generated output) shares the longest prefix with the new prompt. The shared part is
-//! sent as that session's own token ids, which is what is in the engine's KV state; the rest is
-//! tokenised on its own from a cut next to an added token, where tokenisation restarts anyway.
+//! Match candidates by text, but always tokenize the complete incoming prompt. Generated IDs can
+//! spell the same bytes using a noncanonical BPE segmentation. Sending those IDs back as INPUT
+//! makes the new request depend on cache history. Only an identical canonical token-ID prefix
+//! may reuse KV state; the engine independently checks the prefix hint.
 //!
 //! The table outlives a stop (`save`, `load`; docs/engine.md, "Kept sessions"): the engine keeps its
 //! sessions across a planned stop, and the table is what finds them again. It holds the conversations'
@@ -38,7 +38,7 @@ pub struct Plan {
     pub session_id: u64,
     /// The session a new session may fork from (0 = none).
     pub base_session_id: u64,
-    /// Leading ids taken from a session (the rest is tokenised).
+    /// Exact token-ID prefix shared with the selected cached session.
     pub reused: usize,
     pub ids: Vec<u32>,
     /// For the log, counts only: the session whose text shares the most with the prompt (0: none
@@ -274,44 +274,27 @@ impl SessionTable {
             }
         }
         let best = top.filter(|&(_, n)| n >= MIN_SHARED);
-        let (mut plan, cut) = match best {
-            None => (Plan { session_id: self.new_id(), base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }, 0),
-            Some((sid, mut shared)) => {
-                while !text.is_char_boundary(shared) {
-                    shared -= 1;
-                }
+        let mut plan = match best {
+            None => Plan { session_id: self.new_id(), base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 },
+            Some((sid, shared)) => {
                 let s = &self.sessions[&sid];
-                // The last cut point within the shared text that is a token boundary of the session
-                // and an edge of an added token in the new text.
-                let mut cut = (0, 0); // (byte position, ids before it)
-                for (a, e) in tok.added_spans(text) {
-                    if a > shared {
-                        break;
-                    }
-                    for p in [a, e] {
-                        if p <= shared && p > cut.0 {
-                            if let Ok(k) = s.ends.binary_search(&p) {
-                                cut = (p, k + 1);
-                            }
-                        }
-                    }
-                }
-                let ids = s.ids[..cut.1].to_vec();
                 let in_place = !s.busy && shared + PROMPT_SLACK >= s.prompt_len;
-                let plan = if in_place {
-                    Plan { session_id: sid, base_session_id: 0, reused: cut.1, ids, matched: 0, shared: 0, common: 0 }
+                if in_place {
+                    Plan { session_id: sid, base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }
                 } else {
-                    Plan { session_id: self.new_id(), base_session_id: sid, reused: cut.1, ids, matched: 0, shared: 0, common: 0 }
-                };
-                (plan, cut.0)
+                    Plan { session_id: self.new_id(), base_session_id: sid, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }
+                }
             }
         };
-        plan.ids.extend(tok.encode_parallel(&text[cut..], threads));
+        plan.ids = tok.encode_parallel(text, threads);
         if let Some((sid, n)) = top {
             plan.matched = sid;
             plan.shared = n;
-            let s = &self.sessions[&sid].ids;
-            plan.common = s.iter().zip(&plan.ids).take_while(|(a, b)| a == b).count();
+            let s = &self.sessions[&sid];
+            plan.common = s.ids.iter().zip(&plan.ids).take_while(|(a, b)| a == b).count();
+            if best.is_some() {
+                plan.reused = plan.common.min(s.ends.partition_point(|&end| end <= n));
+            }
         }
         let clock = self.clock;
         let s = self.sessions.entry(plan.session_id).or_insert_with(|| Session {
@@ -392,7 +375,7 @@ mod tests {
     const TOKENIZER: &str = "/data/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json";
 
     #[test]
-    fn reuses_the_models_own_ids() {
+    fn canonical_input_is_independent_of_generated_segmentation() {
         let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
         let mut t = SessionTable::new(8, 1 << 20);
         let sys = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.";
@@ -409,8 +392,10 @@ mod tests {
         let mut want = plan.ids.clone();
         want.extend(&gen);
         want.extend(tok.encode("<｜User｜>next<｜Assistant｜></think>"));
-        assert_eq!(plan2.ids, want);
-        assert_eq!(plan2.reused, plan.ids.len() + gen.len());
+        assert_ne!(want, tok.encode(&p2), "fixture must use a different segmentation");
+        assert_eq!(plan2.ids, tok.encode(&p2));
+        assert!(plan2.reused < plan.ids.len() + gen.len());
+        assert!(plan2.reused >= plan.ids.len());
         assert_eq!(tok.decode(&plan2.ids), p2);
         // the same system prompt in another conversation forks instead of taking over the session
         let p3 = format!("{sys}<｜User｜>something else entirely<｜Assistant｜></think>");
